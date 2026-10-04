@@ -1,0 +1,139 @@
+name: spike-nft
+
+# Path-filtered CI for the issue #1 spike (the repo has no workspace yet;
+# issue #2 will exclude spikes/ from it).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'spikes/nft-load/**'
+      - '.github/workflows/spike-nft.yml'
+  pull_request:
+    paths:
+      - 'spikes/nft-load/**'
+      - '.github/workflows/spike-nft.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: spikes/nft-load
+
+jobs:
+  spike:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spikes/nft-load -> target
+
+      - name: Add musl target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: fmt + clippy
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Prepare environment (userns, nftables, modules)
+        run: |
+          uname -a
+          id
+          # Ubuntu 24.04+ AppArmor restricts unprivileged user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if ! command -v nft; then
+            sudo apt-get update && sudo apt-get install -y nftables
+          fi
+          # Preload modules the ruleset needs (may be builtins; ignore errors).
+          sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
+            nft_meta nft_immediate nf_nat nft_counter || true
+          # Smoke test: unprivileged user+net namespace must work.
+          unshare -Urn true
+          echo "unprivileged userns smoke OK"
+
+      - name: Build (static musl release)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+
+      - name: Staticness + size asserts
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/nft-load-spike
+          file "$BIN"
+          # file(1) says "statically linked" or "static-pie linked" depending
+          # on the musl toolchain's default PIE mode — both are fully static.
+          file "$BIN" | grep -qE "static(-pie)? linked"
+          ldd "$BIN" 2>&1 | grep -q "statically linked" || true
+          SIZE=$(stat -c %s "$BIN")
+          echo "binary_bytes=$SIZE"
+          [ "$SIZE" -lt 1048576 ]
+          echo "binary_bytes=$SIZE (< 1 MiB)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Self-tests as unprivileged runner + nsenter cross-check
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/nft-load-spike
+          # Run in background with a keep-alive window; the binary prints
+          # READY pid=<pid> on stderr once self-tests are done.
+          "$BIN" --json --verbose --keep-alive 60 > out.json 2> err.log &
+          OUTER=$!
+          for _ in $(seq 1 150); do
+            grep -q "READY pid=" err.log && break
+            sleep 0.2
+          done
+          PID=$(sed -n 's/.*READY pid=\([0-9]*\).*/\1/p' err.log | head -1)
+          test -n "$PID"
+          # Independent oracle: dump the live netns ruleset with the nft CLI.
+          sudo nsenter -t "$PID" -n nft list ruleset | tee ruleset.txt
+          grep -q "redirect to :15001" ruleset.txt
+          grep -q "policy drop" ruleset.txt
+          grep -q 'fib daddr type != local' ruleset.txt
+          wait "$OUTER"
+          RC=$?
+          [ "$RC" -eq 0 ] || { cat err.log; exit 1; }
+          grep -q '"ok":true' out.json
+
+      - name: Fail-closed (--break-rules)
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/nft-load-spike
+          set +e
+          "$BIN" --break-rules > break.out 2> break.log
+          RC=$?
+          set -e
+          echo "exit=$RC"
+          cat break.log
+          [ "$RC" -eq 3 ]
+          grep -q "FAIL-CLOSED-VERIFIED" break.log
+
+      - name: Flake control (5x full runs)
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/nft-load-spike
+          for i in 1 2 3 4 5; do
+            "$BIN" > /dev/null 2>&1 || { echo "flake loop run $i FAILED"; exit 1; }
+            echo "run $i OK"
+          done
+
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          echo "--- uname ---"; uname -a || true
+          echo "--- dmesg tail ---"; sudo dmesg | tail -50 || true
+          echo "--- /proc/modules (head) ---"; head -30 /proc/modules || true
+          for f in err.log out.json break.log break.out ruleset.txt; do
+            echo "--- $f ---"; cat "$f" 2>/dev/null || true
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-logs
+          path: |
+            spikes/nft-load/out.json
+            spikes/nft-load/err.log
+            spikes/nft-load/ruleset.txt
+            spikes/nft-load/break.log
+          if-no-files-found: ignore
