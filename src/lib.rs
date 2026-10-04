@@ -12,3 +12,4 @@
 //! that the hidden `sbx __init` helper will use.
 
 pub mod cli;
+pub mod policy;

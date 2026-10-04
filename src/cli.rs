@@ -26,7 +26,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 /// `--older-than` cutoff would match every session (destructive). humantime
 /// already rejects negatives, empty input, and overflow. The error is mapped
 /// to [`String`] so clap reports it as an invalid-value usage error (exit 2).
-/// Public for reuse by later issues (#5, #10, #12) and unit tests.
+/// Public for reuse: the policy module's `limits.timeout` shares this exact
+/// contract, as do later issues (#5, #10, #12) and unit tests.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
     if d.is_zero() {
