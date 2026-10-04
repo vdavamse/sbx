@@ -20,3 +20,8 @@ idna = "1.1"
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Property tests for the egress matcher/guard (issue #4). Dev-only: never
+# compiled into release binaries; 1.11 declares rust-version 1.85 = MSRV.
+[dev-dependencies]
+proptest = "1.11"
