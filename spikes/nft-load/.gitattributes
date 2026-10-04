@@ -1,0 +1,5 @@
+# This repo lives on a Windows-mounted filesystem where core.autocrlf=true
+# would convert checked-out files to CRLF, breaking shell scripts and
+# confusing the Rust toolchain. Force LF in the working copy for everything
+# under spikes/nft-load/.
+* text eol=lf
