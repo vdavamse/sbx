@@ -1,0 +1,18 @@
+[package]
+name = "sbx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Run untrusted commands in a locked-down Linux sandbox"
+
+# The root package is its own single-member workspace. spikes/ holds
+# standalone experiment packages (issue #1's nft-load spike) with their own
+# manifests, lockfiles and CI — excluding the directory keeps them out of
+# the workspace whether or not it exists yet (verified both ways).
+[workspace]
+exclude = ["spikes"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+humantime = "2.4"
