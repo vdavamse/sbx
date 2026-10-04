@@ -1,0 +1,40 @@
+# Reference ruleset for the nft-load spike (issue #1).
+#
+# This file is the human-readable specification of the exact byte-level
+# netlink encoding the Rust binary produces (see ground-truth.md). It is
+# loaded with `nft -f` inside `unshare -Urn` as the cross-check oracle:
+#
+#   unshare -Urn bash -c 'ip link set lo up && ip addr add 10.255.255.1/32 dev lo \
+#     && ip route add default dev lo src 10.255.255.1 \
+#     && nft -f rules/reference.nft && nft list ruleset'
+#
+# Notes:
+# - nft 1.0.9 requires explicit chain priorities (empirical fact F9);
+#   `priority dstnat` = -100 and `priority filter` = 0, which is what the
+#   binary hand-encodes. The nat chain MUST run before the filter chain
+#   (policy drop), hence -100 < 0 (fact F2).
+# - `redirect to :15001` redirects non-local TCP to the local listener port;
+#   bare `redirect` on UDP/53 keeps the destination port (53).
+
+table ip sbx {
+	chain nat_out {
+		type nat hook output priority dstnat;
+
+		# Non-loopback TCP -> redirect to local proxy listener :15001.
+		# "Non-loopback" = destination is not a local address (fib
+		# daddr type != local): with the default route via lo, EVERY
+		# packet has oif lo, so oifname matching cannot work (D2).
+		meta l4proto tcp fib daddr type != local redirect to :15001
+
+		# DNS -> redirect to local listener on :53 (port preserved).
+		udp dport 53 redirect
+	}
+
+	chain filter_out {
+		type filter hook output priority filter; policy drop;
+
+		# Accept only traffic to local destinations via lo; the
+		# implicit chain policy drops everything else (fail closed).
+		oifname lo fib daddr type local accept
+	}
+}
