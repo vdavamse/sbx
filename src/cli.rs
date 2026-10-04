@@ -157,11 +157,22 @@ pub fn run() -> ExitCode {
 ///
 /// Success is silent — scripting callers rely on the exit code alone. Both
 /// an invalid policy and an unreadable file are runtime failures (rc 1 with
-/// the reason on stderr), never usage errors: rc 2 stays clap's.
+/// the reason on stderr), never usage errors: rc 2 stays clap's. A closed
+/// stdout (broken pipe, e.g. `check --print-schema | true`) is not an sbx
+/// failure either: Unix convention, silent rc 0 — `println!` would panic
+/// (rc 101) because Rust ignores SIGPIPE.
 fn check(policy: Option<PathBuf>, print_schema: bool) -> ExitCode {
     if print_schema {
-        println!("{}", crate::policy::schema_json());
-        return ExitCode::SUCCESS;
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        return match writeln!(out, "{}", crate::policy::schema_json()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("sbx check: cannot write schema to stdout: {err}");
+                ExitCode::FAILURE
+            }
+        };
     }
     let Some(path) = policy else {
         unreachable!("clap enforces --policy unless --print-schema")

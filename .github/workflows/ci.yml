@@ -251,6 +251,11 @@ jobs:
           grep -q '"\$schema"' schema.json || { echo "FAIL: schema output lacks \$schema"; FAIL=1; }
           grep -q '"additionalProperties": false' schema.json || { echo "FAIL: schema output lacks additionalProperties"; FAIL=1; }
 
+          # Broken pipe is silent success (Unix convention): a closed reader
+          # must not turn into a panic (rc 101) and break the 0/1/2 contract.
+          "$BIN" check --print-schema | true
+          check_rc 0 ${PIPESTATUS[0]} "sbx check --print-schema to a closed pipe"
+
           "$BIN" check > /dev/null 2>&1
           check_rc 2 $? "sbx check without --policy or --print-schema (usage error)"
 
