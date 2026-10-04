@@ -106,8 +106,9 @@ pub enum Cmd {
 /// usage errors, and without the exit-101 + backtrace a panic would produce.
 pub fn run() -> ExitCode {
     // Catches invalid clap configuration (bad defaults, duplicate names,
-    // conflicting attributes) in tests and debug builds; cheap no-op-ish
-    // check in release.
+    // conflicting attributes) at startup. Despite the name, this is NOT
+    // gated on cfg(debug_assertions): it runs in every profile — tests,
+    // debug, and release alike — at negligible cost (once per process).
     Cli::command().debug_assert();
 
     let cli = Cli::parse();
@@ -284,9 +285,42 @@ mod tests {
     }
 
     #[test]
+    fn run_rejects_bad_duration() {
+        let err = Cli::try_parse_from([
+            "sbx",
+            "run",
+            "--policy",
+            "p.json",
+            "--session-dir",
+            "/tmp/s",
+            "--timeout",
+            "abc",
+            "--",
+            "true",
+        ])
+        .expect_err("run with a bad --timeout must fail");
+        // Same ValueValidation contract as gc's --older-than: the humantime
+        // parser rejects "abc" (the binary reports `invalid value 'abc' for
+        // '--timeout <DURATION>'` and exits 2).
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn unknown_subcommand_is_rejected() {
         let err = Cli::try_parse_from(["sbx", "nope"]).expect_err("unknown subcommand must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn bare_invocation_reports_missing_subcommand() {
+        // Freezes the no-subcommand UX: bare `sbx` must yield clap's
+        // help-on-missing-subcommand error (binary: exit 2 + help text),
+        // never a silent success or a stub message.
+        let err = Cli::try_parse_from(["sbx"]).expect_err("bare sbx must fail");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     // ---- hidden __init contract --------------------------------------

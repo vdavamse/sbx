@@ -87,8 +87,9 @@ pin the older version (`cargo update -p <crate> --precise <ver>`) or raise
 Release musl builds are fully static. Note that `file(1)` reports them as
 `static-pie linked` (static position-independent executable) rather than
 the literal string `statically linked` — both mean no dynamic loader and no
-shared-library dependencies (`ldd` confirms `statically linked`). PIE is
-kept on purpose: it preserves ASLR for the sandbox launcher itself.
+shared-library dependencies (`ldd` reports `statically linked` or `not a
+dynamic executable`). PIE is kept on purpose: it preserves ASLR for the
+sandbox launcher itself.
 
 ## Development
 
