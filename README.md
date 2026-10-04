@@ -23,16 +23,20 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#3). The CLI parses the full documented
+**In progress** (issues #2–#4). The CLI parses the full documented
 interface, and `check` is real: it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
-`run`, `gc` and the internal `__init` helper are stubs that exit `1`
-with `not implemented yet`. Exit codes: `0` success, `1` runtime failure
-(including an invalid or unreadable policy file), `2` usage error (clap's
-convention). The architecture and issue roadmap live in tracking issue
-#20. `spikes/` holds standalone experiment packages that are excluded
-from the Cargo workspace.
+The library also carries the egress decision core (issue #4): the
+domain allow-list matcher and the resolved-address guard that the proxy
+and fake-IP resolver (#7–#9) will call — library-only, no user-visible
+behavior change yet. `run`, `gc` and the internal `__init` helper are
+stubs that exit `1` with `not implemented yet`. Exit codes: `0`
+success, `1` runtime failure (including an invalid or unreadable
+policy file), `2` usage error (clap's convention). The architecture
+and issue roadmap live in tracking issue #20. `spikes/` holds
+standalone experiment packages that are excluded from the Cargo
+workspace.
 
 ## How it will work (summary of #20)
 
