@@ -153,8 +153,10 @@ fn spawn_udp(
             eprintln!("[listener] UDP {on} ready (canary={canary}, IP_RECVORIGDSTADDR)");
         }
         let mut buf = [0u8; 1024];
-        // Control buffer for one sockaddr_in cmsg: CMSG_SPACE(16) == 32 on
-        // x86_64 Linux (all supported platforms); 64 bytes leaves headroom.
+        // Control buffer for one sockaddr_in cmsg. On x86_64 Linux both
+        // CMSG_LEN(16) and CMSG_SPACE(16) evaluate to 32 (sizeof(cmsghdr)==16
+        // + 4-byte-aligned payload; verified via python3 socket.CMSG_SPACE).
+        // 64 bytes keeps headroom on any platform.
         let mut ctrl = [0u8; 64];
         loop {
             match recvmsg_origdst(&sock, &mut buf, &mut ctrl) {
@@ -202,16 +204,20 @@ fn get_original_dst(stream: &TcpStream) -> Result<String, i32> {
     if (len as usize) < size_of::<libc::sockaddr_in>() {
         return Err(libc::EINVAL);
     }
-    Ok(format_sockaddr_in(&sa))
+    format_sockaddr_in(&sa).ok_or(libc::EAFNOSUPPORT)
 }
 
-/// Manual 16-byte `sockaddr_in` render: `sin_port` and `sin_addr` are stored
-/// in network byte order ([2..4] and [4..8] of the raw struct).
-fn format_sockaddr_in(sa: &libc::sockaddr_in) -> String {
+/// Validate + render a raw 16-byte `sockaddr_in`: `sin_port` and `sin_addr`
+/// are stored in network byte order ([2..4] and [4..8] of the raw struct).
+/// Returns `None` if the family is not AF_INET.
+fn format_sockaddr_in(sa: &libc::sockaddr_in) -> Option<String> {
+    if sa.sin_family != libc::AF_INET as libc::sa_family_t {
+        return None;
+    }
     // to_ne_bytes() yields the octets in memory order == network order.
     let ip = Ipv4Addr::from(sa.sin_addr.s_addr.to_ne_bytes());
     let port = u16::from_be(sa.sin_port);
-    format!("{ip}:{port}")
+    Some(format!("{ip}:{port}"))
 }
 
 /// `recvmsg` with ancillary data; extracts the `IP_RECVORIGDSTADDR` cmsg
@@ -249,11 +255,21 @@ fn recvmsg_origdst(
                 && (*cmh).cmsg_len as usize >= min_len
             {
                 let sa = libc::CMSG_DATA(cmh).cast::<libc::sockaddr_in>();
-                origdst = Some(format_sockaddr_in(&*sa));
+                // None (non-AF_INET) leaves origdst unset — informational.
+                origdst = format_sockaddr_in(&*sa);
             }
             cmh = libc::CMSG_NXTHDR(&msg, cmh);
         }
 
+        // The kernel rewrites msg_namelen to the actual source-address size;
+        // refuse to parse a truncated sockaddr (symmetric to the getsockopt
+        // length check in get_original_dst).
+        if (msg.msg_namelen as usize) < size_of::<libc::sockaddr_in>() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        if src.sin_family != libc::AF_INET as libc::sa_family_t {
+            return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
+        }
         let peer = SocketAddrV4::new(
             Ipv4Addr::from(src.sin_addr.s_addr.to_ne_bytes()),
             u16::from_be(src.sin_port),

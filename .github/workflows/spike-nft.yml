@@ -80,20 +80,39 @@ jobs:
           # READY pid=<pid> on stderr once self-tests are done.
           "$BIN" --json --verbose --keep-alive 60 > out.json 2> err.log &
           OUTER=$!
-          for _ in $(seq 1 150); do
+          # Wait for the READY marker (printed on stderr after self-tests).
+          # Fail fast with a clear message if the process dies first.
+          for _ in $(seq 1 300); do
             grep -q "READY pid=" err.log && break
+            if ! kill -0 "$OUTER" 2>/dev/null; then
+              echo "spike process exited before printing READY:"
+              cat err.log
+              exit 1
+            fi
             sleep 0.2
           done
           PID=$(sed -n 's/.*READY pid=\([0-9]*\).*/\1/p' err.log | head -1)
-          test -n "$PID"
+          if [ -z "$PID" ]; then
+            echo "no READY marker within 60s (process still alive):"
+            cat err.log
+            exit 1
+          fi
           # Independent oracle: dump the live netns ruleset with the nft CLI.
           sudo nsenter -t "$PID" -n nft list ruleset | tee ruleset.txt
           grep -q "redirect to :15001" ruleset.txt
           grep -q "policy drop" ruleset.txt
           grep -q 'fib daddr type != local' ruleset.txt
+          # Reap the spike and check its verdict (set +e so a non-zero exit
+          # is reported with logs instead of aborting the step silently).
+          set +e
           wait "$OUTER"
           RC=$?
-          [ "$RC" -eq 0 ] || { cat err.log; exit 1; }
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "spike exited $RC"
+            cat err.log
+            exit 1
+          fi
           grep -q '"ok":true' out.json
 
       - name: Fail-closed (--break-rules)
@@ -136,4 +155,5 @@ jobs:
             spikes/nft-load/err.log
             spikes/nft-load/ruleset.txt
             spikes/nft-load/break.log
+            spikes/nft-load/break.out
           if-no-files-found: ignore

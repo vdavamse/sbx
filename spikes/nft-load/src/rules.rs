@@ -362,8 +362,10 @@ fn build_batch(seq: u32, genid: u32, break_rules: bool) -> nftables::ChainedFina
 }
 
 /// Hand-encode the `redir` expression into an open `NFTA_RULE_EXPRESSIONS`
-/// list. Wire layout is byte-for-byte what `nft` 1.0.9 sends
-/// (rules/ground-truth.md §5):
+/// list. The kernel-stored bytes are identical to the `nft` 1.0.9-loaded
+/// reference (raw GETRULE dump in rules/ground-truth.md §5; intra-nest
+/// attribute order in the request direction may differ and is irrelevant —
+/// the kernel parses by type):
 ///
 /// ```text
 /// NFTA_LIST_ELEM(1) nest {
@@ -429,81 +431,136 @@ pub fn load(sock: &mut NetlinkSocket, verbose: bool) -> Result<LoadStats, Fail> 
                     attempts: attempt,
                 });
             }
-            Err((Some(errno), msg)) if errno == ERESTART && attempt < MAX_BATCH_ATTEMPTS => {
-                eprintln!(
-                    "[status] batch rejected with ERESTART (genid race), retrying \
-                     ({attempt}/{MAX_BATCH_ATTEMPTS}): {msg}"
-                );
-            }
-            Err((_, msg)) => {
+            Err((errno, msg)) => {
+                if errno == Some(ERESTART) {
+                    if attempt < MAX_BATCH_ATTEMPTS {
+                        eprintln!(
+                            "[status] batch rejected with ERESTART (genid race), retrying \
+                             ({attempt}/{MAX_BATCH_ATTEMPTS}): {msg}"
+                        );
+                        continue;
+                    }
+                    // Budget exhausted: dedicated error (not the generic one).
+                    return Err(rules_fail(format!(
+                        "batch still rejected with ERESTART after {MAX_BATCH_ATTEMPTS} attempts \
+                         (ruleset keeps changing underneath us; last genid {genid}): {msg}"
+                    )));
+                }
                 return Err(rules_fail(format!(
                     "batch failed (attempt {attempt}/{MAX_BATCH_ATTEMPTS}, genid {genid}): {msg}"
                 )));
             }
         }
     }
-    Err(rules_fail(format!(
-        "batch still failing with ERESTART after {MAX_BATCH_ATTEMPTS} attempts"
-    )))
+    unreachable!("every path in the loop returns or retries on the final attempt");
 }
 
 /// `--break-rules`: load a deliberately broken batch, require the kernel to
-/// reject it AND roll back the whole transaction (F6). Returns the process
-/// exit code plus a report entry:
-/// * rejected + nothing committed => print `FAIL-CLOSED-VERIFIED: <err>` on
-///   stderr, exit 3 (the expected, passing outcome for this mode);
+/// reject it with the ADJUDICATED error (ENOENT on the missing chain — F6)
+/// AND roll back the whole transaction. Returns the process exit code plus
+/// a report entry:
+/// * rejected with ENOENT + nothing committed => print
+///   `FAIL-CLOSED-VERIFIED: <err>` on stderr, exit 3 (the expected, passing
+///   outcome for this mode);
+/// * rejected with an unexpected errno (incl. exhausted ERESTART — the batch
+///   was never adjudicated) => exit 3 WITHOUT the marker
+///   (`FAIL-CLOSED-NOT-VERIFIED`), so CI marker greps stay meaningful;
 /// * batch accepted, or rejected but tables survived => fail-closed violated
 ///   => exit 7.
 pub fn prove_fail_closed(sock: &mut NetlinkSocket, verbose: bool) -> (i32, TestResult) {
-    let genid = match get_genid(sock) {
-        Ok(g) => g,
-        Err(f) => return (f.code, TestResult::failed("fail-closed", f.msg)),
-    };
-    let batch = build_batch(sock.reserve_seq(256), genid, true);
-    if verbose {
-        eprintln!("[rules] sending broken batch (rule -> {CHAIN_MISSING:?}), genid {genid}");
-    }
-    match send_batch(sock, &batch) {
-        Ok(()) => (
-            EXIT_BREAK_ACCEPTED,
-            TestResult::failed(
-                "fail-closed",
-                "broken batch was ACCEPTED by the kernel — fail-closed NOT verified",
-            ),
-        ),
-        Err((_, err)) => match table_names(sock) {
-            Ok(names) if names.is_empty() => {
-                eprintln!("FAIL-CLOSED-VERIFIED: batch rejected and rolled back: {err}");
-                (
-                    EXIT_RULES,
-                    TestResult::passed(
+    for attempt in 1..=MAX_BATCH_ATTEMPTS {
+        let genid = match get_genid(sock) {
+            Ok(g) => g,
+            Err(f) => return (f.code, TestResult::failed("fail-closed", f.msg)),
+        };
+        let batch = build_batch(sock.reserve_seq(256), genid, true);
+        if verbose {
+            eprintln!(
+                "[rules] sending broken batch (rule -> {CHAIN_MISSING:?}), \
+                 genid {genid}, attempt {attempt}"
+            );
+        }
+        match send_batch(sock, &batch) {
+            Ok(()) => {
+                return (
+                    EXIT_BREAK_ACCEPTED,
+                    TestResult::failed(
                         "fail-closed",
-                        format!("FAIL-CLOSED-VERIFIED: batch rejected and rolled back: {err}"),
+                        "broken batch was ACCEPTED by the kernel — fail-closed NOT verified",
                     ),
-                )
+                );
             }
-            Ok(names) => (
-                // Rejected, but objects from the same batch survived: the
-                // all-or-nothing property (F6) does not hold — treat like an
-                // unexpected acceptance (fail-closed violated).
-                EXIT_BREAK_ACCEPTED,
-                TestResult::failed(
-                    "fail-closed",
-                    format!("batch rejected ({err}) but tables survived rollback: {names:?}"),
-                ),
-            ),
-            Err(f) => (
-                EXIT_BREAK_ACCEPTED,
-                TestResult::failed(
-                    "fail-closed",
-                    format!(
-                        "batch rejected ({err}) but rollback check failed: {}",
-                        f.msg
+            Err((errno, err)) => {
+                if errno == Some(ERESTART) {
+                    // ERESTART means the batch was never adjudicated (genid
+                    // race) — retry instead of treating it as proof.
+                    if attempt < MAX_BATCH_ATTEMPTS {
+                        eprintln!(
+                            "[status] broken batch hit ERESTART (not adjudicated), \
+                             retrying ({attempt}/{MAX_BATCH_ATTEMPTS})"
+                        );
+                        continue;
+                    }
+                    let msg = format!(
+                        "FAIL-CLOSED-NOT-VERIFIED: broken batch still hit ERESTART after \
+                         {MAX_BATCH_ATTEMPTS} attempts — never adjudicated: {err}"
+                    );
+                    eprintln!("{msg}");
+                    return (EXIT_RULES, TestResult::failed("fail-closed", msg));
+                }
+                if errno != Some(libc::ENOENT) {
+                    // F6's expected rejection is ENOENT (rule -> nonexistent
+                    // chain). Any other errno means the proof did not exercise
+                    // the intended failure path — do NOT print the marker.
+                    let msg = format!(
+                        "FAIL-CLOSED-NOT-VERIFIED: broken batch rejected with unexpected \
+                         errno {errno:?} (expected ENOENT={}): {err}",
+                        libc::ENOENT
+                    );
+                    eprintln!("{msg}");
+                    return (EXIT_RULES, TestResult::failed("fail-closed", msg));
+                }
+                return match table_names(sock) {
+                    Ok(names) if names.is_empty() => {
+                        eprintln!("FAIL-CLOSED-VERIFIED: batch rejected and rolled back: {err}");
+                        (
+                            EXIT_RULES,
+                            TestResult::passed(
+                                "fail-closed",
+                                format!(
+                                    "FAIL-CLOSED-VERIFIED: batch rejected and rolled back: {err}"
+                                ),
+                            ),
+                        )
+                    }
+                    Ok(names) => (
+                        // Rejected, but objects from the same batch survived:
+                        // the all-or-nothing property (F6) does not hold —
+                        // treat like an unexpected acceptance (fail-closed
+                        // violated).
+                        EXIT_BREAK_ACCEPTED,
+                        TestResult::failed(
+                            "fail-closed",
+                            format!(
+                                "batch rejected ({err}) but tables survived rollback: {names:?}"
+                            ),
+                        ),
                     ),
-                ),
-            ),
-        },
+                    Err(f) => (
+                        EXIT_BREAK_ACCEPTED,
+                        TestResult::failed(
+                            "fail-closed",
+                            format!(
+                                "batch rejected ({err}) but rollback check failed: {}",
+                                f.msg
+                            ),
+                        ),
+                    ),
+                };
+            }
+        }
     }
+    unreachable!("every path in the loop returns or retries on the final attempt");
 }
 
 /// GETTABLE dump => names of all ip-family tables.

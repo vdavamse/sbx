@@ -142,7 +142,7 @@ type); `nft` happens to emit META KEY before DREG.
 | 1 | `meta` | KEY(2)=16 (L4PROTO), DREG(1)=1 |
 | 2 | `cmp` | SREG(1)=1, OP(2)=0 (EQ), DATA(3){ VALUE(1)=`06` len5 } |
 | 3 | `fib` | DREG(1)=1, **RESULT(2)=3 (raw)** , FLAGS(3)=2 (DADDR) |
-| 4 | `cmp` | SREG(1)=1, OP(2)=1 (NEQ), DATA(3){ VALUE(1)=`02` len5 } |
+| 4 | `cmp` | SREG(1)=1, OP(2)=1 (NEQ), DATA(3){ VALUE(1)=`02 00 00 00` len8 } |
 | 5 | `immediate` | DREG(1)=1, DATA(2){ VALUE(1)=`3a 99` len6 } (15001 BE) |
 | 6 | `redir` *(hand)* | DATA(2){ REG_PROTO_MIN(1)=1, REG_PROTO_MAX(2)=1, FLAGS(3)=2 } |
 
@@ -173,7 +173,8 @@ redir expr bytes (`1c 00 02 00` = DATA len 28):
 > The bare `redirect` (no `to :port`) produces an **empty** NFTA_EXPR_DATA
 > nest — the kernel defaults REG_PROTO_MIN/MAX to "keep original port". The
 > encoder pushes `push_name(c"redir")` + `push_nested_header(2)` immediately
-> finalized, byte-for-byte identical to `nft`.
+> finalized; the kernel-stored bytes are identical to the `nft`-loaded
+> reference (`04 00 02 00` in the GETRULE dump above).
 
 ### Rule 3 — `filter_out` accept `oifname lo fib daddr type local` (EXPRESSIONS len=224)
 
@@ -182,17 +183,18 @@ redir expr bytes (`1c 00 02 00` = DATA len 28):
 | 1 | `meta` | KEY(2)=7 (OIFNAME), DREG(1)=1 |
 | 2 | `cmp` | SREG(1)=1, OP(2)=0, DATA{ VALUE(1)=16B `6c 6f 00`+13×`00` len20 } (`"lo\0"` padded) |
 | 3 | `fib` | DREG(1)=1, RESULT(2)=3 (raw), FLAGS(3)=2 |
-| 4 | `cmp` | SREG(1)=1, OP(2)=0, DATA{ VALUE(1)=`02` len8 } |
+| 4 | `cmp` | SREG(1)=1, OP(2)=0, DATA{ VALUE(1)=`02 00 00 00` len8 } |
 | 5 | `immediate` | DREG(1)=**0** (RegVerdict), DATA(2){ VERDICT(2){ CODE(1)=1 (Accept) } } |
 
 immediate/verdict bytes (`10 00 02 00` = DATA len 16 → `0c 00 02 00` VERDICT
 len 12 → `08 00 01 00 00 00 00 01` CODE=1).
 
 > Register discipline (design D-level): data regs = `Reg1`; verdict reg =
-> `Reg0`. The `cmp` VALUE for rule 3 differs in padded length (len 8 vs len 5)
-> from rule 1 purely due to NLA alignment of the preceding 16-byte `oifname`
-> compare; the significant bytes are `02`. `verify_dump` compares the leading
-> value bytes, not the padded length.
+> `Reg0`. Note the cmp VALUE widths: nft stores the fib-result comparison as
+> **4 bytes** (`02 00 00 00` — the register width of the fib addrtype
+> result) in BOTH rules, while l4proto comparisons use 1-byte values (`06`,
+> `11`). The encoder replicates these exact byte strings and lengths;
+> `verify_dump` asserts the full value bytes, length included.
 
 ## 6. Register / constant quick reference
 

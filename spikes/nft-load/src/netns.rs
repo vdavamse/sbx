@@ -32,6 +32,12 @@ const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_LINK: u8 = 253;
 const RTN_UNICAST: u8 = 1;
 
+/// `IFA_F_PERMANENT` from `<linux/if_addr.h>` (not exported by the libc
+/// crate) — the flag `ip addr add` sets for static addresses. The kernel
+/// treats addresses without cacheinfo as permanent anyway; set explicitly
+/// for parity with iproute2 (reference impl for issue #5).
+const IFA_F_PERMANENT: u8 = 0x80;
+
 fn netns_fail(msg: String) -> Fail {
     Fail::new(EXIT_NETNS, format!("netns: {msg}"))
 }
@@ -138,7 +144,7 @@ fn add_sandbox_addr(sock: &mut NetlinkSocket, lo: u32) -> Result<(), Fail> {
         .op_newaddr_do(&rt_addr::Ifaddrmsg {
             ifa_family: libc::AF_INET as u8,
             ifa_prefixlen: 32,
-            ifa_flags: 0,
+            ifa_flags: IFA_F_PERMANENT,
             ifa_scope: RT_SCOPE_UNIVERSE,
             ifa_index: lo,
         });

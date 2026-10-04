@@ -8,8 +8,9 @@ Target: `x86_64-unknown-linux-musl`
 **Chosen: `netlink-bindings =0.3.5` + `netlink-socket2 =0.3.5`** (MIT OR
 Apache-2.0, pure Rust, generated from kernel YAML specs), with the one
 expression the crate cannot generate (`redir`) **hand-encoded through the
-crate's public `Pusher` escape hatch** — byte-for-byte identical to what
-`nft` sends.
+crate's public `Pusher` escape hatch** — the kernel-stored bytes are identical
+to the `nft`-loaded reference (verified via raw GETCHAIN/GETRULE dumps, and by
+`nft list ruleset` reproducing the rule).
 
 Result: a **680,736-byte** static-pie musl binary (no dynamic deps, no C
 toolchain beyond Rust's bundled musl startup objects) that runs as a normal
@@ -79,7 +80,8 @@ verified), so there is no generated `redir` expression type. The crate exposes
 a public, documented escape hatch: `netlink_bindings::traits::Pusher`
 (`as_vec_mut()` on every push-builder) plus `utils::{push_header,
 push_nested_header, finalize_nested_header}`. `src/rules.rs::push_redir` uses
-it to append, byte-for-byte what `nft` 1.0.9 sends:
+it to append an expression whose kernel-stored bytes are identical to the
+`nft`-loaded reference (raw GETRULE dump, `rules/ground-truth.md` §5):
 
 ```text
 NFTA_EXPR_NAME(1) = "redir\0"

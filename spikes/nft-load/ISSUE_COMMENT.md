@@ -1,6 +1,6 @@
 # Spike result: loading nftables rules from Rust (static musl, unprivileged netns)
 
-**Chosen: [`netlink-bindings`](https://crates.io/crates/netlink-bindings) `=0.3.5` + `netlink-socket2` `=0.3.5`** — pure Rust (MIT OR Apache-2.0), generated from the kernel's netlink YAML specs. The one expression the crate can't generate (`redir` — absent from the bundled kernel spec) is hand-encoded through the crate's public `Pusher` escape hatch, byte-for-byte identical to what `nft` sends. Full write-up: `spikes/nft-load/FINDINGS.md` in the PR; ground-truth byte dumps in `spikes/nft-load/rules/ground-truth.md`.
+**Chosen: [`netlink-bindings`](https://crates.io/crates/netlink-bindings) `=0.3.5` + `netlink-socket2` `=0.3.5`** — pure Rust (MIT OR Apache-2.0), generated from the kernel's netlink YAML specs. The one expression the crate can't generate (`redir` — absent from the bundled kernel spec) is hand-encoded through the crate's public `Pusher` escape hatch; the kernel-stored bytes are identical to the `nft`-loaded reference (verified via raw GETCHAIN/GETRULE dumps, and by `nft list ruleset` reproducing the rule). Full write-up: `spikes/nft-load/FINDINGS.md` in the PR; ground-truth byte dumps in `spikes/nft-load/rules/ground-truth.md`.
 
 ## Binary size
 

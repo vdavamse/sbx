@@ -58,9 +58,17 @@ pub fn emit_table(tests: &[TestResult]) {
     println!("SUMMARY: {passed}/{} passed", tests.len());
 }
 
-/// Single-line JSON object on stdout:
-/// `{"ok":...,"exit_code":...,"tests":[...],"binary_bytes":...,"genid":...,"attempts":...}`
-pub fn emit_json(ok: bool, exit_code: i32, tests: &[TestResult], genid: u32, attempts: u32) {
+/// Build the single-line JSON report object. Used by [`emit_json`] and
+/// exercised directly by unit tests (`binary_bytes` is injectable so tests
+/// don't depend on the on-disk binary).
+pub fn json_report(
+    ok: bool,
+    exit_code: i32,
+    tests: &[TestResult],
+    genid: u32,
+    attempts: u32,
+    binary_bytes: u64,
+) -> String {
     let mut s = String::new();
     s.push('{');
     s.push_str(&format!(
@@ -78,10 +86,18 @@ pub fn emit_json(ok: bool, exit_code: i32, tests: &[TestResult], genid: u32, att
         ));
     }
     s.push_str(&format!(
-        "],\"binary_bytes\":{},\"genid\":{genid},\"attempts\":{attempts}}}",
-        binary_bytes()
+        "],\"binary_bytes\":{binary_bytes},\"genid\":{genid},\"attempts\":{attempts}}}"
     ));
-    println!("{s}");
+    s
+}
+
+/// Single-line JSON object on stdout:
+/// `{"ok":...,"exit_code":...,"tests":[...],"binary_bytes":...,"genid":...,"attempts":...}`
+pub fn emit_json(ok: bool, exit_code: i32, tests: &[TestResult], genid: u32, attempts: u32) {
+    println!(
+        "{}",
+        json_report(ok, exit_code, tests, genid, attempts, binary_bytes())
+    );
 }
 
 /// Minimal JSON string escaper.
@@ -122,23 +138,21 @@ mod tests {
     }
 
     #[test]
-    fn json_object_shape() {
-        // The emitted object must contain the CI-greppable "ok":true token.
-        let t = [TestResult::passed("x", "d")];
-        let mut s = String::new();
-        s.push_str(&format!(
-            "{{\"ok\":{},\"exit_code\":{},\"tests\":[",
-            true, 0
-        ));
-        s.push_str(&format!(
-            "{{\"name\":{},\"pass\":{},\"detail\":{}}}",
-            json_str(t[0].name),
-            t[0].pass,
-            json_str(&t[0].detail)
-        ));
-        s.push_str("]}");
+    fn json_report_shape() {
+        // Exercises the same json_report() used by emit_json — the object
+        // must stay single-line and contain the CI-greppable "ok":true token.
+        let tests = [TestResult::passed("x", "d\"q")];
+        let s = json_report(true, 0, &tests, 7, 1, 1234);
+        assert!(s.starts_with('{') && s.ends_with('}'));
+        assert_eq!(s.lines().count(), 1);
         assert!(s.contains("\"ok\":true"));
+        assert!(s.contains("\"exit_code\":0"));
         assert!(s.contains("\"name\":\"x\""));
+        assert!(s.contains("\"pass\":true"));
+        assert!(s.contains("\"detail\":\"d\\\"q\""));
+        assert!(s.contains("\"binary_bytes\":1234"));
+        assert!(s.contains("\"genid\":7"));
+        assert!(s.contains("\"attempts\":1"));
     }
 
     #[test]
