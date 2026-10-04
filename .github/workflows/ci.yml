@@ -1,0 +1,193 @@
+name: ci
+
+# CI for the sbx crate (issue #2).
+#
+# Deliberately NO path filters: if these checks ever become required status
+# checks, a skipped run would hang PRs (skipped required checks never
+# report). The root workspace excludes spikes/, so spike-only PRs run these
+# jobs harmlessly; spikes/nft-load keeps its own path-filtered workflow
+# (spike-nft.yml) and is never touched from here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the jobs only read the repo (checkout).
+permissions:
+  contents: read
+
+# Superseded pushes to the same PR/branch cancel the running jobs: saves CI
+# minutes and avoids two runs racing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy (-D warnings)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Recorded MSRV (Cargo.toml rust-version): the edition-2024 floor and
+      # exactly clap 4.6's own MSRV. Fails loudly if a future Cargo.lock
+      # update needs a newer rustc.
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check on the recorded MSRV
+        run: cargo check --locked --all-targets
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Add musl target
+        run: rustup target add "${{ matrix.target }}"
+
+      # aarch64 leg only: the dependency tree is pure Rust and rustc ships
+      # self-contained musl crt objects, so the Ubuntu cross toolchain is a
+      # sufficient linker (the issue #1 spike proved the x86_64 analogue
+      # with plain gcc). Documented fallback if this ever fails:
+      # cargo-zigbuild.
+      - name: Install aarch64 cross linker
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build (static musl release)
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Staticness asserts
+        run: |
+          BIN="target/${{ matrix.target }}/release/sbx"
+          file "$BIN"
+          # file(1) says "statically linked" or "static-pie linked"
+          # depending on the musl toolchain's default PIE mode — both are
+          # fully static (no interpreter, no shared-library dependencies).
+          # We keep the default PIE build on purpose: forcing the literal
+          # "statically linked" string via -C relocation-model=static would
+          # sacrifice ASLR — a real security regression for a sandbox
+          # launcher.
+          file "$BIN" | grep -qE "static(-pie)? linked"
+          # ldd must corroborate that the binary is not dynamic (wording
+          # varies by musl toolchain).
+          ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable"
+          SIZE=$(stat -c %s "$BIN")
+          echo "binary_bytes=$SIZE"
+          echo "${{ matrix.target }}: $SIZE bytes, static" >> "$GITHUB_STEP_SUMMARY"
+
+      # x86_64 leg only: the aarch64 binary cannot execute on this runner
+      # (qemu is deliberately out of scope). set +e + explicit rc checks so
+      # a failure prints the captured logs instead of aborting opaquely
+      # (spike precedent).
+      - name: Smoke-run the built binary
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          set +e
+          FAIL=0
+
+          check_rc() { # <expected-rc> <actual-rc> <label>
+            if [ "$2" -ne "$1" ]; then
+              echo "FAIL: $3 exited $2 (expected $1)"
+              FAIL=1
+            else
+              echo "ok: $3 exited $2"
+            fi
+          }
+
+          HELP=$("$BIN" --help 2>&1)
+          check_rc 0 $? "sbx --help"
+          echo "$HELP" | grep -q "run"   || { echo "FAIL: help lacks 'run'"; FAIL=1; }
+          echo "$HELP" | grep -q "check" || { echo "FAIL: help lacks 'check'"; FAIL=1; }
+          echo "$HELP" | grep -q "gc"    || { echo "FAIL: help lacks 'gc'"; FAIL=1; }
+          if echo "$HELP" | grep -q "__init"; then
+            echo "FAIL: help leaks hidden '__init'"
+            FAIL=1
+          else
+            echo "ok: help hides __init"
+          fi
+
+          # Each stub parses its documented interface, then exits 1 with
+          # "not implemented" on stderr. The policy/session files need not
+          # exist — the stubs never read them.
+          "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
+          check_rc 1 $? "sbx run (stub)"
+          grep -q "not implemented" run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
+
+          "$BIN" run --policy p.json --session-dir /tmp/s -- /bin/echo --help > /dev/null 2>&1
+          check_rc 1 $? "sbx run with hyphenated trailing args (stub)"
+
+          "$BIN" check --policy p.json > /dev/null 2> check.err
+          check_rc 1 $? "sbx check (stub)"
+          grep -q "not implemented" check.err || { echo "FAIL: check stderr:"; cat check.err; FAIL=1; }
+
+          "$BIN" gc --older-than 7d /tmp/root > /dev/null 2> gc.err
+          check_rc 1 $? "sbx gc (stub)"
+          grep -q "not implemented" gc.err || { echo "FAIL: gc stderr:"; cat gc.err; FAIL=1; }
+
+          "$BIN" __init > /dev/null 2> init.err
+          check_rc 1 $? "sbx __init (hidden stub)"
+          grep -q "not implemented" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
+
+          exit "$FAIL"
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bundled cargo-deny (0.20.x) runs `cargo deny check` — advisories,
+      # licenses, bans and sources — against the root deny.toml and the
+      # committed Cargo.lock. No inputs needed; defaults are exactly the
+      # full check on ./Cargo.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
