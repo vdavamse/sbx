@@ -1,0 +1,34 @@
+[package]
+name = "nft-load-spike"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = """
+Spike for issue #1: prove how to load nftables rules from a fully static Rust
+binary running unprivileged in a fresh user+net namespace. See FINDINGS.md.
+"""
+
+[[bin]]
+name = "nft-load-spike"
+path = "src/main.rs"
+
+[dependencies]
+netlink-bindings = { version = "=0.3.5", default-features = false, features = [
+    "nftables",
+    "rt-link",
+    "rt-addr",
+    "rt-route",
+] }
+netlink-socket2 = { version = "=0.3.5", default-features = false }
+libc = { version = "0.2", default-features = false }
+
+# Size-optimized per design D7: single static binary must stay < 1 MiB.
+# opt-level "s" vs "z" both measured; see FINDINGS.md.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = 0
