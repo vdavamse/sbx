@@ -84,12 +84,15 @@ pin the older version (`cargo update -p <crate> --precise <ver>`) or raise
 
 ## Static binaries
 
-Release musl builds are fully static. Note that `file(1)` reports them as
-`static-pie linked` (static position-independent executable) rather than
-the literal string `statically linked` — both mean no dynamic loader and no
-shared-library dependencies (`ldd` reports `statically linked` or `not a
-dynamic executable`). PIE is kept on purpose: it preserves ASLR for the
-sandbox launcher itself.
+Release musl builds are fully static. `file(1)` reports them as
+`static-pie linked` on x86_64 (the host toolchain defaults to PIE) or
+`statically linked` on aarch64 (the cross toolchain links a non-PIE
+executable) — both mean no dynamic loader and no shared-library
+dependencies. CI asserts the spelling-agnostic regex plus the absence of
+a `PT_INTERP` segment (`readelf`), which is architecture-agnostic; `ldd`
+output is informational only, since its wording varies on foreign-arch
+binaries. PIE is kept wherever the toolchain provides it — forcing a
+single spelling would sacrifice ASLR for the sandbox launcher itself.
 
 ## Development
 

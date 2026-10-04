@@ -110,17 +110,25 @@ jobs:
         run: |
           BIN="target/${{ matrix.target }}/release/sbx"
           file "$BIN"
-          # file(1) says "statically linked" or "static-pie linked"
-          # depending on the musl toolchain's default PIE mode — both are
-          # fully static (no interpreter, no shared-library dependencies).
-          # We keep the default PIE build on purpose: forcing the literal
-          # "statically linked" string via -C relocation-model=static would
-          # sacrifice ASLR — a real security regression for a sandbox
-          # launcher.
-          file "$BIN" | grep -qE "static(-pie)? linked"
-          # ldd must corroborate that the binary is not dynamic (wording
-          # varies by musl toolchain).
-          ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable"
+          # file(1) spells a fully static binary either "static-pie linked"
+          # (x86_64 leg: host gcc defaults to PIE) or "statically linked"
+          # (aarch64 leg: the cross toolchain links a non-PIE static
+          # executable) — both mean no dynamic loader and no shared-library
+          # dependencies. We keep each toolchain's default on purpose:
+          # forcing one spelling via -C relocation-model=static would
+          # sacrifice PIE/ASLR where the toolchain provides it — a real
+          # security regression for a sandbox launcher.
+          file "$BIN" | grep -qE "static(-pie|ally)? linked"
+          # Arch-agnostic corroboration: static and static-pie binaries have
+          # no PT_INTERP segment. ldd's wording varies by host toolchain and
+          # foreign-arch binaries, so it is informational only (printed
+          # below), never a gate.
+          if readelf -lW "$BIN" | grep -q "INTERP"; then
+            echo "FAIL: binary has a PT_INTERP segment (not static)"
+            exit 1
+          fi
+          echo "ok: no PT_INTERP segment"
+          ldd "$BIN" 2>&1 || true
           SIZE=$(stat -c %s "$BIN")
           echo "binary_bytes=$SIZE"
           echo "${{ matrix.target }}: $SIZE bytes, static" >> "$GITHUB_STEP_SUMMARY"
