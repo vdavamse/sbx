@@ -22,6 +22,13 @@ permissions:
 # tag follows in a trailing comment) so a compromised tag force-push cannot
 # execute in CI. Deliberate exemption: dtolnay/rust-toolchain's @stable and
 # @1.85.0 refs are moving version branches by that action's design.
+# Every job starts with step-security/harden-runner in `audit` mode: it
+# fingerprints each job's outbound network calls — the detection layer for a
+# compromised pinned commit or a malicious crate build script exfiltrating
+# during CI. Audit mode blocks nothing except StepSecurity's global list of
+# known-malicious endpoints. Follow-up: flip the build jobs to `block` with
+# an allow-list (crates.io, Ubuntu archives, rustup endpoints) once the
+# observed calls are stable.
 
 # Superseded pushes to the same PR/branch cancel the running jobs: saves CI
 # minutes and avoids two runs racing. Runs on main are exempt — they are the
@@ -39,6 +46,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
@@ -57,6 +68,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Recorded MSRV (Cargo.toml rust-version): the edition-2024 floor and
@@ -73,6 +88,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
@@ -95,6 +114,10 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
@@ -209,12 +232,19 @@ jobs:
           "$BIN" gc --older-than abc /tmp/root > /dev/null 2>&1
           check_rc 2 $? "sbx gc with a bad --older-than (usage error)"
 
+          "$BIN" gc --older-than 0s /tmp/root > /dev/null 2>&1
+          check_rc 2 $? "sbx gc with a zero --older-than (usage error)"
+
           exit "$FAIL"
 
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Bundled cargo-deny (0.20.x) runs `cargo deny check` — advisories,

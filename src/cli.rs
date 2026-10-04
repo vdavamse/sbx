@@ -19,13 +19,20 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-/// Parse a human-readable duration (`120s`, `7d`, `500ms`, ...) for clap.
+/// Parse a positive human-readable duration (`120s`, `7d`, `500ms`, ...) for clap.
 ///
-/// Thin wrapper around [`humantime::parse_duration`]; the error is mapped to
-/// [`String`] so clap reports it as an invalid-value usage error (exit 2).
+/// Wraps [`humantime::parse_duration`] and additionally rejects zero: a zero
+/// `--timeout` is ambiguous (kill immediately vs. never), and a zero
+/// `--older-than` cutoff would match every session (destructive). humantime
+/// already rejects negatives, empty input, and overflow. The error is mapped
+/// to [`String`] so clap reports it as an invalid-value usage error (exit 2).
 /// Public for reuse by later issues (#5, #10, #12) and unit tests.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
-    humantime::parse_duration(s).map_err(|e| e.to_string())
+    let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
+    if d.is_zero() {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    Ok(d)
 }
 
 /// Parsed command-line interface for `sbx`.
@@ -326,6 +333,16 @@ mod tests {
     }
 
     #[test]
+    fn gc_rejects_zero_duration() {
+        // The zero cutoff through the full clap seam: a destructive-by-typo
+        // `gc --older-than 0s` must be a usage error (exit 2), never a parse
+        // success that matches every session directory.
+        let err = Cli::try_parse_from(["sbx", "gc", "--older-than", "0s", "/tmp/root"])
+            .expect_err("gc with a zero cutoff must fail");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
     fn run_rejects_bad_duration() {
         let err = Cli::try_parse_from([
             "sbx",
@@ -343,6 +360,27 @@ mod tests {
         // Same ValueValidation contract as gc's --older-than: the humantime
         // parser rejects "abc" (the binary reports `invalid value 'abc' for
         // '--timeout <DURATION>'` and exits 2).
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn run_rejects_zero_timeout() {
+        // Symmetric with gc_rejects_zero_duration: `--timeout 0s` is
+        // semantically undefined (kill immediately vs. never) and must be a
+        // usage error (exit 2), never a silently accepted sentinel.
+        let err = Cli::try_parse_from([
+            "sbx",
+            "run",
+            "--policy",
+            "p.json",
+            "--session-dir",
+            "/tmp/s",
+            "--timeout",
+            "0s",
+            "--",
+            "true",
+        ])
+        .expect_err("run with a zero --timeout must fail");
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 
@@ -389,6 +427,17 @@ mod tests {
         assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_zero() {
+        // Pins the positive-duration contract: every zero spelling humantime
+        // accepts must be rejected, so `gc --older-than 0s` (a cutoff of
+        // *now* — matches every session, destructive typo) and the ambiguous
+        // `--timeout 0s` (kill immediately vs. never) are usage errors.
+        for s in ["0", "0s", "0ms", "0d", "00s"] {
+            assert!(parse_duration(s).is_err(), "{s:?} must be rejected");
+        }
     }
 
     // ---- clap configuration validity ----------------------------------

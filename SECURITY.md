@@ -34,10 +34,11 @@ Please **do not** file a public issue for a security report.
   vulnerabilities in `sbx` itself, its dependencies, or its unprivileged
   setup path (`sbx __init`).
 - **Out of scope — the product working as designed:** untrusted code
-  misbehaving *within* the sandbox: consuming its allotted CPU/memory/disk,
-  writing inside its writable mounts, or talking to allow-listed
-  destinations. The sandbox contains the command; it does not make the
-  command benign.
+  misbehaving *within* the sandbox: writing inside its writable mounts, or
+  talking to allow-listed destinations. Note: v1 enforces a wall-clock
+  timeout but no CPU/memory/disk quotas; resource exhaustion affecting the
+  host is a known limitation, not a reportable vulnerability. The sandbox
+  contains the command; it does not make the command benign.
 
 ## Response
 

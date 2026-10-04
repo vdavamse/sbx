@@ -50,9 +50,11 @@ sbx check --policy policy.json
 sbx gc --older-than 7d ROOT
 ```
 
-Durations are human format (`500ms`, `90s`, `2h`, `7d`); `--timeout`
-defaults to `120s`. Everything after `--` in `sbx run` is the command,
-verbatim, including hyphenated arguments.
+Durations are human format (`500ms`, `90s`, `2h`, `7d`) and must be
+greater than zero — a zero `--older-than` cutoff would match every session,
+and a zero `--timeout` is ambiguous. `--timeout` defaults to `120s`.
+Everything after `--` in `sbx run` is the command, verbatim, including
+hyphenated arguments.
 
 ## Build
 
