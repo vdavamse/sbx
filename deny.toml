@@ -1,0 +1,63 @@
+# cargo-deny policy for sbx.
+#
+# Schema: cargo-deny >= 0.16 (validated against the 0.20.x bundled by
+# EmbarkStudios/cargo-deny-action@v2). CI runs the default `cargo deny
+# check` = advisories + licenses + bans + sources, against this file and
+# the committed Cargo.lock.
+#
+# NOTE on removed fields: `unlicensed`, `copyleft`, `default`, `deny` and
+# `allow-osi-fsf-free` were removed from [licenses] in cargo-deny 0.16.0
+# and now emit errors. The semantics they used to express are the built-in
+# default: every license NOT listed in `allow` is denied (copyleft included
+# — GPL/AGPL/LGPL stay out), and crates whose license cannot be determined
+# are always errors (use [[licenses.clarify]] if that ever happens).
+
+[advisories]
+# Fail on yanked crates in the committed lockfile (cargo-deny default: warn).
+yanked = "deny"
+# Grow this list only by explicit, justified decisions; prefer the table
+# form with a reason, e.g.
+#   { id = "RUSTSEC-0000-0000", reason = "not reachable in sbx" },
+ignore = []
+
+[licenses]
+# Everything not listed here is denied. The list is deliberately
+# forward-looking: it pre-permits the licenses the issue-#20 architecture
+# will pull in, so future issues don't churn this policy.
+allow = [
+    # The project's own license, and the Rust ecosystem default.
+    "Apache-2.0",
+    "MIT",
+    # unicode-ident (in the tree today via proc-macro2/syn; later also via
+    # serde's transitive deps in #3).
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # rustls / webpki / rustls-platform-verifier family — egress-proxy TLS
+    # (#7).
+    "ISC",
+    # ring's BoringSSL-derived files, if the default rustls crypto provider
+    # pulls ring in (#7).
+    "OpenSSL",
+    # webpki-roots, should a future issue bundle root certificates.
+    # File-level copyleft, compatible with static linking into an
+    # Apache-2.0 binary.
+    "MPL-2.0",
+    # Ubiquitous permissive licenses for C-binding fallback crates.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+]
+# The allow-list above is intentionally forward-looking, so most entries are
+# unused until later issues land. Silence the per-entry "unused allowed
+# license" warnings (cargo-deny default: warn) instead of trimming the list.
+unused-allowed-license = "allow"
+
+[bans]
+# "deny" would create needless friction across the ~17 issues that add
+# dependencies; "warn" surfaces duplicates in CI logs without blocking.
+multiple-versions = "warn"
+
+[sources]
+# Supply-chain hygiene: crates.io only, no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
