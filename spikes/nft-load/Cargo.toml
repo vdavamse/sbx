@@ -24,9 +24,10 @@ netlink-socket2 = { version = "=0.3.5", default-features = false }
 libc = { version = "0.2", default-features = false }
 
 # Size-optimized per design D7: single static binary must stay < 1 MiB.
-# opt-level "s" vs "z" both measured; see FINDINGS.md.
+# Measured (musl, stripped): opt-level "s" = 684,832 B, "z" = 680,736 B —
+# keeping "z" (smaller); both recorded in FINDINGS.md.
 [profile.release]
-opt-level = "s"
+opt-level = "z"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
