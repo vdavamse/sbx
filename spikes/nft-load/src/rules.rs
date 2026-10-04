@@ -457,8 +457,8 @@ pub fn load(sock: &mut NetlinkSocket, verbose: bool) -> Result<LoadStats, Fail> 
 
 /// `--break-rules`: load a deliberately broken batch, require the kernel to
 /// reject it with the ADJUDICATED error (ENOENT on the missing chain — F6)
-/// AND roll back the whole transaction. Returns the process exit code plus
-/// a report entry:
+/// AND roll back the whole transaction. Returns a [`FailClosedOutcome`]:
+/// process exit code, report entry, and the real genid/attempts stats.
 /// * rejected with ENOENT + nothing committed => print
 ///   `FAIL-CLOSED-VERIFIED: <err>` on stderr, exit 3 (the expected, passing
 ///   outcome for this mode);
@@ -467,12 +467,42 @@ pub fn load(sock: &mut NetlinkSocket, verbose: bool) -> Result<LoadStats, Fail> 
 ///   (`FAIL-CLOSED-NOT-VERIFIED`), so CI marker greps stay meaningful;
 /// * batch accepted, or rejected but tables survived => fail-closed violated
 ///   => exit 7.
-pub fn prove_fail_closed(sock: &mut NetlinkSocket, verbose: bool) -> (i32, TestResult) {
+pub fn prove_fail_closed(sock: &mut NetlinkSocket, verbose: bool) -> FailClosedOutcome {
+    // Real stats for the --json report: an operator must be able to tell
+    // attempt 1 from attempt 5 (persistent ERESTART) — no hardcoded 0/1.
+    let mut genid = 0u32;
+    let mut attempts = 0u32;
+    let (code, result) = prove_fail_closed_inner(sock, verbose, &mut genid, &mut attempts);
+    FailClosedOutcome {
+        code,
+        result,
+        genid,
+        attempts,
+    }
+}
+
+/// Outcome of [`prove_fail_closed`]: exit code + report entry + the genid of
+/// the last batch sent and the number of attempts used.
+pub struct FailClosedOutcome {
+    pub code: i32,
+    pub result: TestResult,
+    pub genid: u32,
+    pub attempts: u32,
+}
+
+fn prove_fail_closed_inner(
+    sock: &mut NetlinkSocket,
+    verbose: bool,
+    genid_out: &mut u32,
+    attempts_out: &mut u32,
+) -> (i32, TestResult) {
     for attempt in 1..=MAX_BATCH_ATTEMPTS {
+        *attempts_out = attempt;
         let genid = match get_genid(sock) {
             Ok(g) => g,
             Err(f) => return (f.code, TestResult::failed("fail-closed", f.msg)),
         };
+        *genid_out = genid;
         let batch = build_batch(sock.reserve_seq(256), genid, true);
         if verbose {
             eprintln!(
@@ -625,7 +655,7 @@ fn verify_chains(
         .request(&req)
         .map_err(|e| verify_fail(format!("getchain dump: {e}")))?;
 
-    let mut seen = 0u32;
+    let (mut seen_nat, mut seen_filter) = (false, false);
     while let Some(res) = iter.recv() {
         let (_, attrs) = res.map_err(|e| verify_fail(format!("getchain dump: {e}")))?;
         let name = attrs
@@ -672,25 +702,40 @@ fn verify_chains(
             "chain {name}: hook num={num} priority={prio} policy={policy} type={ctype:?}"
         ));
 
-        let expected = match name.as_str() {
-            "nat_out" => (NF_INET_LOCAL_OUT, PRIO_DSTNAT, POLICY_ACCEPT, "nat"),
-            "filter_out" => (NF_INET_LOCAL_OUT, PRIO_FILTER, POLICY_DROP, "filter"),
+        // Per-name presence flags: a bare count would accept [nat_out,
+        // nat_out] — a duplicate plus a MISSING policy-drop chain. This is
+        // the fail-closed verifier for a security boundary; reject duplicates
+        // and assert both chains are present.
+        let (e_num, e_prio, e_policy, e_type) = match name.as_str() {
+            "nat_out" => {
+                if seen_nat {
+                    return Err(verify_fail("duplicate nat_out in chain dump".into()));
+                }
+                seen_nat = true;
+                (NF_INET_LOCAL_OUT, PRIO_DSTNAT, POLICY_ACCEPT, "nat")
+            }
+            "filter_out" => {
+                if seen_filter {
+                    return Err(verify_fail("duplicate filter_out in chain dump".into()));
+                }
+                seen_filter = true;
+                (NF_INET_LOCAL_OUT, PRIO_FILTER, POLICY_DROP, "filter")
+            }
             other => {
                 return Err(verify_fail(format!("unexpected chain {other:?} in dump")));
             }
         };
-        let (e_num, e_prio, e_policy, e_type) = expected;
         if (num, prio, policy, ctype.as_str()) != (e_num, e_prio, e_policy, e_type) {
             return Err(verify_fail(format!(
                 "chain {name}: got hook num={num} priority={prio} policy={policy} type={ctype:?}, \
                  expected num={e_num} priority={e_prio} policy={e_policy} type={e_type:?}"
             )));
         }
-        seen += 1;
     }
-    if seen != 2 {
+    if !seen_nat || !seen_filter {
         return Err(verify_fail(format!(
-            "expected 2 chains, dump returned {seen}"
+            "expected chains nat_out + filter_out \
+             (found nat_out={seen_nat} filter_out={seen_filter})"
         )));
     }
     Ok(())

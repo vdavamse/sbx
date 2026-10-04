@@ -15,6 +15,17 @@ on:
       - '.github/workflows/spike-nft.yml'
   workflow_dispatch:
 
+# Least privilege: the job only reads the repo (checkout); artifact upload
+# goes through the Actions service, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Superseded pushes to the same PR/branch cancel the running job: saves CI
+# minutes and avoids two spike runs racing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 defaults:
   run:
     working-directory: spikes/nft-load
@@ -36,10 +47,11 @@ jobs:
       - name: Add musl target
         run: rustup target add x86_64-unknown-linux-musl
 
-      - name: fmt + clippy
+      - name: fmt + clippy + unit tests
         run: |
           cargo fmt --check
           cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
 
       - name: Prepare environment (userns, nftables, modules)
         run: |
@@ -67,7 +79,9 @@ jobs:
           # file(1) says "statically linked" or "static-pie linked" depending
           # on the musl toolchain's default PIE mode — both are fully static.
           file "$BIN" | grep -qE "static(-pie)? linked"
-          ldd "$BIN" 2>&1 | grep -q "statically linked" || true
+          # Same property as scripts/local-test.sh: ldd must confirm the
+          # binary is not dynamic (wording varies by musl toolchain).
+          ldd "$BIN" 2>&1 | grep -qE "statically linked|not a dynamic executable"
           SIZE=$(stat -c %s "$BIN")
           echo "binary_bytes=$SIZE"
           [ "$SIZE" -lt 1048576 ]
@@ -131,7 +145,15 @@ jobs:
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/nft-load-spike
           for i in 1 2 3 4 5; do
-            "$BIN" > /dev/null 2>&1 || { echo "flake loop run $i FAILED"; exit 1; }
+            # Keep every run's output: when a flake hits, the failing run's
+            # table/status/JSON are the evidence (the diagnostics step and
+            # the uploaded artifact would otherwise only contain the stale
+            # keep-alive logs from earlier steps).
+            "$BIN" > "flake-$i.out" 2> "flake-$i.err" || {
+              echo "flake loop run $i FAILED"
+              cat "flake-$i.err" "flake-$i.out"
+              exit 1
+            }
             echo "run $i OK"
           done
 
@@ -141,7 +163,8 @@ jobs:
           echo "--- uname ---"; uname -a || true
           echo "--- dmesg tail ---"; sudo dmesg | tail -50 || true
           echo "--- /proc/modules (head) ---"; head -30 /proc/modules || true
-          for f in err.log out.json break.log break.out ruleset.txt; do
+          for f in err.log out.json break.log break.out ruleset.txt \
+                   flake-*.err flake-*.out; do
             echo "--- $f ---"; cat "$f" 2>/dev/null || true
           done
 
@@ -156,4 +179,5 @@ jobs:
             spikes/nft-load/ruleset.txt
             spikes/nft-load/break.log
             spikes/nft-load/break.out
+            spikes/nft-load/flake-*
           if-no-files-found: ignore

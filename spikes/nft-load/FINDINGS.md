@@ -175,12 +175,13 @@ spike's own self-tests:
 ## Reproducing
 
 ```sh
-bash scripts/local-test.sh          # build + staticness + size + 10× + break-rules + oracle + json
+bash scripts/local-test.sh          # unit tests + build + staticness + size + 10× + break-rules + oracle + json
 cargo test                          # unit tests (arg parsing, JSON escaping, SNMP parsing)
 ./target/x86_64-unknown-linux-musl/release/nft-load-spike --verbose --dump-rules
 ```
 
-CI: `.github/workflows/spike-nft.yml` (path-filtered) runs fmt/clippy, the
-musl build, staticness/size asserts, the self-tests as the unprivileged
-`runner` user with a `sudo nsenter` + `nft list ruleset` cross-check, the
-fail-closed case, and a 5× flake loop; logs are uploaded as artifacts.
+CI: `.github/workflows/spike-nft.yml` (path-filtered) runs fmt/clippy/unit
+tests, the musl build, staticness/size asserts, the self-tests as the
+unprivileged `runner` user with a `sudo nsenter` + `nft list ruleset`
+cross-check, the fail-closed case, and a 5× flake loop; all logs (including
+per-flake-run output) are uploaded as artifacts.

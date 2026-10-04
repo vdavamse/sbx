@@ -68,9 +68,15 @@ pub fn start(verbose: bool) -> Result<Listeners, Fail> {
     let sandbox = Ipv4Addr::from(SANDBOX_ADDR);
     spawn_tcp(tx.clone(), Ipv4Addr::LOCALHOST, false, verbose)?;
     spawn_udp(tx.clone(), Ipv4Addr::LOCALHOST, false, verbose)?;
-    // Canaries: the fib-based rules only match NON-local destinations (D2),
-    // so redirected traffic must never land here; direct connections to the
-    // sandbox address must (t2b).
+    // Canaries: redirected traffic must never land here; direct connections
+    // to the sandbox address must (t2b). This invariant is TCP-only: rule 1
+    // carries a `fib daddr type != local` guard (D2), but rule 2 redirects
+    // ALL udp/53 regardless of destination locality, so the UDP canary is
+    // unreachable by construction and its silence in t6 is not evidence of
+    // UDP rule scoping — there is no UDP analogue of t2b. NOTE(#5): revisit
+    // if the production ruleset ever intends UDP scoping (adding a fib guard
+    // to rule 2 would deviate from the documented ground truth, so the spike
+    // keeps the rule and corrects this comment instead).
     spawn_tcp(tx.clone(), sandbox, true, verbose)?;
     spawn_udp(tx, sandbox, true, verbose)?;
     Ok(Listeners { rx })
@@ -111,6 +117,11 @@ fn spawn_tcp(
                 Err(errno) => format!("errno={errno}"),
             };
             let line = format!("OK original_dst={od} accepted_on={on} peer={peer}\n");
+            // NOTE(#5): the production listener needs SO_SNDTIMEO (or
+            // non-blocking writes) here — this accept loop is serial, so one
+            // peer that advertises a zero window against a full send buffer
+            // would block it indefinitely and halt ALL redirects. Safe for
+            // the spike: one ~100-byte line per connection, then close.
             let _ = (&stream).write_all(line.as_bytes());
             // drop(stream) closes the connection.
         }
@@ -156,10 +167,11 @@ fn spawn_udp(
         // Control buffer for one sockaddr_in cmsg. On x86_64 Linux both
         // CMSG_LEN(16) and CMSG_SPACE(16) evaluate to 32 (sizeof(cmsghdr)==16
         // + 4-byte-aligned payload; verified via python3 socket.CMSG_SPACE).
-        // 64 bytes keeps headroom on any platform.
-        let mut ctrl = [0u8; 64];
+        // 64 bytes keeps headroom on any platform; CtrlBuf guarantees the
+        // align-8 the cmsg casts in recvmsg_origdst require.
+        let mut ctrl = CtrlBuf([0; 64]);
         loop {
-            match recvmsg_origdst(&sock, &mut buf, &mut ctrl) {
+            match recvmsg_origdst(&sock, &mut buf, &mut ctrl.0) {
                 Ok((n, peer, origdst)) => {
                     let payload = String::from_utf8_lossy(&buf[..n]).into_owned();
                     let _ = tx.send(ServerEvent::UdpReceived {
@@ -220,8 +232,19 @@ fn format_sockaddr_in(sa: &libc::sockaddr_in) -> Option<String> {
     Some(format!("{ip}:{port}"))
 }
 
+/// Align-8 control buffer for `recvmsg` cmsg data. A plain `[u8; 64]` is
+/// only align-1, but [`recvmsg_origdst`] casts it to `*cmsghdr` (contains
+/// u64 members on x86_64 → required alignment 8) and `*sockaddr_in`;
+/// creating references to under-aligned structs is UB by Rust's rules, even
+/// though rustc usually happens to place stack arrays 8-aligned.
+#[repr(align(8))]
+struct CtrlBuf([u8; 64]);
+
 /// `recvmsg` with ancillary data; extracts the `IP_RECVORIGDSTADDR` cmsg
 /// (original destination as seen by the kernel — post-DNAT per F4).
+///
+/// `ctrl` must be suitably aligned for `cmsghdr`/`sockaddr_in` (see
+/// [`CtrlBuf`]).
 fn recvmsg_origdst(
     sock: &UdpSocket,
     buf: &mut [u8],
@@ -245,14 +268,31 @@ fn recvmsg_origdst(
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        // The kernel truncated the control data: the cmsg chain is
+        // incomplete and its last header may advertise bytes past the end of
+        // `ctrl`. Treat as a transient error (the caller's loop moves on to
+        // the next datagram) rather than parse a malformed chain.
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
 
         let mut origdst = None;
+        let ctrl_end = ctrl.as_ptr() as usize + ctrl.len();
         let mut cmh = libc::CMSG_FIRSTHDR(&msg);
         while !cmh.is_null() {
             let min_len = libc::CMSG_LEN(size_of::<libc::sockaddr_in>() as libc::c_uint) as usize;
+            // Bounds invariant (defense in depth on top of the MSG_CTRUNC
+            // check): the advertised length must cover at least the header
+            // and stay inside the control buffer before CMSG_DATA is read.
+            // Written overflow-free (cmh <= ctrl_end always holds): a garbage
+            // cmsg_len near usize::MAX must not wrap the addition.
+            let claimed = (*cmh).cmsg_len as usize;
+            if claimed < size_of::<libc::cmsghdr>() || claimed > ctrl_end - cmh as usize {
+                break;
+            }
             if (*cmh).cmsg_level == SOL_IP
                 && (*cmh).cmsg_type == IP_RECVORIGDSTADDR
-                && (*cmh).cmsg_len as usize >= min_len
+                && claimed >= min_len
             {
                 let sa = libc::CMSG_DATA(cmh).cast::<libc::sockaddr_in>();
                 // None (non-AF_INET) leaves origdst unset — informational.

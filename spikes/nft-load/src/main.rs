@@ -205,12 +205,12 @@ fn run(args: &Args) -> Outcome {
 
     if args.break_rules {
         eprintln!("[status] --break-rules: sending deliberately broken batch");
-        let (code, tr) = rules::prove_fail_closed(&mut sock, args.verbose);
+        let fc = rules::prove_fail_closed(&mut sock, args.verbose);
         return Outcome {
-            code,
-            tests: vec![tr],
-            genid: 0,
-            attempts: 1,
+            code: fc.code,
+            tests: vec![fc.result],
+            genid: fc.genid,
+            attempts: fc.attempts,
         };
     }
 

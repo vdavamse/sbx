@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Local gate for the nft-load spike (sbx issue #1).
 #
-#   1. build the static musl release (--locked)
-#   2. assert staticness (file/ldd/readelf: no NEEDED, no INTERP)
-#   3. assert size < 1 MiB
-#   4. run the binary with `env -i` (no environment dependencies)
-#   5. 10x full self-test runs, each must exit 0
-#   6. 1x --break-rules: must exit 3 with FAIL-CLOSED-VERIFIED on stderr
-#   7. cross-check: enter the live netns of a --keep-alive run and compare
+#   1. unit tests (cargo test --locked) — same gate CI runs
+#   2. build the static musl release (--locked)
+#   3. assert staticness (file/ldd/readelf: no NEEDED, no INTERP)
+#   4. assert size < 1 MiB
+#   5. run the binary with `env -i` (no environment dependencies)
+#   6. 10x full self-test runs, each must exit 0
+#   7. 1x --break-rules: must exit 3 with FAIL-CLOSED-VERIFIED on stderr
+#   8. cross-check: enter the live netns of a --keep-alive run and compare
 #      `nft list ruleset` output against the reference ruleset (best effort:
 #      uses python3 os.setns — plain unprivileged `nsenter -U -n` fails at
 #      nsenter's own setgroups() because setgroups=deny is permanent in the
 #      sandbox userns; CI uses `sudo nsenter` instead)
-#   8. --json report must be valid JSON containing "ok":true
+#   9. --json report must be valid JSON containing "ok":true
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -25,6 +26,9 @@ MAX_SIZE=1048576 # 1 MiB — same assert as CI
 say() { printf '\n=== %s ===\n' "$*"; }
 cleanup() { rm -f run.out run.err break.err ka.err ruleset.txt cross.err out.json; }
 trap cleanup EXIT
+
+say "unit tests (cargo test --locked)"
+cargo test --locked
 
 say "build (musl release, --locked)"
 cargo build --release --locked --target "$TARGET"
@@ -40,7 +44,9 @@ fi
 if readelf -l "$BIN" 2>/dev/null | grep -q "INTERP"; then
   echo "FAIL: INTERP segment present"; exit 1
 fi
-ldd "$BIN" 2>&1 | grep -q "statically linked" || { echo "FAIL: ldd disagrees"; exit 1; }
+# glibc ldd exits 1 when it prints "not a dynamic executable" — swallow its
+# status (subshell, pipefail-safe) and let grep be the only judge.
+(ldd "$BIN" 2>&1 || true) | grep -qE "statically linked|not a dynamic executable" || { echo "FAIL: ldd disagrees"; exit 1; }
 echo "OK: static (no NEEDED, no INTERP, ldd agrees)"
 
 say "size"
