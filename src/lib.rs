@@ -13,4 +13,5 @@
 //! unprivileged nftables-loading approach that `sbx __init` will use.
 
 pub mod cli;
+pub mod egress;
 pub mod policy;

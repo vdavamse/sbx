@@ -201,7 +201,7 @@ impl Domain {
     /// Parse a domain string into its canonical stored form.
     ///
     /// The single normalization pipeline behind both policy deserialization
-    /// and runtime-host matching (#4's `crate::egress::allowed`): UTS #46
+    /// and runtime-host matching (#4's [`crate::egress::allowed`]): UTS #46
     /// ToASCII (URL deny-list, hyphen first/last checks, DNS-length
     /// verification) with wildcard, IP-literal and legacy inet_aton
     /// rejection applied to the raw input AND to the normalized output.
