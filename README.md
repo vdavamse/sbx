@@ -23,12 +23,16 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**Skeleton** (issue #2). The CLI parses the full documented interface, but
-`run`, `check`, `gc` and the internal `__init` helper are stubs that exit
-`1` with `not implemented yet`. Exit codes: `0` success, `1` stub/runtime
-failure, `2` usage error (clap's convention). The architecture and issue
-roadmap live in tracking issue #20. `spikes/` holds standalone experiment
-packages that are excluded from the Cargo workspace.
+**In progress** (issues #2–#3). The CLI parses the full documented
+interface, and `check` is real: it validates a policy file against the
+versioned policy schema (`--policy`) and prints that JSON Schema
+(`--print-schema`); example policies live in [`examples/`](examples/).
+`run`, `gc` and the internal `__init` helper are stubs that exit `1`
+with `not implemented yet`. Exit codes: `0` success, `1` runtime failure
+(including an invalid or unreadable policy file), `2` usage error (clap's
+convention). The architecture and issue roadmap live in tracking issue
+#20. `spikes/` holds standalone experiment packages that are excluded
+from the Cargo workspace.
 
 ## How it will work (summary of #20)
 
@@ -47,6 +51,7 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout 120s] [--audit FILE] -- COMMAND [ARGS...]
 sbx check --policy policy.json
+sbx check --print-schema
 sbx gc --older-than 7d ROOT
 ```
 
@@ -55,6 +60,12 @@ greater than zero — a zero `--older-than` cutoff would match every session,
 and a zero `--timeout` is ambiguous. `--timeout` defaults to `120s`.
 Everything after `--` in `sbx run` is the command, verbatim, including
 hyphenated arguments.
+
+`check --policy` validates a policy file (silently; exit `1` with
+`sbx check: <reason>` on failure) and `check --print-schema` prints the
+policy JSON Schema (draft 2020-12) to stdout; the two flags are mutually
+exclusive. Policy files follow schema version 1 — see
+[`examples/`](examples/).
 
 ## Build
 

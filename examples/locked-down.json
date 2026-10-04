@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "filesystem": { "ro": [], "rw": [], "deny": [] },
+  "network": { "mode": "none", "allow": [], "ports": [] },
+  "env": { "pass": [], "set": {} },
+  "limits": { "timeout": "1s", "output_bytes": 0 }
+}

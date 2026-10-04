@@ -1,16 +1,18 @@
 //! Command-line interface for `sbx`.
 //!
-//! Issue #2 freezes the documented flag surface: every subcommand parses its
-//! full interface, then reports `not implemented yet` and exits 1. Later
-//! issues replace the stub bodies behind [`run`] without CLI churn:
+//! Issue #2 froze the documented flag surface; issue #3 replaced the
+//! `check` stub. The remaining subcommands parse their full interface, then
+//! report `not implemented yet` and exit 1 until later issues replace the
+//! stub bodies behind [`run`] without CLI churn:
 //!
 //! - `run`    — sandbox lifecycle, egress proxy, audit log (#10, #7, #8)
-//! - `check`  — policy validation (#3)
+//! - `check`  — policy validation + JSON Schema (real since #3)
 //! - `gc`     — session-directory garbage collection (#12)
 //! - `__init` — re-exec'd namespace helper (#5 defines its real interface)
 //!
 //! Exit-code contract: 0 = success, 1 = stub/runtime failure
-//! ([`ExitCode::FAILURE`]), 2 = usage error (clap's own convention).
+//! ([`ExitCode::FAILURE`]) — for `check`, an invalid or unreadable policy
+//! file — 2 = usage error (clap's own convention).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -26,7 +28,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 /// `--older-than` cutoff would match every session (destructive). humantime
 /// already rejects negatives, empty input, and overflow. The error is mapped
 /// to [`String`] so clap reports it as an invalid-value usage error (exit 2).
-/// Public for reuse by later issues (#5, #10, #12) and unit tests.
+/// Public for reuse: the policy module's `limits.timeout` shares this exact
+/// contract, as do later issues (#5, #10, #12) and unit tests.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let d = humantime::parse_duration(s).map_err(|e| e.to_string())?;
     if d.is_zero() {
@@ -91,11 +94,15 @@ pub enum Cmd {
         cmd: Vec<OsString>,
     },
 
-    /// Validate a policy file without running anything.
+    /// Validate a policy file, or print the policy JSON Schema.
     Check {
         /// Sandbox policy file (JSON) to validate.
-        #[arg(long, value_name = "PATH")]
-        policy: PathBuf,
+        #[arg(long, value_name = "PATH", required_unless_present = "print_schema")]
+        policy: Option<PathBuf>,
+
+        /// Print the policy JSON Schema (draft 2020-12) to stdout and exit.
+        #[arg(long, conflicts_with = "policy")]
+        print_schema: bool,
     },
 
     /// Delete session directories older than a cutoff.
@@ -114,12 +121,19 @@ pub enum Cmd {
     Init,
 }
 
-/// Binary entry point: parse `argv` and dispatch to the (stub) subcommand.
+/// Binary entry point: parse `argv` and dispatch to the subcommand.
 ///
-/// Stub contract (issue #2): a successfully parsed subcommand prints
-/// `sbx <sub>: not implemented yet` to stderr and returns
-/// [`ExitCode::FAILURE`] (1) — deliberately distinct from clap's exit 2 for
-/// usage errors, and without the exit-101 + backtrace a panic would produce.
+/// `check` contract (issue #3): `--policy PATH` validates the file —
+/// silent rc 0 on success, rc 1 with `sbx check: <reason>` on stderr for
+/// an invalid *or* unreadable policy — and `--print-schema` prints the
+/// policy JSON Schema to stdout with rc 0. The two flags are mutually
+/// exclusive and exactly one is required; anything else is clap's rc 2.
+///
+/// Stub contract (issue #2) for the remaining subcommands: a successfully
+/// parsed `run`, `gc` or `__init` prints `sbx <sub>: not implemented yet`
+/// to stderr and returns [`ExitCode::FAILURE`] (1) — deliberately distinct
+/// from clap's exit 2 for usage errors, and without the exit-101 +
+/// backtrace a panic would produce.
 pub fn run() -> ExitCode {
     // Catches invalid clap configuration (bad defaults, duplicate names,
     // conflicting attributes) at startup. Despite the name, this is NOT
@@ -130,9 +144,45 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Run { .. } => not_implemented("run"),
-        Cmd::Check { .. } => not_implemented("check"),
+        Cmd::Check {
+            policy,
+            print_schema,
+        } => check(policy, print_schema),
         Cmd::Gc { .. } => not_implemented("gc"),
         Cmd::Init => not_implemented("__init"),
+    }
+}
+
+/// `check` dispatch: print the JSON Schema, or validate a policy file.
+///
+/// Success is silent — scripting callers rely on the exit code alone. Both
+/// an invalid policy and an unreadable file are runtime failures (rc 1 with
+/// the reason on stderr), never usage errors: rc 2 stays clap's. A closed
+/// stdout (broken pipe, e.g. `check --print-schema | true`) is not an sbx
+/// failure either: Unix convention, silent rc 0 — `println!` would panic
+/// (rc 101) because Rust ignores SIGPIPE.
+fn check(policy: Option<PathBuf>, print_schema: bool) -> ExitCode {
+    if print_schema {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        return match writeln!(out, "{}", crate::policy::schema_json()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("sbx check: cannot write schema to stdout: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let Some(path) = policy else {
+        unreachable!("clap enforces --policy unless --print-schema")
+    };
+    match crate::policy::Policy::from_file(&path) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("sbx check: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -282,7 +332,29 @@ mod tests {
         let cli = Cli::try_parse_from(["sbx", "check", "--policy", "p.json"])
             .expect("check invocation must parse");
         match cli.command {
-            Cmd::Check { policy } => assert_eq!(policy, Path::new("p.json")),
+            Cmd::Check {
+                policy,
+                print_schema,
+            } => {
+                assert_eq!(policy.as_deref(), Some(Path::new("p.json")));
+                assert!(!print_schema);
+            }
+            other => panic!("expected Cmd::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_print_schema_parses() {
+        let cli = Cli::try_parse_from(["sbx", "check", "--print-schema"])
+            .expect("check --print-schema must parse");
+        match cli.command {
+            Cmd::Check {
+                policy,
+                print_schema,
+            } => {
+                assert_eq!(policy, None);
+                assert!(print_schema);
+            }
             other => panic!("expected Cmd::Check, got {other:?}"),
         }
     }
@@ -385,6 +457,24 @@ mod tests {
     }
 
     #[test]
+    fn check_requires_policy_or_print_schema() {
+        // `required_unless_present`: a bare `check` has nothing to do — the
+        // binary reports clap's usage error and exits 2.
+        let err = Cli::try_parse_from(["sbx", "check"]).expect_err("bare check must fail");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn check_rejects_policy_with_print_schema() {
+        // `conflicts_with`: printing the schema ignores the policy file, so
+        // combining the flags is a usage error (exit 2), never a silent
+        // print-and-ignore.
+        let err = Cli::try_parse_from(["sbx", "check", "--policy", "p.json", "--print-schema"])
+            .expect_err("--policy with --print-schema must fail");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
     fn unknown_subcommand_is_rejected() {
         let err = Cli::try_parse_from(["sbx", "nope"]).expect_err("unknown subcommand must fail");
         assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
@@ -417,6 +507,24 @@ mod tests {
         assert!(help.contains("check"), "help must list check:\n{help}");
         assert!(help.contains("gc"), "help must list gc:\n{help}");
         assert!(!help.contains("__init"), "help must hide __init:\n{help}");
+    }
+
+    #[test]
+    fn check_help_lists_both_flags() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("check")
+            .expect("check subcommand must exist")
+            .render_help()
+            .to_string();
+        assert!(
+            help.contains("--policy"),
+            "help must list --policy:\n{help}"
+        );
+        assert!(
+            help.contains("--print-schema"),
+            "help must list --print-schema:\n{help}"
+        );
     }
 
     // ---- duration parser ---------------------------------------------

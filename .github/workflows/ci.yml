@@ -201,9 +201,10 @@ jobs:
             echo "ok: help hides __init"
           fi
 
-          # Each stub parses its documented interface, then exits 1 with
-          # "not implemented" on stderr. The policy/session files need not
-          # exist — the stubs never read them.
+          # `run`, `gc` and `__init` are still stubs: each parses its
+          # documented interface, then exits 1 with "not implemented" on
+          # stderr. The policy/session files need not exist — the stubs
+          # never read them.
           "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
           check_rc 1 $? "sbx run (stub)"
           grep -q "not implemented" run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
@@ -211,9 +212,55 @@ jobs:
           "$BIN" run --policy p.json --session-dir /tmp/s -- /bin/echo --help > /dev/null 2>&1
           check_rc 1 $? "sbx run with hyphenated trailing args (stub)"
 
-          "$BIN" check --policy p.json > /dev/null 2> check.err
-          check_rc 1 $? "sbx check (stub)"
-          grep -q "not implemented" check.err || { echo "FAIL: check stderr:"; cat check.err; FAIL=1; }
+          # check is real since issue #3: it validates a policy file (rc 0
+          # valid / rc 1 invalid-or-unreadable, "sbx check: <reason>" on
+          # stderr) and prints the JSON Schema with --print-schema (rc 0).
+          # rc 2 stays clap-only (missing/conflicting flags). The shipped
+          # examples double as the valid fixtures; the invalid one is a
+          # heredoc (relative path — the most basic rejection).
+          "$BIN" check --policy examples/default.json > /dev/null 2> check.err
+          check_rc 0 $? "sbx check examples/default.json"
+          if [ -s check.err ]; then
+            echo "FAIL: check wrote to stderr on success:"; cat check.err; FAIL=1
+          fi
+
+          "$BIN" check --policy examples/locked-down.json > /dev/null 2> check.err
+          check_rc 0 $? "sbx check examples/locked-down.json"
+
+          cat > check-invalid.json <<'EOF'
+            {
+              "version": 1,
+              "filesystem": { "ro": ["usr"], "rw": [], "deny": [] },
+              "network": { "mode": "none", "allow": [], "ports": [] },
+              "env": { "pass": [], "set": {} },
+              "limits": { "timeout": "120s", "output_bytes": 10485760 }
+            }
+          EOF
+
+          "$BIN" check --policy check-invalid.json > /dev/null 2> check.err
+          check_rc 1 $? "sbx check (invalid policy)"
+          grep -q "sbx check:" check.err || { echo "FAIL: check stderr:"; cat check.err; FAIL=1; }
+          grep -q "absolute path" check.err || { echo "FAIL: check stderr lacks the reason:"; cat check.err; FAIL=1; }
+
+          "$BIN" check --policy missing.json > /dev/null 2> check.err
+          check_rc 1 $? "sbx check (missing policy file)"
+          grep -q "cannot read" check.err || { echo "FAIL: missing-file stderr:"; cat check.err; FAIL=1; }
+
+          "$BIN" check --print-schema > schema.json 2> check.err
+          check_rc 0 $? "sbx check --print-schema"
+          grep -q '"\$schema"' schema.json || { echo "FAIL: schema output lacks \$schema"; FAIL=1; }
+          grep -q '"additionalProperties": false' schema.json || { echo "FAIL: schema output lacks additionalProperties"; FAIL=1; }
+
+          # Broken pipe is silent success (Unix convention): a closed reader
+          # must not turn into a panic (rc 101) and break the 0/1/2 contract.
+          "$BIN" check --print-schema | true
+          check_rc 0 ${PIPESTATUS[0]} "sbx check --print-schema to a closed pipe"
+
+          "$BIN" check > /dev/null 2>&1
+          check_rc 2 $? "sbx check without --policy or --print-schema (usage error)"
+
+          "$BIN" check --policy examples/default.json --print-schema > /dev/null 2>&1
+          check_rc 2 $? "sbx check --policy with --print-schema (usage error)"
 
           "$BIN" gc --older-than 7d /tmp/root > /dev/null 2> gc.err
           check_rc 1 $? "sbx gc (stub)"
