@@ -255,8 +255,13 @@ fn embedded_v4(bits: u128) -> Option<Ipv4Addr> {
 }
 
 // A deny-table row: hit iff bits >> (width - mask) == prefix >>
-// (width - mask), where width is 32 (V4) or 128 (V6). Mask lengths are
-// ≥ 4 everywhere, so the hit-test shifts can never overflow.
+// (width - mask), where width is 32 (V4) or 128 (V6). Every mask
+// satisfies 0 < mask ≤ width (pinned by
+// tables_sorted_most_specific_first) — that is the bound the hit-test
+// shifts rely on: a row with mask > width would make width - mask
+// underflow (panic in debug; in release it wraps and the shift amount
+// is masked mod width, degenerating the row into a huge bogus equality
+// class — wrong-region over-denial, not a silent no-op).
 struct V4Row {
     prefix: u32,
     mask: u32,
@@ -1003,13 +1008,25 @@ mod tests {
             ("::ffff:0:0", Denied::Unspecified), // mapped → 0.0.0.0
             ("100::", Denied::DiscardOnly),
             ("100::1", Denied::DiscardOnly),
+            ("100::ffff:ffff:ffff:ffff", Denied::DiscardOnly), // 100::/64 last
             ("100:0:0:1::", Denied::DiscardOnly),
             ("100:0:0:1::1", Denied::DiscardOnly),
+            // dummy /64 last
+            ("100:0:0:1:ffff:ffff:ffff:ffff", Denied::DiscardOnly),
             ("2001::", Denied::Transition),
             ("2001::1", Denied::Transition),
             ("2001:1::1", Denied::Reserved), // umbrella (anycasts folded)
             ("2001:2::", Denied::Benchmarking),
             ("2001:2::1", Denied::Benchmarking),
+            // /48 last address, then the first address past it (falls to
+            // the 2001::/23 umbrella): pins the row's full extent on both
+            // sides. These two are adjacent, so they bound the divergence
+            // window the once-truncated /48 oracle bound opened rather
+            // than enclosing it — the window runs ~2⁹⁶ addresses past
+            // 2001:2:1::, which random sampling almost never hits and
+            // tables_and_oracles_reconcile now pins deterministically.
+            ("2001:2:0:ffff:ffff:ffff:ffff:ffff", Denied::Benchmarking),
+            ("2001:2:1::", Denied::Reserved),
             ("2001:3::1", Denied::Reserved),     // AMT, umbrella
             ("2001:4:112::1", Denied::Reserved), // AS112-v6, umbrella
             ("2001:10::", Denied::Deprecated),
@@ -1358,7 +1375,12 @@ mod tests {
         // disjoint (equal-length prefixes overlap iff their masked values
         // are identical). This is what makes ::1 report Loopback (not the
         // ::/96 blanket Deprecated) and 2001::1 report Transition (not the
-        // 2001::/23 umbrella Reserved).
+        // 2001::/23 umbrella Reserved). Rows must also be CANONICAL — no
+        // host bits set in the prefix — because every check here (and the
+        // hit test itself) is shift-based and silently ignores host bits:
+        // a deceptive row like 192.88.99.2/24 would behave exactly as
+        // 192.88.99.0/24 while reading as a different address, and neither
+        // the sort nor the disjointness check would notice.
         let v4: Vec<(u128, u32)> = V4_TABLE
             .iter()
             .map(|row| (u128::from(row.prefix), row.mask))
@@ -1369,6 +1391,11 @@ mod tests {
                 assert!(
                     mask > 0 && mask <= width,
                     "{family} row {i}: bad mask {mask}"
+                );
+                assert_eq!(
+                    prefix & ((1u128 << (width - mask)) - 1),
+                    0,
+                    "{family} row {i}: prefix {prefix:#x} has host bits set for a /{mask}"
                 );
                 if i > 0 {
                     let prev = rows[i - 1].1;
@@ -1388,6 +1415,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn tables_and_oracles_reconcile() {
+        // The deny tables and the property oracles are two deliberately
+        // different representations of the same registry transcription
+        // (prefix/mask shift arithmetic vs inclusive interval endpoints).
+        // Reconcile them row-by-row: every table row's
+        // (prefix & mask, prefix | !mask, variant) must equal exactly one
+        // oracle interval, and vice versa. This keeps the representational
+        // independence the properties rely on — the comparison derives each
+        // side's intervals from that side's own arithmetic — while turning
+        // a one-sided transcription typo (an oracle bound encoding
+        // 2001:2::/32 while claiming the /48) into a hard failure instead
+        // of a silent oracle/implementation disagreement window that
+        // random sampling almost never hits. The sibling class — a WKP
+        // literal truncated to 96 bits — is pinned by
+        // embedded_v4_intervals_are_full_width instead: the embedded
+        // families are deliberately NOT table rows (embedded_v4() unwraps
+        // them before the scan), so this bijection never sees them.
+        fn reconcile(
+            family: &str,
+            table: &[(u128, u128, Denied)],
+            oracle: &[(u128, u128, Denied)],
+        ) {
+            assert_eq!(
+                table.len(),
+                oracle.len(),
+                "{family}: table rows vs oracle intervals count"
+            );
+            for (i, row) in table.iter().enumerate() {
+                let hits = oracle.iter().filter(|interval| *interval == row).count();
+                assert_eq!(
+                    hits, 1,
+                    "{family} row {i} {row:?}: {hits} oracle intervals match its extent"
+                );
+            }
+            for (i, interval) in oracle.iter().enumerate() {
+                let hits = table.iter().filter(|row| *row == interval).count();
+                assert_eq!(
+                    hits, 1,
+                    "{family} oracle interval {i} {interval:?}: {hits} table rows match its extent"
+                );
+            }
+        }
+        let v4_table: Vec<(u128, u128, Denied)> = V4_TABLE
+            .iter()
+            .map(|row| {
+                let mask = !0u32 << (32 - row.mask);
+                (
+                    u128::from(row.prefix & mask),
+                    u128::from(row.prefix | !mask),
+                    row.denied,
+                )
+            })
+            .collect();
+        let v4_oracle: Vec<(u128, u128, Denied)> = V4_INTERVALS
+            .iter()
+            .map(|(lo, hi, denied)| (u128::from(*lo), u128::from(*hi), *denied))
+            .collect();
+        reconcile("V4", &v4_table, &v4_oracle);
+        let v6_table: Vec<(u128, u128, Denied)> = V6_TABLE
+            .iter()
+            .map(|row| {
+                let mask = !0u128 << (128 - row.mask);
+                (row.prefix & mask, row.prefix | !mask, row.denied)
+            })
+            .collect();
+        reconcile("V6", &v6_table, V6_INTERVALS);
     }
 
     // ---- meta ------------------------------------------------------------------
@@ -1571,7 +1667,7 @@ mod tests {
         ), // 100:0:0:1::/64
         (
             0x2001_0002_0000_0000_0000_0000_0000_0000,
-            0x2001_0002_ffff_ffff_ffff_ffff_ffff_ffff,
+            0x2001_0002_0000_ffff_ffff_ffff_ffff_ffff,
             Denied::Benchmarking,
         ), // 2001:2::/48
         (
@@ -1641,22 +1737,34 @@ mod tests {
         ), // fc00::/7
     ];
 
+    // The embedded families with an RFC-guaranteed layout, checked FIRST:
+    // mapped ::ffff:0:0/96 and NAT64 WKP 64:ff9b::/96 delegate to the v4
+    // oracle on the low 32 bits (the inner reason propagates). Expressed
+    // as inclusive intervals — deliberately NOT the implementation's
+    // bits >> 32 + hi-96-constant shape, so the oracle stays an
+    // independent representation end to end.
+    //
+    // Every literal is written FULL-WIDTH (32 hex digits): a shorter u128
+    // literal silently truncates from the top — 0x0064_ff9b_0000_0000_0000_0000
+    // as u128 is 0:0:64:ff9b::, not 64:ff9b:: — which once
+    // described a bogus range no real WKP address falls in, leaving this
+    // branch vacuous while every test stayed green.
+    // embedded_v4_intervals_are_full_width pins the endpoints against
+    // std-parsed textual addresses so the class cannot recur.
+    const EMBEDDED_V4_INTERVALS: &[(u128, u128)] = &[
+        // ::ffff:0:0/96 (mapped)
+        (
+            0x0000_0000_0000_0000_0000_ffff_0000_0000,
+            0x0000_0000_0000_0000_0000_ffff_ffff_ffff,
+        ),
+        // 64:ff9b::/96 (NAT64 WKP)
+        (
+            0x0064_ff9b_0000_0000_0000_0000_0000_0000,
+            0x0064_ff9b_0000_0000_0000_0000_ffff_ffff,
+        ),
+    ];
+
     fn v6_oracle(bits: u128) -> Option<Denied> {
-        // The embedded families with an RFC-guaranteed layout FIRST:
-        // mapped ::ffff:0:0/96 and NAT64 WKP 64:ff9b::/96 delegate to the
-        // v4 oracle on the low 32 bits (the inner reason propagates).
-        // Expressed as inclusive intervals — deliberately NOT the
-        // implementation's bits >> 32 + hi-96-constant shape, so the
-        // oracle stays an independent representation end to end.
-        const EMBEDDED_V4_INTERVALS: &[(u128, u128)] = &[
-            // ::ffff:0:0/96 (mapped)
-            (0xffff_0000_0000, 0xffff_ffff_ffff),
-            // 64:ff9b::/96 (NAT64 WKP)
-            (
-                0x0064_ff9b_0000_0000_0000_0000,
-                0x0064_ff9b_0000_0000_ffff_ffff,
-            ),
-        ];
         if EMBEDDED_V4_INTERVALS
             .iter()
             .any(|(lo, hi)| (*lo..=*hi).contains(&bits))
@@ -1667,6 +1775,46 @@ mod tests {
             .iter()
             .find(|(lo, hi, _)| (*lo..=*hi).contains(&bits))
             .map(|(_, _, denied)| *denied)
+    }
+
+    #[test]
+    fn embedded_v4_intervals_are_full_width() {
+        // The pin the truncated-WKP-literal bug needed: each embedded
+        // interval's endpoints must equal the std-parsed textual addresses
+        // of the family's first/last address — a representation that
+        // cannot truncate — and the delegation must work end to end in
+        // BOTH directions (inner deny AND inner allow). With the once-
+        // truncated bounds, `64:ff9b::1` fell outside the bogus interval,
+        // the branch never fired, and the property stayed green because
+        // uniform u128 sampling hits a 96-bit window with probability
+        // ~2⁻⁹⁶. Any recurrence now fails loudly here.
+        fn v6bits(s: &str) -> u128 {
+            match ip(s) {
+                IpAddr::V6(v6) => v6.to_bits(),
+                IpAddr::V4(_) => panic!("{s}: expected an IPv6 textual form"),
+            }
+        }
+        let endpoints = [
+            ("::ffff:0.0.0.0", "::ffff:255.255.255.255"), // mapped /96
+            ("64:ff9b::", "64:ff9b::ffff:ffff"),          // NAT64 WKP /96
+        ];
+        assert_eq!(EMBEDDED_V4_INTERVALS.len(), endpoints.len());
+        for ((lo, hi), (first, last)) in EMBEDDED_V4_INTERVALS.iter().zip(endpoints) {
+            assert_eq!(*lo, v6bits(first), "{first}");
+            assert_eq!(*hi, v6bits(last), "{last}");
+        }
+        let probes = [
+            ("::ffff:7f00:1", Some(Denied::Loopback)),
+            ("::ffff:808:808", None),
+            ("64:ff9b::7f00:1", Some(Denied::Loopback)),
+            ("64:ff9b::808:808", None),
+        ];
+        for (probe, expected) in probes {
+            assert_eq!(v6_oracle(v6bits(probe)), expected, "{probe}");
+            // Oracle AND implementation on the same probe — the delegation
+            // must agree end to end, in both directions.
+            assert_eq!(guard(ip(probe)), expected.map_or(Ok(()), Err), "{probe}");
+        }
     }
 
     proptest! {
