@@ -583,6 +583,43 @@ mod tests {
     }
 
     #[test]
+    fn shipped_examples_validate() {
+        // Drift guard: every examples/*.json must satisfy the current
+        // validation rules — the CI smoke exercises them through the real
+        // static binary too.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let mut count = 0;
+        for entry in std::fs::read_dir(&dir).expect("examples/ must exist") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                Policy::from_file(&path).unwrap_or_else(|err| {
+                    panic!("{} must be a valid policy: {err}", path.display())
+                });
+                count += 1;
+            }
+        }
+        assert_eq!(count, 2, "exactly default.json + locked-down.json ship");
+    }
+
+    #[test]
+    fn default_example_matches_issue_draft() {
+        // The shipped default IS the issue #3 draft, byte-for-byte (modulo
+        // the file's trailing newline) — and therefore value-equal to the
+        // test fixture. The committed file is LF; the `replace` tolerates
+        // CRLF *working copies* (core.autocrlf=true checkouts): rustc
+        // normalizes CRLF to LF inside string literals, so DRAFT is LF
+        // regardless of how policy.rs itself was checked out, while the
+        // file is read from disk verbatim.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/default.json");
+        let text = std::fs::read_to_string(&path).expect("default.json must be readable");
+        assert_eq!(text.trim_end().replace("\r\n", "\n"), DRAFT);
+        assert_eq!(
+            Policy::from_file(&path).expect("default.json must be valid"),
+            policy_of(DRAFT)
+        );
+    }
+
+    #[test]
     fn minimal_empty_policy_valid() {
         // Q(ii)=A: all sections required, but every list may be empty —
         // the minimal valid policy is the full draft shape with no entries.

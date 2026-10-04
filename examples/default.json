@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "filesystem": { "ro": ["/usr", "/etc/ssl"], "rw": [], "deny": [] },
+  "network": { "mode": "transparent", "allow": ["github.com", "pypi.org"], "ports": [443, 80] },
+  "env": { "pass": ["LANG"], "set": { "GIT_TERMINAL_PROMPT": "0" } },
+  "limits": { "timeout": "120s", "output_bytes": 10485760 }
+}
