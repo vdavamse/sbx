@@ -22,10 +22,11 @@
 //! 6. `///` doc comments on policy types are author-facing: schemars renders
 //!    them as JSON Schema descriptions. Rust-internal rationale lives in `//`
 //!    comments (same convention as cli.rs).
-//! 7. Downstream consumers: #4 consumes [`Domain`]'s canonical form, #6
-//!    consumes [`AbsolutePath`]/[`Env`], #10 consumes [`Limits`], #11
-//!    consumes [`NetworkMode`]. Reuse the types — none of their logic lives
-//!    here.
+//! 7. Downstream consumers: #4 consumes [`Domain`]'s canonical form and
+//!    [`Domain::parse`] (the public seam over the normalization pipeline —
+//!    `egress::allowed` normalizes runtime hosts through it), #6 consumes
+//!    [`AbsolutePath`]/[`Env`], #10 consumes [`Limits`], #11 consumes
+//!    [`NetworkMode`]. Reuse the types — none of their logic lives here.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -172,13 +173,46 @@ impl JsonSchema for AbsolutePath {
 /// The stored form is canonical — ASCII, lowercase, no root dot, with
 /// wildcards and IP literals rejected. "IP literals" includes the legacy
 /// inet_aton numeric forms (a bare `123`, `0001.2.3.4`, `0x7f.0.0.1`),
-/// which getaddrinfo resolves to addresses without DNS. Downstream matching
-/// (#4) never needs to re-normalize.
+/// which getaddrinfo resolves to addresses without DNS. Policy-side
+/// matching never re-normalizes the stored form; runtime hosts normalize
+/// through [`Domain::parse`] (#4's `egress::allowed` strips exactly one
+/// trailing root dot, then parses — one pipeline, both directions).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct Domain(String);
 
+/// Why [`Domain::parse`] rejected a string.
+///
+/// The message is one of the pinned rejection strings — byte-identical to
+/// what policy deserialization reports for the same input (single pipeline,
+/// single source; `parse_equals_deserialize` pins the equivalence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainError(String);
+
+impl std::fmt::Display for DomainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DomainError {}
+
 impl Domain {
+    /// Parse a domain string into its canonical stored form.
+    ///
+    /// The single normalization pipeline behind both policy deserialization
+    /// and runtime-host matching (#4's [`crate::egress::allowed`]): UTS #46
+    /// ToASCII (URL deny-list, hyphen first/last checks, DNS-length
+    /// verification) with wildcard, IP-literal and legacy inet_aton
+    /// rejection applied to the raw input AND to the normalized output.
+    ///
+    /// Does **not** strip a trailing root dot — policy entries are written
+    /// dot-less (`example.com.` is rejected); `egress::allowed` strips
+    /// exactly one ASCII dot from runtime hosts before calling.
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        normalize_domain(raw).map(Self).map_err(DomainError)
+    }
+
     /// The normalized domain: lowercase punycode ASCII, no root dot.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -272,10 +306,9 @@ fn normalize_domain(raw: &str) -> Result<String, String> {
 impl<'de> Deserialize<'de> for Domain {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
-        match normalize_domain(&raw) {
-            Ok(normalized) => Ok(Self(normalized)),
-            Err(message) => Err(serde::de::Error::custom(message)),
-        }
+        // DomainError's Display is the pinned message, so custom() carries
+        // it byte-identically — one pipeline for both entry points.
+        Self::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -954,6 +987,135 @@ mod tests {
         ] {
             let err = err_of(&with_allow(bad));
             assert!(err.contains("not a valid domain name"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn domain_parse_accepts_and_normalizes() {
+        // The constructor is the runtime-host normalization seam (#4): the
+        // same pipeline and the same canonical output as deserialization.
+        let label63 = "a".repeat(63);
+        let cases = [
+            ("EXAMPLE.COM", "example.com"),
+            ("例え.jp", "xn--r8jz45g.jp"),
+            ("ＸＮ--Ｒ８ＪＺ４５Ｇ.ＪＰ", "xn--r8jz45g.jp"),
+            ("ｅｘａｍｐｌｅ.ｃｏｍ", "example.com"),
+            ("localhost", "localhost"),
+            (label63.as_str(), label63.as_str()),
+            ("ex_ample.com", "ex_ample.com"),
+            ("123.com", "123.com"),
+        ];
+        for (input, expected) in cases {
+            let parsed = Domain::parse(input).unwrap_or_else(|err| panic!("{input:?}: {err}"));
+            assert_eq!(parsed.as_str(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn domain_parse_rejects_with_pinned_messages() {
+        // Exact-message pins per rejection family — the constructor reports
+        // the identical strings deserialization does (single source).
+        let not_valid = |raw: &str| format!("not a valid domain name (got {raw:?})");
+        let wildcard = |raw: &str| format!("wildcard domains are not allowed (got {raw:?})");
+        let ip =
+            |raw: &str| format!("IP literals are not allowed; use a domain name (got {raw:?})");
+        let label64 = "a".repeat(64);
+        let cases = [
+            ("example.com.", not_valid("example.com.")),
+            ("", not_valid("")),
+            ("ex..com", not_valid("ex..com")),
+            (label64.as_str(), not_valid(&label64)),
+            ("-bad.com", not_valid("-bad.com")),
+            ("bad-.com", not_valid("bad-.com")),
+            ("*.example.com", wildcard("*.example.com")),
+            ("＊.example.com", wildcard("＊.example.com")),
+            ("1.2.3.4", ip("1.2.3.4")),
+            ("::1", ip("::1")),
+            ("123", ip("123")),
+            ("0x7f.0.0.1", ip("0x7f.0.0.1")),
+            ("0177.0.0.1", ip("0177.0.0.1")),
+            ("１.２.３.４", ip("１.２.３.４")),
+        ];
+        for (input, expected) in cases {
+            let err = Domain::parse(input).unwrap_err();
+            assert_eq!(err.to_string(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn parse_equals_deserialize() {
+        // Meta/equivalence: the public constructor and the serde path share
+        // one pipeline, so they can never drift — same accepts, same
+        // canonical form, same rejection text (serde adds only its line/
+        // column position context around the identical custom message).
+        let label63 = "a".repeat(63);
+        let label64 = "a".repeat(64);
+        let matrix = [
+            // accepted: canonical, case-folded, IDN, fullwidth, underscore,
+            // numeric look-alikes, hyphen rules, long label
+            "example.com",
+            "EXAMPLE.COM",
+            "localhost",
+            "ex_ample.com",
+            "123.com",
+            "0xdead.beef",
+            "1.2.3.4.com",
+            "a--b.com",
+            "r1---sn-abc.googlevideo.com",
+            label63.as_str(),
+            "例え.jp",
+            "xn--r8jz45g.jp",
+            "ＸＮ--Ｒ８ＪＺ４５Ｇ.ＪＰ",
+            "ｅｘａｍｐｌｅ.ｃｏｍ",
+            // rejected: root dot, empty string/label, overlong label, edge
+            // hyphens, wildcards (ASCII + fullwidth), IP literals (strict +
+            // inet_aton spellings + fullwidth digits)
+            "example.com.",
+            "",
+            "ex..com",
+            label64.as_str(),
+            "-bad.com",
+            "bad-.com",
+            "*.example.com",
+            "*",
+            "example.*",
+            "＊.example.com",
+            "1.2.3.4",
+            "::1",
+            "2001:db8::1",
+            "123",
+            "2130706433",
+            "0001.2.3.4",
+            "0177.0.0.1",
+            "0x7f.0.0.1",
+            "0x7f000001",
+            "１２３",
+            "１.２.３.４",
+        ];
+        for input in matrix {
+            match (
+                Domain::parse(input),
+                serde_json::from_str::<Domain>(&json_str(input)),
+            ) {
+                (Ok(parsed), Ok(deserialized)) => {
+                    assert_eq!(parsed, deserialized, "{input:?}");
+                }
+                (Err(parse_err), Err(deserialize_err)) => {
+                    let text = deserialize_err.to_string();
+                    assert!(
+                        text.starts_with(&parse_err.to_string()),
+                        "{input:?}: {text:?} does not carry {parse_err:?}"
+                    );
+                }
+                (Ok(parsed), Err(err)) => {
+                    panic!("{input:?}: parse accepted {parsed:?} but deserialize failed: {err}")
+                }
+                (Err(err), Ok(deserialized)) => {
+                    panic!(
+                        "{input:?}: parse rejected ({err}) but deserialize accepted {deserialized:?}"
+                    )
+                }
+            }
         }
     }
 
