@@ -514,8 +514,11 @@ static V6_TABLE: &[V6Row] = &[
 
 #[cfg(test)]
 mod tests {
+    // Deep property runs: PROPTEST_CASES=10000 cargo test --locked egress
+    // (the default — and CI — runs 256 cases per property).
     use super::*;
     use crate::policy::Policy;
+    use proptest::prelude::*;
     use std::path::Path;
 
     // ---- fixtures / helpers ------------------------------------------------
@@ -1435,6 +1438,428 @@ mod tests {
                 matches!(ip(addr).to_canonical(), IpAddr::V6(_)),
                 "{addr}: to_canonical() must leave this form untouched"
             );
+        }
+    }
+
+    // ---- property tests (proptest) ------------------------------------------
+    //
+    // Oracle soundness: the generators emit only SELF-CANONICAL
+    // lowercase-ASCII names — asserted inside every property, so generator
+    // drift fails loudly instead of silently vacuating the oracle. Given
+    // canonicity, the raw-string `in_set_oracle` (concat + ends_with — a
+    // different data path from the implementation's normalize-then-
+    // strip_suffix rule, sharing no code with it) is an independent judge.
+    // The guard oracles use inclusive-interval membership transcribed from
+    // the RFC endpoints — interval arithmetic vs the implementation's
+    // prefix/shift arithmetic: two representations cross-checking.
+
+    // label: [a-z][a-z0-9]{0,9} — never hyphenated, never starts with a
+    // digit (⇒ never all-numeric, never a "0x" hex form), ≤10 chars.
+    fn prop_label() -> impl Strategy<Value = String> {
+        (
+            proptest::char::range('a', 'z'),
+            proptest::collection::vec(prop_lower_alnum_char(), 0..=9),
+        )
+            .prop_map(|(first, rest)| std::iter::once(first).chain(rest).collect())
+    }
+
+    // [a-z0-9] via core strategies only (proptest 1.11 has no char_in;
+    // char::range's `ranges` fully define the output set — the default
+    // special/preferred biases never escape them, and shrinking never
+    // crosses them, so self-canonicity holds for shrunk values too).
+    fn prop_lower_alnum_char() -> impl Strategy<Value = char> {
+        prop_oneof![
+            proptest::char::range('a', 'z'),
+            proptest::char::range('0', '9'),
+        ]
+    }
+
+    // tld: [a-z]{2,6} — alphabetic ⇒ never inet_aton-form, never an
+    // all-numeric TLD.
+    fn prop_tld() -> impl Strategy<Value = String> {
+        proptest::collection::vec(proptest::char::range('a', 'z'), 2..=6)
+            .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    // domain: 2–3 labels ending in the tld (allow-entry shape).
+    fn prop_domain() -> impl Strategy<Value = String> {
+        (proptest::collection::vec(prop_label(), 1..=2), prop_tld()).prop_map(
+            |(mut labels, tld)| {
+                labels.push(tld);
+                labels.join(".")
+            },
+        )
+    }
+
+    // host: 1–5 labels ending in the tld (runtime-host shape).
+    fn prop_host() -> impl Strategy<Value = String> {
+        (proptest::collection::vec(prop_label(), 0..=4), prop_tld()).prop_map(
+            |(mut labels, tld)| {
+                labels.push(tld);
+                labels.join(".")
+            },
+        )
+    }
+
+    // The raw-string oracle: `∃d ∈ allow: h == d || h.ends_with("." + d)`
+    // — the issue's own rule, implemented independently of the matcher.
+    // Sound over self-canonical inputs (asserted in every property).
+    fn in_set_oracle(host: &str, allow: &[String]) -> bool {
+        allow
+            .iter()
+            .any(|d| host == d || host.ends_with(&format!(".{d}")))
+    }
+
+    // The v4 guard oracle: INCLUSIVE intervals transcribed from the RFC
+    // endpoints of the V4_TABLE rows. Pairwise disjoint, so scan order is
+    // irrelevant for the verdict — unlike the implementation, which relies
+    // on its sort invariant.
+    const V4_INTERVALS: &[(u32, u32, Denied)] = &[
+        (0x0000_0000, 0x00ff_ffff, Denied::Unspecified), // 0.0.0.0/8
+        (0x0a00_0000, 0x0aff_ffff, Denied::PrivateNetwork), // 10.0.0.0/8
+        (0x6440_0000, 0x647f_ffff, Denied::SharedAddressSpace), // 100.64.0.0/10
+        (0x7f00_0000, 0x7fff_ffff, Denied::Loopback),    // 127.0.0.0/8
+        (0xa9fe_0000, 0xa9fe_ffff, Denied::LinkLocal),   // 169.254.0.0/16
+        (0xac10_0000, 0xac1f_ffff, Denied::PrivateNetwork), // 172.16.0.0/12
+        (0xc000_0000, 0xc000_00ff, Denied::Reserved),    // 192.0.0.0/24
+        (0xc000_0200, 0xc000_02ff, Denied::Documentation), // 192.0.2.0/24
+        (0xc01f_c400, 0xc01f_c4ff, Denied::Reserved),    // 192.31.196.0/24
+        (0xc034_c100, 0xc034_c1ff, Denied::Reserved),    // 192.52.193.0/24
+        (0xc058_6300, 0xc058_63ff, Denied::Deprecated),  // 192.88.99.0/24
+        (0xc0a8_0000, 0xc0a8_ffff, Denied::PrivateNetwork), // 192.168.0.0/16
+        (0xc0af_3000, 0xc0af_30ff, Denied::Reserved),    // 192.175.48.0/24
+        (0xc612_0000, 0xc613_ffff, Denied::Benchmarking), // 198.18.0.0/15
+        (0xc633_6400, 0xc633_64ff, Denied::Documentation), // 198.51.100.0/24
+        (0xcb00_7100, 0xcb00_71ff, Denied::Documentation), // 203.0.113.0/24
+        (0xe000_0000, 0xefff_ffff, Denied::Multicast),   // 224.0.0.0/4
+        (0xf000_0000, 0xffff_ffff, Denied::Reserved),    // 240.0.0.0/4
+    ];
+
+    fn v4_oracle(bits: u32) -> Option<Denied> {
+        V4_INTERVALS
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&bits))
+            .map(|(_, _, denied)| *denied)
+    }
+
+    // The v6 guard oracle: same transcription, ordered most-specific-first
+    // (mirroring the table's invariants: ::1/:: before the ::/96 blanket;
+    // the /48, /32 and /28 refinements before the 2001::/23 umbrella), so
+    // first-match is the most specific reason. Containments beyond those
+    // are impossible: every other interval is pairwise disjoint.
+    const V6_INTERVALS: &[(u128, u128, Denied)] = &[
+        (
+            0x0000_0000_0000_0000_0000_0000_0000_0001,
+            0x0000_0000_0000_0000_0000_0000_0000_0001,
+            Denied::Loopback,
+        ), // ::1/128
+        (0, 0, Denied::Unspecified), // ::/128
+        (
+            0,
+            0x0000_0000_0000_0000_0000_0000_ffff_ffff,
+            Denied::Deprecated,
+        ), // ::/96 compatible — blanket, no recursion
+        (
+            0x0100_0000_0000_0000_0000_0000_0000_0000,
+            0x0100_0000_0000_0000_ffff_ffff_ffff_ffff,
+            Denied::DiscardOnly,
+        ), // 100::/64
+        (
+            0x0100_0000_0000_0001_0000_0000_0000_0000,
+            0x0100_0000_0000_0001_ffff_ffff_ffff_ffff,
+            Denied::DiscardOnly,
+        ), // 100:0:0:1::/64
+        (
+            0x2001_0002_0000_0000_0000_0000_0000_0000,
+            0x2001_0002_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Benchmarking,
+        ), // 2001:2::/48
+        (
+            0x2620_004f_8000_0000_0000_0000_0000_0000,
+            0x2620_004f_8000_ffff_ffff_ffff_ffff_ffff,
+            Denied::Reserved,
+        ), // 2620:4f:8000::/48
+        (
+            0x0064_ff9b_0001_0000_0000_0000_0000_0000,
+            0x0064_ff9b_0001_ffff_ffff_ffff_ffff_ffff,
+            Denied::Transition,
+        ), // 64:ff9b:1::/48
+        (
+            0x2001_0000_0000_0000_0000_0000_0000_0000,
+            0x2001_0000_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Transition,
+        ), // 2001::/32 Teredo
+        (
+            0x2001_0db8_0000_0000_0000_0000_0000_0000,
+            0x2001_0db8_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Documentation,
+        ), // 2001:db8::/32
+        (
+            0x2001_0010_0000_0000_0000_0000_0000_0000,
+            0x2001_001f_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Deprecated,
+        ), // 2001:10::/28 ORCHID
+        (
+            0x2001_0000_0000_0000_0000_0000_0000_0000,
+            0x2001_01ff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Reserved,
+        ), // 2001::/23 umbrella
+        (
+            0x3fff_0000_0000_0000_0000_0000_0000_0000,
+            0x3fff_0fff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Documentation,
+        ), // 3fff::/20
+        (
+            0x2002_0000_0000_0000_0000_0000_0000_0000,
+            0x2002_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Transition,
+        ), // 2002::/16 6to4
+        (
+            0x5f00_0000_0000_0000_0000_0000_0000_0000,
+            0x5f00_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Reserved,
+        ), // 5f00::/16
+        (
+            0xfe80_0000_0000_0000_0000_0000_0000_0000,
+            0xfebf_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::LinkLocal,
+        ), // fe80::/10
+        (
+            0xfec0_0000_0000_0000_0000_0000_0000_0000,
+            0xfeff_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Deprecated,
+        ), // fec0::/10
+        (
+            0xff00_0000_0000_0000_0000_0000_0000_0000,
+            0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::Multicast,
+        ), // ff00::/8
+        (
+            0xfc00_0000_0000_0000_0000_0000_0000_0000,
+            0xfdff_ffff_ffff_ffff_ffff_ffff_ffff_ffff,
+            Denied::UniqueLocal,
+        ), // fc00::/7
+    ];
+
+    fn v6_oracle(bits: u128) -> Option<Denied> {
+        // The embedded families with an RFC-guaranteed layout FIRST:
+        // mapped ::ffff:0:0/96 and NAT64 WKP 64:ff9b::/96 delegate to the
+        // v4 oracle on the low 32 bits (the inner reason propagates).
+        // Expressed as inclusive intervals — deliberately NOT the
+        // implementation's bits >> 32 + hi-96-constant shape, so the
+        // oracle stays an independent representation end to end.
+        const EMBEDDED_V4_INTERVALS: &[(u128, u128)] = &[
+            // ::ffff:0:0/96 (mapped)
+            (0xffff_0000_0000, 0xffff_ffff_ffff),
+            // 64:ff9b::/96 (NAT64 WKP)
+            (
+                0x0064_ff9b_0000_0000_0000_0000,
+                0x0064_ff9b_0000_0000_ffff_ffff,
+            ),
+        ];
+        if EMBEDDED_V4_INTERVALS
+            .iter()
+            .any(|(lo, hi)| (*lo..=*hi).contains(&bits))
+        {
+            return v4_oracle(bits as u32);
+        }
+        V6_INTERVALS
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&bits))
+            .map(|(_, _, denied)| *denied)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_out_of_set_hosts_never_allowed(
+            allow_names in proptest::collection::vec(prop_domain(), 1..=4),
+            host in prop_host(),
+        ) {
+            // THE acceptance criterion: "no host outside the allow set is
+            // ever accepted" — the !oracle ⇒ None direction is the
+            // security-critical half; the equality also catches
+            // over-denial. Self-canonical inputs make the oracle sound.
+            for name in allow_names.iter().chain([&host]) {
+                prop_assert!(
+                    Domain::parse(name).is_ok_and(|p| p.as_str() == name.as_str()),
+                    "generated name {name:?} must be self-canonical"
+                );
+            }
+            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            prop_assert_eq!(
+                allowed(&host, &entries).is_some(),
+                in_set_oracle(&host, &allow_names)
+            );
+        }
+
+        #[test]
+        fn prop_subdomains_of_allowed_always_allowed(
+            allow_names in proptest::collection::vec(prop_domain(), 1..=4),
+            prefixes in proptest::collection::vec(prop_label(), 0..=2),
+            pick in any::<proptest::sample::Index>(),
+        ) {
+            // A host built by prepending 0–2 random labels to a random
+            // allow entry is in-set by definition ⇒ always Some.
+            let entry = pick.get(&allow_names);
+            let host = prefixes
+                .iter()
+                .chain([entry])
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(".");
+            prop_assert!(
+                Domain::parse(&host).is_ok_and(|p| p.as_str() == host.as_str()),
+                "generated host {host:?} must be self-canonical"
+            );
+            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            prop_assert!(allowed(&host, &entries).is_some());
+        }
+
+        #[test]
+        fn prop_semantics_preserving_mutations_still_allowed(
+            allow_names in proptest::collection::vec(prop_domain(), 1..=4),
+            pick in any::<proptest::sample::Index>(),
+            mutation in 0..3u8,
+        ) {
+            let entry = pick.get(&allow_names);
+            // Mutations whose canonical form is the entry itself: case
+            // flip, a single trailing root dot, fullwidth fold (each ASCII
+            // char → its U+FF01-range equivalent). Canonical ⇒ in-set ⇒
+            // Some; no oracle needed.
+            let host = match mutation {
+                0 => entry.to_uppercase(),
+                1 => format!("{entry}."),
+                _ => entry
+                    .chars()
+                    .map(|c| {
+                        char::from_u32(u32::from(c) - 0x21 + 0xFF01).expect("fullwidth char")
+                    })
+                    .collect(),
+            };
+            // Canonical-form identity through the runtime pipeline: strip
+            // one ASCII dot, then parse (mirrors allowed()'s own steps).
+            let bare = host.strip_suffix('.').unwrap_or(&host);
+            prop_assert!(Domain::parse(bare).is_ok_and(|p| p.as_str() == entry.as_str()));
+            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            prop_assert!(allowed(&host, &entries).is_some());
+        }
+
+        #[test]
+        fn prop_adversarial_mutations_match_oracle(
+            allow_names in proptest::collection::vec(prop_domain(), 1..=4),
+            pick in any::<proptest::sample::Index>(),
+            mutation in 0..2u8,
+        ) {
+            let entry = pick.get(&allow_names);
+            // Boundary-breaking mutations: bare-prefix glue (the eBPF bug
+            // class) and suffix escape. Both stay self-canonical, so the
+            // raw-string oracle decides — never a hardcoded None:
+            // accidental collisions with OTHER generated entries (allow
+            // can itself contain "evil<entry>" or "<label>.evil.tld") must
+            // be handled correctly, and the oracle does that by design.
+            let host = match mutation {
+                0 => format!("evil{entry}"),
+                _ => format!("{entry}.evil.tld"),
+            };
+            prop_assert!(
+                Domain::parse(&host).is_ok_and(|p| p.as_str() == host.as_str()),
+                "mutation {host:?} must be self-canonical"
+            );
+            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            prop_assert_eq!(
+                allowed(&host, &entries).is_some(),
+                in_set_oracle(&host, &allow_names)
+            );
+        }
+
+        #[test]
+        fn prop_arbitrary_unicode_never_panics_and_matches_oracle(
+            allow_names in proptest::collection::vec(prop_domain(), 0..=3),
+            host in any::<String>(),
+        ) {
+            for name in &allow_names {
+                prop_assert!(
+                    Domain::parse(name).is_ok_and(|p| p.as_str() == name.as_str()),
+                    "generated name {name:?} must be self-canonical"
+                );
+            }
+            // Fuzz-lite: arbitrary Unicode hosts must never panic (the
+            // fork+timeout features turn aborts/hangs into ordinary
+            // failures too), and the verdict must equal the contract:
+            // normalize (one ASCII dot stripped, single pipeline) —
+            // Err ⇒ None; Ok ⇒ the raw-string oracle over the canonical
+            // form.
+            let bare = host.strip_suffix('.').unwrap_or(&host);
+            let expected = match Domain::parse(bare) {
+                Ok(parsed) => in_set_oracle(parsed.as_str(), &allow_names),
+                Err(_) => false,
+            };
+            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            prop_assert_eq!(allowed(&host, &entries).is_some(), expected);
+        }
+
+        #[test]
+        fn prop_guard_v4_matches_interval_oracle(bits in any::<u32>()) {
+            // Verdict AND variant equality over the whole v4 space:
+            // interval-membership arithmetic vs prefix/shift arithmetic.
+            let expected = match v4_oracle(bits) {
+                Some(denied) => Err(denied),
+                None => Ok(()),
+            };
+            prop_assert_eq!(guard(IpAddr::V4(Ipv4Addr::from(bits))), expected);
+        }
+
+        #[test]
+        fn prop_guard_v6_matches_interval_oracle(bits in any::<u128>()) {
+            let expected = match v6_oracle(bits) {
+                Some(denied) => Err(denied),
+                None => Ok(()),
+            };
+            prop_assert_eq!(guard(IpAddr::V6(Ipv6Addr::from(bits))), expected);
+        }
+
+        #[test]
+        fn prop_mapped_and_nat64_equivalence(bits in any::<u32>()) {
+            // Full Result equality (inner variants included): the
+            // guaranteed-layout embedded forms are verdict-identical to
+            // the bare IPv4 they carry — over the WHOLE v4 space, not
+            // just the denied ranges.
+            let v4 = IpAddr::V4(Ipv4Addr::from(bits));
+            let payload = u128::from(bits);
+            let mapped = IpAddr::V6(Ipv6Addr::from(
+                0x0000_0000_0000_0000_0000_ffff_0000_0000u128 | payload,
+            ));
+            let wkp = IpAddr::V6(Ipv6Addr::from(
+                0x0064_ff9b_0000_0000_0000_0000_0000_0000u128 | payload,
+            ));
+            prop_assert_eq!(guard(mapped), guard(v4));
+            prop_assert_eq!(guard(wkp), guard(v4));
+        }
+
+        #[test]
+        fn prop_transition_payloads_always_denied(payload in any::<u128>()) {
+            // The blanket decisions (R1/R2) at property scale: whatever
+            // the payload — a "public" IPv4, loopback, anything — the
+            // three Transition ranges deny with Transition. The masks
+            // keep each address inside its range, so no more-specific row
+            // can fire (Teredo's second group stays 0x0000, excluding the
+            // 2001:2::/48 and 2001:10::/28 refinements) and no
+            // embedded-v4 recursion triggers (the local-NAT64 third group
+            // stays 0x0001 ≠ the WKP's 0x0000).
+            const MASK96: u128 = 0x0000_0000_ffff_ffff_ffff_ffff_ffff_ffff;
+            const MASK112: u128 = 0x0000_ffff_ffff_ffff_ffff_ffff_ffff_ffff;
+            const MASK80: u128 = 0x0000_0000_0000_ffff_ffff_ffff_ffff_ffff;
+            let cases = [
+                0x2001_0000_0000_0000_0000_0000_0000_0000u128 | (payload & MASK96),
+                0x2002_0000_0000_0000_0000_0000_0000_0000u128 | (payload & MASK112),
+                0x0064_ff9b_0001_0000_0000_0000_0000_0000u128 | (payload & MASK80),
+            ];
+            for bits in cases {
+                prop_assert_eq!(
+                    guard(IpAddr::V6(Ipv6Addr::from(bits))),
+                    Err(Denied::Transition)
+                );
+            }
         }
     }
 }
