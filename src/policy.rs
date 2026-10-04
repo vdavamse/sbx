@@ -16,6 +16,9 @@
 //!    points that enforce the policy-wide validation rules (version, ports,
 //!    environment-variable names). Deserializing [`Policy`] directly with
 //!    serde_json enforces only the value-level rules baked into the types.
+//!    The asymmetry is deliberate in v1, pinned by the
+//!    `direct_deserialization_skips_policy_wide_rules` test, and slated to
+//!    become a type-level invariant before #6 consumes [`Policy`].
 //! 6. `///` doc comments on policy types are author-facing: schemars renders
 //!    them as JSON Schema descriptions. Rust-internal rationale lives in `//`
 //!    comments (same convention as cli.rs).
@@ -108,6 +111,18 @@ fn check_path(s: &str) -> Result<(), String> {
     if !s.starts_with('/') {
         return Err(format!("must be an absolute path (got {s:?})"));
     }
+    // NUL cannot cross any C-string interface. Rust's own spawn path is
+    // fail-closed (std::process::Command rejects a NUL in argv/env with
+    // InvalidInput before the kernel ever sees it), but #6 may assemble
+    // bwrap argv via raw byte buffers, where the kernel would truncate at
+    // the NUL and the *validated* path would silently differ from the
+    // *mounted* one — so we reject here, at the contract boundary, instead
+    // of relying on each downstream caller to fail closed. What we validate
+    // must be what the kernel sees. (Domain already rejects NUL implicitly
+    // via ToASCII.)
+    if s.contains('\0') {
+        return Err(format!("must not contain NUL bytes (got {s:?})"));
+    }
     if s == "/" {
         return Err("the host root '/' is never allowed in a policy path".to_owned());
     }
@@ -146,7 +161,7 @@ impl JsonSchema for AbsolutePath {
         // documentation and editor support, not the enforcement point.
         json_schema!({
             "type": "string",
-            "description": "An absolute, lexically canonical filesystem path (no '.', '..' or empty segments, no trailing slash). The host root '/' is never allowed: the filesystem sections are allow-lists of bind mounts.",
+            "description": "An absolute, lexically canonical filesystem path (no '.', '..' or empty segments, no trailing slash, no NUL bytes). The host root '/' is never allowed: the filesystem sections are allow-lists of bind mounts.",
             "pattern": "^/([^/]+/)*[^/]+$"
         })
     }
@@ -353,8 +368,48 @@ pub struct Env {
     /// Variable names inherited from the host environment.
     pub pass: Vec<String>,
 
-    /// Variables set to fixed values inside the sandbox.
+    /// Variables set to fixed values inside the sandbox. Duplicate keys are
+    /// rejected rather than silently resolved last-wins: a hand-edited
+    /// policy with a botched merge must not pass `sbx check`.
+    #[serde(deserialize_with = "de_env_set")]
     pub set: BTreeMap<String, String>,
+}
+
+// serde derive rejects duplicate *struct* keys, but plain BTreeMap
+// deserialization keeps only the last of duplicate dynamic keys. For a
+// hand-edited security policy that silently drops an assignment (botched
+// merge, copy-paste), so env.set rejects repeats instead — with serde's
+// line/column context. The declared field type is unchanged, so the
+// generated JSON Schema is identical to a plain BTreeMap<String, String>.
+fn de_env_set<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct EnvSetVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for EnvSetVisitor {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of environment variable names to values")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if entries.insert(key.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate key {key:?} in env.set"
+                    )));
+                }
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_map(EnvSetVisitor)
 }
 
 /// Resource limits for the sandboxed command.
@@ -399,16 +454,37 @@ impl Policy {
     /// Read, parse, and validate a policy file.
     ///
     /// An unreadable file is a [`PolicyError`] naming the path — same rc-1
-    /// class as an invalid policy, never a panic.
+    /// class as an invalid policy, never a panic. A file whose bytes are
+    /// not UTF-8 gets its own accurate message (it *was* read; *decoding*
+    /// it failed).
     pub fn from_file(path: &Path) -> Result<Self, PolicyError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|err| PolicyError(format!("cannot read {}: {err}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            // read_to_string reports InvalidData when the bytes are not
+            // valid UTF-8; every other failure is a genuine read error.
+            if err.kind() == std::io::ErrorKind::InvalidData {
+                PolicyError(format!("{} is not valid UTF-8", path.display()))
+            } else {
+                PolicyError(format!("cannot read {}: {err}", path.display()))
+            }
+        })?;
         Self::from_json_str(&text)
     }
 
-    // Policy-wide rules that no single value can express on its own (D3):
-    // value-level invariants live in the newtypes' Deserialize impls so they
-    // carry line/column context; these run after a successful parse.
+    // Policy-wide rules (D3): value-level invariants live in the newtypes'
+    // Deserialize impls so they carry line/column context; these run after a
+    // successful parse and are reachable only via from_json_str/from_file —
+    // direct serde_json deserialization of `Policy` skips them (module doc
+    // point 5; pinned by direct_deserialization_skips_policy_wide_rules).
+    // TODO(#6): make "`Policy` exists ⇒ `Policy` is valid" a type-level
+    // invariant — e.g. a private raw mirror with #[serde(try_from)], or
+    // Port/EnvName validating newtypes (which would also restore
+    // line/column context for these errors) — before enforcement
+    // consumers (#6/#10) start constructing `Policy` outside this module.
+    // #6 should also revisit NUL in env.set *values* (deliberately
+    // unrestricted here; keys/pass-names are POSIX-validated hence
+    // NUL-free): Rust's Command::env fails closed, but the same
+    // "validated == what the kernel sees" rationale resurfaces once #6
+    // assembles `bwrap --setenv`.
     fn validate(&self) -> Result<(), PolicyError> {
         if self.version != SUPPORTED_VERSION {
             return Err(PolicyError(format!(
@@ -457,7 +533,7 @@ fn env_name_error(where_: &str, name: &str) -> PolicyError {
 /// Render the policy JSON Schema (draft 2020-12) as pretty JSON.
 ///
 /// Deterministic for a pinned dependency set: no trailing newline (the
-/// caller's `println!` adds one).
+/// caller adds one when writing to stdout).
 pub fn schema_json() -> String {
     serde_json::to_string_pretty(&schema_for!(Policy))
         .expect("serializing a generated schema to JSON cannot fail")
@@ -724,6 +800,16 @@ mod tests {
         for path in ["//usr", "/usr/", "/usr/../etc", "/./x", "/a//b"] {
             let err = err_of(&with_ro(path));
             assert!(err.contains("canonical"), "{path:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn nul_byte_paths_rejected() {
+        // NUL is the one byte that cannot survive any C-string interface:
+        // what `check` validates must be what the kernel would mount (#5/#6).
+        for path in ["/usr\0etc", "/\0", "/a\0b/c"] {
+            let err = err_of(&with_ro(path));
+            assert!(err.contains("NUL"), "{path:?}: {err}");
         }
     }
 
@@ -1057,6 +1143,23 @@ mod tests {
         assert_eq!(keys, ["A", "M", "Z"]);
     }
 
+    #[test]
+    fn duplicate_env_set_keys_rejected() {
+        // Plain BTreeMap deserialization would silently keep only the last
+        // duplicate (last-win), dropping an assignment from a hand-edited
+        // security policy; env.set rejects repeats instead, with serde's
+        // line/column context.
+        let json = draft_with(
+            r#""set": { "GIT_TERMINAL_PROMPT": "0" }"#,
+            r#""set": { "A": "1", "A": "2" }"#,
+        );
+        let err = err_of(&json);
+        assert!(err.contains("duplicate key"), "{err}");
+        assert!(err.contains(r#""A""#), "{err}");
+        assert!(err.contains("env.set"), "{err}");
+        assert!(err.contains("line"), "{err}"); // serde position context
+    }
+
     // ---- network mode --------------------------------------------------------
 
     #[test]
@@ -1193,6 +1296,29 @@ mod tests {
         }
     }
 
+    // ---- validation entry points ------------------------------------------
+
+    #[test]
+    fn direct_deserialization_skips_policy_wide_rules() {
+        // Pins the module-doc point-5 asymmetry: raw serde_json
+        // deserialization enforces only the value-level rules baked into the
+        // types; version/port-0/env-name checks run in validate(), which
+        // only from_json_str/from_file call. Future consumers (#6, #10)
+        // must load policies through those entry points. If this test ever
+        // fails, the asymmetry changed (e.g. the TODO(#6) type-level
+        // invariant landed): update the module docs, this test, and the
+        // handoff notes in the same change.
+        for json in [
+            draft_with(r#""version": 1,"#, r#""version": 2,"#),
+            draft_with(r#""ports": [443, 80]"#, r#""ports": [443, 0]"#),
+            draft_with(r#""pass": ["LANG"]"#, r#""pass": ["1BAD"]"#),
+        ] {
+            serde_json::from_str::<Policy>(&json)
+                .expect("raw deserialization must skip validate()");
+            err_of(&json); // the same text IS rejected via from_json_str
+        }
+    }
+
     // ---- files -----------------------------------------------------------------
 
     #[test]
@@ -1201,5 +1327,22 @@ mod tests {
             .expect_err("a missing file must be an error")
             .to_string();
         assert!(err.contains("cannot read"), "{err}");
+    }
+
+    #[test]
+    fn from_file_reports_non_utf8() {
+        // "cannot read" means an I/O failure; a byte-level decode failure
+        // gets its own accurate message (both stay rc 1 via `sbx check`).
+        let dir = std::env::temp_dir().join(format!("sbx-policy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir must be creatable");
+        let path = dir.join("invalid-utf8.json");
+        std::fs::write(&path, b"{ \"version\": 1, \xff\xfe }").expect("temp file must be writable");
+        let err = Policy::from_file(&path)
+            .expect_err("non-UTF-8 must be rejected")
+            .to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert!(err.contains("invalid-utf8.json"), "{err}");
+        assert!(!err.contains("cannot read"), "{err}");
     }
 }
