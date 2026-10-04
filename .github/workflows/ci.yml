@@ -18,11 +18,18 @@ on:
 permissions:
   contents: read
 
+# Supply chain: third-party actions are pinned to full commit SHAs (the human
+# tag follows in a trailing comment) so a compromised tag force-push cannot
+# execute in CI. Deliberate exemption: dtolnay/rust-toolchain's @stable and
+# @1.85.0 refs are moving version branches by that action's design.
+
 # Superseded pushes to the same PR/branch cancel the running jobs: saves CI
-# minutes and avoids two runs racing.
+# minutes and avoids two runs racing. Runs on main are exempt — they are the
+# record that what landed on the default branch was green, so a later push
+# must never cancel an in-flight one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,14 +37,15 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: rustfmt
         run: cargo fmt --check
@@ -47,27 +55,29 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Recorded MSRV (Cargo.toml rust-version): the edition-2024 floor and
       # exactly clap 4.6's own MSRV. Fails loudly if a future Cargo.lock
       # update needs a newer rustc.
       - uses: dtolnay/rust-toolchain@1.85.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo check on the recorded MSRV
         run: cargo check --locked --all-targets
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: cargo test
         run: cargo test --locked
@@ -75,6 +85,9 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # Longer budget: release musl compile plus the aarch64 leg's apt-installed
+    # cross toolchain.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -82,11 +95,11 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Add musl target
         run: rustup target add "${{ matrix.target }}"
@@ -187,15 +200,25 @@ jobs:
           check_rc 1 $? "sbx __init (hidden stub)"
           grep -q "not implemented" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
 
+          # Exit-code contract: 2 = usage error (cli.rs module docs / README).
+          # The unit tests pin clap's ErrorKinds; these pin the exit code a
+          # scripting caller actually observes from the shipped static binary.
+          "$BIN" run --policy p.json --session-dir /tmp/s > /dev/null 2>&1
+          check_rc 2 $? "sbx run without a trailing command (usage error)"
+
+          "$BIN" gc --older-than abc /tmp/root > /dev/null 2>&1
+          check_rc 2 $? "sbx gc with a bad --older-than (usage error)"
+
           exit "$FAIL"
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       # Bundled cargo-deny (0.20.x) runs `cargo deny check` — advisories,
       # licenses, bans and sources — against the root deny.toml and the
       # committed Cargo.lock. No inputs needed; defaults are exactly the
       # full check on ./Cargo.toml.
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

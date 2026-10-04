@@ -25,9 +25,10 @@ timeout and an audit trail, and tears everything down on exit.
 
 **Skeleton** (issue #2). The CLI parses the full documented interface, but
 `run`, `check`, `gc` and the internal `__init` helper are stubs that exit
-`1` with `not implemented yet`. The architecture and issue roadmap live in
-tracking issue #20. `spikes/` holds standalone experiment packages that are
-excluded from the Cargo workspace.
+`1` with `not implemented yet`. Exit codes: `0` success, `1` stub/runtime
+failure, `2` usage error (clap's convention). The architecture and issue
+roadmap live in tracking issue #20. `spikes/` holds standalone experiment
+packages that are excluded from the Cargo workspace.
 
 ## How it will work (summary of #20)
 

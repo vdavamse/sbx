@@ -12,6 +12,7 @@
 //! Exit-code contract: 0 = success, 1 = stub/runtime failure
 //! ([`ExitCode::FAILURE`]), 2 = usage error (clap's own convention).
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -66,13 +67,21 @@ pub enum Cmd {
         audit: Option<PathBuf>,
 
         /// Command to run, verbatim — everything after `--`.
+        //
+        // `OsString`, not `String`: Linux argv is arbitrary bytes, and the
+        // verbatim pass-through contract must survive non-UTF-8 arguments
+        // (a `String` parser rejects them with exit 2). Downstream consumers
+        // (`std::process::Command::args`, bwrap) take `OsStr` anyway. The
+        // rationale is a `//` comment, not `///`: clap derive renders doc
+        // comments as user-facing long help, where Rust type names have no
+        // place.
         #[arg(
             trailing_var_arg = true,
             allow_hyphen_values = true,
             num_args = 1..,
             required = true
         )]
-        cmd: Vec<String>,
+        cmd: Vec<OsString>,
     },
 
     /// Validate a policy file without running anything.
@@ -225,6 +234,38 @@ mod tests {
         .expect("run without -- must parse");
         match cli.command {
             Cmd::Run { cmd, .. } => assert_eq!(cmd, ["/bin/echo", "--help"]),
+            other => panic!("expected Cmd::Run, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_preserves_non_utf8_args() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        // Linux argv is arbitrary bytes: the verbatim contract must survive
+        // arguments that are not valid UTF-8 (a `String` value parser would
+        // reject these with InvalidUtf8, exit 2).
+        let bad = OsString::from_vec(b"/bin/\xff-cmd".to_vec());
+        let cli = Cli::try_parse_from(
+            [
+                "sbx",
+                "run",
+                "--policy",
+                "p.json",
+                "--session-dir",
+                "/tmp/s",
+                "--",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .chain([bad.clone()]),
+        )
+        .expect("non-UTF-8 trailing args must survive verbatim");
+        match cli.command {
+            Cmd::Run { cmd, .. } => {
+                assert_eq!(cmd, [bad]);
+                assert_eq!(cmd[0].as_bytes(), b"/bin/\xff-cmd");
+            }
             other => panic!("expected Cmd::Run, got {other:?}"),
         }
     }
