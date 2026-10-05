@@ -344,6 +344,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "netlink-bindings"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15c68f271f059945bc6fb55d210e78c1ceb2d3eac00d18fe9b0806ade81e8a21"
+
+[[package]]
+name = "netlink-socket2"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0951d4d6a5131a59af90a26fcecd4e366e8fcee3a38880ba58705e479f5bd8c3"
+dependencies = [
+ "libc",
+ "netlink-bindings",
+ "strip-async",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -533,6 +550,9 @@ dependencies = [
  "clap",
  "humantime",
  "idna",
+ "libc",
+ "netlink-bindings",
+ "netlink-socket2",
  "proptest",
  "schemars",
  "serde",
@@ -629,6 +649,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "strip-async"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ec932792e62b2d3936163eacbd2e09984453bcd114f665c1e1694e36ff59c9"
 
 [[package]]
 name = "strsim"

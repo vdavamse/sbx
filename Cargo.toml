@@ -17,6 +17,14 @@ exclude = ["spikes"]
 clap = { version = "4.6", features = ["derive"] }
 humantime = "2.4"
 idna = "1.1"
+libc = { version = "0.2", default-features = false }
+# Namespace/netlink plumbing for `sbx __init` (issue #5) — spike-verified
+# exact pins (spikes/nft-load/FINDINGS.md): neither crate declares
+# rust-version, so `=0.3.5` + `--locked` is the MSRV-1.85 guarantee.
+netlink-bindings = { version = "=0.3.5", default-features = false, features = [
+    "nftables", "rt-link", "rt-addr", "rt-route",
+] }
+netlink-socket2 = { version = "=0.3.5", default-features = false }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
