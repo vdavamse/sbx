@@ -2,8 +2,8 @@
 //!
 //! The crate is split into a library and a thin binary so every piece of
 //! logic (starting with CLI parsing) is unit-testable without spawning a
-//! process. Later issues add modules alongside [`cli`] (proxy, dns, bwrap,
-//! ...); the binary surface stays a one-liner.
+//! process. Later issues add modules alongside [`cli`] (proxy, dns, ...);
+//! the binary surface stays a one-liner.
 //!
 //! Current status: the CLI parses the full documented interface; `check`
 //! validates policy files against [`policy`]'s versioned schema and prints
@@ -18,11 +18,21 @@
 //! `exec` of the payload — plus the parent-side control-protocol
 //! primitives ([`init::fdpass`]) #10 drives. `__init` setup failures are
 //! staged (`sbx __init: <stage>: <reason>`, exit 1, payload never started);
-//! success is silent. `run` and `gc` remain stubs that exit 1. Tracking
-//! issue #20 describes the architecture; the issue #1 spike
-//! (`spikes/nft-load`) proved the unprivileged nftables-loading approach
-//! `sbx __init` ships.
+//! success is silent. [`bwrap`] is the real launcher-argv builder (issue
+//! #6): a pure, deterministic `build()` from a validated policy + session
+//! directory to the complete unmodified-bwrap argv (allow-list mounts with
+//! ancestor/priority ordering, `--clearenv` + explicit `--setenv`
+//! environment, user/pid/ipc/uts/cgroup isolation, `--disable-userns`
+//! hardening, synthetic `/etc`, session work/home/tmp), plus bwrap
+//! discovery/version parsing; #10 spawns it via `Launch::command()` (which
+//! encodes the `env_clear` contract). [`policy`] deserialization now
+//! validates on EVERY path — the old point-5 asymmetry is resolved
+//! (TODO(#6)(a), landed with issue #6). `run` and `gc` remain stubs
+//! that exit 1. Tracking issue #20 describes the architecture; the
+//! issue #1 spike (`spikes/nft-load`) proved the unprivileged
+//! nftables-loading approach `sbx __init` ships.
 
+pub mod bwrap;
 pub mod cli;
 pub mod egress;
 pub mod init;

@@ -1,0 +1,762 @@
+//! The bwrap launcher-argv builder (issue #6) — a pure, deterministic
+//! function from a validated policy + session directory to the complete
+//! unmodified-bwrap invocation.
+//!
+//! 1. **Ownership & purity** — [`build`] is pure argv assembly: no I/O, no
+//!    spawn, no filesystem probing; deterministic for identical inputs.
+//!    Consumers: #10 spawns [`Launch::command`], #11 reports
+//!    discovery/version via [`version`], #13 reuses the goldens' flag
+//!    vocabulary. Materialization ([`etc::SessionLayout::materialize`]) is
+//!    the caller's separate step.
+//! 2. **Fail-closed validation** — the builder rejects before the kernel
+//!    sees anything ("what we validate must be what the kernel sees" — the
+//!    `check_path` NUL rationale in [`crate::policy`]): absolute bwrap
+//!    path / session dir / cwd, a lexically canonical session dir that is
+//!    not the host root (a root alias would aim the session layout at the
+//!    host's OWN /etc, /home, /tmp — see `etc::check_session_dir`), a
+//!    non-empty command, no NUL in any emitted byte (paths, command
+//!    elements, `--setenv` values — closed by a final whole-argv sweep, so
+//!    no emission path can reopen the hole), no policy filesystem
+//!    path overlapping the session dir (an ancestor bind like `rw /var`
+//!    with the session at `/var/lib/sbx/s1` would hand the payload
+//!    host-side write access to the synthetic `/etc` files' inodes —
+//!    ro-ness is per-mount, not per-file), and no session dir inside an
+//!    infra `/etc` bind (row 14 — the infra binds are unconditional, so
+//!    e.g. `/etc/ssl/s1` would be an ancestor bind by placement alone:
+//!    sibling sessions exposed, payload writes landing in the CA tree).
+//!    Binds are plain
+//!    (`--ro-bind`/`--bind`, never the `-try` variants): a missing host
+//!    path aborts bwrap ⇒ the sandbox never starts (Q9; #11 pre-detects
+//!    and reports).
+//! 3. **Allow-list purity** — the sandbox filesystem is exactly: policy
+//!    binds + the infra `/etc` set + generated `/etc` files + the three
+//!    session leaves. The host root is never bound (`AbsolutePath` rejects
+//!    `/` — a type-level guarantee since the validity invariant landed),
+//!    the session dir's PARENT is never bound (only the `work/`, `home/`,
+//!    `tmp/` leaves), and there is no fd-passing (`--ro-bind-data` is
+//!    impossible: #5's `fd_hygiene` closes every fd > 2 before exec —
+//!    hence on-disk synthetic files, Q6).
+//! 4. **Order is semantics** — bwrap applies filesystem ops in argv order.
+//!    All mounts sort by (dest ascending byte order, priority ascending):
+//!    byte order puts ancestors before descendants (ro parent before nested
+//!    rw; `/tmp` before its contents); priority (policy 0 < infra 1 <
+//!    session 2) plus bwrap's last-mount-wins makes infra/session win
+//!    same-dest collisions (Q13, golden-pinned). `--proc /proc --dev /dev`
+//!    follow all binds (any policy bind under `/proc`/`/dev` is silently
+//!    covered — documented limitation); deny `--tmpfs` masks come last so
+//!    deny always wins (Q5). Exact `(op, src, dest)` duplicates collapse
+//!    (max priority kept).
+//! 5. **Environment contract** — `--clearenv` plus explicit `--setenv`
+//!    only; the SPAWNER must `env_clear()` ([`Launch::command`] encodes it
+//!    exactly once): bwrap itself is pid 1 in the sandbox, so its spawn
+//!    environment is world-readable inside at `/proc/1/environ` —
+//!    `--clearenv` alone cleans only the payload (issue #6 rationale;
+//!    pinned by the `secret-env-absent` integration scenario). Emission
+//!    order: infra (`HOME`, `PATH`, `TMPDIR` — alphabetical) → resolved
+//!    `env.pass` → `env.set` → explicit-mode proxy vars; later groups
+//!    override earlier ones by name (bwrap last-`--setenv`-wins), so policy
+//!    can override `PATH`/`HOME` but NOT the proxy vars in explicit mode
+//!    (infra decides; documented) — nor `PWD`, which is not sbx's to
+//!    decide at all: bwrap itself re-exports `PWD` from `--chdir` after
+//!    every `--setenv` (bubblewrap.c v0.9.0 `xsetenv("PWD", new_cwd, 1)`),
+//!    so a policy `env.set {"PWD": …}` is silently clobbered (pinned by
+//!    the `secret-env-absent` integration scenario).
+//! 6. **No `--unshare-net`, ever** — the network namespace belongs to
+//!    `sbx __init` (#5): bwrap joins the inherited netns where the
+//!    nftables rules and listeners already live. A proptest invariant pins
+//!    the flag's absence for every generated policy.
+//! 7. **Process isolation & hardening** — `--unshare-user --unshare-pid
+//!    --unshare-ipc --unshare-uts --unshare-cgroup-try` (never host
+//!    `/proc`; `cgroup-try` tolerates hosts without a cgroup ns) and
+//!    `--disable-userns --cap-drop ALL --die-with-parent --new-session
+//!    --hostname sandbox`. `--disable-userns` needs bwrap ≥ 0.8
+//!    ([`version::BWRAP_MIN`]); it works because `--unshare-user` is
+//!    present (the kernel rejects disable-userns without a private userns).
+//!    HANDOFF NOTE: `--die-with-parent` fires on the parent THREAD's death
+//!    — #10 must spawn from the thread that waits. HANDOFF NOTE 2:
+//!    `--dev /dev` binds the HOST's controlling terminal at `/dev/console`
+//!    whenever bwrap's stdout is a tty (v0.9.0 `host_tty_dev = ttyname(1)`
+//!    under `isatty(1)`) — #10 must pipe bwrap's stdio (never
+//!    `Stdio::inherit()` a tty) unless #14's threat model explicitly
+//!    accepts the exposure (output spoofing, TIOCSTI-class keystroke
+//!    injection on older kernels); the integration suite pins
+//!    `/dev/console` absent under piped stdio.
+//! 8. **usr-merge shims** — `--symlink usr/bin /bin` etc. for `/bin`
+//!    `/sbin` `/lib` `/lib64` (relative targets, matching the host
+//!    usrmerge convention), emitted before the binds, and SKIPPED
+//!    whenever a bind dest or a deny path EQUALS OR IS UNDER the shim's
+//!    dest (descendant-aware, review round 2): a mount/`--tmpfs` on a symlink
+//!    FOLLOWS the link, so leaving the shim would silently redirect the op
+//!    onto `/usr/*` — and a bind UNDER a still-dangling shim (e.g.
+//!    `/lib/x86_64-linux-gnu`, which the dest byte-order sort processes
+//!    before the `/usr` bind that would resolve the link) aborts the
+//!    launch in bwrap's mountpoint creation (`Can't mkdir parents for
+//!    /lib/x86_64-linux-gnu`, ENOENT — bubblewrap.c v0.9.0). Suppressing
+//!    the shim lets bwrap's `mkdir_with_parents`
+//!    create a real directory instead. Trade-off (documented; #11's
+//!    conformance report is the place to surface it): with a shim
+//!    skipped, uncovered `/lib/*`-style content no longer resolves into
+//!    `/usr/*`. A dangling `/lib64` shim on hosts without `usr/lib64` is
+//!    harmless (symlink(2) does not require the target to exist;
+//!    resolution yields ENOENT exactly like absence, and no interpreter
+//!    references it there). Non-merged hosts are documented as
+//!    unsupported-with-shims (the goldens pin the shim rule; #13 covers
+//!    conformance).
+//! 9. **Discovery & version** — [`version::find_bwrap`] (`SBX_BWRAP`
+//!    override → PATH scan → fixed fallbacks) and
+//!    [`version::parse_version`] against [`version::BWRAP_MIN`]; the
+//!    builder takes an already-resolved ABSOLUTE path (Q10) because
+//!    argv\[0\] is exec'd by `__init`'s `execvp` in an environment #10
+//!    empties (R16 — no PATH ⇒ no search).
+//! 10. **Layout materialization** — [`etc`] defines the session layout and
+//!     the synthetic `/etc` files (pinned contents); `materialize` is
+//!     idempotent so retries and `sbx gc` (#12) interplay stay simple, and
+//!     hardened (private 0700 dirs, the root-alias guard, `O_NOFOLLOW` +
+//!     fd-based-mode file writes, dir type/owner verification — the
+//!     CWE-59/TOCTOU class; see [`etc`]'s module docs).
+
+pub mod etc;
+pub mod version;
+
+// Private: the argv layout is the module's implementation detail — `build`
+// (below) is the public face together with `etc` (layout/materialization)
+// and `version` (discovery), mirroring `init`'s two-tier visibility.
+mod argv;
+
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+
+use crate::policy::Policy;
+
+/// Why the builder rejected an input.
+///
+/// `Display` is the reason ONLY (the [`crate::policy::PolicyError`] /
+/// [`crate::policy::DomainError`] precedent): #10 composes any prefix
+/// (`sbx run: …`) at its own seam. Every reason is a pinned string —
+/// `golden_error_pins` asserts them byte-exact.
+#[derive(Debug)]
+pub struct BwrapError(String);
+
+impl std::fmt::Display for BwrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BwrapError {}
+
+/// Everything [`build`] needs — the pure argv-assembly input bag (pub
+/// fields, the [`Policy`] precedent).
+pub struct Build<'a> {
+    /// The policy to enforce. Every `Policy`-producing path validates
+    /// (policy module docs point 5), so the builder can rely on the
+    /// value-level invariants (`AbsolutePath` canonical + NUL-free,
+    /// POSIX env names).
+    pub policy: &'a Policy,
+    /// Host-side session directory; must be absolute — bwrap would
+    /// resolve a relative one against its OWN cwd, not the spawner's —
+    /// lexically canonical (no `.`/`..` segments), not the host root or
+    /// an alias of it (rows 3–6), no policy filesystem path may
+    /// overlap it (row 13), and it must not sit inside an infra `/etc`
+    /// bind (row 14 — those bind unconditionally, so the session would
+    /// have an ancestor bind by placement alone).
+    pub session_dir: &'a Path,
+    /// Resolved bwrap binary ([`version::find_bwrap`] output); must be
+    /// absolute — argv\[0\] is exec'd by `__init`'s `execvp` with no PATH
+    /// to search (R16).
+    pub bwrap_path: &'a Path,
+    /// The payload command, emitted verbatim after `--` (Q12: no shell
+    /// wrapping — that is #10's decision). Must be non-empty.
+    pub command: &'a [OsString],
+    /// Working directory INSIDE the sandbox (the cli.rs `--cwd`
+    /// contract); `None` ⇒ [`etc::DEST_WORK`].
+    pub cwd: Option<&'a Path>,
+    /// #10's pre-resolved `env.pass` values (Q11): host values for the
+    /// pass names, absent names omitted. Emission is filtered by policy
+    /// membership — a buggy resolver can never inject a name the policy
+    /// did not allow.
+    pub passed_env: &'a BTreeMap<String, OsString>,
+}
+
+/// A complete, validated bwrap invocation.
+#[derive(Debug)]
+pub struct Launch {
+    // Private: consumers go through argv()/command() so the env_clear
+    // spawn contract stays encoded in exactly one place (module docs
+    // point 5).
+    argv: Vec<OsString>,
+}
+
+impl Launch {
+    /// The full bwrap argv — argv\[0\] is the absolute bwrap path, the tail
+    /// is `--` + the command verbatim.
+    pub fn argv(&self) -> &[OsString] {
+        &self.argv
+    }
+
+    /// A [`std::process::Command`] for this launch, with the `env_clear()`
+    /// contract applied — THE single encoding site of the spawner-side
+    /// environment rule (module docs point 5): bwrap is pid 1 inside the
+    /// sandbox and its spawn environment is world-readable at
+    /// `/proc/1/environ`, so `--clearenv` alone is not enough.
+    ///
+    /// The `argv[0]` index is safe: [`build`] guarantees a non-empty argv
+    /// (bwrap path first, and a non-empty command is validated).
+    pub fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.argv[0]);
+        command.args(&self.argv[1..]);
+        command.env_clear();
+        command
+    }
+}
+
+/// Assemble the complete bwrap argv for `input` — pure, deterministic, no
+/// I/O (module docs point 1).
+///
+/// Validation runs first and fails closed (module docs point 2); the
+/// fourteen rejection reasons below — plus the final whole-argv NUL sweep
+/// — are pinned byte-exact by `golden_error_pins`.
+/// The "validated == what the kernel sees" principle applies to NUL in
+/// particular: `std::process::Command` fails closed on NUL anyway, but the
+/// builder pre-rejects so the ONLY error surface for a bad build is
+/// [`BwrapError`] with sbx's own vocabulary — #10 never translates an
+/// opaque spawn `InvalidInput`.
+pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
+    // Row 1: bwrap path absolute (R16 — execvp without a PATH).
+    if !input.bwrap_path.is_absolute() {
+        return Err(BwrapError(format!(
+            "bwrap path must be absolute (got {:?})",
+            input.bwrap_path
+        )));
+    }
+    // Row 2: bwrap path NUL-free.
+    if contains_nul(input.bwrap_path.as_os_str()) {
+        return Err(BwrapError(format!(
+            "bwrap path must not contain NUL bytes (got {:?})",
+            input.bwrap_path
+        )));
+    }
+    // Row 3: session dir absolute (bwrap resolves relative paths against
+    // its own cwd, not the spawner's).
+    if !input.session_dir.is_absolute() {
+        return Err(BwrapError(format!(
+            "session directory must be absolute (got {:?})",
+            input.session_dir
+        )));
+    }
+    // Row 4: session dir NUL-free.
+    if contains_nul(input.session_dir.as_os_str()) {
+        return Err(BwrapError(format!(
+            "session directory must not contain NUL bytes (got {:?})",
+            input.session_dir
+        )));
+    }
+    // Rows 5–6: session dir lexically canonical (no "."/".." segments —
+    // TOCTOU-prone spellings like /etc/.. alias host directories through
+    // the pure layout joins) and NOT the host root or an alias of it
+    // ("/", "//"): with --session-dir /, materialize() would rewrite the
+    // host's OWN /etc/{resolv.conf,passwd,group} and the leaves would
+    // bind the host's /home and /tmp rw into the sandbox. One helper with
+    // materialize()'s pre-I/O guard (etc::check_session_dir) so both
+    // public seams reject identically — materialize is callable WITHOUT
+    // build().
+    if let Err(reason) = etc::check_session_dir(input.session_dir) {
+        return Err(BwrapError(reason));
+    }
+    // Rows 7–8: cwd (when given) absolute and NUL-free.
+    if let Some(cwd) = input.cwd {
+        if !cwd.is_absolute() {
+            return Err(BwrapError(format!("cwd must be absolute (got {cwd:?})")));
+        }
+        if contains_nul(cwd.as_os_str()) {
+            return Err(BwrapError(format!(
+                "cwd must not contain NUL bytes (got {cwd:?})"
+            )));
+        }
+    }
+    // Row 9: non-empty command — the exact exec_payload wording
+    // (init/mod.rs): one vocabulary for "nothing to exec" across the chain.
+    if input.command.is_empty() {
+        return Err(BwrapError("no payload command given".to_owned()));
+    }
+    // Row 10: every command element NUL-free (the "interior NUL byte"
+    // vocabulary matches exec_payload's).
+    for (index, element) in input.command.iter().enumerate() {
+        if contains_nul(element) {
+            return Err(BwrapError(format!(
+                "command[{index}] contains an interior NUL byte"
+            )));
+        }
+    }
+    // Row 11: every env.set value NUL-free — TODO(#6)(b), resolved here at
+    // the builder seam: policy deliberately leaves values unrestricted
+    // (env_values_unrestricted), and this is the point where a value
+    // becomes a kernel-visible `--setenv` operand.
+    for (key, value) in &input.policy.env.set {
+        if value.contains('\0') {
+            return Err(BwrapError(format!(
+                "env.set value for {key:?} contains an interior NUL byte"
+            )));
+        }
+    }
+    // Row 12: every EMITTED passed_env value NUL-free. Only pass members
+    // are emitted (the argv.rs membership filter), so only those need the
+    // check — and non-POSIX KEYS need no separate check: a passed_env key
+    // reaches the argv only by being a pass name, and pass names are
+    // POSIX-validated at the deserialize level (the policy validity
+    // invariant — see the policy module doc point 5's residual
+    // struct-literal gap), hence NUL-free.
+    for (name, value) in input.passed_env {
+        if input.policy.env.pass.iter().any(|allowed| allowed == name) && contains_nul(value) {
+            return Err(BwrapError(format!(
+                "passed env value for {name:?} contains an interior NUL byte"
+            )));
+        }
+    }
+    // Row 13: policy filesystem paths must not OVERLAP the session dir —
+    // in either direction. Policy mounts use src == dest == the written
+    // path, so an ancestor-or-equal bind (rw /var with the session at
+    // /var/lib/sbx/s1, or the session dir itself) hands the payload
+    // host-side write access to <session>/etc/{resolv.conf,passwd,group}:
+    // the SAME inodes the generated ro-binds expose at /etc/* — ro-ness
+    // is per-mount, not per-file, and the read-only-synthetic-/etc-files
+    // guarantee would be silently void (a payload-planted symlink there
+    // persists host-side and arms the NEXT materialize() against an
+    // arbitrary target — the O_NOFOLLOW hardening there is the second
+    // half of this fix). A path INSIDE the session dir (rw <session>/etc)
+    // voids the same guarantee directly, so both directions are rejected.
+    // Shadowed spellings (a /tmp bind the session tmp leaf would mask at
+    // dest /tmp anyway) fail closed under the same uniform rule. An RO
+    // ancestor is rejected too, and for a second reason: ro /var with the
+    // session at /var/lib/sbx/s1 also exposes SIBLING sessions'
+    // work/home/tmp to the payload through the host-path view. #10's
+    // session-dir placement must avoid tripping this row legitimately AND
+    // use unique, unguessable names under a root- or euid-owned base:
+    // materialize() verifies the session root and below, so a predictable
+    // multi-component path under a world-writable base would remain
+    // redirectable by a planted ANCESTOR symlink (handoff notes).
+    // Lexical component-exact prefix both ways (Path::starts_with;
+    // each side is lexically canonical — AbsolutePath by the policy
+    // validity invariant, session dir by rows 5–6; symlink-aliased host
+    // paths are the documented lexical limitation, #11/#14). Deny paths
+    // are NOT checked: a --tmpfs mask covers a sandbox-side path and
+    // cannot alias host state.
+    for path in input
+        .policy
+        .filesystem
+        .ro
+        .iter()
+        .chain(&input.policy.filesystem.rw)
+    {
+        if input.session_dir.starts_with(path.as_path()) {
+            return Err(BwrapError(format!(
+                "policy filesystem path {:?} must not be or contain the session directory",
+                path.as_str()
+            )));
+        }
+        if path.as_path().starts_with(input.session_dir) {
+            return Err(BwrapError(format!(
+                "policy filesystem path {:?} must not be inside the session directory",
+                path.as_str()
+            )));
+        }
+    }
+    // Row 14: the session dir must not sit inside an infra /etc bind —
+    // row 13's infra-side symmetry (review round 3). The INFRA_ETC binds
+    // are emitted UNCONDITIONALLY (Q1), so a misplacement like
+    // --session-dir /etc/ssl/s1 with an EMPTY policy passes every other
+    // row while the argv binds an ANCESTOR of the session tree: when sbx
+    // runs as root (the deployment etc's module docs explicitly
+    // contemplate), materialize() succeeds inside the host CA tree, the
+    // payload's /work writes land host-side under /etc/ssl, and every
+    // SIBLING session under that base is visible inside the sandbox
+    // (payload uid 0 == owner uid 0 through __init's 0→0 id map, so the
+    // 0700 leaves are readable) — voiding etc module docs point 2 ("the
+    // session directory itself and its parent never are [bound]") by
+    // placement alone. The asymmetry this closes: the SAME placement
+    // plus an explicit (redundant) ro ["/etc/ssl"] is already rejected
+    // by row 13; the empty policy must not slip through just because
+    // infra binds the ancestor anyway. File-valued entries can never
+    // ancestor a real directory but are checked uniformly — lexical,
+    // fail-closed, no legitimate false positive (a session never needs
+    // to live inside the CA tree); symlink-aliased spellings remain row
+    // 13's documented lexical limitation (#11/#14). DELIBERATELY no
+    // materialize()-side twin (unlike rows 5–6): this row's threat —
+    // the ancestor BIND exposing sibling sessions — exists only on the
+    // launch path, which rejects here; a direct root-run materialize
+    // inside /etc/ssl is host pollution of the same class as one inside
+    // any other misplaced base, which etc's module docs already assign
+    // to #10's placement contract.
+    for infra in argv::INFRA_ETC {
+        if input.session_dir.starts_with(infra) {
+            return Err(BwrapError(format!(
+                "session directory must not be inside the infra bind {infra:?}"
+            )));
+        }
+    }
+    // The argv layout itself has no failure modes (module docs point 1) —
+    // but the assembly output gets one final sweep before it is trusted.
+    let argv = argv::assemble(input);
+    // Final whole-argv NUL sweep (defense in depth, review round 2): the
+    // rows above cover every input the builder itself validates; policy
+    // filesystem path BYTES ride on AbsolutePath's deserialize invariant
+    // (its inner field is private, so even the pub-field struct-literal
+    // gap — policy module doc point 5 — cannot forge a NUL-carrying path
+    // from outside the crate; the validate()-level rules ARE externally
+    // forgeable and the rows above cover their kernel-visible effects).
+    // The sweep is the backstop against any future refactor weakening
+    // that invariant, and it keeps this module's contract total:
+    // BwrapError with sbx's own vocabulary is the ONLY error surface for
+    // a bad build (std's Command would fail closed on NUL at spawn
+    // anyway, but with an opaque InvalidInput). One O(n) pass closes
+    // every current and future emission path at once.
+    if argv.iter().any(|element| contains_nul(element)) {
+        return Err(BwrapError(
+            "assembled bwrap argv contains a NUL byte".to_owned(),
+        ));
+    }
+    Ok(Launch { argv })
+}
+
+// NUL cannot cross any C-string interface (execvp's argv/environ, bwrap's
+// own parsing): the policy module's check_path rationale, applied to the
+// bytes the builder emits.
+fn contains_nul(value: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    value.as_bytes().contains(&0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    /// A minimal valid policy for the error pins (draft shape; `pass`
+    /// carries LANG so row 10 has an emitted entry to test with).
+    const POLICY: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": [], "rw": [], "deny": [] },
+      "network": { "mode": "none", "allow": [], "ports": [] },
+      "env": { "pass": ["LANG"], "set": {} },
+      "limits": { "timeout": "1s", "output_bytes": 0 }
+    }"#;
+
+    /// [`POLICY`] with a NUL inside an env.set VALUE — legal per the
+    /// policy schema (values unrestricted), rejected by build() row 11
+    /// (TODO(#6)(b) at the builder seam). `\u0000` is serde_json's escape
+    /// for the NUL character.
+    const POLICY_NUL_SET: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": [], "rw": [], "deny": [] },
+      "network": { "mode": "none", "allow": [], "ports": [] },
+      "env": { "pass": ["LANG"], "set": { "SBX": "a\u0000b" } },
+      "limits": { "timeout": "1s", "output_bytes": 0 }
+    }"#;
+
+    /// [`POLICY`] with `ro: ["/tmp"]` — an ANCESTOR of the golden session
+    /// dir (`/tmp/sbx-golden-session`), rejected by build() row 13
+    /// (session containment).
+    const POLICY_SESSION_ANCESTOR: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": ["/tmp"], "rw": [], "deny": [] },
+      "network": { "mode": "none", "allow": [], "ports": [] },
+      "env": { "pass": ["LANG"], "set": {} },
+      "limits": { "timeout": "1s", "output_bytes": 0 }
+    }"#;
+
+    /// [`POLICY`] with `rw` pointing INSIDE the golden session dir — the
+    /// descendant half of row 13 (same guarantee, direct route: the bind
+    /// would expose `<session>/etc`'s inodes rw).
+    const POLICY_SESSION_INSIDE: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": [], "rw": ["/tmp/sbx-golden-session/etc"], "deny": [] },
+      "network": { "mode": "none", "allow": [], "ports": [] },
+      "env": { "pass": ["LANG"], "set": {} },
+      "limits": { "timeout": "1s", "output_bytes": 0 }
+    }"#;
+
+    /// [`POLICY`] with a SIBLING of the golden session dir
+    /// (`…-session-2` shares the prefix STRING but not a path component) —
+    /// row 13's non-triggering counterpart: `Path::starts_with` is
+    /// component-exact, so the sibling stays legal.
+    const POLICY_SESSION_SIBLING: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": ["/tmp/sbx-golden-session-2"], "rw": [], "deny": [] },
+      "network": { "mode": "none", "allow": [], "ports": [] },
+      "env": { "pass": ["LANG"], "set": {} },
+      "limits": { "timeout": "1s", "output_bytes": 0 }
+    }"#;
+
+    fn policy_of(json: &str) -> Policy {
+        Policy::from_json_str(json).unwrap_or_else(|err| panic!("fixture must parse: {err}"))
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn os_bytes(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    /// The valid baseline input — each error-pin case breaks exactly one
+    /// row of the validation table.
+    fn base_input<'a>(
+        policy: &'a Policy,
+        command: &'a [OsString],
+        passed_env: &'a BTreeMap<String, OsString>,
+    ) -> Build<'a> {
+        Build {
+            policy,
+            session_dir: Path::new("/tmp/sbx-golden-session"),
+            bwrap_path: Path::new("/usr/bin/bwrap"),
+            command,
+            cwd: None,
+            passed_env,
+        }
+    }
+
+    #[test]
+    fn golden_error_pins() {
+        // Golden 10 (design §2.6's numbering — golden 11 is
+        // launch_command_pins_argv_and_env_clear below; the argv-side
+        // series runs 1–9, 12–13 in argv.rs): one case per row of build()'s
+        // validation table (plus the final whole-argv NUL sweep) —
+        // assert_eq against the exact pinned string (the BwrapError
+        // Display == reason-only contract is pinned transitively: no
+        // prefix, no suffix). Goldens are intentionally brittle: any
+        // message edit is a deliberate, reviewed change.
+        let policy = policy_of(POLICY);
+        let command = os(&["/bin/echo", "hi"]);
+        let no_env = BTreeMap::new();
+        let err = |input: &Build<'_>| build(input).expect_err("must be rejected").to_string();
+
+        // Row 1: bwrap path absolute.
+        let mut input = base_input(&policy, &command, &no_env);
+        input.bwrap_path = Path::new("relative/bwrap");
+        assert_eq!(
+            err(&input),
+            r#"bwrap path must be absolute (got "relative/bwrap")"#
+        );
+
+        // Row 2: bwrap path NUL-free. (`Path` is just an `OsStr` view, so
+        // it CAN hold interior NULs — build() rejects them here, before
+        // any spawn or C-string interface sees them.)
+        let nul_bwrap = os_bytes(b"/usr/bin/bwrap\0");
+        input.bwrap_path = Path::new(&nul_bwrap);
+        assert_eq!(
+            err(&input),
+            r#"bwrap path must not contain NUL bytes (got "/usr/bin/bwrap\0")"#
+        );
+        input.bwrap_path = Path::new("/usr/bin/bwrap");
+
+        // Row 3: session dir absolute.
+        input.session_dir = Path::new("relative/session");
+        assert_eq!(
+            err(&input),
+            r#"session directory must be absolute (got "relative/session")"#
+        );
+
+        // Row 4: session dir NUL-free.
+        let nul_session = os_bytes(b"/tmp/sbx\0session");
+        input.session_dir = Path::new(&nul_session);
+        assert_eq!(
+            err(&input),
+            r#"session directory must not contain NUL bytes (got "/tmp/sbx\0session")"#
+        );
+        input.session_dir = Path::new("/tmp/sbx-golden-session");
+
+        // Row 5: session dir lexically canonical — "."/".."/empty-segment
+        // spellings alias host directories through the pure layout joins
+        // (/etc/.. resolves toward the host root; a TOCTOU-prone shape the
+        // kernel, not sbx, would resolve). check_path's lexical vocabulary.
+        input.session_dir = Path::new("/etc/..");
+        assert_eq!(
+            err(&input),
+            r#"session directory must be lexically canonical: no '.', '..' or empty ('//'/trailing-slash) segments (got "/etc/..")"#
+        );
+        input.session_dir = Path::new("/tmp/x/./s");
+        assert_eq!(
+            err(&input),
+            r#"session directory must be lexically canonical: no '.', '..' or empty ('//'/trailing-slash) segments (got "/tmp/x/./s")"#
+        );
+
+        // Row 6: session dir not the host root — under ANY alias spelling
+        // ("/" and "//" collapse to RootDir-only; "/." normalizes to the
+        // root too). With --session-dir /, materialize() would rewrite the
+        // host's OWN /etc files and the leaves would bind the host's /home
+        // and /tmp rw into the sandbox. (materialize() runs the same guard
+        // before any I/O — etc.rs tests pin that seam.)
+        input.session_dir = Path::new("/");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be the host root (got "/")"#
+        );
+        input.session_dir = Path::new("//");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be the host root (got "//")"#
+        );
+        input.session_dir = Path::new("/tmp/sbx-golden-session");
+
+        // Row 7: cwd absolute (when given).
+        input.cwd = Some(Path::new("work/sub"));
+        assert_eq!(err(&input), r#"cwd must be absolute (got "work/sub")"#);
+
+        // Row 8: cwd NUL-free.
+        let nul_cwd = os_bytes(b"/work\0sub");
+        input.cwd = Some(Path::new(&nul_cwd));
+        assert_eq!(
+            err(&input),
+            r#"cwd must not contain NUL bytes (got "/work\0sub")"#
+        );
+
+        // Row 9: non-empty command — the exact exec_payload wording.
+        let empty: Vec<OsString> = Vec::new();
+        let input = base_input(&policy, &empty, &no_env);
+        assert_eq!(err(&input), "no payload command given");
+
+        // Row 10: command elements NUL-free (index reported).
+        let nul_command = vec![OsString::from("/bin/echo"), os_bytes(b"hi\0")];
+        let input = base_input(&policy, &nul_command, &no_env);
+        assert_eq!(err(&input), "command[1] contains an interior NUL byte");
+
+        // Row 11: env.set values NUL-free (TODO(#6)(b) at the seam).
+        let nul_policy = policy_of(POLICY_NUL_SET);
+        let input = base_input(&nul_policy, &command, &no_env);
+        assert_eq!(
+            err(&input),
+            r#"env.set value for "SBX" contains an interior NUL byte"#
+        );
+
+        // Row 12: emitted passed_env values NUL-free.
+        let mut passed = BTreeMap::new();
+        passed.insert("LANG".to_owned(), os_bytes(b"C\0"));
+        let input = base_input(&policy, &command, &passed);
+        assert_eq!(
+            err(&input),
+            r#"passed env value for "LANG" contains an interior NUL byte"#
+        );
+
+        // Row 12's scope is exactly the EMITTED entries: a NUL-carrying
+        // value under a name the policy does NOT pass is never emitted
+        // (the argv.rs membership filter), so it does not reject — the
+        // resolver-bug backstop drops it silently instead. (The final
+        // sweep below agrees: the dropped value never reaches the argv.)
+        let mut passed = BTreeMap::new();
+        passed.insert("LANG".to_owned(), OsString::from("C.UTF-8"));
+        passed.insert("EVIL".to_owned(), os_bytes(b"x\0"));
+        let input = base_input(&policy, &command, &passed);
+        let launch = build(&input).expect("a non-emitted NUL value must not reject");
+        assert!(launch.argv().iter().all(|element| !contains_nul(element)));
+
+        // Row 13: policy filesystem paths must not be or contain the
+        // session dir (an ancestor bind would expose the synthetic /etc
+        // files' inodes rw — ro-ness is per-mount, not per-file).
+        let ancestor = policy_of(POLICY_SESSION_ANCESTOR);
+        let input = base_input(&ancestor, &command, &no_env);
+        assert_eq!(
+            err(&input),
+            r#"policy filesystem path "/tmp" must not be or contain the session directory"#
+        );
+        // …nor be inside it (the descendant route to the same inodes).
+        let inside = policy_of(POLICY_SESSION_INSIDE);
+        let input = base_input(&inside, &command, &no_env);
+        assert_eq!(
+            err(&input),
+            r#"policy filesystem path "/tmp/sbx-golden-session/etc" must not be inside the session directory"#
+        );
+        // A path merely SHARING A PREFIX STRING with the session dir is
+        // NOT an overlap — Path::starts_with is component-exact
+        // ("/tmp/sbx-golden-session-2" is a sibling, not a parent).
+        let sibling = policy_of(POLICY_SESSION_SIBLING);
+        let input = base_input(&sibling, &command, &no_env);
+        assert!(
+            build(&input).is_ok(),
+            "a sibling of the session dir must stay legal"
+        );
+
+        // Row 14: the session dir must not sit inside an infra /etc bind.
+        // The policy is EMPTY here — row 13 is a no-op and the
+        // unconditional infra binds are the only ancestor route (review
+        // round 3: a root-run /etc/ssl/s1 would expose sibling sessions
+        // to the payload and land /work writes inside the host CA tree).
+        let mut input = base_input(&policy, &command, &no_env);
+        input.session_dir = Path::new("/etc/ssl/s1");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be inside the infra bind "/etc/ssl""#
+        );
+        // Equality rejects too (materialize would write INTO the bind).
+        input.session_dir = Path::new("/etc/ssl");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be inside the infra bind "/etc/ssl""#
+        );
+        // Component-exact boundary: a sibling sharing the prefix STRING
+        // ("/etc/ssl-certs") is not inside ("/etc/ssl").
+        input.session_dir = Path::new("/etc/ssl-certs/s1");
+        assert!(
+            build(&input).is_ok(),
+            "a sibling of an infra bind must stay legal"
+        );
+
+        // Final whole-argv NUL sweep: no per-input row inspects ro/rw
+        // path BYTES — they ride on AbsolutePath's deserialize invariant
+        // (private inner field: from OUTSIDE the crate even the pub-field
+        // struct-literal gap cannot forge a NUL-carrying path, so the
+        // sweep is the backstop against INTERNAL refactors weakening the
+        // invariant) — and it keeps BwrapError the only error surface for
+        // a bad build. (AbsolutePath::new_unchecked is the cfg(test) hatch
+        // constructing exactly this deserialize-impossible value; without
+        // the sweep, this build would return Ok.)
+        let mut sweep = policy_of(POLICY);
+        sweep
+            .filesystem
+            .ro
+            .push(crate::policy::AbsolutePath::new_unchecked(
+                "/usr\u{0}".to_owned(),
+            ));
+        let input = base_input(&sweep, &command, &no_env);
+        assert_eq!(err(&input), "assembled bwrap argv contains a NUL byte");
+    }
+
+    #[test]
+    fn launch_command_pins_argv_and_env_clear() {
+        // Golden 11: Launch::command() is THE single encoding site of the
+        // spawn contract (module docs point 5): program == argv[0], args
+        // == argv[1..], environment cleared.
+        let policy = policy_of(POLICY);
+        let command = os(&["/bin/echo", "hi"]);
+        let no_env = BTreeMap::new();
+        let launch =
+            build(&base_input(&policy, &command, &no_env)).expect("valid inputs must build");
+        let spawned = launch.command();
+        assert_eq!(spawned.get_program(), OsStr::new("/usr/bin/bwrap"));
+        let args: Vec<&OsStr> = spawned.get_args().collect();
+        assert_eq!(args, &launch.argv()[1..]);
+        // Command::get_envs is stable since 1.75 ≤ MSRV 1.85 (the msrv CI
+        // job is the backstop): env_clear() must leave the environment
+        // map EMPTY — the spawner-side half of the /proc/1/environ
+        // contract. If this ever fails to compile on the MSRV, drop this
+        // assertion and rely on the integration pin (secret-env-absent).
+        assert_eq!(
+            spawned.get_envs().next(),
+            None,
+            "env_clear() must be applied"
+        );
+    }
+
+    #[test]
+    fn bwrap_error_display_is_reason_only() {
+        // The Display == reason contract (#10 composes any prefix): no
+        // "sbx bwrap:"-style decoration at this layer.
+        let err = BwrapError("no payload command given".to_owned());
+        assert_eq!(err.to_string(), "no payload command given");
+        // std::error::Error is implemented (the PolicyError precedent) so
+        // ? and anyhow-style consumers work at #10's seam.
+        let boxed: Box<dyn std::error::Error> = Box::new(BwrapError("x".to_owned()));
+        assert_eq!(boxed.to_string(), "x");
+    }
+}

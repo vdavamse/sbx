@@ -12,21 +12,31 @@
 //! 4. Parsing is fail-fast: serde reports only the first problem, with
 //!    `line N column M` context. Collecting every error in one pass is
 //!    deliberately out of scope for v1.
-//! 5. [`Policy::from_json_str`] and [`Policy::from_file`] are the only entry
-//!    points that enforce the policy-wide validation rules (version, ports,
-//!    environment-variable names). Deserializing [`Policy`] directly with
-//!    serde_json enforces only the value-level rules baked into the types.
-//!    The asymmetry is deliberate in v1, pinned by the
-//!    `direct_deserialization_skips_policy_wide_rules` test, and slated to
-//!    become a type-level invariant before #6 consumes [`Policy`].
+//! 5. Every [`Policy`]-producing path validates (TODO(#6)(a), landed with
+//!    issue #6): [`Policy::from_json_str`]/[`Policy::from_file`] deserialize
+//!    the private `RawPolicy` mirror and run `validate()` themselves —
+//!    position-free pinned messages, the `sbx check` surface; direct serde
+//!    deserialization goes through [`Policy`]'s manual `Deserialize` impl,
+//!    which runs the same `validate()` and therefore carries serde's
+//!    line/column context. Root-shape errors (sequence/scalar roots) are
+//!    byte-identical across both paths: the manual impl's visitor
+//!    delegates map AND seq roots to the mirror and shares its `expecting`
+//!    pin. Pinned by
+//!    `direct_deserialization_enforces_policy_wide_rules` and
+//!    `root_non_object_error_names_the_public_type`. Residual gap,
+//!    deliberately: the `pub` fields allow struct-literal construction by
+//!    ANY crate with access to the type — governed by review, not types
+//!    (the validating-newtypes alternative would have changed
+//!    schema-rendered types for no consumer gain).
 //! 6. `///` doc comments on policy types are author-facing: schemars renders
 //!    them as JSON Schema descriptions. Rust-internal rationale lives in `//`
 //!    comments (same convention as cli.rs).
 //! 7. Downstream consumers: #4 consumes [`Domain`]'s canonical form and
 //!    [`Domain::parse`] (the public seam over the normalization pipeline —
-//!    `egress::allowed` normalizes runtime hosts through it), #6 consumes
-//!    [`AbsolutePath`]/[`Env`], #10 consumes [`Limits`], #11 consumes
-//!    [`NetworkMode`]. Reuse the types — none of their logic lives here.
+//!    `egress::allowed` normalizes runtime hosts through it), issue #6's
+//!    [`crate::bwrap`] builder consumes [`AbsolutePath`]/[`Env`], #10
+//!    consumes [`Limits`], #11 consumes [`NetworkMode`]. Reuse the types —
+//!    none of their logic lives here.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -101,6 +111,17 @@ impl AbsolutePath {
     /// The same path as a [`Path`] — the seam for bwrap argv assembly (#6).
     pub fn as_path(&self) -> &Path {
         Path::new(&self.0)
+    }
+
+    /// Test-only escape hatch (review round 2, the whole-argv NUL-sweep
+    /// pin): constructs an `AbsolutePath` that NO deserialization path can
+    /// produce (`check_path` rejects NUL). The inner field is private, so
+    /// this value class is unreachable from outside the crate — the
+    /// `bwrap::build()` sweep it pins is the backstop against internal
+    /// refactors weakening the invariant.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(s: String) -> Self {
+        Self(s)
     }
 }
 
@@ -332,7 +353,11 @@ impl JsonSchema for Domain {
 /// implicit. The policy states the *minimum* sbx must enforce; the session
 /// directory never comes from the policy (always `--session-dir`). See
 /// `examples/` for the canonical shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+// deny_unknown_fields on `Policy` is consumed by SCHEMARS only (it renders
+// `additionalProperties: false` — pinned 5× by schema_pins_structure).
+// serde behavior, including this attribute, comes from the private
+// RawPolicy mirror + the manual Deserialize impl below (module doc point 5).
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Policy schema version; this sbx build accepts version 1.
@@ -476,12 +501,187 @@ fn ser_duration<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::
     serializer.serialize_str(&humantime::format_duration(*duration).to_string())
 }
 
+// Private raw mirror: the deserialization shape (TODO(#6)(a) — the
+// type-level validity invariant, landed with issue #6). Identical fields,
+// identical serde attributes — every parse/type/value-level error string
+// and its line/column context is unchanged. `Policy`'s manual `Deserialize`
+// impl below routes EVERY deserialization path through `validate()`, so
+// "`Policy` exists ⇒ `Policy` is valid" holds wherever a `Policy` came from
+// serde. Deliberately NOT `#[serde(try_from = "RawPolicy")]`: schemars 1.2
+// honors try_from and would re-root the JSON Schema to a `$ref` (breaking
+// `schema_pins_structure` and the CI schema smoke) — a manual impl is
+// invisible to the `JsonSchema` derive, keeping the schema byte-identical.
+// The `rename` + `expecting` pair keeps the private mirror's name OUT of
+// user-facing error text (review M1): serde's derived length/type errors
+// quote the visitor's `expecting` message, which serde_derive builds from
+// the IDENT (`params.type_name()`), not the rename — so the explicit
+// `expecting` reproduces, byte for byte, the message the original derived
+// `Deserialize for Policy` produced ("expected struct Policy with 5
+// elements"), and `sbx check` never shows policy authors the
+// implementation artifact's name. `Policy`'s manual-impl visitor carries
+// the SAME `expecting` text, so root-shape errors match byte-for-byte
+// across the two deserialization paths (review round 2). schemars is
+// unaffected (RawPolicy has
+// no JsonSchema), so the schema hash does not move.
+// No `///` docs: `RawPolicy` has no `JsonSchema`, and house rule reserves
+// `///` for author-facing schema text (module doc point 6).
+#[derive(Deserialize)]
+#[serde(
+    rename = "Policy",
+    deny_unknown_fields,
+    expecting = "struct Policy with 5 elements"
+)]
+struct RawPolicy {
+    version: u32,
+    filesystem: Filesystem,
+    network: Network,
+    env: Env,
+    limits: Limits,
+}
+
+impl RawPolicy {
+    // Policy-wide rules (D3): value-level invariants live in the newtypes'
+    // Deserialize impls so they carry line/column context; these run after a
+    // successful parse on EVERY Policy-producing path (module doc point 5) —
+    // from_json_str/from_file call validate() directly (position-free pinned
+    // messages, the `sbx check` surface), and Policy's manual Deserialize
+    // impl runs the same validate() for direct serde deserialization (the
+    // same reason text plus serde's line/column context). Pinned by
+    // direct_deserialization_enforces_policy_wide_rules.
+    //
+    // TODO(#6)(a) landed with issue #6 (this shape — the mirror, not
+    // validating newtypes, because those would have changed the
+    // schema-rendered types). TODO(#6)(b) resolved at the builder seam:
+    // env.set *values* stay deliberately unrestricted here (keys/pass-names
+    // are POSIX-validated hence NUL-free), and `bwrap::build()` rejects
+    // NUL-carrying values with its own pinned message — the same
+    // "validated == what the kernel sees" rationale as `check_path`'s NUL
+    // comment.
+    fn validate(&self) -> Result<(), PolicyError> {
+        if self.version != SUPPORTED_VERSION {
+            return Err(PolicyError(format!(
+                "unsupported policy version {}; this sbx supports version {}",
+                self.version, SUPPORTED_VERSION
+            )));
+        }
+        // ro∩rw exact overlap (issue #6, Q8): the same path listed in BOTH
+        // allow-lists is an authoring contradiction — which mode wins would
+        // otherwise depend on argv assembly order, so it is rejected here
+        // (duplicate env.set key precedent). Nested ro/rw in either
+        // direction stays legal: it is the documented mount-nesting pattern
+        // (ro parent, rw child). Linear `contains` scan, first hit in ro
+        // list order wins the error: policy lists are tiny and
+        // `AbsolutePath` is `PartialEq` — a set would add machinery for no
+        // measurable gain. Positioned after the version check and before
+        // the ports loop: struct field-declaration order (`filesystem`
+        // precedes `network`), keeping fail-fast first-error semantics
+        // consistent with the schema's shape.
+        for path in &self.filesystem.ro {
+            if self.filesystem.rw.contains(path) {
+                return Err(PolicyError(format!(
+                    "{:?} appears in both filesystem.ro and filesystem.rw",
+                    path.as_str()
+                )));
+            }
+        }
+        for (index, port) in self.network.ports.iter().enumerate() {
+            if *port == 0 {
+                return Err(PolicyError(format!(
+                    "network.ports[{index}] is 0; port 0 is not a valid destination port"
+                )));
+            }
+        }
+        for (index, name) in self.env.pass.iter().enumerate() {
+            if !valid_env_name(name) {
+                return Err(env_name_error(&format!("env.pass[{index}]"), name));
+            }
+        }
+        for name in self.env.set.keys() {
+            if !valid_env_name(name) {
+                return Err(env_name_error("env.set key", name));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The type-level validity invariant (module doc point 5): no
+        // `Policy` escapes serde unvalidated. validate() runs INSIDE the
+        // visitor, not after the inner deserialize returned: serde_json
+        // attaches its line/column context only to custom errors raised
+        // while its own parse machinery is still active (the
+        // duplicate_env_set_keys_rejected precedent) — an error returned
+        // after the root deserialize completed propagates position-free.
+        // Delegating through MapAccessDeserializer/SeqAccessDeserializer
+        // keeps RawPolicy's derived field machinery (deny_unknown_fields,
+        // the newtype validators, every error string) as the single parse
+        // implementation — and makes root-shape errors byte-identical to
+        // from_json_str's (review round 2): BOTH the map and the seq arm
+        // delegate, and the visitor's `expecting` matches RawPolicy's pin,
+        // so sequence and scalar roots report the same message on either
+        // path (root_non_object_error_names_the_public_type).
+        // from_json_str does NOT route through this impl:
+        // it keeps the two-step deserialize-then-validate shape so its
+        // pinned messages stay position-free (version_must_be_one).
+        struct PolicyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PolicyVisitor {
+            type Value = Policy;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                // Byte-identical to RawPolicy's #[serde(expecting = …)]
+                // pin, so a scalar root ("x", 42, null, true) produces the
+                // SAME default-visit error text here as on the
+                // from_json_str path (review round 2 root-shape symmetry).
+                formatter.write_str("struct Policy with 5 elements")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let raw =
+                    RawPolicy::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                raw.validate().map_err(serde::de::Error::custom)?;
+                Ok(Policy::from_raw(raw))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // A sequence root ("[]") gets RawPolicy's derived visit_seq
+                // machinery — the invalid_length error text AND its serde
+                // position — instead of a visit_seq-specific message that
+                // would diverge from the from_json_str path.
+                let raw =
+                    RawPolicy::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+                raw.validate().map_err(serde::de::Error::custom)?;
+                Ok(Policy::from_raw(raw))
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "Policy",
+            &["version", "filesystem", "network", "env", "limits"],
+            PolicyVisitor,
+        )
+    }
+}
+
 impl Policy {
     /// Parse and validate a policy from its JSON text.
     pub fn from_json_str(text: &str) -> Result<Self, PolicyError> {
-        let policy: Self = serde_json::from_str(text)?;
-        policy.validate()?;
-        Ok(policy)
+        // Two-step on the private mirror — NOT serde_json::from_str::<Self>,
+        // which would route validation through the manual Deserialize impl
+        // and gain serde's line/column suffix. The pinned messages this
+        // surface reports (the `sbx check` contract) stay byte-identical
+        // and position-free.
+        let raw: RawPolicy = serde_json::from_str(text)?;
+        raw.validate()?;
+        Ok(Self::from_raw(raw))
     }
 
     /// Read, parse, and validate a policy file.
@@ -503,46 +703,16 @@ impl Policy {
         Self::from_json_str(&text)
     }
 
-    // Policy-wide rules (D3): value-level invariants live in the newtypes'
-    // Deserialize impls so they carry line/column context; these run after a
-    // successful parse and are reachable only via from_json_str/from_file —
-    // direct serde_json deserialization of `Policy` skips them (module doc
-    // point 5; pinned by direct_deserialization_skips_policy_wide_rules).
-    // TODO(#6): make "`Policy` exists ⇒ `Policy` is valid" a type-level
-    // invariant — e.g. a private raw mirror with #[serde(try_from)], or
-    // Port/EnvName validating newtypes (which would also restore
-    // line/column context for these errors) — before enforcement
-    // consumers (#6/#10) start constructing `Policy` outside this module.
-    // #6 should also revisit NUL in env.set *values* (deliberately
-    // unrestricted here; keys/pass-names are POSIX-validated hence
-    // NUL-free): Rust's Command::env fails closed, but the same
-    // "validated == what the kernel sees" rationale resurfaces once #6
-    // assembles `bwrap --setenv`.
-    fn validate(&self) -> Result<(), PolicyError> {
-        if self.version != SUPPORTED_VERSION {
-            return Err(PolicyError(format!(
-                "unsupported policy version {}; this sbx supports version {}",
-                self.version, SUPPORTED_VERSION
-            )));
+    // Move the five fields out of the validated mirror — the only
+    // RawPolicy → Policy conversion site (both serde paths above).
+    fn from_raw(raw: RawPolicy) -> Self {
+        Self {
+            version: raw.version,
+            filesystem: raw.filesystem,
+            network: raw.network,
+            env: raw.env,
+            limits: raw.limits,
         }
-        for (index, port) in self.network.ports.iter().enumerate() {
-            if *port == 0 {
-                return Err(PolicyError(format!(
-                    "network.ports[{index}] is 0; port 0 is not a valid destination port"
-                )));
-            }
-        }
-        for (index, name) in self.env.pass.iter().enumerate() {
-            if !valid_env_name(name) {
-                return Err(env_name_error(&format!("env.pass[{index}]"), name));
-            }
-        }
-        for name in self.env.set.keys() {
-            if !valid_env_name(name) {
-                return Err(env_name_error("env.set key", name));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1461,24 +1631,112 @@ mod tests {
     // ---- validation entry points ------------------------------------------
 
     #[test]
-    fn direct_deserialization_skips_policy_wide_rules() {
-        // Pins the module-doc point-5 asymmetry: raw serde_json
-        // deserialization enforces only the value-level rules baked into the
-        // types; version/port-0/env-name checks run in validate(), which
-        // only from_json_str/from_file call. Future consumers (#6, #10)
-        // must load policies through those entry points. If this test ever
-        // fails, the asymmetry changed (e.g. the TODO(#6) type-level
-        // invariant landed): update the module docs, this test, and the
-        // handoff notes in the same change.
-        for json in [
-            draft_with(r#""version": 1,"#, r#""version": 2,"#),
-            draft_with(r#""ports": [443, 80]"#, r#""ports": [443, 0]"#),
-            draft_with(r#""pass": ["LANG"]"#, r#""pass": ["1BAD"]"#),
-        ] {
-            serde_json::from_str::<Policy>(&json)
-                .expect("raw deserialization must skip validate()");
-            err_of(&json); // the same text IS rejected via from_json_str
+    fn direct_deserialization_enforces_policy_wide_rules() {
+        // TODO(#6)(a) landed: "`Policy` exists ⇒ `Policy` is valid" now
+        // holds on EVERY deserialization path — direct serde_json
+        // deserialization runs the same validate() through Policy's manual
+        // Deserialize impl. The old skip-asymmetry is gone; what remains is
+        // positional: from_json_str keeps the position-free pinned messages
+        // (the `sbx check` surface), while the direct path carries the same
+        // reason text plus serde's line/column context (the
+        // duplicate_env_set_keys_rejected precedent; starts_with is the
+        // parse_equals_deserialize house pattern).
+        let cases = [
+            (
+                draft_with(r#""version": 1,"#, r#""version": 2,"#),
+                "unsupported policy version 2; this sbx supports version 1".to_owned(),
+            ),
+            (
+                draft_with(r#""ports": [443, 80]"#, r#""ports": [443, 0]"#),
+                "network.ports[1] is 0; port 0 is not a valid destination port".to_owned(),
+            ),
+            (
+                draft_with(r#""pass": ["LANG"]"#, r#""pass": ["1BAD"]"#),
+                r#"env.pass[0]: "1BAD" is not a valid environment variable name (expected ^[A-Za-z_][A-Za-z0-9_]*$)"#.to_owned(),
+            ),
+            (
+                draft_with(
+                    r#""ro": ["/usr", "/etc/ssl"], "rw": []"#,
+                    r#""ro": ["/usr"], "rw": ["/usr"]"#,
+                ),
+                r#""/usr" appears in both filesystem.ro and filesystem.rw"#.to_owned(),
+            ),
+        ];
+        for (json, pinned) in cases {
+            // Dual assertion: from_json_str's message stays the exact
+            // pinned reason, position-free.
+            assert_eq!(err_of(&json), pinned);
+            let direct = serde_json::from_str::<Policy>(&json)
+                .expect_err("direct deserialization must enforce validate() too")
+                .to_string();
+            assert!(
+                direct.starts_with(&pinned),
+                "{direct:?} must carry {pinned:?}"
+            );
+            assert!(
+                direct.contains("line"),
+                "{direct:?} must carry serde position context"
+            );
         }
+    }
+
+    #[test]
+    fn root_non_object_error_names_the_public_type() {
+        // Review M1: the private mirror's serde rename keeps `RawPolicy`
+        // out of the user-facing error surface — `sbx check` prints these
+        // messages verbatim, and a policy author knows only the public
+        // type name.
+        let err = err_of("[]");
+        assert!(err.contains("struct Policy"), "{err}");
+        assert!(!err.contains("RawPolicy"), "{err}");
+        // Review round 2 (root-shape symmetry): the direct path's
+        // root-shape errors are byte-identical to from_json_str's — the
+        // manual impl's visit_seq delegates to RawPolicy exactly like
+        // visit_map does, and PolicyVisitor's `expecting` matches
+        // RawPolicy's pin, so scalar roots agree too. Both paths fail
+        // closed; the mirror's name never surfaces on either.
+        for json in ["[]", "[1, 2]", "\"x\"", "42", "null", "true"] {
+            let direct = serde_json::from_str::<Policy>(json)
+                .expect_err("a non-object root must be rejected on the direct path too")
+                .to_string();
+            assert_eq!(direct, err_of(json), "root-shape asymmetry for {json}");
+            assert!(!direct.contains("RawPolicy"), "{direct}");
+        }
+    }
+
+    // ---- ro∩rw overlap (issue #6, Q8) ----------------------------------------
+
+    #[test]
+    fn ro_rw_exact_overlap_rejected() {
+        // The same path listed in BOTH allow-lists is an authoring
+        // contradiction — rejected with the pinned message instead of
+        // silently resolved by argv assembly order.
+        let json = draft_with(
+            r#""ro": ["/usr", "/etc/ssl"], "rw": []"#,
+            r#""ro": ["/usr"], "rw": ["/usr"]"#,
+        );
+        assert_eq!(
+            err_of(&json),
+            r#""/usr" appears in both filesystem.ro and filesystem.rw"#
+        );
+    }
+
+    #[test]
+    fn ro_rw_nested_stays_legal() {
+        // Only EXACT string overlap is rejected: nesting in either
+        // direction (ro parent + rw child, rw parent + ro child) is the
+        // documented mount-nesting pattern issue #6's argv ordering rule
+        // relies on.
+        let json = draft_with(
+            r#""ro": ["/usr", "/etc/ssl"], "rw": []"#,
+            r#""ro": ["/usr"], "rw": ["/usr/local"]"#,
+        );
+        policy_of(&json);
+        let json = draft_with(
+            r#""ro": ["/usr", "/etc/ssl"], "rw": []"#,
+            r#""ro": ["/a/b"], "rw": ["/a"]"#,
+        );
+        policy_of(&json);
     }
 
     // ---- files -----------------------------------------------------------------
