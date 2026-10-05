@@ -38,10 +38,13 @@
 //!    recursive creation gives any implicitly-created ancestors 0700 too
 //!    (#10 handoff: a root daemon materializing under a shared base for
 //!    per-user spawners would block traversal); the synthetic files are
-//!    opened `O_NOFOLLOW` and
-//!    chmodded on the FD, so a planted `<session>/etc/passwd` symlink
-//!    fails closed (ELOOP) instead of redirecting the truncate+write onto
-//!    its target (CWE-59). Files are explicitly 0644
+//!    opened `O_NOFOLLOW | O_NONBLOCK`, type-gated on the fd (regular
+//!    files only) and chmodded on the FD, so a planted
+//!    `<session>/etc/passwd` symlink fails closed (ELOOP) instead of
+//!    redirecting the truncate+write onto its target (CWE-59), and a
+//!    planted FIFO fails closed instantly (ENXIO — or the fd type gate
+//!    with a reader attached) instead of hanging the open. Files are
+//!    explicitly 0644
 //!    (umask-independent; sandbox-internal permissions are irrelevant —
 //!    single uid 0). The session ROOT's lifecycle belongs to #10/#12:
 //!    `materialize` creates it implicitly but never deletes anything.
@@ -184,7 +187,9 @@ impl SessionLayout {
     /// root-owned or euid-owned base — a predictable multi-component path
     /// under a world-writable base remains redirectable by an ancestor
     /// plant (documented limitation; #10/#14). The files are opened
-    /// `O_NOFOLLOW` and chmodded on the fd (race-free — a path-based
+    /// `O_NOFOLLOW | O_NONBLOCK`, type-gated on the fd (regular files
+    /// only — a planted FIFO fails closed instantly instead of hanging
+    /// the open) and chmodded on the fd (race-free — a path-based
     /// `set_permissions` has a replace race).
     ///
     /// The session root itself is created implicitly — its lifecycle
@@ -280,7 +285,14 @@ fn check_private_dir(dir: &Path) -> std::io::Result<()> {
 // path fails ELOOP instead of truncating+overwriting the TARGET with the
 // pinned bytes (CWE-59 — the payload of an earlier run, or any local user
 // who can pre-create the session path, must not be able to steer this
-// write). The chmod runs on the FD, not the path: race-free, and
+// write). O_NONBLOCK (review round 3): a planted FIFO fails the open
+// instantly (ENXIO) instead of blocking until a reader appears — a hang
+// is the one non-fail-closed outcome this hardened path must not have;
+// the flag is a no-op for regular files. The fd-based type gate then
+// rejects the openable residuals (a FIFO WITH a cooperative reader
+// attached, a char device): only a regular file receives the pinned
+// bytes — same single-fd, race-free discipline as check_private_dir.
+// The chmod runs on the FD, not the path: race-free, and
 // umask-independent (the open's .mode() is umask-filtered; the explicit
 // set makes 0644 exact). The 0644 is host-side tidiness, not a security
 // boundary (the bind is read-only inside the sandbox and every sandbox
@@ -291,8 +303,14 @@ fn write_synthetic_file(path: &Path, content: &str) -> std::io::Result<()> {
         .truncate(true)
         .write(true)
         .mode(FILE_MODE)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(invalid_input(format!(
+            "{} must be a regular file",
+            path.display()
+        )));
+    }
     std::io::Write::write_all(&mut file, content.as_bytes())?;
     file.set_permissions(Permissions::from_mode(FILE_MODE))
 }
@@ -526,6 +544,81 @@ mod tests {
     }
 
     #[test]
+    fn materialize_rejects_planted_fifo() {
+        // Review round 3 (minor): the one non-fail-closed outcome the
+        // O_NOFOLLOW hardening left — a FIFO planted at a synthetic
+        // file's path passes the symlink gate but blocks an O_WRONLY
+        // open indefinitely when no reader ever attaches (`sbx run`
+        // wedges before any timeout applies). O_NONBLOCK makes the
+        // readerless open fail instantly (ENXIO — phase 1), and the fd
+        // type gate rejects the openable residual: a FIFO WITH a
+        // cooperative reader attached (phase 2). Reachability is narrow
+        // — the dir gate stops the cross-uid planter one layer earlier,
+        // leaving same-uid plants — but the DIRECTORY side already fails
+        // fast on its analogous plant (O_DIRECTORY → ENOTDIR), so the
+        // file side must too.
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let dir = scratch("etc-fifo-file");
+        let session = dir.join("session");
+        std::fs::create_dir_all(session.join("etc")).expect("temp dirs must be creatable");
+        let fifo = session.join("etc").join("passwd");
+        let c_path =
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("scratch path is NUL-free");
+        // SAFETY: mkfifo(3) takes a valid NUL-terminated path pointer and
+        // a mode; the CString keeps the scratch-path bytes alive for the
+        // duration of the call, and nothing else creates this path.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let layout = session_layout(&session);
+
+        // Phase 1 — no reader: the open fails instantly instead of
+        // hanging. This assertion RETURNING is the hang-regression pin:
+        // a regressed flag fails as a test-suite timeout, not a silent
+        // pass.
+        let err = layout
+            .materialize()
+            .expect_err("a readerless FIFO must fail closed");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENXIO),
+            "expected ENXIO from O_NONBLOCK on a readerless FIFO, got: {err}"
+        );
+
+        // Phase 2 — cooperative reader attached: the open SUCCEEDS, so
+        // the fd type gate is the half that rejects, with the pinned
+        // InvalidInput message. O_RDONLY|O_NONBLOCK opens a readerless
+        // FIFO instantly (POSIX), so no spawn/timing race is involved.
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("a nonblocking read-open of a FIFO must succeed");
+        let err = layout
+            .materialize()
+            .expect_err("a FIFO must fail closed even with a reader");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("must be a regular file"),
+            "unexpected message: {err}"
+        );
+        drop(reader);
+
+        // The FIFO itself survived — never opened for write, truncated
+        // nor replaced (the type gate runs before any byte is written).
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .expect("fifo must survive")
+                .file_type()
+                .is_fifo()
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
     fn materialize_rejects_symlinked_or_foreign_dirs() {
         // Review round 2 (major): the dir verification half — a symlinked
         // <session>/etc (create_dir_all-style creation FOLLOWS it) fails
@@ -554,7 +647,8 @@ mod tests {
         // pre-created dirs) — untestable without privilege; the positive
         // half (owner == euid) runs in every materialize above. The
         // check itself is pinned by construction: check_private_dir
-        // compares symlink_metadata().uid() against geteuid().
+        // compares the fstat uid of the single O_NOFOLLOW|O_DIRECTORY fd
+        // against geteuid().
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

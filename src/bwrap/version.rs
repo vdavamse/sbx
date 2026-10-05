@@ -287,6 +287,15 @@ mod tests {
             .expect("cwd must be readable")
             .join("bwrap");
         let _guard = CwdGuard(planted.clone());
+        // Self-heal a SIGKILL/power-loss leftover: the guard's Drop
+        // covers every in-process exit path, but a killed run leaves
+        // ./bwrap behind (the .gitignore entry anticipates exactly
+        // that) — remove-first keeps the precondition assert from
+        // reddening EVERY subsequent run with a confusing message (the
+        // etc.rs scratch() and this module's
+        // find_bwrap_path_scan_requires_executable_file remove-first
+        // precedent).
+        let _ = std::fs::remove_file(&planted);
         assert!(
             !planted.exists(),
             "the package root must not already contain a bwrap file"

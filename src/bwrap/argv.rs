@@ -11,10 +11,10 @@
 //!     --hostname sandbox
 //!  4  --clearenv
 //!  5  --symlink usr/bin /bin      ┐ the four usr-merge shims, in this
-//!     --symlink usr/sbin /sbin    │ fixed order, each SKIPPED when its
-//!     --symlink usr/lib /lib      │ dest (/bin, /sbin, /lib, /lib64)
-//!     --symlink usr/lib64 /lib64  ┘ EQUALS OR IS UNDER any bind's dest
-//!                                   OR any deny path (descendant-aware)
+//!     --symlink usr/sbin /sbin    │ fixed order, each SKIPPED when ANY
+//!     --symlink usr/lib /lib      │ bind's dest OR deny path EQUALS OR
+//!     --symlink usr/lib64 /lib64  ┘ IS UNDER its dest (/bin, /sbin,
+//!                                   /lib, /lib64) — descendant-aware
 //!  6  the merged mount list, sorted by (dest ascending BYTE order, prio
 //!     ascending), deduped on exact (op, src, dest) keeping max prio;
 //!     each emits {--ro-bind|--bind} {src} {dest}:
@@ -73,8 +73,11 @@ const INFRA_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbi
 /// fail-closed: no `-try` variants, so a host missing any of these aborts
 /// bwrap and the sandbox never starts (Q9; #11 pre-detects and reports).
 /// Declaration order is dest-sorted; emission order comes from the merge
-/// sort anyway.
-const INFRA_ETC: [&str; 7] = [
+/// sort anyway. `pub(super)`: these binds are UNCONDITIONAL, so
+/// [`super::build`]'s row 14 cross-checks the session dir against them —
+/// a session inside an infra bind would be an ancestor bind by placement
+/// alone, with no policy involvement.
+pub(super) const INFRA_ETC: [&str; 7] = [
     "/etc/alternatives",
     "/etc/ca-certificates",
     "/etc/hosts",
@@ -87,11 +90,11 @@ const INFRA_ETC: [&str; 7] = [
 /// The four usr-merge shims (module docs point 8): (dest, relative
 /// target). Fixed order; the descendant-aware skip rule applies at
 /// emission time — a mount/--tmpfs on a symlink FOLLOWS the link (so a
-/// shim whose dest is a bind dest or a deny path would silently redirect
-/// that op onto /usr/*), and a bind UNDER a still-dangling shim aborts
-/// the launch at bwrap's mountpoint creation (ENOENT — the dest
-/// byte-order sort processes /lib/x86_64-linux-gnu before the /usr bind
-/// that would resolve the link).
+/// bind or deny whose dest equals or is under a shim's dest would
+/// silently redirect that op onto /usr/*), and a bind UNDER a
+/// still-dangling shim aborts the launch at bwrap's mountpoint creation
+/// (ENOENT — the dest byte-order sort processes /lib/x86_64-linux-gnu
+/// before the /usr bind that would resolve the link).
 const USR_MERGE_SHIMS: [(&str, &str); 4] = [
     ("/bin", "usr/bin"),
     ("/sbin", "usr/sbin"),

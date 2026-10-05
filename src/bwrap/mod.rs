@@ -16,11 +16,15 @@
 //!    host's OWN /etc, /home, /tmp — see `etc::check_session_dir`), a
 //!    non-empty command, no NUL in any emitted byte (paths, command
 //!    elements, `--setenv` values — closed by a final whole-argv sweep, so
-//!    no emission path can reopen the hole), and no policy filesystem
+//!    no emission path can reopen the hole), no policy filesystem
 //!    path overlapping the session dir (an ancestor bind like `rw /var`
 //!    with the session at `/var/lib/sbx/s1` would hand the payload
 //!    host-side write access to the synthetic `/etc` files' inodes —
-//!    ro-ness is per-mount, not per-file). Binds are plain
+//!    ro-ness is per-mount, not per-file), and no session dir inside an
+//!    infra `/etc` bind (row 14 — the infra binds are unconditional, so
+//!    e.g. `/etc/ssl/s1` would be an ancestor bind by placement alone:
+//!    sibling sessions exposed, payload writes landing in the CA tree).
+//!    Binds are plain
 //!    (`--ro-bind`/`--bind`, never the `-try` variants): a missing host
 //!    path aborts bwrap ⇒ the sandbox never starts (Q9; #11 pre-detects
 //!    and reports).
@@ -79,9 +83,9 @@
 //!    `/dev/console` absent under piped stdio.
 //! 8. **usr-merge shims** — `--symlink usr/bin /bin` etc. for `/bin`
 //!    `/sbin` `/lib` `/lib64` (relative targets, matching the host
-//!    usrmerge convention), emitted before the binds, and SKIPPED for any
-//!    dest that EQUALS OR IS UNDER a bind dest or a deny path
-//!    (descendant-aware, review round 2): a mount/`--tmpfs` on a symlink
+//!    usrmerge convention), emitted before the binds, and SKIPPED
+//!    whenever a bind dest or a deny path EQUALS OR IS UNDER the shim's
+//!    dest (descendant-aware, review round 2): a mount/`--tmpfs` on a symlink
 //!    FOLLOWS the link, so leaving the shim would silently redirect the op
 //!    onto `/usr/*` — and a bind UNDER a still-dangling shim (e.g.
 //!    `/lib/x86_64-linux-gnu`, which the dest byte-order sort processes
@@ -153,8 +157,10 @@ pub struct Build<'a> {
     /// Host-side session directory; must be absolute — bwrap would
     /// resolve a relative one against its OWN cwd, not the spawner's —
     /// lexically canonical (no `.`/`..` segments), not the host root or
-    /// an alias of it (rows 3–6), and no policy filesystem path may
-    /// overlap it (row 13).
+    /// an alias of it (rows 3–6), no policy filesystem path may
+    /// overlap it (row 13), and it must not sit inside an infra `/etc`
+    /// bind (row 14 — those bind unconditionally, so the session would
+    /// have an ancestor bind by placement alone).
     pub session_dir: &'a Path,
     /// Resolved bwrap binary ([`version::find_bwrap`] output); must be
     /// absolute — argv\[0\] is exec'd by `__init`'s `execvp` with no PATH
@@ -209,7 +215,7 @@ impl Launch {
 /// I/O (module docs point 1).
 ///
 /// Validation runs first and fails closed (module docs point 2); the
-/// thirteen rejection reasons below — plus the final whole-argv NUL sweep
+/// fourteen rejection reasons below — plus the final whole-argv NUL sweep
 /// — are pinned byte-exact by `golden_error_pins`.
 /// The "validated == what the kernel sees" principle applies to NUL in
 /// particular: `std::process::Command` fails closed on NUL anyway, but the
@@ -353,6 +359,39 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             return Err(BwrapError(format!(
                 "policy filesystem path {:?} must not be inside the session directory",
                 path.as_str()
+            )));
+        }
+    }
+    // Row 14: the session dir must not sit inside an infra /etc bind —
+    // row 13's infra-side symmetry (review round 3). The INFRA_ETC binds
+    // are emitted UNCONDITIONALLY (Q1), so a misplacement like
+    // --session-dir /etc/ssl/s1 with an EMPTY policy passes every other
+    // row while the argv binds an ANCESTOR of the session tree: when sbx
+    // runs as root (the deployment etc's module docs explicitly
+    // contemplate), materialize() succeeds inside the host CA tree, the
+    // payload's /work writes land host-side under /etc/ssl, and every
+    // SIBLING session under that base is visible inside the sandbox
+    // (payload uid 0 == owner uid 0 through __init's 0→0 id map, so the
+    // 0700 leaves are readable) — voiding etc module docs point 2 ("the
+    // session directory itself and its parent never are [bound]") by
+    // placement alone. The asymmetry this closes: the SAME placement
+    // plus an explicit (redundant) ro ["/etc/ssl"] is already rejected
+    // by row 13; the empty policy must not slip through just because
+    // infra binds the ancestor anyway. File-valued entries can never
+    // ancestor a real directory but are checked uniformly — lexical,
+    // fail-closed, no legitimate false positive (a session never needs
+    // to live inside the CA tree); symlink-aliased spellings remain row
+    // 13's documented lexical limitation (#11/#14). DELIBERATELY no
+    // materialize()-side twin (unlike rows 5–6): this row's threat —
+    // the ancestor BIND exposing sibling sessions — exists only on the
+    // launch path, which rejects here; a direct root-run materialize
+    // inside /etc/ssl is host pollution of the same class as one inside
+    // any other misplaced base, which etc's module docs already assign
+    // to #10's placement contract.
+    for infra in argv::INFRA_ETC {
+        if input.session_dir.starts_with(infra) {
+            return Err(BwrapError(format!(
+                "session directory must not be inside the infra bind {infra:?}"
             )));
         }
     }
@@ -636,6 +675,31 @@ mod tests {
         assert!(
             build(&input).is_ok(),
             "a sibling of the session dir must stay legal"
+        );
+
+        // Row 14: the session dir must not sit inside an infra /etc bind.
+        // The policy is EMPTY here — row 13 is a no-op and the
+        // unconditional infra binds are the only ancestor route (review
+        // round 3: a root-run /etc/ssl/s1 would expose sibling sessions
+        // to the payload and land /work writes inside the host CA tree).
+        let mut input = base_input(&policy, &command, &no_env);
+        input.session_dir = Path::new("/etc/ssl/s1");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be inside the infra bind "/etc/ssl""#
+        );
+        // Equality rejects too (materialize would write INTO the bind).
+        input.session_dir = Path::new("/etc/ssl");
+        assert_eq!(
+            err(&input),
+            r#"session directory must not be inside the infra bind "/etc/ssl""#
+        );
+        // Component-exact boundary: a sibling sharing the prefix STRING
+        // ("/etc/ssl-certs") is not inside ("/etc/ssl").
+        input.session_dir = Path::new("/etc/ssl-certs/s1");
+        assert!(
+            build(&input).is_ok(),
+            "a sibling of an infra bind must stay legal"
         );
 
         // Final whole-argv NUL sweep: no per-input row inspects ro/rw
