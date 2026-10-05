@@ -237,17 +237,25 @@ pub fn recv_listener_fds(ctrl: RawFd) -> io::Result<ListenerFds> {
     let mut ctrlbuf = CtrlBuf([0; CTRL_BUF_LEN]);
     let (n, msg_flags, controllen) =
         recvmsg_raw(ctrl, &mut data, &mut ctrlbuf.0, libc::MSG_CMSG_CLOEXEC)?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "peer closed before sending the listener fds",
-        ));
-    }
     // From recvmsg's return the kernel may have installed fds into our
     // table — including on messages the strict decode is about to REJECT.
     // The guard owns them from here until ownership transfers into
     // ListenerFds on the success path (m1).
     let mut guard = ReceivedFdGuard::default();
+    if n == 0 {
+        // A zero-length SEQPACKET message can legally carry SCM_RIGHTS fds
+        // on Linux (recvmsg returns 0 with the fds installed and
+        // msg_controllen > 0): run the collect-first decode walk so
+        // anything the kernel installed lands in the guard and is closed
+        // on this path too (m1 — an open listener socket would pin the
+        // dead sandbox's netns). The decode's verdict is irrelevant here;
+        // EOF stays the error.
+        let _ = decode_fds_message(&[], &ctrlbuf.0[..controllen], msg_flags, &mut guard.0);
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "peer closed before sending the listener fds",
+        ));
+    }
     decode_fds_message(
         &data[..n],
         &ctrlbuf.0[..controllen],
@@ -809,10 +817,19 @@ mod tests {
         let err = result.expect_err("wrong byte must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(sink, [5, 6, 7], "the rejection must not strand the fds");
-        let (result, _) = decode(&[], &ctrl, 0);
+        let (result, sink) = decode(&[], &ctrl, 0);
         assert_eq!(
             result.expect_err("empty data must be rejected").kind(),
             io::ErrorKind::InvalidData
+        );
+        // The zero-length-data walk still collects first: this is the arm
+        // recv_listener_fds' EOF path relies on — a zero-length SEQPACKET
+        // message can legally carry SCM_RIGHTS fds (recvmsg returns 0 with
+        // them installed), and the guard must close them there too (m1).
+        assert_eq!(
+            sink,
+            [5, 6, 7],
+            "zero-length data must not strand the installed fds"
         );
         let (result, _) = decode(&[FDS_PAYLOAD_BYTE, FDS_PAYLOAD_BYTE], &ctrl, 0);
         assert_eq!(
