@@ -23,15 +23,24 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#4). The CLI parses the full documented
+**In progress** (issues #2–#5). The CLI parses the full documented
 interface, and `check` is real: it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
 The library also carries the egress decision core (issue #4): the
 domain allow-list matcher and the resolved-address guard that the proxy
-and fake-IP resolver (#7–#9) will call — library-only, no user-visible
-behavior change yet. `run`, `gc` and the internal `__init` helper are
-stubs that exit `1` with `not implemented yet`. Exit codes: `0`
+and fake-IP resolver (#7–#9) will call. The internal `__init` helper is
+real (issue #5): `sbx run` (#10) will re-exec it with one end of a
+control socketpair, and it unshares user + network namespaces, brings
+loopback up as `10.255.255.1` with a default route into the sandbox,
+disables IPv6, binds the three proxy listeners (transparent `:15001/tcp`,
+explicit `:3128/tcp`, DNS `:53/udp`), atomically loads the spike-proven
+nftables ruleset with post-load dump verification, hands the listener
+fds to the parent over SCM_RIGHTS, waits for the go byte, then `exec`s
+the payload command. `__init` setup failures are staged — `sbx __init:
+<stage>: <reason>` on stderr, exit `1`, payload never started; success
+is silent and the exit code is the payload's. `run` and `gc` are stubs
+that exit `1` with `not implemented yet`. Exit codes: `0`
 success, `1` runtime failure (including an invalid or unreadable
 policy file), `2` usage error (clap's convention). The architecture
 and issue roadmap live in tracking issue #20. `spikes/` holds

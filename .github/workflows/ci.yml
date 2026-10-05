@@ -201,10 +201,9 @@ jobs:
             echo "ok: help hides __init"
           fi
 
-          # `run`, `gc` and `__init` are still stubs: each parses its
-          # documented interface, then exits 1 with "not implemented" on
-          # stderr. The policy/session files need not exist — the stubs
-          # never read them.
+          # `run` and `gc` are still stubs: each parses its documented
+          # interface, then exits 1 with "not implemented" on stderr. The
+          # policy/session files need not exist — the stubs never read them.
           "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
           check_rc 1 $? "sbx run (stub)"
           grep -q "not implemented" run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
@@ -266,9 +265,20 @@ jobs:
           check_rc 1 $? "sbx gc (stub)"
           grep -q "not implemented" gc.err || { echo "FAIL: gc stderr:"; cat gc.err; FAIL=1; }
 
-          "$BIN" __init > /dev/null 2> init.err
-          check_rc 1 $? "sbx __init (hidden stub)"
-          grep -q "not implemented" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
+          # __init is real since issue #5, but a full run needs a control
+          # socketpair handed over by `run` (#10). The namespace-independent
+          # contract stays deterministic on ANY runner: the control-fd
+          # validation runs BEFORE unshare by design, so no userns/AppArmor
+          # dependency leaks into the build job.
+          "$BIN" __init > /dev/null 2>&1
+          check_rc 2 $? "sbx __init without --fd (usage error)"
+
+          "$BIN" __init --fd abc -- /bin/true > /dev/null 2>&1
+          check_rc 2 $? "sbx __init with a non-numeric --fd (usage error)"
+
+          "$BIN" __init --fd 999 -- /bin/true > /dev/null 2> init.err
+          check_rc 1 $? "sbx __init --fd 999 (staged control-fd error)"
+          grep -q "sbx __init: control:" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
 
           # Exit-code contract: 2 = usage error (cli.rs module docs / README).
           # The unit tests pin clap's ErrorKinds; these pin the exit code a
