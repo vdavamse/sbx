@@ -742,8 +742,12 @@ fn scenario_mutation_degraded() -> Result<(), String> {
 
 /// AC (CI tier): under `bwrap --unshare-user --cap-drop ALL
 /// --disable-userns`, route + nft mutation answer EPERM AND creating a new
-/// userns from inside is blocked (EPERM) — the `--disable-userns` proof
-/// (bwrap ≥ 0.8; noble ships 0.9.0).
+/// userns from inside is blocked — the `--disable-userns` proof (bwrap ≥
+/// 0.8; noble ships 0.9.0). bwrap implements `--disable-userns` by setting
+/// `user.max_user_namespaces` to 0 inside the sandbox userns, so the
+/// kernel rejects nested `unshare(CLONE_NEWUSER)` with **ENOSPC** (observed
+/// on the GitHub runner); EPERM is also accepted (other blocking
+/// mechanisms/versions). The role prints the actual errno.
 fn scenario_mutation_bwrap() -> Result<(), String> {
     // Env passes through bwrap by default, so SBX_IT_ROLE reaches the
     // payload. Fallback argv if `--ro-bind / /` ever proves fragile on
@@ -785,7 +789,7 @@ fn scenario_mutation_bwrap() -> Result<(), String> {
     drop(fds);
     assert_success(
         &out,
-        &["mutation tier=bwrap route=EPERM nft=EPERM userns=EPERM"],
+        &["mutation tier=bwrap route=EPERM nft=EPERM userns=blocked"],
     )
 }
 
@@ -1236,22 +1240,32 @@ fn await_udp_refused(addr: SocketAddrV4, deadline: Instant) -> Result<(), String
 
 /// mutation tiers: raw-netlink route + nftables mutations must be EPERM
 /// once capabilities over the sandbox netns are gone. `bwrap_tier`
-/// additionally proves `--disable-userns` (unshare ⇒ EPERM); the degraded
-/// tier proves the nested-userns capability boundary instead
-/// (nested unshare ⇒ ok, then everything is EPERM).
+/// additionally proves `--disable-userns` (nested unshare ⇒ blocked:
+/// bwrap zeroes `user.max_user_namespaces` inside the sandbox userns, so
+/// the kernel answers ENOSPC — EPERM also accepted); the degraded tier
+/// proves the nested-userns capability boundary instead (nested unshare
+/// ⇒ ok, then everything is EPERM).
 fn role_check_mutation(bwrap_tier: bool) -> Result<(), String> {
+    let mut userns_errno = 0i32;
     if bwrap_tier {
         // bwrap --unshare-user --cap-drop ALL already stripped us;
         // --disable-userns (bwrap ≥ 0.8) must ALSO block creating a new
-        // userns from inside.
+        // userns from inside. Its mechanism is
+        // `/proc/sys/user/max_user_namespaces = 0` in the sandbox userns,
+        // and the kernel's create_user_ns() returns ENOSPC when that
+        // limit is hit (empirically verified on the GitHub runner,
+        // bubblewrap 0.9.0); EPERM is what a capability-based block would
+        // return. Either errno proves the block — anything else (or
+        // success) does not.
         let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER) };
         if rc == 0 {
             return Err("unshare(CLONE_NEWUSER) SUCCEEDED despite --disable-userns".to_owned());
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EPERM) {
+        userns_errno = err.raw_os_error().unwrap_or(0);
+        if userns_errno != libc::EPERM && userns_errno != libc::ENOSPC {
             return Err(format!(
-                "expected EPERM from unshare under --disable-userns, got {err}"
+                "expected EPERM or ENOSPC from unshare under --disable-userns, got {err}"
             ));
         }
     } else {
@@ -1291,7 +1305,9 @@ fn role_check_mutation(bwrap_tier: bool) -> Result<(), String> {
     }
 
     if bwrap_tier {
-        marker("mutation tier=bwrap route=EPERM nft=EPERM userns=EPERM");
+        marker(&format!(
+            "mutation tier=bwrap route=EPERM nft=EPERM userns=blocked(errno={userns_errno})"
+        ));
     } else {
         marker("mutation tier=degraded route=EPERM nft=EPERM nested_userns=ok");
     }
