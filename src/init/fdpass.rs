@@ -277,15 +277,40 @@ pub fn recv_listener_fds(ctrl: RawFd) -> io::Result<ListenerFds> {
 }
 
 /// Parent side: send the go byte — exactly `[`[`GO_BYTE`]`]`, one message.
+///
+/// Retries on EINTR (m2) — and this is the side that NEEDS it: the parent
+/// is the process with signal handlers installed (#10: tokio
+/// ctrl-c/SIGTERM/SIGCHLD, typically registered without `SA_RESTART`), so
+/// an interrupted `send` here would otherwise surface as a spurious
+/// `Interrupted system call` on a healthy startup. The retry is safe: for
+/// `AF_UNIX` + `SOCK_SEQPACKET` a queued message is atomic and EINTR is
+/// only returned when the interrupt hit BEFORE anything was queued, so the
+/// go byte cannot duplicate. `MSG_NOSIGNAL` makes the call
+/// disposition-independent (no SIGPIPE kill even if a future caller
+/// restores the default disposition).
 pub fn send_go(ctrl: RawFd) -> io::Result<()> {
-    let n = unsafe { libc::send(ctrl, [GO_BYTE].as_ptr().cast::<libc::c_void>(), 1, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        let n = unsafe {
+            libc::send(
+                ctrl,
+                [GO_BYTE].as_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            // Signal delivery is not a protocol event (m2): retry.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n != 1 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        return Ok(());
     }
-    if n != 1 {
-        return Err(io::Error::from(io::ErrorKind::WriteZero));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -296,9 +321,10 @@ pub fn send_go(ctrl: RawFd) -> io::Result<()> {
 /// (`[`[`FDS_PAYLOAD_BYTE`]`]` data payload + the fd cmsg), wire order per
 /// [`ListenerFds`].
 ///
-/// EPIPE means the parent died before receiving the fds (std leaves SIGPIPE
-/// at SIG_IGN, so parent death surfaces as EPIPE — probe-verified): staged
-/// [`Stage::SendFds`] failure, the payload is never exec'd.
+/// EPIPE means the parent died before receiving the fds — probe-verified;
+/// `MSG_NOSIGNAL` makes the detection independent of the SIGPIPE
+/// disposition: staged [`Stage::SendFds`] failure, the payload is never
+/// exec'd.
 pub fn send_listener_fds(ctrl: RawFd, fds: &[RawFd; LISTENER_FD_COUNT]) -> Result<(), InitError> {
     let mut data = Vec::with_capacity(1);
     let mut ctrlbuf = Vec::new();
@@ -609,6 +635,11 @@ struct CtrlBuf([u8; CTRL_BUF_LEN]);
 /// `sendmsg` of one data payload + encoded cmsg bytes. `ctrl` must fit the
 /// aligned buffer (only [`encode_fds_message`]'s output — 32 B for three
 /// fds — ever reaches here).
+///
+/// Retries on EINTR (m2 — same contract as [`recvmsg_raw`]): the interrupt
+/// hit before anything was queued (SEQPACKET messages are atomic), so the
+/// fds message cannot duplicate on retry. `MSG_NOSIGNAL` keeps the
+/// caller's EPIPE detection independent of the SIGPIPE disposition.
 fn sendmsg_raw(sock: RawFd, data: &[u8], ctrl: &[u8]) -> io::Result<()> {
     let mut buf = CtrlBuf([0; CTRL_BUF_LEN]);
     if ctrl.len() > buf.0.len() {
@@ -631,10 +662,18 @@ fn sendmsg_raw(sock: RawFd, data: &[u8], ctrl: &[u8]) -> io::Result<()> {
     msg.msg_iovlen = 1;
     msg.msg_control = buf.0.as_mut_ptr().cast::<libc::c_void>();
     msg.msg_controllen = ctrl.len() as _;
-    let n = unsafe { libc::sendmsg(sock, &msg, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let n = loop {
+        let n = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            // Signal delivery is not a protocol event (m2): retry.
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        break n;
+    };
     if n as usize != data.len() {
         return Err(io::Error::from(io::ErrorKind::WriteZero));
     }
