@@ -142,13 +142,19 @@ struct Scenario {
     run: fn() -> Result<(), String>,
 }
 
-/// The 15 scenarios, 1:1 with the design's AC-mapping table.
+/// The 16 scenarios: the design's 15 AC-mapped ones plus `sigpipe-default`
+/// (added post-design — pins `exec_payload`'s SIGPIPE restore end-to-end).
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
             name: "only-lo",
             gate: Gate::Userns,
             run: scenario_only_lo,
+        },
+        Scenario {
+            name: "sigpipe-default",
+            gate: Gate::Userns,
+            run: scenario_sigpipe_default,
         },
         Scenario {
             name: "tcp-redirect",
@@ -578,7 +584,7 @@ fn assert_success(out: &Outcome, markers: &[&str]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// scenarios 1–8: the sandbox works
+// scenarios 1–9: the sandbox works
 // ---------------------------------------------------------------------------
 
 /// AC: inside the sandbox, `lo` is the only interface, IPv6 is off, the
@@ -607,6 +613,68 @@ fn scenario_only_lo() -> Result<(), String> {
             "fds=0,1,2",
         ],
     )
+}
+
+/// Exec hygiene (module docs point 6): std ignores SIGPIPE at startup and
+/// ignored dispositions survive `execve`, so `exec_payload` restores
+/// `SIG_DFL` right before the exec — the payload must NOT inherit broken
+/// `cmd | head`-style pipe semantics (writers dying silently by signal
+/// instead of erroring with EPIPE).
+///
+/// The payload is `/bin/sh`, NOT the test binary: a Rust payload cannot
+/// pin this (its own std startup re-ignores SIGPIPE before `main` runs),
+/// while a POSIX shell leaves inherited dispositions untouched (ignored
+/// on entry stay ignored, defaults stay defaults). The shell prints its
+/// `SigIgn` mask from `/proc/self/status`; the harness asserts the SIGPIPE
+/// bit (signal 13 ⇒ bit 12) is CLEAR. Pure shell builtins — no awk/grep
+/// dependency. bwrap is not in this chain (the suite execs payloads
+/// directly) and upstream `bubblewrap.c` restores only SIGCHLD, so the
+/// production `run` → `__init` → bwrap → payload chain relies on exactly
+/// this restore.
+fn scenario_sigpipe_default() -> Result<(), String> {
+    // Marker-prefixed like every payload line (suite convention).
+    let script = format!(
+        "while read -r name value; do \
+         case $name in SigIgn:) echo \"{MARKER} SigIgn=$value\";; esac; \
+         done < /proc/self/status"
+    );
+    let payload: Vec<OsString> = ["/bin/sh", "-c", &script]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let sp = spawn_init("sigpipe-default", &[], &payload)?;
+    let fds = recv_fds(&sp)?;
+    send_go(&sp)?;
+    let out = finish(sp, "sigpipe-default payload")?;
+    // Hold the listener fds until the payload is reaped ("hold fds").
+    drop(fds);
+    if out.rc != 0 {
+        return Err(format!(
+            "payload rc {} (expected 0)\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.rc, out.stdout, out.stderr
+        ));
+    }
+    if !out.stderr.trim().is_empty() {
+        return Err(format!(
+            "stderr must be silent on success: {:?}",
+            out.stderr
+        ));
+    }
+    let mask_hex = out
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{MARKER} SigIgn=")))
+        .ok_or_else(|| format!("no SigIgn marker line in payload stdout:\n{}", out.stdout))?;
+    let mask = u64::from_str_radix(mask_hex.trim(), 16)
+        .map_err(|e| format!("SigIgn mask {mask_hex:?} is not hex: {e}"))?;
+    let sigpipe_bit = 1u64 << (libc::SIGPIPE - 1);
+    if mask & sigpipe_bit != 0 {
+        return Err(format!(
+            "SIGPIPE still ignored after exec (SigIgn={mask:016x}) — \
+             exec_payload must restore SIG_DFL before execvp"
+        ));
+    }
+    Ok(())
 }
 
 /// AC: a direct connect to 1.1.1.1:443 (the acceptance literal, Q6(a)) and
@@ -794,7 +862,7 @@ fn scenario_mutation_bwrap() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// scenarios 9–15: the failure paths
+// scenarios 10–16: the failure paths
 // ---------------------------------------------------------------------------
 
 /// AC: `--fd 999` (nothing open there) fails at the CONTROL stage — before

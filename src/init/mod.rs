@@ -35,15 +35,22 @@
 //!    always the *same binary* — `run` re-execs `current_exe` — so the
 //!    control protocol validates exact bytes ('F' payload, 'G' go, exactly
 //!    three fds) with no version negotiation (design D4).
-//! 6. **fd discipline (spike risks R5/R6).** The control fd (`--fd N`) is
-//!    deliberately *not* CLOEXEC — it must survive the re-exec from `run` —
-//!    so it is closed explicitly before the payload exec, backed by a
-//!    `/proc/self/fd` scan. Listener sockets are std-owned (CLOEXEC by
-//!    default): they die at exec even if the scan ever missed one, while the
-//!    parent's SCM_RIGHTS-dup'd copies live on (cross-netns fd passing).
-//!    The socketpair itself is created CLOEXEC on *both* ends with the child
-//!    end cleared only in the spawn window — see [`fdpass::prepare_child_end`]
-//!    for the bug class that discipline prevents.
+//! 6. **Exec hygiene: fds AND runtime state (spike risks R5/R6).** The
+//!    control fd (`--fd N`) is deliberately *not* CLOEXEC — it must survive
+//!    the re-exec from `run` — so it is closed explicitly before the payload
+//!    exec, backed by a `/proc/self/fd` scan. Listener sockets are std-owned
+//!    (CLOEXEC by default): they die at exec even if the scan ever missed
+//!    one, while the parent's SCM_RIGHTS-dup'd copies live on (cross-netns fd
+//!    passing). The socketpair itself is created CLOEXEC on *both* ends with
+//!    the child end cleared only in the spawn window — see
+//!    [`fdpass::prepare_child_end`] for the bug class that discipline
+//!    prevents. The same seam applies to runtime state: std sets `SIGPIPE` to
+//!    `SIG_IGN` at startup and ignored dispositions survive `execve` (bwrap
+//!    does not reset them either — upstream `bubblewrap.c`'s only `SIG_DFL`
+//!    restore is `SIGCHLD`), so `exec_payload` restores `SIG_DFL` right
+//!    before the `execvp` — the payload would otherwise inherit broken
+//!    `cmd | head`-style pipe semantics — and re-ignores `SIGPIPE` on the
+//!    failure return so the staged diagnostics stay EPIPE-safe.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
 //!    (`control_socketpair` → `prepare_child_end` → spawn →
 //!    `recv_listener_fds` → serve (#7/#8/#9) → `send_go`); [`consts`] is the
@@ -391,6 +398,15 @@ fn scan_fds_above_stdio() -> Option<Vec<RawFd>> {
 /// argument is kernel-forbidden (hence unreachable from real argv — the
 /// kernel's argv strings are NUL-terminated by construction) and maps to a
 /// staged error instead of a panic (N4).
+///
+/// Runtime-state hygiene across the exec seam (module docs point 6):
+/// `SIGPIPE` is restored to `SIG_DFL` immediately before the `execvp` —
+/// std's startup `SIG_IGN` would otherwise survive `execve` (and bwrap:
+/// upstream `bubblewrap.c` restores only `SIGCHLD`) and break the payload's
+/// `cmd | head`-style pipe semantics — and set back to `SIG_IGN` on the
+/// failure return, keeping [`run_init`]'s staged `eprintln` EPIPE-safe.
+/// The integration suite's `sigpipe-default` scenario pins the restore
+/// end-to-end with a non-Rust payload.
 fn exec_payload(cmd: &[OsString]) -> InitError {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -422,10 +438,33 @@ fn exec_payload(cmd: &[OsString]) -> InitError {
     // through by default, so anything in `run`'s env would otherwise reach
     // the untrusted payload.
     //
+    // SIGPIPE hygiene (module docs point 6): std ignores SIGPIPE at
+    // startup, ignored dispositions survive execve, and bwrap does not
+    // reset them — restore the default RIGHT before the exec so the
+    // payload gets normal `cmd | head`-style pipe semantics. Ordering is
+    // safe: every EPIPE-detecting send of this process is done by here
+    // (send_listener_fds ran before wait-go, and both sends are
+    // MSG_NOSIGNAL anyway).
+    //
+    // SAFETY: signal() sets one disposition (SIGPIPE) to a constant
+    // handler (SIG_DFL); the child is single-threaded and installs no
+    // handlers of its own, so there is nothing to race.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // SAFETY: execvp with a NULL-terminated argv of valid C strings built
     // above; ptrs and c_argv outlive the call (it only returns on error).
     unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
     let err = std::io::Error::last_os_error();
+    // The exec failed — re-ignore SIGPIPE before returning: run_init's
+    // staged eprintln onto a dead stderr pipe must not SIGPIPE-kill the
+    // diagnostics (rc-1 contract, module docs point 4).
+    //
+    // SAFETY: as above — one disposition, constant handler,
+    // single-threaded.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     InitError::new(
         Stage::Exec,
         match err.raw_os_error() {
