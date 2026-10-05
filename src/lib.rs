@@ -23,6 +23,7 @@
 //! (`spikes/nft-load`) proved the unprivileged nftables-loading approach
 //! `sbx __init` ships.
 
+pub mod bwrap;
 pub mod cli;
 pub mod egress;
 pub mod init;
