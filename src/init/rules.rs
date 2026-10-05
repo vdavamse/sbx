@@ -633,17 +633,33 @@ fn verify_rules(sock: &mut NetlinkSocket) -> Result<(), InitError> {
         )));
     }
 
-    // Expected expression trees — byte-exact values from ground-truth.md §5
-    // (kernel dump of the nft-loaded reference ruleset).
+    // Expected expression trees. The `value=[…]` byte literals are DERIVED
+    // from the same consts `build_batch` encodes (IP_PROTO_TCP/UDP,
+    // RTN_LOCAL, OIFNAME_LO, and PORT_REDIR_BE/PORT_DNS_BE ← consts.rs's
+    // cross-issue port surface): a transcribed hex literal would silently
+    // strand if a const ever changed — fail-closed (every sandbox would die
+    // at nft-verify, rc 1), but deriving removes the drift class. The
+    // absolute ground-truth pin lives in the byte-golden unit tests vs the
+    // captured envelope. Structural renderings (dreg/sreg/key/op, the FIB
+    // raw result 3 F11 pins, the verdict code, the redir data nest) stay
+    // literal — the captured kernel dump is their source of truth
+    // (ground-truth.md §5).
+    let want_tcp = format!("sreg=1 op=0 value=[{}]", hex_bytes(&IP_PROTO_TCP));
+    let want_udp = format!("sreg=1 op=0 value=[{}]", hex_bytes(&IP_PROTO_UDP));
+    let want_not_local = format!("sreg=1 op=1 value=[{}]", hex_bytes(&RTN_LOCAL));
+    let want_local = format!("sreg=1 op=0 value=[{}]", hex_bytes(&RTN_LOCAL));
+    let want_redir_port = format!("dreg=1 value=[{}]", hex_bytes(&PORT_REDIR_BE));
+    let want_dns_port = format!("sreg=1 op=0 value=[{}]", hex_bytes(&PORT_DNS_BE));
+    let want_oif_lo = format!("sreg=1 op=0 value=[{}]", hex_bytes(&OIFNAME_LO));
     expect_exprs(
         "nat_out rule 1 (tcp redirect :15001)",
         &nat[0],
         &[
             ("meta", "dreg=1 key=16"),
-            ("cmp", "sreg=1 op=0 value=[06]"),
+            ("cmp", want_tcp.as_str()),
             ("fib", "dreg=1 result=3 flags=2"), // F11: raw result 3
-            ("cmp", "sreg=1 op=1 value=[02 00 00 00]"),
-            ("immediate", "dreg=1 value=[3a 99]"),
+            ("cmp", want_not_local.as_str()),
+            ("immediate", want_redir_port.as_str()),
             ("redir", "data{1=1 2=1 3=2}"),
         ],
     )?;
@@ -652,9 +668,9 @@ fn verify_rules(sock: &mut NetlinkSocket) -> Result<(), InitError> {
         &nat[1],
         &[
             ("meta", "dreg=1 key=16"),
-            ("cmp", "sreg=1 op=0 value=[11]"),
+            ("cmp", want_udp.as_str()),
             ("payload", "dreg=1 base=2 offset=2 len=2"),
-            ("cmp", "sreg=1 op=0 value=[00 35]"),
+            ("cmp", want_dns_port.as_str()),
             ("redir", "data{}"), // bare redirect: EMPTY data nest
         ],
     )?;
@@ -663,12 +679,9 @@ fn verify_rules(sock: &mut NetlinkSocket) -> Result<(), InitError> {
         &filter[0],
         &[
             ("meta", "dreg=1 key=7"),
-            (
-                "cmp",
-                "sreg=1 op=0 value=[6c 6f 00 00 00 00 00 00 00 00 00 00 00 00 00 00]",
-            ),
+            ("cmp", want_oif_lo.as_str()),
             ("fib", "dreg=1 result=3 flags=2"),
-            ("cmp", "sreg=1 op=0 value=[02 00 00 00]"),
+            ("cmp", want_local.as_str()),
             ("immediate", "dreg=0 verdict.code=1"),
         ],
     )?;
