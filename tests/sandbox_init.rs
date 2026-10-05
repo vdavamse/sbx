@@ -894,18 +894,31 @@ fn scenario_fail_nonsocket_fd() -> Result<(), String> {
 }
 
 /// AC (probe-verified race 1): the parent dies BEFORE the fds arrive —
-/// sendmsg sees EPIPE (std keeps SIGPIPE ignored), the child aborts staged
-/// send-fds rc 1, and the payload never starts.
+/// sendmsg sees EPIPE (MSG_NOSIGNAL makes the detection
+/// disposition-independent), the child aborts staged send-fds rc 1, and
+/// the payload never starts.
+///
+/// The peer end is dropped BEFORE the fork, making the EPIPE
+/// deterministic instead of a scheduling race: EPIPE requires the peer
+/// end's refcount to hit 0, and the child inherits only its OWN end (a
+/// reference to the child end, not to `parent_end`), so no interleaving
+/// of the harness thread against the child's setup pipeline can change
+/// the verdict. `child_end` stays open across the spawn window — the fd
+/// number is valid and the socket object alive for the child's
+/// `control`-stage getsockname — and is dropped immediately after (R6).
 fn scenario_fail_eof_before_go() -> Result<(), String> {
     let (parent_end, child_end) =
         fdpass::control_socketpair().map_err(|e| format!("control_socketpair: {e}"))?;
     let child_fd = fdpass::prepare_child_end(child_end.as_fd())
         .map_err(|e| format!("prepare_child_end: {e}"))?;
-    let sp = spawn_argv("marker", &[], &payload_self()?, child_fd)?;
-    // Drop BOTH parent ends immediately: by the time the child finishes
-    // its ~sub-second setup and sends, the peer is long gone ⇒ EPIPE.
-    drop(child_end);
+    // Peer definitively gone BEFORE the fork ⇒ the child's sendmsg can
+    // only ever see EPIPE — no race against the child's setup duration
+    // (spawn-then-drop would let a descheduled harness thread queue the
+    // fds message into the still-alive peer, moving the failure to
+    // wait-go and failing the send-fds prefix assertion).
     drop(parent_end);
+    let sp = spawn_argv("marker", &[], &payload_self()?, child_fd)?;
+    drop(child_end);
     let out = finish(sp, "fail-eof-before-go child")?;
     assert_staged_failure(&out, "sbx __init: send-fds:")
 }
