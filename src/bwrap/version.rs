@@ -10,7 +10,10 @@
 //!    returned VERBATIM when set and non-empty — no existence or
 //!    absoluteness check; [`super::build`]'s absolute check and the spawn
 //!    failure are the fail-closed backstops) → `PATH` scan (first
-//!    `<dir>/bwrap` that is a file with any execute bit) → fixed
+//!    `<dir>/bwrap` that is a file with any execute bit; NON-ABSOLUTE
+//!    entries are SKIPPED — unlike a shell's PATH search, an empty or
+//!    relative entry must never resolve the sandbox-enforcement binary
+//!    against the cwd) → fixed
 //!    fallbacks `/usr/local/bin/bwrap`, `/usr/bin/bwrap`, `/bin/bwrap`
 //!    (PATH is unset or empty in #10's env_clear world). Else `None` —
 //!    callers SKIP or report, never guess.
@@ -93,10 +96,19 @@ fn find_bwrap_with(override_env: Option<&OsStr>, path_var: Option<&OsStr>) -> Op
         }
     }
     // (2) PATH scan: first <dir>/bwrap that is a FILE with any execute
-    // bit (std's split_paths — ':' on Unix, empty entries resolve
-    // relative to the cwd exactly like the shell's PATH search).
+    // bit. Non-absolute entries are SKIPPED (review round 2) — this is
+    // deliberately NOT the shell's PATH search, where an empty entry
+    // resolves against the cwd: momentarily entertaining a cwd-planted
+    // ./bwrap as the sandbox-enforcement binary is the wrong posture for
+    // a security tool, and a hit would shadow every legitimate absolute
+    // entry later in PATH only to die at build()'s row-1 absolute check
+    // (fail-closed, but a confusing launch failure with /usr/bin/bwrap
+    // sitting right there).
     if let Some(path_var) = path_var {
         for dir in std::env::split_paths(path_var) {
+            if !dir.is_absolute() {
+                continue;
+            }
             let candidate = dir.join("bwrap");
             if is_executable_file(&candidate) {
                 return Some(candidate);
@@ -250,5 +262,66 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn find_bwrap_skips_relative_path_entries() {
+        // Review round 2: empty/relative PATH entries must never resolve
+        // bwrap against the cwd. Plant an executable ./bwrap in the
+        // process cwd (the package root under cargo test) and scan
+        // PATH=":" — the empty entry yields the relative candidate
+        // "bwrap", which the pre-fix scan happily returned, shadowing
+        // every legitimate absolute entry after it. Post-fix the result
+        // is a fixed fallback or None (host-dependent — assert
+        // absoluteness/membership, never the planted file). The guard
+        // removes the plant on EVERY exit path (panic included); no other
+        // test in this binary probes a relative PATH, so the plant cannot
+        // disturb the parallel runs.
+        struct CwdGuard(PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let planted = std::env::current_dir()
+            .expect("cwd must be readable")
+            .join("bwrap");
+        let _guard = CwdGuard(planted.clone());
+        assert!(
+            !planted.exists(),
+            "the package root must not already contain a bwrap file"
+        );
+        std::fs::write(&planted, b"#!/bin/sh\n").expect("cwd must be writable");
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let found = find_bwrap_with(None, Some(OsStr::new(":")));
+        assert_ne!(
+            found.as_deref(),
+            Some(Path::new("bwrap")),
+            "the empty entry's cwd-relative candidate must be skipped (it \
+             exists and is executable — the pre-fix scan returned it)"
+        );
+        assert_ne!(
+            found.as_deref(),
+            Some(planted.as_path()),
+            "the cwd-planted bwrap must never be returned"
+        );
+        assert!(
+            found.as_ref().is_none_or(|path| path.is_absolute()),
+            "discovery must yield absolute candidates only: {found:?}"
+        );
+        assert!(is_fallback_or_none(&found), "unexpected result {found:?}");
+
+        // A relative directory entry is skipped the same way — even one
+        // that WOULD contain an executable bwrap when resolved against
+        // the cwd (the plant above is exactly that candidate: "." +
+        // "/bwrap").
+        let found = find_bwrap_with(None, Some(OsStr::new(".")));
+        assert_ne!(
+            found.as_deref(),
+            Some(Path::new("./bwrap")),
+            "a relative PATH entry must be skipped: {found:?}"
+        );
+        assert!(is_fallback_or_none(&found), "unexpected result {found:?}");
     }
 }

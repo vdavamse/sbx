@@ -12,8 +12,9 @@
 //!  4  --clearenv
 //!  5  --symlink usr/bin /bin      ┐ the four usr-merge shims, in this
 //!     --symlink usr/sbin /sbin    │ fixed order, each SKIPPED when its
-//!     --symlink usr/lib /lib      │ dest (/bin, /sbin, /lib, /lib64) is
-//!     --symlink usr/lib64 /lib64  ┘ any bind's dest OR any deny path
+//!     --symlink usr/lib /lib      │ dest (/bin, /sbin, /lib, /lib64)
+//!     --symlink usr/lib64 /lib64  ┘ EQUALS OR IS UNDER any bind's dest
+//!                                   OR any deny path (descendant-aware)
 //!  6  the merged mount list, sorted by (dest ascending BYTE order, prio
 //!     ascending), deduped on exact (op, src, dest) keeping max prio;
 //!     each emits {--ro-bind|--bind} {src} {dest}:
@@ -52,7 +53,7 @@
 //! and wins. There is no collision error class by design (golden 4 pins
 //! the behavior).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -84,9 +85,13 @@ const INFRA_ETC: [&str; 7] = [
 ];
 
 /// The four usr-merge shims (module docs point 8): (dest, relative
-/// target). Fixed order; the skip rule applies at emission time — a
-/// mount/--tmpfs on a symlink FOLLOWS the link, so a shim whose dest is a
-/// bind dest or a deny path would silently redirect that op onto /usr/*.
+/// target). Fixed order; the descendant-aware skip rule applies at
+/// emission time — a mount/--tmpfs on a symlink FOLLOWS the link (so a
+/// shim whose dest is a bind dest or a deny path would silently redirect
+/// that op onto /usr/*), and a bind UNDER a still-dangling shim aborts
+/// the launch at bwrap's mountpoint creation (ENOENT — the dest
+/// byte-order sort processes /lib/x86_64-linux-gnu before the /usr bind
+/// that would resolve the link).
 const USR_MERGE_SHIMS: [(&str, &str); 4] = [
     ("/bin", "usr/bin"),
     ("/sbin", "usr/sbin"),
@@ -169,15 +174,29 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     argv.push(OsString::from("--clearenv"));
 
     // The merged mount list (element 6) — computed before the shims
-    // because the shim skip rule needs the bind-dest set.
+    // because the shim skip rule needs the bind dests.
     let mounts = merged_mounts(input, &layout);
-    let bind_dests: BTreeSet<&str> = mounts.iter().map(|mount| mount.dest.as_str()).collect();
     let denies = sorted_denies(&input.policy.filesystem.deny);
 
-    // 5. The usr-merge shims (module docs point 8), each skipped when its
-    //    dest is a bind dest OR a deny path.
+    // 5. The usr-merge shims (module docs point 8), each skipped when any
+    //    bind dest or deny path EQUALS OR IS UNDER its dest
+    //    (descendant-aware, review round 2): a mount/--tmpfs on the shim
+    //    symlink would FOLLOW it onto /usr/*, and a bind under a
+    //    still-dangling shim (dest byte order processes
+    //    /lib/x86_64-linux-gnu before the /usr bind that would resolve
+    //    the link) dies in bwrap's mountpoint creation with a cryptic
+    //    "Can't mkdir parents for /lib/x86_64-linux-gnu" ENOENT
+    //    (bubblewrap.c v0.9.0 mkdir_with_parents → ensure_dir on the
+    //    dangling link → die_with_error). Suppressing the shim lets
+    //    bwrap's mkdir_with_parents create a REAL directory instead —
+    //    trade-off: uncovered /lib/*-style content no longer resolves
+    //    into /usr/* (#11's conformance report surfaces that; golden 12
+    //    pins the shape, the bind-under-shim-dest integration scenario
+    //    proves the launch).
     for (dest, target) in USR_MERGE_SHIMS {
-        if bind_dests.contains(dest) || denies.contains(&dest) {
+        if mounts.iter().any(|mount| at_or_under(&mount.dest, dest))
+            || denies.iter().any(|deny| at_or_under(deny, dest))
+        {
             continue;
         }
         argv.extend(["--symlink", target, dest].map(OsString::from));
@@ -194,6 +213,15 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     //    (module docs points 4/7). Any policy bind under /proc or /dev is
     //    silently covered by this (documented limitation; proptest P7
     //    pins the position).
+    //    HAZARD NOTE (review round 2, #10/#14 handoff): --dev /dev makes
+    //    bwrap bind the HOST's controlling terminal at /dev/console
+    //    whenever bwrap's stdout is a tty (v0.9.0: host_tty_dev =
+    //    ttyname(1) under isatty(1)) — read/write terminal access for the
+    //    untrusted payload (output spoofing; TIOCSTI-class keystroke
+    //    injection on older kernels). The integration harness always
+    //    pipes stdio (allowlist-only-visible pins /dev/console ABSENT),
+    //    but #10 must never Stdio::inherit() a tty into bwrap unless #14
+    //    explicitly accepts the exposure.
     argv.extend(["--proc", "/proc", "--dev", "/dev"].map(OsString::from));
 
     // 8. Deny masks LAST among the filesystem ops — deny always wins
@@ -277,6 +305,19 @@ fn setenv(argv: &mut Vec<OsString>, name: &str, value: &OsStr) {
     argv.push(OsString::from("--setenv"));
     argv.push(OsString::from(name));
     argv.push(value.to_os_string());
+}
+
+/// Segment-exact "equals or is under": `path` is `root` itself or inside
+/// it. The '/' boundary check makes it segment-exact — "/lib/x" is under
+/// "/lib", but "/lib64" is NOT under "/lib" (a plain starts_with would
+/// wrongly suppress the /lib64 shim). Both sides are lexically canonical
+/// by the time this runs (AbsolutePath's invariant; no trailing slashes
+/// survive it), so the string rule equals the component rule.
+fn at_or_under(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The merged, deduped, sorted mount list (module docs point 4; layout
@@ -398,6 +439,7 @@ mod tests {
     use crate::bwrap::build;
     use crate::policy::Policy;
     use proptest::prelude::*;
+    use std::collections::BTreeSet;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
 
@@ -687,11 +729,14 @@ mod tests {
         // bwrap's last-mount-wins — no error class. The policy
         // /etc/hosts collapses into the infra entry (exact duplicate);
         // the policy /etc/passwd emits BEFORE the generated bind (prio
-        // 0 < 1 ⇒ generated wins); the policy ro /tmp before the session
-        // rw /tmp (session wins).
+        // 0 < 1 ⇒ generated wins); the policy ro /work before the session
+        // rw /work (session wins). (The collision demo uses /work, not
+        // /tmp: build() row 13 now rejects policy paths that are or
+        // contain the session dir, and /tmp is an ancestor of SESSION_DIR
+        // — the dest-/work collision exercises the same prio-2 rule.)
         let policy = policy_of(&base_with(&[(
             r#""ro": []"#,
-            r#""ro": ["/etc/hosts", "/tmp", "/etc/passwd"]"#,
+            r#""ro": ["/etc/hosts", "/work", "/etc/passwd"]"#,
         )]));
         let argv = golden_argv(&policy, &BTreeMap::new());
         assert_eq!(
@@ -736,12 +781,12 @@ mod tests {
                     "--bind",
                     "/tmp/sbx-golden-session/home",
                     "/root",
-                    "--ro-bind",
-                    "/tmp",
-                    "/tmp",
                     "--bind",
                     "/tmp/sbx-golden-session/tmp",
                     "/tmp",
+                    "--ro-bind",
+                    "/work",
+                    "/work",
                     "--bind",
                     "/tmp/sbx-golden-session/work",
                     "/work",
@@ -927,6 +972,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn golden_bind_under_shim_dest() {
+        // Golden 12 (review round 2, shim-descendant class): a bind UNDER
+        // a shim dest suppresses that shim — descendant-aware, not exact
+        // match. With the /lib shim emitted, bwrap would process the
+        // /lib/x86_64-linux-gnu mount while the shim symlink still dangles
+        // (dest byte order sorts it before the /usr bind that resolves
+        // the link) and abort in mkdir_with_parents ("Can't mkdir parents
+        // for /lib/x86_64-linux-gnu", ENOENT — bubblewrap.c v0.9.0).
+        // Suppressed, bwrap's
+        // mkdir_with_parents creates a REAL /newroot/lib and the bind
+        // lands (the bind-under-shim-dest integration scenario proves the
+        // launch). /lib64 is UNTOUCHED: "/lib/x86_64-linux-gnu" is not
+        // under "/lib64" — the segment-exact at_or_under boundary. Bind
+        // position is the plain dest byte order: /etc block < /lib/… <
+        // /root < /tmp < /usr < /work.
+        let policy = policy_of(&base_with(&[(
+            r#""ro": []"#,
+            r#""ro": ["/usr", "/lib/x86_64-linux-gnu"]"#,
+        )]));
+        let argv = golden_argv(&policy, &BTreeMap::new());
+        assert_eq!(
+            argv,
+            expected(&[
+                HEAD,
+                &[
+                    "--symlink",
+                    "usr/bin",
+                    "/bin",
+                    "--symlink",
+                    "usr/sbin",
+                    "/sbin",
+                    "--symlink",
+                    "usr/lib64",
+                    "/lib64",
+                ],
+                INFRA_BINDS_NO_POLICY,
+                &[
+                    "--ro-bind",
+                    "/lib/x86_64-linux-gnu",
+                    "/lib/x86_64-linux-gnu"
+                ],
+                SESSION_BINDS,
+                &["--ro-bind", "/usr", "/usr"],
+                WORK_BIND,
+                PROC_DEV,
+                INFRA_ENV,
+                TAIL,
+            ])
+        );
+    }
+
+    #[test]
+    fn golden_deny_masks_generated_file() {
+        // Golden 13 (review round 2, the sharpest Q5 edge): a deny path
+        // targeting a GENERATED/infra dest still emits its --tmpfs mask
+        // LAST — after the generated --ro-bind of the same dest — so deny
+        // wins over everything, the synthetic-file binds included. ARGV
+        // contract only: --tmpfs on a FILE dest fails at bwrap runtime
+        // (the documented v1 lexical-deny limitation; #11 pre-detects,
+        // #13 covers conformance) — this golden pins the ordering
+        // algebra, not launchability.
+        let policy = policy_of(&base_with(&[(
+            r#""deny": []"#,
+            r#""deny": ["/etc/passwd"]"#,
+        )]));
+        let argv = golden_argv(&policy, &BTreeMap::new());
+        assert_eq!(
+            argv,
+            expected(&[
+                HEAD,
+                SHIMS,
+                INFRA_BINDS_NO_POLICY,
+                SESSION_BINDS,
+                WORK_BIND,
+                PROC_DEV,
+                &["--tmpfs", "/etc/passwd"],
+                INFRA_ENV,
+                TAIL,
+            ])
+        );
+    }
+
     // ---- proptest invariants P1–P9 (design §2.6) -----------------------------
     //
     // House style from egress.rs: core strategies only (proptest 1.11 has
@@ -988,21 +1116,22 @@ mod tests {
     }
 
     // env value: arbitrary chars minus NUL (policy leaves values
-    // unrestricted; NUL is build() row 9's rejection, so generators must
-    // not emit it).
+    // unrestricted; NUL is build() row 11's rejection, so generators must
+    // not emit it — prop_nul_injection_is_rejected covers the rejection).
     fn prop_env_value() -> impl Strategy<Value = String> {
         proptest::collection::vec(
-            proptest::char::any().prop_filter("NUL is rejected by build() row 9", |c| *c != '\0'),
+            proptest::char::any().prop_filter("NUL is rejected by build() row 11", |c| *c != '\0'),
             0..=8,
         )
         .prop_map(|chars| chars.into_iter().collect())
     }
 
-    // command: 1–4 elements of 1–12 arbitrary bytes, NUL-free (row 8).
+    // command: 1–4 elements of 1–12 arbitrary bytes, NUL-free (row 10).
     fn prop_command() -> impl Strategy<Value = Vec<OsString>> {
         proptest::collection::vec(
             proptest::collection::vec(
-                proptest::num::u8::ANY.prop_filter("NUL is rejected by build() row 8", |b| *b != 0),
+                proptest::num::u8::ANY
+                    .prop_filter("NUL is rejected by build() row 10", |b| *b != 0),
                 1..=12,
             ),
             1..=4,
@@ -1022,9 +1151,16 @@ mod tests {
     }
 
     // A valid policy JSON text generator: version 1, three modes, ports
-    // 1..=65535, and the Q8 fixup — rw members exactly equal to a ro
-    // member are dropped (deterministic, not sample rejection; nesting in
-    // either direction stays, which is what P1 exercises).
+    // 1..=65535, and two deterministic fixups (sample rejection would
+    // bias; these are the rw∩ro-drop precedent): (a) rw members exactly
+    // equal to a ro member are dropped (Q8 — nesting in either direction
+    // stays, which is what P1 exercises); (b) "/tmp" is dropped from
+    // ro/rw — it is the ONLY generatable path that overlaps the golden
+    // SESSION_DIR (/tmp/sbx-golden-session): an ancestor bind build() row
+    // 13 rejects (session containment), and "sbx-golden-session" contains
+    // '-' outside the segment charset, so no generated path can reach
+    // inside the session dir. deny keeps "/tmp": a --tmpfs mask covers a
+    // sandbox-side path and cannot alias host state (row 13's doc).
     fn prop_policy_json() -> impl Strategy<Value = String> {
         (
             proptest::collection::vec(prop_path(), 0..=4),
@@ -1040,7 +1176,11 @@ mod tests {
             proptest::collection::vec(1u16..=65535, 0..=3),
         )
             .prop_map(|(ro, rw, deny, mode, pass, set, ports)| {
-                let rw: Vec<String> = rw.into_iter().filter(|path| !ro.contains(path)).collect();
+                let ro: Vec<String> = ro.into_iter().filter(|path| path != "/tmp").collect();
+                let rw: Vec<String> = rw
+                    .into_iter()
+                    .filter(|path| path != "/tmp" && !ro.contains(path))
+                    .collect();
                 format!(
                     r#"{{"version": 1, "filesystem": {{"ro": {}, "rw": {}, "deny": {}}}, "network": {{"mode": {mode:?}, "allow": [], "ports": {}}}, "env": {{"pass": {}, "set": {}}}, "limits": {{"timeout": "120s", "output_bytes": 10485760}}}}"#,
                     json_list(&ro),
@@ -1283,6 +1423,19 @@ mod tests {
                     );
                 }
             }
+
+            // P4 (part 3, review round 2): the whole-argv sweep's
+            // generative half — valid inputs ⇒ EVERY emitted element is
+            // NUL-free (prop_nul_injection_is_rejected is the rejection
+            // half; together they pin "no NUL in any emitted byte" beyond
+            // the deterministic row pins).
+            for element in &argv {
+                prop_assert!(
+                    !element.as_os_str().as_bytes().contains(&0),
+                    "NUL byte in an emitted argv element: {:?}",
+                    element
+                );
+            }
         }
 
         #[test]
@@ -1461,10 +1614,12 @@ mod tests {
             let (flags, _) = split_tail(&argv, &command);
             let events = parse_flags(flags);
 
-            // P9: a shim is emitted ⟺ its dest is neither a bind dest nor
-            // a deny path — and the emitted ones keep the fixed order
-            // (/bin, /sbin, /lib, /lib64), which the sequence equality
-            // pins together with the subset rule.
+            // P9 (descendant-aware, review round 2): a shim is emitted ⟺
+            // NO bind dest or deny path equals or is under its dest (the
+            // production at_or_under rule, recomputed here from the parsed
+            // events) — and the emitted ones keep the fixed order (/bin,
+            // /sbin, /lib, /lib64), which the sequence equality pins
+            // together with the subset rule.
             let bind_dests: BTreeSet<&str> = events.iter().filter_map(bind_dest).collect();
             let denies: BTreeSet<&str> = policy
                 .filesystem
@@ -1482,9 +1637,81 @@ mod tests {
             let expected: Vec<&str> = USR_MERGE_SHIMS
                 .iter()
                 .map(|(dest, _)| *dest)
-                .filter(|dest| !bind_dests.contains(dest) && !denies.contains(dest))
+                .filter(|dest| {
+                    !bind_dests.iter().any(|bind| at_or_under(bind, dest))
+                        && !denies.iter().any(|deny| at_or_under(deny, dest))
+                })
                 .collect();
             prop_assert_eq!(actual, expected);
         }
+
+        #[test]
+        fn prop_nul_injection_is_rejected(
+            policy_json in prop_policy_json(),
+            command in prop_command(),
+            inject_into_command in proptest::bool::ANY,
+            name in prop_env_name(),
+            value in prop_env_value(),
+            value_pos in 0..=8usize,
+            cmd_index in 0..=3usize,
+            cmd_pos in 0..=12usize,
+        ) {
+            // Review round 2 (coverage gap 1): the generators exclude NUL
+            // by construction, so without this property "no NUL in any
+            // emitted byte" would rest on the deterministic row pins
+            // alone — a refactor reopening an emission path could pass
+            // silently. Inject a NUL at a random position of a random
+            // env.set value OR command element: build() must reject with
+            // the matching row's EXACT message (row 11 / row 10), never
+            // emit the byte. (passed_env values are the row-12 pin's
+            // deterministic case — the membership filter makes a
+            // generative version depend on policy.env.pass contents for
+            // no additional coverage.)
+            let mut policy = prop_policy(&policy_json);
+            let mut command = command;
+            let expected = if inject_into_command {
+                let index = cmd_index % command.len();
+                let mut bytes = command[index].as_os_str().as_bytes().to_vec();
+                bytes.insert(cmd_pos.min(bytes.len()), 0);
+                command[index] = OsString::from_vec(bytes);
+                format!("command[{index}] contains an interior NUL byte")
+            } else {
+                let mut chars: Vec<char> = value.chars().collect();
+                chars.insert(value_pos.min(chars.len()), '\0');
+                policy
+                    .env
+                    .set
+                    .insert(name.clone(), chars.into_iter().collect());
+                format!("env.set value for {name:?} contains an interior NUL byte")
+            };
+            let empty = BTreeMap::new();
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &empty,
+            };
+            let err = build(&input)
+                .expect_err("an injected NUL byte must be rejected")
+                .to_string();
+            prop_assert_eq!(err, expected);
+        }
+    }
+
+    #[test]
+    fn at_or_under_is_segment_exact() {
+        // The shim skip rule's boundary (review round 2): segment-exact,
+        // never plain string-prefix — "/lib64" is NOT under "/lib" (a
+        // starts_with rule would wrongly suppress the /lib64 shim).
+        assert!(at_or_under("/lib", "/lib"));
+        assert!(at_or_under("/lib/x86_64-linux-gnu", "/lib"));
+        assert!(at_or_under("/bin/sh", "/bin"));
+        assert!(at_or_under("/etc/passwd", "/etc"));
+        assert!(!at_or_under("/lib64", "/lib"));
+        assert!(!at_or_under("/library", "/lib"));
+        assert!(!at_or_under("/et", "/etc"));
+        assert!(!at_or_under("/usr", "/lib"));
     }
 }

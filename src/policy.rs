@@ -18,8 +18,12 @@
 //!    position-free pinned messages, the `sbx check` surface; direct serde
 //!    deserialization goes through [`Policy`]'s manual `Deserialize` impl,
 //!    which runs the same `validate()` and therefore carries serde's
-//!    line/column context. Pinned by
-//!    `direct_deserialization_enforces_policy_wide_rules`. Residual gap,
+//!    line/column context. Root-shape errors (sequence/scalar roots) are
+//!    byte-identical across both paths: the manual impl's visitor
+//!    delegates map AND seq roots to the mirror and shares its `expecting`
+//!    pin. Pinned by
+//!    `direct_deserialization_enforces_policy_wide_rules` and
+//!    `root_non_object_error_names_the_public_type`. Residual gap,
 //!    deliberately: the `pub` fields allow struct-literal construction by
 //!    ANY crate with access to the type — governed by review, not types
 //!    (the validating-newtypes alternative would have changed
@@ -107,6 +111,17 @@ impl AbsolutePath {
     /// The same path as a [`Path`] — the seam for bwrap argv assembly (#6).
     pub fn as_path(&self) -> &Path {
         Path::new(&self.0)
+    }
+
+    /// Test-only escape hatch (review round 2, the whole-argv NUL-sweep
+    /// pin): constructs an `AbsolutePath` that NO deserialization path can
+    /// produce (`check_path` rejects NUL). The inner field is private, so
+    /// this value class is unreachable from outside the crate — the
+    /// `bwrap::build()` sweep it pins is the backstop against internal
+    /// refactors weakening the invariant.
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(s: String) -> Self {
+        Self(s)
     }
 }
 
@@ -503,7 +518,10 @@ fn ser_duration<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::
 // `expecting` reproduces, byte for byte, the message the original derived
 // `Deserialize for Policy` produced ("expected struct Policy with 5
 // elements"), and `sbx check` never shows policy authors the
-// implementation artifact's name. schemars is unaffected (RawPolicy has
+// implementation artifact's name. `Policy`'s manual-impl visitor carries
+// the SAME `expecting` text, so root-shape errors match byte-for-byte
+// across the two deserialization paths (review round 2). schemars is
+// unaffected (RawPolicy has
 // no JsonSchema), so the schema hash does not move.
 // No `///` docs: `RawPolicy` has no `JsonSchema`, and house rule reserves
 // `///` for author-facing schema text (module doc point 6).
@@ -591,15 +609,20 @@ impl<'de> Deserialize<'de> for Policy {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // The type-level validity invariant (module doc point 5): no
         // `Policy` escapes serde unvalidated. validate() runs INSIDE the
-        // map visitor, not after the inner deserialize returned: serde_json
+        // visitor, not after the inner deserialize returned: serde_json
         // attaches its line/column context only to custom errors raised
         // while its own parse machinery is still active (the
         // duplicate_env_set_keys_rejected precedent) — an error returned
         // after the root deserialize completed propagates position-free.
-        // Delegating through MapAccessDeserializer keeps RawPolicy's
-        // derived field machinery (deny_unknown_fields, the newtype
-        // validators, every error string) as the single parse
-        // implementation. from_json_str does NOT route through this impl:
+        // Delegating through MapAccessDeserializer/SeqAccessDeserializer
+        // keeps RawPolicy's derived field machinery (deny_unknown_fields,
+        // the newtype validators, every error string) as the single parse
+        // implementation — and makes root-shape errors byte-identical to
+        // from_json_str's (review round 2): BOTH the map and the seq arm
+        // delegate, and the visitor's `expecting` matches RawPolicy's pin,
+        // so sequence and scalar roots report the same message on either
+        // path (root_non_object_error_names_the_public_type).
+        // from_json_str does NOT route through this impl:
         // it keeps the two-step deserialize-then-validate shape so its
         // pinned messages stay position-free (version_must_be_one).
         struct PolicyVisitor;
@@ -608,7 +631,11 @@ impl<'de> Deserialize<'de> for Policy {
             type Value = Policy;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a sandbox policy object")
+                // Byte-identical to RawPolicy's #[serde(expecting = …)]
+                // pin, so a scalar root ("x", 42, null, true) produces the
+                // SAME default-visit error text here as on the
+                // from_json_str path (review round 2 root-shape symmetry).
+                formatter.write_str("struct Policy with 5 elements")
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
@@ -617,6 +644,20 @@ impl<'de> Deserialize<'de> for Policy {
             ) -> Result<Self::Value, A::Error> {
                 let raw =
                     RawPolicy::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                raw.validate().map_err(serde::de::Error::custom)?;
+                Ok(Policy::from_raw(raw))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                // A sequence root ("[]") gets RawPolicy's derived visit_seq
+                // machinery — the invalid_length error text AND its serde
+                // position — instead of a visit_seq-specific message that
+                // would diverge from the from_json_str path.
+                let raw =
+                    RawPolicy::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
                 raw.validate().map_err(serde::de::Error::custom)?;
                 Ok(Policy::from_raw(raw))
             }
@@ -1648,6 +1689,19 @@ mod tests {
         let err = err_of("[]");
         assert!(err.contains("struct Policy"), "{err}");
         assert!(!err.contains("RawPolicy"), "{err}");
+        // Review round 2 (root-shape symmetry): the direct path's
+        // root-shape errors are byte-identical to from_json_str's — the
+        // manual impl's visit_seq delegates to RawPolicy exactly like
+        // visit_map does, and PolicyVisitor's `expecting` matches
+        // RawPolicy's pin, so scalar roots agree too. Both paths fail
+        // closed; the mirror's name never surfaces on either.
+        for json in ["[]", "[1, 2]", "\"x\"", "42", "null", "true"] {
+            let direct = serde_json::from_str::<Policy>(json)
+                .expect_err("a non-object root must be rejected on the direct path too")
+                .to_string();
+            assert_eq!(direct, err_of(json), "root-shape asymmetry for {json}");
+            assert!(!direct.contains("RawPolicy"), "{direct}");
+        }
     }
 
     // ---- ro∩rw overlap (issue #6, Q8) ----------------------------------------

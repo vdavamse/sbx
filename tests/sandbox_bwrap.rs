@@ -19,9 +19,9 @@
 //! itself — materialize → `build()` → `Launch::command()` (skip:
 //! `USERNS_SKIP` on AppArmor/seccomp-style blocks; every probe failure
 //! prints its captured rc/stderr diagnostic first, so a CI skip names
-//! its own cause). On a host without bwrap (local WSL) all nine
+//! its own cause). On a host without bwrap (local WSL) all ten
 //! scenarios print SKIP and the suite exits 0; CI installs bubblewrap
-//! and must show nine PASS lines.
+//! and must show ten PASS lines.
 //!
 //! The probe initializer also pollutes the harness environment with
 //! `SBX_IT_SECRET` — the sentinel `secret-env-absent` proves never
@@ -417,7 +417,7 @@ fn assert_clean_success(out: &Outcome) {
 }
 
 // ---------------------------------------------------------------------------
-// the nine scenarios
+// the ten scenarios
 // ---------------------------------------------------------------------------
 
 /// AC-i: nothing outside the allow list is visible. The allow-listed set
@@ -425,6 +425,16 @@ fn assert_clean_success(out: &Outcome) {
 /// all exist; host paths nobody bound (/home, /opt, /var, /srv, /mnt,
 /// /sys, /etc/shadow, /etc/machine-id) do NOT; /etc/passwd is the
 /// synthetic one (Q7).
+///
+/// /dev/console absence pins the PIPED-STDIO assumption (review round 2,
+/// host-tty hazard): `--dev /dev` makes bwrap bind the host's controlling
+/// terminal at /dev/console whenever bwrap's stdout is a tty (v0.9.0
+/// `host_tty_dev = ttyname(1)` under `isatty(1)`) — read/write host-tty
+/// access for the untrusted payload (output spoofing; TIOCSTI-class
+/// keystroke injection on older kernels). This harness ALWAYS pipes stdio
+/// (run_bounded), so the node must not exist; #10 must keep it that way
+/// (never Stdio::inherit() a tty) unless #14's threat model explicitly
+/// accepts the exposure — see the --dev emission-site comment in argv.rs.
 #[test]
 fn allowlist_only_visible() {
     const NAME: &str = "allowlist-only-visible";
@@ -436,7 +446,7 @@ fn allowlist_only_visible() {
 for p in /usr /bin/sh /etc/passwd /etc/hosts /root /tmp /work /etc/ssl; do
   if test -e "$p"; then echo "SBX-BW-MARKER exists $p"; else echo "SBX-BW-MARKER MISSING $p"; fi
 done
-for p in /home /opt /var /srv /mnt /sys /etc/shadow /etc/machine-id; do
+for p in /home /opt /var /srv /mnt /sys /etc/shadow /etc/machine-id /dev/console; do
   if test -e "$p"; then echo "SBX-BW-MARKER LEAK $p"; fi
 done
 echo "SBX-BW-MARKER passwd-count=$(grep -c '^root:x:0:0:root:/root:/bin/bash$' /etc/passwd)"
@@ -719,6 +729,73 @@ if test -d /usr/share; then echo "SBX-BW-MARKER parent-exists"; else echo "SBX-B
         !out.stdout.contains(&format!("{MARKER} mask-dir-MISSING"))
             && !out.stdout.contains(&format!("{MARKER} parent-MISSING")),
         "unexpected MISSING marker:\n{}",
+        out.stdout
+    );
+    house_print(&format!("PASS {NAME}"));
+}
+
+/// Spawnability pin (review round 2, shim-descendant class — the blind
+/// spot that let the C1 smoke bug through a suite that runs real bwrap):
+/// a policy bind UNDER a usr-merge shim dest. With the old exact-match
+/// skip rule the `/lib` shim was emitted and the launch DIED on real
+/// bwrap: the dest byte-order sort processes `/lib/x86_64-linux-gnu`
+/// before the `/usr` bind that would resolve the dangling symlink, and
+/// bwrap's mountpoint creation fails (`Can't mkdir parents for
+/// /lib/x86_64-linux-gnu`, ENOENT — bubblewrap.c v0.9.0). With the
+/// descendant-aware rule the `/lib` shim is suppressed,
+/// bwrap's `mkdir_with_parents` creates a REAL `/newroot/lib`, and the
+/// bind lands read-only — proven here end-to-end on a policy as ordinary
+/// as `ro: ["/usr", "/lib/x86_64-linux-gnu"]`. The other three shims are
+/// untouched (`/bin/sh` still runs the payload — segment-exact
+/// `at_or_under`: `/lib/x86_64-linux-gnu` is not under `/lib64`).
+#[test]
+fn bind_under_shim_dest() {
+    const NAME: &str = "bind-under-shim-dest";
+    let Some(bwrap) = probe_ready(NAME) else {
+        return;
+    };
+    // Vacuity guard (deny_masks_path precedent): the host subtree must
+    // exist for the bind to mean anything (true on noble — libc6's
+    // multiarch dir, reached through the /lib → usr/lib usrmerge
+    // symlink; bwrap resolves bind SOURCES on the host).
+    assert!(
+        Path::new("/lib/x86_64-linux-gnu").is_dir(),
+        "host /lib/x86_64-linux-gnu is missing — the scenario would be vacuous \
+         (this suite targets the CI's Ubuntu noble + local WSL)"
+    );
+    let session = TempSession::new(NAME);
+    let policy = policy_with(&[(
+        r#""ro": ["/usr"]"#,
+        r#""ro": ["/usr", "/lib/x86_64-linux-gnu"]"#,
+    )]);
+    let script = r#"
+if test -d /lib/x86_64-linux-gnu; then echo "SBX-BW-MARKER subdir-exists"; else echo "SBX-BW-MARKER subdir-MISSING"; fi
+if test -L /lib; then echo "SBX-BW-MARKER lib-is-symlink"; else echo "SBX-BW-MARKER lib-is-real"; fi
+if touch /lib/x86_64-linux-gnu/sbx-nope 2>/dev/null; then echo "SBX-BW-MARKER write-LEAK"; else echo "SBX-BW-MARKER write-refused"; fi
+if test -x /bin/sh; then echo "SBX-BW-MARKER bin-shim-ok"; else echo "SBX-BW-MARKER bin-shim-MISSING"; fi
+"#;
+    let out = run_payload(bwrap, &session, &policy, &no_env(), script)
+        .expect("bind-under-shim-dest payload run");
+    assert_clean_success(&out);
+    assert!(
+        has_marker(&out, "subdir-exists"),
+        "the bind under the suppressed shim's dest must be visible:\n{}",
+        out.stdout
+    );
+    assert!(
+        has_marker(&out, "lib-is-real"),
+        "/lib must be a REAL directory (shim suppressed, mountpoint \
+         created by bwrap), not the usr-merge symlink:\n{}",
+        out.stdout
+    );
+    assert!(
+        has_marker(&out, "write-refused") && !has_marker(&out, "write-LEAK"),
+        "the bind is read-only — writes must fail (EROFS):\n{}",
+        out.stdout
+    );
+    assert!(
+        has_marker(&out, "bin-shim-ok"),
+        "the untouched /bin shim must still serve the payload's /bin/sh:\n{}",
         out.stdout
     );
     house_print(&format!("PASS {NAME}"));
