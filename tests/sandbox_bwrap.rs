@@ -794,13 +794,23 @@ done
         pid1[0]
     );
     // The harness pid does not exist in the fresh pidns.
+    //
+    // Line-anchored marker_lines, NOT substring has_marker/contains:
+    // this scenario cats /proc/1/cmdline, and pid 1 is bwrap — whose argv
+    // ends with `-- /bin/sh -c {script}`, so the SCRIPT'S OWN SOURCE (with
+    // every marker literal it contains, on both branches of the if/else)
+    // is echoed back inside the pid1= blob. A raw `stdout.contains(MARKER
+    // + " host-pid-LEAK")` therefore matches the echoed source and fails
+    // even in a perfectly isolated sandbox (CI-proved); a real leak marker
+    // is a standalone LINE starting with the prefix, and echoed source
+    // lines start with `if test…`/`echo "` — never with the bare marker.
     assert!(
-        has_marker(&out, "host-pid-absent"),
-        "the host pid must be invisible in the sandbox pidns:\n{}",
+        !marker_lines(&out, "host-pid-absent").is_empty(),
+        "the harness-pid probe marker is missing:\n{}",
         out.stdout
     );
     assert!(
-        !out.stdout.contains(&format!("{MARKER} host-pid-LEAK")),
+        marker_lines(&out, "host-pid-LEAK").is_empty(),
         "the host pid is visible inside the sandbox:\n{}",
         out.stdout
     );
