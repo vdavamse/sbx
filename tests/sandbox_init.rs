@@ -36,10 +36,12 @@
 //! (Q6(a)) plus TEST-NET-3 `203.0.113.7` for everything else — neither can
 //! leave the sandbox netns (lo is the only interface, probe-proven).
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -142,8 +144,11 @@ struct Scenario {
     run: fn() -> Result<(), String>,
 }
 
-/// The 16 scenarios: the design's 15 AC-mapped ones plus `sigpipe-default`
-/// (added post-design — pins `exec_payload`'s SIGPIPE restore end-to-end).
+/// The 17 scenarios: the design's 15 AC-mapped ones plus `sigpipe-default`
+/// (added post-design — pins `exec_payload`'s SIGPIPE restore end-to-end)
+/// and `full-chain-bwrap` (added with issue #6 — the production
+/// `run` → `__init` → bwrap → payload chain shape, built through #6's
+/// public builder API).
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -225,6 +230,11 @@ fn scenarios() -> Vec<Scenario> {
             name: "usage-contract",
             gate: Gate::Always,
             run: scenario_usage_contract,
+        },
+        Scenario {
+            name: "full-chain-bwrap",
+            gate: Gate::Bwrap,
+            run: scenario_full_chain_bwrap,
         },
     ]
 }
@@ -373,6 +383,47 @@ fn spawn_init_core(
     drop(child_end);
     spawned.parent_end = Some(parent_end);
     Ok(spawned)
+}
+
+/// The #10 production spawn contract, modeled exactly (issue #6's
+/// `full-chain-bwrap` scenario): `sbx __init --fd N -- <payload argv>`
+/// with `env_clear()` and NO `ROLE_ENV` — the role reaches the payload
+/// purely through the policy's env.set → bwrap `--setenv` chain, and
+/// `exec_payload`'s `execvp` of the ABSOLUTE bwrap argv[0] must work
+/// without a PATH (R16 — the scenario's core proof). `own_group` (m4):
+/// the payload tree here is sbx → bwrap monitor → reaper → payload, so a
+/// timeout kill must reach grandchildren holding the stdio pipes.
+fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
+    use std::os::unix::process::CommandExt;
+
+    let (parent_end, child_end) =
+        fdpass::control_socketpair().map_err(|e| format!("control_socketpair: {e}"))?;
+    let child_fd = fdpass::prepare_child_end(child_end.as_fd())
+        .map_err(|e| format!("prepare_child_end: {e}"))?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.arg("__init").arg("--fd").arg(child_fd.to_string());
+    cmd.arg("--");
+    cmd.args(payload_argv);
+    // THE production contract: `__init` gets an empty environment (nothing
+    // in the pipeline reads env; `execvp` inherits the emptiness to bwrap,
+    // whose pid-1 reaper fork then shows it at /proc/1/environ).
+    cmd.env_clear();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn sbx __init (env_clear): {e}"))?;
+    let stdout = reader_thread(child.stdout.take().expect("stdout is piped"));
+    let stderr = reader_thread(child.stderr.take().expect("stderr is piped"));
+    // R6: drop the parent's copy of the child end IMMEDIATELY after spawn.
+    drop(child_end);
+    Ok(Spawned {
+        child,
+        parent_end: Some(parent_end),
+        own_group: true,
+        stdout,
+        stderr,
+    })
 }
 
 /// Spawn the role binary as the payload: `__init -- <current_exe>` with
@@ -627,10 +678,10 @@ fn scenario_only_lo() -> Result<(), String> {
 /// on entry stay ignored, defaults stay defaults). The shell prints its
 /// `SigIgn` mask from `/proc/self/status`; the harness asserts the SIGPIPE
 /// bit (signal 13 ⇒ bit 12) is CLEAR. Pure shell builtins — no awk/grep
-/// dependency. bwrap is not in this chain (the suite execs payloads
-/// directly) and upstream `bubblewrap.c` restores only SIGCHLD, so the
-/// production `run` → `__init` → bwrap → payload chain relies on exactly
-/// this restore.
+/// dependency. bwrap is not in THIS chain (this scenario execs payloads
+/// directly; `full-chain-bwrap` covers the production `run` → `__init` →
+/// bwrap → payload shape) and upstream `bubblewrap.c` restores only
+/// SIGCHLD, so the production chain relies on exactly this restore.
 fn scenario_sigpipe_default() -> Result<(), String> {
     // Marker-prefixed like every payload line (suite convention).
     let script = format!(
@@ -1017,6 +1068,94 @@ fn scenario_usage_contract() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// scenario 17: the full production chain (issue #6)
+// ---------------------------------------------------------------------------
+
+/// AC (issue #6): the FULL production chain shape — `run` → `__init` →
+/// bwrap → payload — built entirely through #6's public API (`find_bwrap`
+/// → `session_layout().materialize()` → `Build` → `build()` → the `Launch`
+/// argv as `__init`'s payload). Proves in one run: the absolute bwrap
+/// argv[0] execs under `execvp` with an EMPTY environment (R16 —
+/// `spawn_init_env_clear` sets no PATH and no ROLE_ENV); the role reaches
+/// the payload purely through the policy's env.set → `--setenv` chain;
+/// the nested userns works (bwrap's `--unshare-user` inside `__init`'s);
+/// and the rc flows back through bwrap's reaper and `__init`'s exec
+/// (issue #5 contract — the role exits 0 and so does the chain).
+fn scenario_full_chain_bwrap() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    // R19 restricted-binds precedent (the mutation-eperm-bwrap fallback
+    // argv): bind /usr (tooling + libc) and the exe's OWN directory, so
+    // the absolute payload path resolves inside the sandbox at the same
+    // location (policy binds are src == dest).
+    let deps_dir = exe
+        .parent()
+        .ok_or("current_exe has no parent directory")?
+        .to_path_buf();
+    let deps_dir = deps_dir
+        .to_str()
+        .ok_or("the exe's directory is not valid UTF-8 (policy paths are JSON strings)")?;
+    let bwrap = sbx::bwrap::version::find_bwrap()
+        .ok_or("find_bwrap found nothing despite the Gate::Bwrap preflight")?;
+    // Session dir: TempSession-style guard (unique by pid; removed on
+    // every exit path — the inner fn returns the result through it).
+    let session = std::env::temp_dir().join(format!("sbx-init-bwrap-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&session);
+    let result = run_full_chain(&exe, deps_dir, &bwrap, &session);
+    let _ = std::fs::remove_dir_all(&session);
+    result
+}
+
+fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> Result<(), String> {
+    // The role env reaches the payload PURELY through --setenv — that is
+    // the elegant part: it proves the policy → builder → bwrap → payload
+    // environment chain without any harness-side env passing.
+    let policy_json = format!(
+        r#"{{
+          "version": 1,
+          "filesystem": {{ "ro": ["/usr", {deps}], "rw": [], "deny": [] }},
+          "network": {{ "mode": "none", "allow": [], "ports": [] }},
+          "env": {{ "pass": [], "set": {{ "SBX_IT_ROLE": "check-bwrap-chain" }} }},
+          "limits": {{ "timeout": "120s", "output_bytes": 10485760 }}
+        }}"#,
+        deps = serde_json::Value::String(deps_dir.to_owned())
+    );
+    let policy = sbx::policy::Policy::from_json_str(&policy_json)
+        .map_err(|e| format!("full-chain policy must parse: {e}"))?;
+    sbx::bwrap::etc::session_layout(session)
+        .materialize()
+        .map_err(|e| format!("materialize {}: {e}", session.display()))?;
+    let command = vec![exe.as_os_str().to_os_string()];
+    let passed_env = BTreeMap::new();
+    let input = sbx::bwrap::Build {
+        policy: &policy,
+        session_dir: session,
+        bwrap_path: bwrap,
+        command: &command,
+        cwd: None,
+        passed_env: &passed_env,
+    };
+    let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
+
+    let sp = spawn_init_env_clear(launch.argv())?;
+    let fds = recv_fds(&sp)?;
+    send_go(&sp)?;
+    let out = finish(sp, "full-chain-bwrap payload")?;
+    // Hold the listener fds until the payload is reaped ("hold fds"), then
+    // assert. Success is silent (D6): stderr must be empty.
+    drop(fds);
+    if !out.stderr.trim().is_empty() {
+        return Err(format!(
+            "stderr must be silent on success: {:?}",
+            out.stderr
+        ));
+    }
+    assert_success(
+        &out,
+        &["chain uid=0 hostname=sandbox cwd=/work proc1_environ=empty role_env=ok"],
+    )
+}
+
+// ---------------------------------------------------------------------------
 // child side: role dispatch + roles
 // ---------------------------------------------------------------------------
 
@@ -1032,6 +1171,7 @@ fn child_main(role: &str) -> ExitCode {
         "check-gone" => role_check_gone(),
         "check-mutation" => role_check_mutation(false),
         "check-mutation-bwrap" => role_check_mutation(true),
+        "check-bwrap-chain" => role_check_bwrap_chain(),
         other => Err(format!("unknown {ROLE_ENV} {other:?}")),
     };
     match result {
@@ -1392,6 +1532,54 @@ fn role_check_mutation(bwrap_tier: bool) -> Result<(), String> {
     } else {
         marker("mutation tier=degraded route=EPERM nft=EPERM nested_userns=ok");
     }
+    Ok(())
+}
+
+/// full-chain-bwrap: the payload role at the end of the production chain
+/// (`run` → `__init` → bwrap → payload). The role itself arrived through
+/// the policy's env.set → `--setenv` (child_main's dispatch read
+/// SBX_IT_ROLE from this process's environment — the chain's own proof);
+/// the checks below are the builder's sandbox-side promises: uid 0 (#5's
+/// id maps through bwrap's nested userns), UTS hostname `sandbox`, cwd
+/// `/work` (--chdir default), and — the load-bearing one —
+/// `/proc/1/environ` EMPTY (0 bytes). bwrap's pid-1 reaper is a fork of
+/// the bwrap main process (it never execs), so its environ block is
+/// exactly what `spawn_init_env_clear`'s env_clear() gave `__init`
+/// (execvp inherits it to bwrap; later setenv modifications live on the
+/// heap and never touch the /proc-visible block): 0 bytes = the
+/// empty-env contract held through TWO exec hops.
+fn role_check_bwrap_chain() -> Result<(), String> {
+    // SAFETY: getuid is a pure no-argument syscall wrapper.
+    let uid = unsafe { libc::getuid() };
+    if uid != 0 {
+        return Err(format!("sandbox uid is {uid}, expected 0"));
+    }
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_err(|e| format!("read /proc/sys/kernel/hostname: {e}"))?;
+    if hostname.trim() != "sandbox" {
+        return Err(format!(
+            "hostname is {:?}, expected \"sandbox\"",
+            hostname.trim()
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("current_dir: {e}"))?;
+    if cwd != Path::new("/work") {
+        return Err(format!("cwd is {}, expected /work", cwd.display()));
+    }
+    let environ =
+        std::fs::read("/proc/1/environ").map_err(|e| format!("read /proc/1/environ: {e}"))?;
+    if !environ.is_empty() {
+        return Err(format!(
+            "/proc/1/environ is {} bytes, expected EMPTY (the env_clear contract through __init's execvp)",
+            environ.len()
+        ));
+    }
+    if std::env::var_os(ROLE_ENV).is_none() {
+        return Err(format!(
+            "{ROLE_ENV} is missing — the policy env.set → --setenv chain broke"
+        ));
+    }
+    marker("chain uid=0 hostname=sandbox cwd=/work proc1_environ=empty role_env=ok");
     Ok(())
 }
 
