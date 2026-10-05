@@ -33,3 +33,11 @@ serde_json = "1.0"
 # compiled into release binaries; 1.11 declares rust-version 1.85 = MSRV.
 [dev-dependencies]
 proptest = "1.11"
+
+# Issue #5 integration suite: spawns the real binary inside real user+net
+# namespaces. libtest is multithreaded, but unshare(CLONE_NEWUSER) requires
+# a single-threaded process, so the suite hand-rolls its runner
+# (SKIP-with-message where unprivileged userns is unavailable).
+[[test]]
+name = "sandbox_init"
+harness = false

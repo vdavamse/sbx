@@ -98,6 +98,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # Netns/nftables preparation for the issue #5 integration suite
+      # (tests/sandbox_init.rs), modeled on the spike's spike-nft.yml prep.
+      # harden-runner above stays compatible: the job runs in `audit` mode,
+      # which fingerprints but blocks nothing except known-malicious
+      # endpoints; when this job is ever flipped to `block` mode, the
+      # allow-list must include the Ubuntu archive endpoints for the
+      # apt-get step below (same traffic the build job's cross-linker step
+      # already exercises).
+      - name: Prepare environment (userns, nftables, modules)
+        run: |
+          uname -a
+          id
+          # Ubuntu 24.04+ AppArmor restricts unprivileged user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update
+          sudo apt-get install -y nftables bubblewrap
+          # Preload modules the ruleset needs (may be builtins; ignore errors).
+          sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
+            nft_meta nft_immediate nf_nat nft_counter || true
+          # Smoke test: unprivileged user+net namespace must work.
+          unshare -Urn true
+          echo "unprivileged userns smoke OK"
+          bwrap --version
+
       - name: cargo test
         run: cargo test --locked
 
