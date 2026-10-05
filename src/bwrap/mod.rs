@@ -73,7 +73,7 @@
 //!    override → PATH scan → fixed fallbacks) and
 //!    [`version::parse_version`] against [`version::BWRAP_MIN`]; the
 //!    builder takes an already-resolved ABSOLUTE path (Q10) because
-//!    argv[0] is exec'd by `__init`'s `execvp` in an environment #10
+//!    argv\[0\] is exec'd by `__init`'s `execvp` in an environment #10
 //!    empties (R16 — no PATH ⇒ no search).
 //! 10. **Layout materialization** — [`etc`] defines the session layout and
 //!     the synthetic `/etc` files (pinned contents); `materialize` is
@@ -122,7 +122,7 @@ pub struct Build<'a> {
     /// resolve a relative one against its OWN cwd, not the spawner's.
     pub session_dir: &'a Path,
     /// Resolved bwrap binary ([`version::find_bwrap`] output); must be
-    /// absolute — argv[0] is exec'd by `__init`'s `execvp` with no PATH
+    /// absolute — argv\[0\] is exec'd by `__init`'s `execvp` with no PATH
     /// to search (R16).
     pub bwrap_path: &'a Path,
     /// The payload command, emitted verbatim after `--` (Q12: no shell
@@ -148,7 +148,7 @@ pub struct Launch {
 }
 
 impl Launch {
-    /// The full bwrap argv — argv[0] is the absolute bwrap path, the tail
+    /// The full bwrap argv — argv\[0\] is the absolute bwrap path, the tail
     /// is `--` + the command verbatim.
     pub fn argv(&self) -> &[OsString] {
         &self.argv
