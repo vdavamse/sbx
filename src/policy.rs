@@ -20,10 +20,10 @@
 //!    which runs the same `validate()` and therefore carries serde's
 //!    line/column context. Pinned by
 //!    `direct_deserialization_enforces_policy_wide_rules`. Residual gap,
-//!    deliberately: the `pub` fields allow in-crate struct-literal
-//!    construction — governed by review, not types (the validating-newtypes
-//!    alternative would have changed schema-rendered types for no consumer
-//!    gain).
+//!    deliberately: the `pub` fields allow struct-literal construction by
+//!    ANY crate with access to the type — governed by review, not types
+//!    (the validating-newtypes alternative would have changed
+//!    schema-rendered types for no consumer gain).
 //! 6. `///` doc comments on policy types are author-facing: schemars renders
 //!    them as JSON Schema descriptions. Rust-internal rationale lives in `//`
 //!    comments (same convention as cli.rs).
@@ -496,10 +496,23 @@ fn ser_duration<S: Serializer>(duration: &Duration, serializer: S) -> Result<S::
 // honors try_from and would re-root the JSON Schema to a `$ref` (breaking
 // `schema_pins_structure` and the CI schema smoke) — a manual impl is
 // invisible to the `JsonSchema` derive, keeping the schema byte-identical.
+// The `rename` + `expecting` pair keeps the private mirror's name OUT of
+// user-facing error text (review M1): serde's derived length/type errors
+// quote the visitor's `expecting` message, which serde_derive builds from
+// the IDENT (`params.type_name()`), not the rename — so the explicit
+// `expecting` reproduces, byte for byte, the message the original derived
+// `Deserialize for Policy` produced ("expected struct Policy with 5
+// elements"), and `sbx check` never shows policy authors the
+// implementation artifact's name. schemars is unaffected (RawPolicy has
+// no JsonSchema), so the schema hash does not move.
 // No `///` docs: `RawPolicy` has no `JsonSchema`, and house rule reserves
 // `///` for author-facing schema text (module doc point 6).
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(
+    rename = "Policy",
+    deny_unknown_fields,
+    expecting = "struct Policy with 5 elements"
+)]
 struct RawPolicy {
     version: u32,
     filesystem: Filesystem,
@@ -1624,6 +1637,17 @@ mod tests {
                 "{direct:?} must carry serde position context"
             );
         }
+    }
+
+    #[test]
+    fn root_non_object_error_names_the_public_type() {
+        // Review M1: the private mirror's serde rename keeps `RawPolicy`
+        // out of the user-facing error surface — `sbx check` prints these
+        // messages verbatim, and a policy author knows only the public
+        // type name.
+        let err = err_of("[]");
+        assert!(err.contains("struct Policy"), "{err}");
+        assert!(!err.contains("RawPolicy"), "{err}");
     }
 
     // ---- ro∩rw overlap (issue #6, Q8) ----------------------------------------

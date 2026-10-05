@@ -44,7 +44,11 @@
 //!    `env.pass` → `env.set` → explicit-mode proxy vars; later groups
 //!    override earlier ones by name (bwrap last-`--setenv`-wins), so policy
 //!    can override `PATH`/`HOME` but NOT the proxy vars in explicit mode
-//!    (infra decides; documented).
+//!    (infra decides; documented) — nor `PWD`, which is not sbx's to
+//!    decide at all: bwrap itself re-exports `PWD` from `--chdir` after
+//!    every `--setenv` (bubblewrap.c v0.9.0 `xsetenv("PWD", new_cwd, 1)`),
+//!    so a policy `env.set {"PWD": …}` is silently clobbered (pinned by
+//!    the `secret-env-absent` integration scenario).
 //! 6. **No `--unshare-net`, ever** — the network namespace belongs to
 //!    `sbx __init` (#5): bwrap joins the inherited netns where the
 //!    nftables rules and listeners already live. A proptest invariant pins
@@ -250,8 +254,9 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // are emitted (the argv.rs membership filter), so only those need the
     // check — and non-POSIX KEYS need no separate check: a passed_env key
     // reaches the argv only by being a pass name, and pass names are
-    // POSIX-validated at the type level (the policy validity invariant),
-    // hence NUL-free.
+    // POSIX-validated at the deserialize level (the policy validity
+    // invariant — see the policy module doc point 5's residual
+    // struct-literal gap), hence NUL-free.
     for (name, value) in input.passed_env {
         if input.policy.env.pass.iter().any(|allowed| allowed == name) && contains_nul(value) {
             return Err(BwrapError(format!(
@@ -350,7 +355,9 @@ mod tests {
             r#"bwrap path must be absolute (got "relative/bwrap")"#
         );
 
-        // Row 2: bwrap path NUL-free.
+        // Row 2: bwrap path NUL-free. (`Path` is just an `OsStr` view, so
+        // it CAN hold interior NULs — build() rejects them here, before
+        // any spawn or C-string interface sees them.)
         let nul_bwrap = os_bytes(b"/usr/bin/bwrap\0");
         input.bwrap_path = Path::new(&nul_bwrap);
         assert_eq!(

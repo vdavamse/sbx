@@ -15,10 +15,13 @@
 //!
 //! Gating: one `OnceLock` probe, initialized exactly once — `find_bwrap`
 //! (skip: `BWRAP_SKIP`), `--version` parsed against `BWRAP_MIN` (skip:
-//! `BWRAP_OLD_SKIP`), then a live bwrap smoke under the production flag
-//! block (skip: `USERNS_SKIP` on AppArmor/seccomp-style blocks). On a
-//! host without bwrap (local WSL) all nine scenarios print SKIP and the
-//! suite exits 0; CI installs bubblewrap and must show nine PASS lines.
+//! `BWRAP_OLD_SKIP`), then a live smoke through the PRODUCTION pipeline
+//! itself — materialize → `build()` → `Launch::command()` (skip:
+//! `USERNS_SKIP` on AppArmor/seccomp-style blocks; every probe failure
+//! prints its captured rc/stderr diagnostic first, so a CI skip names
+//! its own cause). On a host without bwrap (local WSL) all nine
+//! scenarios print SKIP and the suite exits 0; CI installs bubblewrap
+//! and must show nine PASS lines.
 //!
 //! The probe initializer also pollutes the harness environment with
 //! `SBX_IT_SECRET` — the sentinel `secret-env-absent` proves never
@@ -76,37 +79,41 @@ const EXPECTED_INFRA_ENV: [&str; 3] = [
 /// set by --setenv"). With `--chdir /work` the value is deterministic.
 const EXPECTED_PWD: &str = "PWD=/work";
 
-/// The live-smoke argv (design §2.7 gate step 3): the production isolation
-/// and hardening blocks with a minimal /usr-only filesystem. Failure to
-/// run THIS (AppArmor-blocked userns, seccomp, missing /usr …) skips the
-/// suite with `USERNS_SKIP` — every scenario needs at least this much.
-const SMOKE_ARGS: [&str; 25] = [
-    "--unshare-user",
-    "--unshare-pid",
-    "--unshare-ipc",
-    "--unshare-uts",
-    "--unshare-cgroup-try",
-    "--disable-userns",
-    "--cap-drop",
-    "ALL",
-    "--die-with-parent",
-    "--new-session",
-    "--hostname",
-    "sandbox",
-    "--clearenv",
-    "--ro-bind",
-    "/usr",
-    "/usr",
-    "--symlink",
-    "usr/bin",
-    "/bin",
-    "--dev",
-    "/dev",
-    "--proc",
-    "/proc",
-    "--",
-    "/bin/true",
-];
+/// The live smoke (design §2.7 gate step 3, review C1): the PRODUCTION
+/// pipeline — materialize a scratch session, `build()` the `BASE_POLICY`
+/// (ro `/usr`, mode none) around `/bin/true`, spawn via
+/// `Launch::command()`. A hand-rolled argv is exactly the drift class
+/// review C1 caught: the first version shipped only the `/bin` shim, so
+/// dynamically-linked `/bin/true` never found its `/lib64` loader
+/// (`PT_INTERP` resolves inside the new root), the smoke failed on every
+/// real host, and the whole suite would silently skip with the WRONG
+/// reason. Through `build()` the gate proves exactly what every scenario
+/// needs — the full flag block, all four usr-merge shims, the
+/// infra/generated `/etc` binds, the session leaves — and cannot drift
+/// from it again. Failure to run THIS (AppArmor-blocked userns, seccomp,
+/// missing `/usr` …) skips the suite with `USERNS_SKIP`.
+fn smoke_launch(bwrap: &Path) -> Result<Outcome, String> {
+    let session = TempSession::new("probe-smoke");
+    let policy = Policy::from_json_str(BASE_POLICY).expect("BASE_POLICY must parse");
+    let empty = no_env();
+    let command = [OsString::from("/bin/true")];
+    let input = Build {
+        policy: &policy,
+        session_dir: &session.dir,
+        bwrap_path: bwrap,
+        command: &command,
+        cwd: None,
+        passed_env: &empty,
+    };
+    // The run_payload pipeline with `/bin/true` instead of a `/bin/sh`
+    // script (the smoke needs no shell — only the loader + coreutils-free
+    // exec).
+    session_layout(&session.dir)
+        .materialize()
+        .map_err(|e| format!("materialize {}: {e}", session.dir.display()))?;
+    let launch = build(&input).map_err(|e| format!("build: {e}"))?;
+    run_bounded(launch.command(), "bwrap live smoke")
+}
 
 // ---------------------------------------------------------------------------
 // gating probe
@@ -142,10 +149,14 @@ fn probe() -> &'static Probe {
         };
         // Version gate: {bwrap} --version, bounded, parsed with the strict
         // grammar; None ("unparseable") and below-min both mean not-usable
-        // (fail-closed) and share the pinned OLD skip reason.
+        // (fail-closed) and share the pinned OLD skip reason. Probe
+        // failures print the captured diagnostics first (review S2): the
+        // pinned reason strings stay byte-identical, but the CI log names
+        // the actual cause.
         let mut version_cmd = Command::new(&bwrap);
         version_cmd.arg("--version").env_clear();
-        let version_ok = match run_bounded(version_cmd, "bwrap --version") {
+        let version_out = run_bounded(version_cmd, "bwrap --version");
+        let version_ok = match &version_out {
             Ok(out) => {
                 out.rc == 0
                     && parse_version(&out.stdout).is_some_and(|version| version >= BWRAP_MIN)
@@ -153,16 +164,34 @@ fn probe() -> &'static Probe {
             Err(_) => false,
         };
         if !version_ok {
+            match &version_out {
+                Ok(out) => house_print(&format!(
+                    "bwrap version gate failed: rc={} stdout={:?} stderr={:?}",
+                    out.rc,
+                    out.stdout.trim(),
+                    out.stderr.trim()
+                )),
+                Err(err) => house_print(&format!("bwrap version gate failed: {err}")),
+            }
             return Probe::Skip(BWRAP_OLD_SKIP);
         }
-        // Live smoke: the production flag block must actually run here
-        // (unprivileged userns usable, /usr bindable). Any failure skips
-        // with the userns reason — the scenarios cannot do less than this.
-        let mut smoke = Command::new(&bwrap);
-        smoke.args(SMOKE_ARGS).env_clear();
-        match run_bounded(smoke, "bwrap live smoke") {
+        // Live smoke through the production pipeline (review C1 — see
+        // smoke_launch). Any failure skips with the userns reason — the
+        // scenarios cannot do less than this.
+        match smoke_launch(&bwrap) {
             Ok(out) if out.rc == 0 => Probe::Ready(bwrap),
-            _ => Probe::Skip(USERNS_SKIP),
+            Ok(out) => {
+                house_print(&format!(
+                    "bwrap live smoke failed: rc={} stderr={:?}",
+                    out.rc,
+                    out.stderr.trim()
+                ));
+                Probe::Skip(USERNS_SKIP)
+            }
+            Err(err) => {
+                house_print(&format!("bwrap live smoke failed: {err}"));
+                Probe::Skip(USERNS_SKIP)
+            }
         }
     })
 }
@@ -796,11 +825,18 @@ done
     house_print(&format!("PASS {NAME}"));
 }
 
-/// Requirement pin (Q7 identity): the sandbox uid is 0, `whoami` resolves
-/// root through the SYNTHETIC passwd (never the host's), the UTS hostname
-/// is `sandbox` (read via /proc/sys — no hostname(1) dependency), the
-/// generated resolv.conf points at the netns-local resolver, and
-/// /etc/group is the synthetic one.
+/// Requirement pin (Q7 identity, review C2): the sandbox uid PASSES
+/// THROUGH the spawner's real uid — this suite spawns bwrap directly from
+/// the unprivileged harness, and bubblewrap.c v0.9.0 defaults
+/// `opt_sandbox_uid = real_uid` (:2796–7), so the uid here is the
+/// runner's, NOT 0. The uid-0 identity of the production chain (where
+/// the spawner is `__init`, already ns-root) is pinned end-to-end by
+/// sandbox_init.rs `full-chain-bwrap`. `whoami` is deliberately NOT
+/// pinned here: the synthetic passwd describes root only (Q7), so at a
+/// non-zero uid it legitimately cannot resolve. The uid-independent pins:
+/// the UTS hostname is `sandbox` (read via /proc/sys — no hostname(1)
+/// dependency), the generated resolv.conf points at the netns-local
+/// resolver, and /etc/group is the synthetic one.
 #[test]
 fn identity_and_hostname() {
     const NAME: &str = "identity-and-hostname";
@@ -808,9 +844,12 @@ fn identity_and_hostname() {
         return;
     };
     let session = TempSession::new(NAME);
+    // SAFETY: getuid(2) takes no arguments, never fails, and is
+    // async-signal-safe. The harness's real uid is exactly the value
+    // bubblewrap maps into the sandbox (opt_sandbox_uid default).
+    let expected_uid = unsafe { libc::getuid() };
     let script = r#"
 echo "SBX-BW-MARKER uid=$(id -u)"
-echo "SBX-BW-MARKER whoami=$(whoami)"
 echo "SBX-BW-MARKER hostname=$(cat /proc/sys/kernel/hostname)"
 echo "SBX-BW-MARKER resolv=$(cat /etc/resolv.conf)"
 echo "SBX-BW-MARKER group=$(cat /etc/group)"
@@ -818,13 +857,13 @@ echo "SBX-BW-MARKER group=$(cat /etc/group)"
     let out = run_payload(bwrap, &session, BASE_POLICY, &no_env(), script)
         .expect("identity-and-hostname payload run");
     assert_clean_success(&out);
-    for expected in [
-        "uid=0",
-        "whoami=root",
-        "hostname=sandbox",
-        "resolv=nameserver 127.0.0.1",
-        "group=root:x:0:",
-    ] {
+    let expected = [
+        format!("uid={expected_uid}"),
+        "hostname=sandbox".to_owned(),
+        "resolv=nameserver 127.0.0.1".to_owned(),
+        "group=root:x:0:".to_owned(),
+    ];
+    for expected in &expected {
         assert!(
             has_marker(&out, expected),
             "missing identity marker {expected:?}:\n{}",

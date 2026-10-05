@@ -35,8 +35,9 @@
 //!     FILTER is deliberate (Q11 seam)
 //! 11  --setenv {k} {v} for policy.env.set in BTreeMap order (overrides
 //!     pass on name collision — emission order = precedence)
-//! 12  explicit mode ONLY (Q4): the 8 proxy vars in byte-sorted order —
-//!     ALL_PROXY, HTTP_PROXY, HTTPS_PROXY, NO_PROXY + lowercase twins;
+//! 12  explicit mode ONLY (Q4): the 8 proxy vars in a FIXED order —
+//!     ALL_PROXY, HTTP_PROXY, HTTPS_PROXY, NO_PROXY + lowercase twins
+//!     (not byte order: HTTPS_PROXY would sort before HTTP_PROXY);
 //!     values from init::consts::{EXPLICIT_TCP_PORT, SANDBOX_ADDR}
 //! 13  --chdir {cwd | /work}
 //! 14  --
@@ -217,8 +218,9 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     //     policy did not allow. BTreeMap iteration = sorted-name order.
     //     Non-POSIX passed_env keys need no separate check: a key is
     //     emitted only by being a pass name, and pass names are
-    //     POSIX-validated at the type level (the policy validity
-    //     invariant), hence NUL-free.
+    //     POSIX-validated at the deserialize level (the policy validity
+    //     invariant — see the policy module doc point 5's residual
+    //     struct-literal gap), hence NUL-free.
     for (name, value) in input.passed_env {
         if input.policy.env.pass.iter().any(|allowed| allowed == name) {
             setenv(&mut argv, name, value);
@@ -231,8 +233,10 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
         setenv(&mut argv, name, OsStr::new(value));
     }
 
-    // 12. The explicit-mode proxy vars (Q4: BOTH cases — 8 vars,
-    //     byte-sorted: uppercase before lowercase). Values are formatted
+    // 12. The explicit-mode proxy vars (Q4: BOTH cases — 8 vars, fixed
+    //     order: ALL/HTTP/HTTPS/NO uppercase, then the lowercase twins;
+    //     NOT byte order — strict byte order would put HTTPS_PROXY before
+    //     HTTP_PROXY, 'S' < '_'). Values are formatted
     //     from init::consts — the single source whose docs already
     //     forward-reference #6. Emitted LAST, so they override any
     //     same-named env.set (infra decides; golden 6 pins it).
@@ -790,8 +794,9 @@ mod tests {
 
     #[test]
     fn golden_explicit_proxy_env() {
-        // Golden 6 (Q4): explicit mode ⇒ the 8 proxy vars in byte-sorted
-        // order (uppercase before lowercase) with the consts-derived
+        // Golden 6 (Q4): explicit mode ⇒ the 8 proxy vars in the fixed
+        // emission order (ALL/HTTP/HTTPS/NO uppercase, then the lowercase
+        // twins — NOT byte order) with the consts-derived
         // values — emitted AFTER env.set, so a policy-set HTTP_PROXY is
         // overridden (infra decides; module docs point 5).
         let policy = policy_of(&base_with(&[
