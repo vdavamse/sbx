@@ -25,10 +25,22 @@
 //! environment, user/pid/ipc/uts/cgroup isolation, `--disable-userns`
 //! hardening, synthetic `/etc`, session work/home/tmp), plus bwrap
 //! discovery/version parsing; #10 spawns it via `Launch::command()` (which
-//! encodes the `env_clear` contract). [`policy`] deserialization now
-//! validates on EVERY path — the old point-5 asymmetry is resolved
-//! (TODO(#6)(a), landed with issue #6). `run` and `gc` remain stubs
-//! that exit 1. Tracking issue #20 describes the architecture; the
+//! encodes the `env_clear` contract). [`proxy`] is the real transparent
+//! egress proxy (issue #7): it serves #5's handed-off transparent listener
+//! fd, recovers the dialed destination via `SO_ORIGINAL_DST`, maps fake IPs
+//! back to names through the [`proxy::DnsMap`] seam (#9), enforces the
+//! policy's port + domain allow-lists, and inspects WITHOUT terminating the
+//! protocol preamble — TLS `ClientHello` SNI on 443 (rustls's `Acceptor`
+//! with NO crypto provider; ECH denied) and the HTTP request line + `Host`
+//! on 80 — then resolves and dials BY NAME under [`egress::guard`] (every
+//! resolved address, plus the connected `peer_addr()` re-check as the
+//! DNS-rebinding backstop), replays the buffered bytes, and relays
+//! bidirectionally. Every connection ends in exactly one
+//! [`proxy::Decision`] recorded to the [`proxy::DecisionSink`] seam (#10)
+//! with the pinned deny vocabulary; everything fails closed. [`policy`]
+//! deserialization now validates on EVERY path — the old point-5 asymmetry
+//! is resolved (TODO(#6)(a), landed with issue #6). `run` and `gc` remain
+//! stubs that exit 1. Tracking issue #20 describes the architecture; the
 //! issue #1 spike (`spikes/nft-load`) proved the unprivileged
 //! nftables-loading approach `sbx __init` ships.
 
@@ -37,3 +49,4 @@ pub mod cli;
 pub mod egress;
 pub mod init;
 pub mod policy;
+pub mod proxy;

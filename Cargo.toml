@@ -15,6 +15,11 @@ exclude = ["spikes"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+# HTTP/1 request-line + Host parsing for the transparent proxy's port-80
+# inspector (issue #7). Zero deps; no declared rust-version — same situation
+# as netlink-bindings: the exact pin + `--locked` + the MSRV CI job are the
+# guarantee (precedent: the netlink-bindings entry below).
+httparse = "=1.10.1"
 humantime = "2.4"
 idna = "1.1"
 libc = { version = "0.2", default-features = false }
@@ -25,9 +30,22 @@ netlink-bindings = { version = "=0.3.5", default-features = false, features = [
     "nftables", "rt-link", "rt-addr", "rt-route",
 ] }
 netlink-socket2 = { version = "=0.3.5", default-features = false }
+# TLS ClientHello inspection for the transparent proxy (issue #7) — NO crypto
+# provider (default-features off): the Acceptor parse path needs none
+# (`Accepted::into_connection` is NEVER called — TLS is passed through, not
+# terminated) and the aarch64 static-musl leg requires a pure-Rust tree (no
+# cc/cmake). Spike-verified on rustc 1.85.0: rustls 0.23.45, MSRV 1.71.
+rustls = { version = "0.23.45", default-features = false, features = ["std"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Single-threaded runtime for the transparent proxy (issue #7's body pins
+# "tokio, single-threaded runtime"). lookup_host uses the blocking pool
+# ("rt"); copy_bidirectional + the duplex test fakes ("io-util");
+# accept/connect ("net"); decision/connect timeouts + accept backoff
+# ("time"). Spike-verified 1.53.2. The "macros" feature is deliberately OFF
+# (tests hand-roll their block_on).
+tokio = { version = "1.53.2", features = ["rt", "net", "io-util", "time"] }
 
 # Property tests for the egress matcher/guard (issue #4). Dev-only: never
 # compiled into release binaries; 1.11 declares rust-version 1.85 = MSRV.
@@ -40,4 +58,12 @@ proptest = "1.11"
 # (SKIP-with-message where unprivileged userns is unavailable).
 [[test]]
 name = "sandbox_init"
+harness = false
+
+# Issue #7 integration suite: spawns the real binary inside real user+net
+# namespaces and serves the handed-off transparent listener fd from the
+# parent — the same single-threaded-process rationale and hand-rolled
+# SKIP-with-message runner as sandbox_init above.
+[[test]]
+name = "sandbox_proxy"
 harness = false
