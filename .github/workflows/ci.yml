@@ -98,6 +98,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # Netns/nftables preparation for the issue #5 integration suite
+      # (tests/sandbox_init.rs), modeled on the spike's spike-nft.yml prep.
+      # harden-runner above stays compatible: the job runs in `audit` mode,
+      # which fingerprints but blocks nothing except known-malicious
+      # endpoints; when this job is ever flipped to `block` mode, the
+      # allow-list must include the Ubuntu archive endpoints for the
+      # apt-get step below (same traffic the build job's cross-linker step
+      # already exercises).
+      - name: Prepare environment (userns, nftables, modules)
+        run: |
+          uname -a
+          id
+          # Ubuntu 24.04+ AppArmor restricts unprivileged user namespaces.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update
+          sudo apt-get install -y nftables bubblewrap
+          # Preload modules the ruleset needs (may be builtins; ignore errors).
+          sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
+            nft_meta nft_immediate nf_nat nft_counter || true
+          # Smoke test: unprivileged user+net namespace must work.
+          unshare -Urn true
+          echo "unprivileged userns smoke OK"
+          bwrap --version
+
       - name: cargo test
         run: cargo test --locked
 
@@ -201,10 +225,9 @@ jobs:
             echo "ok: help hides __init"
           fi
 
-          # `run`, `gc` and `__init` are still stubs: each parses its
-          # documented interface, then exits 1 with "not implemented" on
-          # stderr. The policy/session files need not exist — the stubs
-          # never read them.
+          # `run` and `gc` are still stubs: each parses its documented
+          # interface, then exits 1 with "not implemented" on stderr. The
+          # policy/session files need not exist — the stubs never read them.
           "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
           check_rc 1 $? "sbx run (stub)"
           grep -q "not implemented" run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
@@ -266,9 +289,20 @@ jobs:
           check_rc 1 $? "sbx gc (stub)"
           grep -q "not implemented" gc.err || { echo "FAIL: gc stderr:"; cat gc.err; FAIL=1; }
 
-          "$BIN" __init > /dev/null 2> init.err
-          check_rc 1 $? "sbx __init (hidden stub)"
-          grep -q "not implemented" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
+          # __init is real since issue #5, but a full run needs a control
+          # socketpair handed over by `run` (#10). The namespace-independent
+          # contract stays deterministic on ANY runner: the control-fd
+          # validation runs BEFORE unshare by design, so no userns/AppArmor
+          # dependency leaks into the build job.
+          "$BIN" __init > /dev/null 2>&1
+          check_rc 2 $? "sbx __init without --fd (usage error)"
+
+          "$BIN" __init --fd abc -- /bin/true > /dev/null 2>&1
+          check_rc 2 $? "sbx __init with a non-numeric --fd (usage error)"
+
+          "$BIN" __init --fd 999 -- /bin/true > /dev/null 2> init.err
+          check_rc 1 $? "sbx __init --fd 999 (staged control-fd error)"
+          grep -q "sbx __init: control:" init.err || { echo "FAIL: __init stderr:"; cat init.err; FAIL=1; }
 
           # Exit-code contract: 2 = usage error (cli.rs module docs / README).
           # The unit tests pin clap's ErrorKinds; these pin the exit code a

@@ -1,20 +1,25 @@
 //! Command-line interface for `sbx`.
 //!
 //! Issue #2 froze the documented flag surface; issue #3 replaced the
-//! `check` stub. The remaining subcommands parse their full interface, then
-//! report `not implemented yet` and exit 1 until later issues replace the
-//! stub bodies behind [`run`] without CLI churn:
+//! `check` stub; issue #5 made `__init` real. The remaining stub subcommands
+//! parse their full interface, then report `not implemented yet` and exit 1
+//! until later issues replace the stub bodies behind [`run`] without CLI
+//! churn:
 //!
 //! - `run`    — sandbox lifecycle, egress proxy, audit log (#10, #7, #8)
 //! - `check`  — policy validation + JSON Schema (real since #3)
 //! - `gc`     — session-directory garbage collection (#12)
-//! - `__init` — re-exec'd namespace helper (#5 defines its real interface)
+//! - `__init` — re-exec'd namespace helper (real since #5; hidden — #10's
+//!   `run` is its only production caller)
 //!
 //! Exit-code contract: 0 = success, 1 = stub/runtime failure
 //! ([`ExitCode::FAILURE`]) — for `check`, an invalid or unreadable policy
-//! file — 2 = usage error (clap's own convention).
+//! file; for `__init`, a staged setup failure (`sbx __init: <stage>:
+//! <reason>`, the payload never started) — 2 = usage error (clap's own
+//! convention).
 
 use std::ffi::OsString;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -36,6 +41,32 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         return Err("duration must be greater than zero".to_owned());
     }
     Ok(d)
+}
+
+/// Parse the `__init --fd` value for clap: a base-10 file-descriptor number
+/// in `0..=i32::MAX`.
+///
+/// Rejects anything that cannot be a valid fd number — non-integers,
+/// negatives and out-of-range values all become clap `ValueValidation`
+/// errors (exit 2), keeping rc 1 exclusively for staged setup failures
+/// (design D8). Probe-verified: BOTH `--fd -1` and `--fd=-1` spellings
+/// reach this parser (clap 4.6 hands the hyphenated token to the value
+/// parser of a value-expecting option), so one range check covers every
+/// spelling. Private: unlike [`parse_duration`], no policy schema shares
+/// this contract.
+fn parse_control_fd(s: &str) -> Result<RawFd, String> {
+    // i64 (not i32) so out-of-range values report the range message
+    // instead of clap's generic integer-overflow text.
+    let parsed: i64 = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a file descriptor number"))?;
+    if !(0..=i64::from(i32::MAX)).contains(&parsed) {
+        return Err(format!(
+            "file descriptor `{s}` is out of range (0..={})",
+            i32::MAX
+        ));
+    }
+    Ok(parsed as RawFd) // range-checked above
 }
 
 /// Parsed command-line interface for `sbx`.
@@ -116,9 +147,43 @@ pub enum Cmd {
         root: PathBuf,
     },
 
-    /// Internal namespace helper, re-exec'd by `run` (hidden; #5 defines it).
+    /// Internal namespace helper, re-exec'd by `run` (hidden; real since #5).
     #[command(name = "__init", hide = true)]
-    Init,
+    Init {
+        /// Inherited control socketpair end (SOCK_SEQPACKET).
+        //
+        // The number `run` passes after clearing CLOEXEC on exactly this end
+        // in the spawn window (fdpass::prepare_child_end — the R6 bug-class
+        // discipline). Validated in the pipeline's `control` stage BEFORE
+        // any namespace work, so a bad fd fails fast and deterministically.
+        // `//` rationale, not `///`: clap renders doc comments as help text.
+        #[arg(long, value_name = "FD", value_parser = parse_control_fd)]
+        fd: RawFd,
+
+        /// (hidden) Test-only: load a deliberately broken ruleset batch.
+        //
+        // Fail-only by construction (Q4(a)): it can make setup FAIL (the
+        // kernel rejects the batch with ENOENT and rolls everything back,
+        // spike fact F6) but can never WEAKEN the sandbox — the only way to
+        // integration-test the nft-load failure path in a fresh netns.
+        #[arg(long, hide = true)]
+        test_break_rules: bool,
+
+        /// Command to exec, verbatim — everything after `--`.
+        //
+        // Same contract as `run`'s trailing command (OsString-clean,
+        // hyphens preserved): `required = true` (design D7) — an `__init`
+        // with nothing to exec has no runtime meaning, and the
+        // MissingRequiredArgument rc 2 keeps rc 1 exclusively for staged
+        // setup failures.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            required = true
+        )]
+        cmd: Vec<OsString>,
+    },
 }
 
 /// Binary entry point: parse `argv` and dispatch to the subcommand.
@@ -129,11 +194,17 @@ pub enum Cmd {
 /// policy JSON Schema to stdout with rc 0. The two flags are mutually
 /// exclusive and exactly one is required; anything else is clap's rc 2.
 ///
+/// `__init` contract (issue #5): `--fd N [--test-break-rules] -- CMD
+/// ARGS…` runs the namespace pipeline ([`crate::init`]) and `exec`s CMD —
+/// success is silent and the exit code is the payload's own (via `exec`);
+/// ANY setup failure is rc 1 with `sbx __init: <stage>: <reason>` on
+/// stderr and the payload never starts; usage errors stay clap's rc 2.
+///
 /// Stub contract (issue #2) for the remaining subcommands: a successfully
-/// parsed `run`, `gc` or `__init` prints `sbx <sub>: not implemented yet`
-/// to stderr and returns [`ExitCode::FAILURE`] (1) — deliberately distinct
-/// from clap's exit 2 for usage errors, and without the exit-101 +
-/// backtrace a panic would produce.
+/// parsed `run` or `gc` prints `sbx <sub>: not implemented yet` to stderr
+/// and returns [`ExitCode::FAILURE`] (1) — deliberately distinct from
+/// clap's exit 2 for usage errors, and without the exit-101 + backtrace a
+/// panic would produce.
 pub fn run() -> ExitCode {
     // Catches invalid clap configuration (bad defaults, duplicate names,
     // conflicting attributes) at startup. Despite the name, this is NOT
@@ -149,7 +220,11 @@ pub fn run() -> ExitCode {
             print_schema,
         } => check(policy, print_schema),
         Cmd::Gc { .. } => not_implemented("gc"),
-        Cmd::Init => not_implemented("__init"),
+        Cmd::Init {
+            fd,
+            test_break_rules,
+            cmd,
+        } => crate::init::run_init(fd, test_break_rules, cmd),
     }
 }
 
@@ -494,10 +569,130 @@ mod tests {
 
     // ---- hidden __init contract --------------------------------------
 
+    // Helper: parse an __init invocation that must succeed and destructure
+    // the three fields.
+    fn init_of(args: &[&str]) -> (RawFd, bool, Vec<OsString>) {
+        let cli = Cli::try_parse_from(["sbx", "__init"].into_iter().chain(args.iter().copied()))
+            .expect("__init invocation must parse");
+        match cli.command {
+            Cmd::Init {
+                fd,
+                test_break_rules,
+                cmd,
+            } => (fd, test_break_rules, cmd),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn hidden_init_parses() {
-        let cli = Cli::try_parse_from(["sbx", "__init"]).expect("__init must parse");
-        assert!(matches!(cli.command, Cmd::Init));
+    fn init_parses_full_form() {
+        let (fd, tbr, cmd) = init_of(&["--fd", "7", "--", "/bin/echo", "--help", "-x"]);
+        assert_eq!(fd, 7);
+        assert!(!tbr);
+        // Hyphenated args survive verbatim; the `--` separator itself is
+        // consumed by clap and never reaches cmd (same contract as `run`).
+        assert_eq!(cmd, ["/bin/echo", "--help", "-x"]);
+    }
+
+    #[test]
+    fn init_parses_equals_form_fd() {
+        let (fd, _, cmd) = init_of(&["--fd=7", "--", "/bin/true"]);
+        assert_eq!(fd, 7);
+        assert_eq!(cmd, ["/bin/true"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_preserves_non_utf8_cmd() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        // Linux argv is arbitrary bytes: the verbatim contract must survive
+        // non-UTF-8 payload arguments (a `String` parser would reject them
+        // with exit 2) — exec_payload consumes them as OsStr bytes.
+        let bad = OsString::from_vec(b"/bin/\xff-payload".to_vec());
+        let cli = Cli::try_parse_from(
+            ["sbx", "__init", "--fd", "3", "--"]
+                .into_iter()
+                .map(OsString::from)
+                .chain([bad.clone()]),
+        )
+        .expect("non-UTF-8 payload args must survive verbatim");
+        match cli.command {
+            Cmd::Init { cmd, .. } => {
+                assert_eq!(cmd, [bad]);
+                assert_eq!(cmd[0].as_bytes(), b"/bin/\xff-payload");
+            }
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_requires_fd() {
+        // REPLACES the old hidden_init_parses: a bare `__init` is now a
+        // usage error (rc 2), never a parse success.
+        let err =
+            Cli::try_parse_from(["sbx", "__init", "--", "/bin/true"]).expect_err("--fd required");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn init_requires_command() {
+        // D7: `cmd` is required — an `__init` with nothing to exec has no
+        // runtime meaning, and rc 2 keeps rc 1 exclusively for staged
+        // setup failures.
+        let err = Cli::try_parse_from(["sbx", "__init", "--fd", "3"])
+            .expect_err("a trailing command must be required");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn init_rejects_negative_fd() {
+        // D8, probe-verified: BOTH spellings hand the hyphenated token to
+        // the value parser (not to clap's flag matcher), so one range check
+        // covers `--fd -1` and `--fd=-1`.
+        for args in [
+            vec!["--fd", "-1", "--", "/bin/true"],
+            vec!["--fd=-1", "--", "/bin/true"],
+        ] {
+            let err = Cli::try_parse_from(["sbx", "__init"].into_iter().chain(args))
+                .expect_err("negative fd must be a usage error");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{err}");
+        }
+    }
+
+    #[test]
+    fn init_rejects_non_numeric_fd() {
+        let err = Cli::try_parse_from(["sbx", "__init", "--fd", "abc", "--", "/bin/true"])
+            .expect_err("non-numeric fd must be a usage error");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn init_rejects_out_of_range_fd() {
+        // 2^32 — parses as an integer but is not a valid RawFd; the parser
+        // reports the range, not clap's generic overflow text.
+        let err = Cli::try_parse_from(["sbx", "__init", "--fd", "4294967296", "--", "/bin/true"])
+            .expect_err("out-of-range fd must be a usage error");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn init_test_break_rules_parses_and_is_hidden() {
+        let (fd, tbr, cmd) = init_of(&["--fd", "3", "--test-break-rules", "--", "/bin/true"]);
+        assert_eq!(fd, 3);
+        assert!(tbr);
+        assert_eq!(cmd, ["/bin/true"]);
+        // The flag is fail-only test surface (Q4(a)): it must never render
+        // in the (already hidden) __init help.
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("__init")
+            .expect("hidden subcommands stay findable")
+            .render_help()
+            .to_string();
+        assert!(
+            !help.contains("test-break-rules"),
+            "hidden flag must not render:\n{help}"
+        );
     }
 
     #[test]
@@ -546,6 +741,24 @@ mod tests {
         for s in ["0", "0s", "0ms", "0d", "00s"] {
             assert!(parse_duration(s).is_err(), "{s:?} must be rejected");
         }
+    }
+
+    // ---- control-fd parser ----------------------------------------------
+
+    #[test]
+    fn parse_control_fd_table() {
+        // The full acceptance table (D8): valid fd numbers pass through;
+        // negatives, non-integers, the empty string and anything past
+        // i32::MAX are Strings (clap renders them as ValueValidation, rc 2).
+        assert_eq!(parse_control_fd("0"), Ok(0));
+        assert_eq!(parse_control_fd("7"), Ok(7));
+        assert_eq!(parse_control_fd("2147483647"), Ok(i32::MAX));
+        for bad in ["-1", "abc", "", "4294967296", "7.0", " 7", "0x7"] {
+            assert!(parse_control_fd(bad).is_err(), "{bad:?} must be rejected");
+        }
+        // "-0" parses as the integer 0 (Rust's FromStr accepts it) — a
+        // harmless spelling of stdin's fd number, accepted like "0".
+        assert_eq!(parse_control_fd("-0"), Ok(0));
     }
 
     // ---- clap configuration validity ----------------------------------
