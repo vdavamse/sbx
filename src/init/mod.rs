@@ -52,6 +52,11 @@
 
 pub mod consts;
 pub mod fdpass;
+// PROVISIONALLY public (design D16): pub-reachable items never trip the
+// dead_code lint, so this module stays warning-free under `clippy -D
+// warnings` until the wiring commit consumes it and tightens it to a
+// private `mod` — no temporary `#[allow(dead_code)]` churn.
+pub mod rules;
 
 use std::fmt;
 

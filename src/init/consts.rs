@@ -73,6 +73,13 @@ pub const SO_ORIGINAL_DST: i32 = 80;
 /// it is informational only (replies go via `recv_from`'s peer address).
 pub const IP_RECVORIGDSTADDR: i32 = 20;
 
+/// `ERESTART` from `<asm-generic/errno.h>` — kernel-internal errno returned
+/// by nfnetlink batch processing when the ruleset generation id changed
+/// between GETGEN and batch commit. NOT exported by the libc crate.
+/// `pub(crate)` (design D10's kernel-plumbing tier): consumed by exactly
+/// `rules`'s retry loop.
+pub(crate) const ERESTART: i32 = 85;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +107,6 @@ mod tests {
         assert_eq!(SO_ORIGINAL_DST, 80);
         assert_eq!(IP_RECVORIGDSTADDR, 20);
         assert_eq!(SOL_IP, libc::IPPROTO_IP);
+        assert_eq!(ERESTART, 85);
     }
 }
