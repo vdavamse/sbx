@@ -80,6 +80,17 @@ pub const IP_RECVORIGDSTADDR: i32 = 20;
 /// `rules`'s retry loop.
 pub(crate) const ERESTART: i32 = 85;
 
+/// `IFF_UP` from `<net/if.h>`; the `ifinfomsg` flag fields are `u32`.
+/// `pub(crate)`: consumed by `netns`'s link-up request and read-back.
+pub(crate) const IFF_UP: u32 = libc::IFF_UP as u32;
+
+/// `IFA_F_PERMANENT` from `<linux/if_addr.h>` — NOT exported by the libc
+/// crate. The flag `ip addr add` sets for static addresses; the kernel
+/// treats cacheinfo-less addresses as permanent anyway, but sbx sets it
+/// explicitly for parity with iproute2 (the issue #5 reference
+/// implementation). `pub(crate)`: consumed by `netns`'s addr request.
+pub(crate) const IFA_F_PERMANENT: u8 = 0x80;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +119,7 @@ mod tests {
         assert_eq!(IP_RECVORIGDSTADDR, 20);
         assert_eq!(SOL_IP, libc::IPPROTO_IP);
         assert_eq!(ERESTART, 85);
+        assert_eq!(IFF_UP, 1);
+        assert_eq!(IFA_F_PERMANENT, 0x80);
     }
 }
