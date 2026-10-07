@@ -35,7 +35,9 @@
 //! on 80 — then resolves and dials BY NAME under [`egress::guard`] (every
 //! resolved address, plus the connected `peer_addr()` re-check as the
 //! DNS-rebinding backstop), replays the buffered bytes, and relays
-//! bidirectionally. Every connection ends in exactly one
+//! bidirectionally — on 443 with the client→upstream bytes still watched
+//! by the relay-phase scanner: a SECOND `ClientHello` (the post-HRR retry
+//! shape) tears the connection down. Every connection ends in exactly one
 //! [`proxy::Decision`] recorded to the [`proxy::DecisionSink`] seam (#10)
 //! with the pinned deny vocabulary; everything fails closed. [`policy`]
 //! deserialization now validates on EVERY path — the old point-5 asymmetry

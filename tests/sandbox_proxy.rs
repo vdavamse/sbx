@@ -31,7 +31,10 @@
 //! (the kernel RSTs when the proxy closes with an unread receive queue —
 //! both mean "closed with zero application bytes relayed"). The echo
 //! server is half-duplex (read-to-end, write-back, close) which is
-//! deterministic because roles `shutdown(Write)` after writing.
+//! deterministic because roles `shutdown(Write)` after writing; the
+//! second-hello teardown scenario uses the immediate-echo variant
+//! (chunk-by-chunk write-back) whose CH1 echo is the role's signal that
+//! the relay phase is live (R12: signal-driven, no fixed sleeps).
 //!
 //! SKIPs exit 0 (graceful on restricted hosts; CI runs everything); any
 //! FAIL exits 1.
@@ -169,9 +172,9 @@ struct Scenario {
     run: fn() -> Result<(), String>,
 }
 
-/// The 15 gated scenarios (the design's table minus the origdst-probe
+/// The 16 gated scenarios (the design's table minus the origdst-probe
 /// canary, which the runner handles inline): the six host-netns F8-tier
-/// ones and the nine full-chain userns ones.
+/// ones and the ten full-chain userns ones.
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -208,6 +211,11 @@ fn scenarios() -> Vec<Scenario> {
             name: "tls-allowed-relay-443",
             gate: Gate::Userns,
             run: scenario_tls_allowed_relay_443,
+        },
+        Scenario {
+            name: "tls-second-hello-torn-down",
+            gate: Gate::Userns,
+            run: scenario_tls_second_hello_torn_down,
         },
         Scenario {
             name: "http-allowed-relay-80",
@@ -631,12 +639,14 @@ impl Connector for NeverConnector {
     }
 }
 
-/// Half-duplex echo server on 127.0.0.1:0 — accept ONE connection,
-/// read-to-end, write-back, close. Deterministic because the roles
-/// `shutdown(Write)` after writing (so read_to_end completes). Bounded by
-/// construction: non-blocking accept polled at 10 ms against `BOUND`, a
-/// stop flag for expect-miss scenarios, socket timeouts on the served
-/// stream.
+/// Echo server on 127.0.0.1:0 — accept ONE connection, read-to-end,
+/// report the exact bytes received. In [`EchoMode::OnEof`] the write-back
+/// happens after read-to-end (deterministic because the roles
+/// `shutdown(Write)` after writing); in [`EchoMode::Immediate`] every chunk
+/// is echoed as it arrives (best-effort — the teardown scenarios' proof is
+/// the RECEIVED bytes). Bounded by construction: non-blocking accept
+/// polled at 10 ms against `BOUND`, a stop flag for expect-miss scenarios,
+/// socket timeouts on the served stream.
 #[derive(Debug)]
 enum EchoOutcome {
     /// Served one connection; carries the exact bytes received (the
@@ -686,7 +696,7 @@ impl Drop for EchoServer {
     }
 }
 
-fn spawn_echo_server() -> Result<EchoServer, String> {
+fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|e| format!("echo bind: {e}"))?;
     listener
@@ -707,12 +717,38 @@ fn spawn_echo_server() -> Result<EchoServer, String> {
                             .set_read_timeout(Some(BOUND))
                             .map_err(|e| format!("echo set_read_timeout: {e}"))?;
                         let mut buf = Vec::new();
-                        stream
-                            .read_to_end(&mut buf)
-                            .map_err(|e| format!("echo read_to_end: {e}"))?;
-                        stream
-                            .write_all(&buf)
-                            .map_err(|e| format!("echo write_all: {e}"))?;
+                        match mode {
+                            EchoMode::OnEof => {
+                                stream
+                                    .read_to_end(&mut buf)
+                                    .map_err(|e| format!("echo read_to_end: {e}"))?;
+                                stream
+                                    .write_all(&buf)
+                                    .map_err(|e| format!("echo write_all: {e}"))?;
+                            }
+                            EchoMode::Immediate => {
+                                let mut chunk = [0u8; 4096];
+                                loop {
+                                    match stream.read(&mut chunk) {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            buf.extend_from_slice(&chunk[..n]);
+                                            // Best-effort: the teardown
+                                            // scenarios' proxy may already
+                                            // have dropped the socket — the
+                                            // RECEIVED bytes are the proof
+                                            // (EchoMode::Immediate docs).
+                                            if stream.write_all(&chunk[..n]).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            return Err(format!("echo read: {err}"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Ok(buf)
                     })();
                     return match served {
@@ -772,6 +808,24 @@ enum EchoSpec {
     None,
     ExpectHit,
     ExpectMiss,
+    /// Like `ExpectHit`, but the server echoes every chunk IMMEDIATELY
+    /// (not after read-to-end) — the second-hello role needs the CH1 echo
+    /// back as its signal that the relay phase is live (R12: signal-driven,
+    /// no fixed sleeps).
+    ExpectHitEchoing,
+}
+
+/// The echo server's write-back discipline.
+#[derive(Clone, Copy)]
+enum EchoMode {
+    /// Read-to-end, then write everything back (the half-duplex contract
+    /// the relay roles' `shutdown(Write)` makes deterministic).
+    OnEof,
+    /// Echo every chunk as it arrives; the write-back is best-effort (a
+    /// teardown scenario's proxy has already dropped the socket — the
+    /// RECEIVED bytes are the proof there, and the role side asserts the
+    /// echoed prefix independently).
+    Immediate,
 }
 
 /// One serve thread on its own current-thread runtime; the result travels
@@ -845,7 +899,8 @@ fn run_netns(
 ) -> Result<NetnsRun, String> {
     let echo_server = match echo {
         EchoSpec::None => None,
-        EchoSpec::ExpectHit | EchoSpec::ExpectMiss => Some(spawn_echo_server()?),
+        EchoSpec::ExpectHit | EchoSpec::ExpectMiss => Some(spawn_echo_server(EchoMode::OnEof)?),
+        EchoSpec::ExpectHitEchoing => Some(spawn_echo_server(EchoMode::Immediate)?),
     };
     // Captured up front: the echo server itself moves into the teardown
     // join below, but the relay scenarios assert `upstream == echo addr`.
@@ -1288,6 +1343,54 @@ fn scenario_tls_allowed_relay_443() -> Result<(), String> {
     Ok(())
 }
 
+/// Review-fix pin (the second-hello defense, proxy module docs point 12):
+/// after the Allowed decision and the byte-exact CH1 replay, a SECOND
+/// ClientHello on the wire (the post-HRR CH2 shape, sent only once the
+/// CH1 echo proves the relay phase is live) tears the relay down — the
+/// upstream sees EXACTLY the first hello and never one byte of the
+/// second, the single Allowed decision is the whole audit (the teardown
+/// is normal relay lifecycle), and the payload observes the close.
+fn scenario_tls_second_hello_torn_down() -> Result<(), String> {
+    let run = run_netns(
+        "pt-tls-second-hello",
+        &[(TEST3, ALLOWED)],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHitEchoing,
+    )?;
+    assert_payload_success(&run.payload, &["second hello torn down"])?;
+    let expected = build_client_hello(Some(ALLOWED), &[]);
+    match run.echo {
+        Some(EchoOutcome::Hit(ref bytes)) if *bytes == expected => {}
+        Some(EchoOutcome::Failed(ref err)) => {
+            return Err(format!("the echo server failed: {err}"));
+        }
+        ref other => {
+            return Err(format!(
+                "the upstream must see EXACTLY the first hello (the second must be \
+                 withheld byte-for-byte): {other:?}"
+            ));
+        }
+    }
+    let upstream = run.echo_addr.expect("echo server was spawned");
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Allowed {
+            name: Domain::parse(ALLOWED).expect("fixture"),
+            upstream,
+        },
+        &format!("allowed {ALLOWED} via {upstream}"),
+    )?;
+    if run.connector_log != [format!("{ALLOWED}:443")] {
+        return Err(format!(
+            "the connector must see exactly one by-name request: {:?}",
+            run.connector_log
+        ));
+    }
+    Ok(())
+}
+
 /// AC allowed host works (80): the HTTP head + pipelined body relay
 /// end-to-end with one Allowed decision.
 fn scenario_http_allowed_relay_80() -> Result<(), String> {
@@ -1522,6 +1625,7 @@ fn child_main(role: &str) -> ExitCode {
     let result = match role {
         "probe-userns" => role_probe_userns(),
         "pt-tls-ok" => role_relay(&tls_relay_payload(), TEST3, 443),
+        "pt-tls-second-hello" => role_second_hello(),
         "pt-http-ok" => role_relay(&http_relay_payload(), TEST3, 80),
         "pt-tls-sni-mismatch" => {
             let hello = build_client_hello(Some(EVIL), &[]);
@@ -1604,6 +1708,72 @@ fn role_relay(payload: &[u8], ip: Ipv4Addr, port: u16) -> Result<(), String> {
         ));
     }
     marker(&format!("relay ok {} bytes on {addr}", payload.len()));
+    Ok(())
+}
+
+/// The second-hello role (review-fix pin, proxy module docs point 12): a
+/// valid CH1 with the allowed SNI under the real REDIRECT, then — once the
+/// CH1 echo proves the decision/replay/relay are all live (signal-driven,
+/// no fixed sleeps — R12) — a SECOND ClientHello with a different SNI (the
+/// post-HRR CH2 attack shape). Teardown proof: zero application bytes
+/// beyond the CH1 echo, then a clean EOF or the kernel RST.
+fn role_second_hello() -> Result<(), String> {
+    let addr = SocketAddr::V4(SocketAddrV4::new(TEST3, 443));
+    let mut stream =
+        TcpStream::connect_timeout(&addr, BOUND).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(BOUND))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    let ch1 = build_client_hello(Some(ALLOWED), &[]);
+    stream
+        .write_all(&ch1)
+        .map_err(|e| format!("write CH1 to {addr}: {e}"))?;
+    // The bounded signal wait: the immediate-echo upstream returns CH1 the
+    // moment the proxy replays it, so its arrival proves the relay phase
+    // is live and the second hello will be a distinct relay-phase record
+    // (never pipelined into the inspection read — that shape is pinned
+    // separately by inspect_tls_pipelined_second_hello_denied).
+    let mut echoed = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while echoed.len() < ch1.len() {
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err("the connection closed before the CH1 echo".to_owned()),
+            Ok(n) => echoed.extend_from_slice(&chunk[..n]),
+            Err(err) => return Err(format!("waiting for the CH1 echo: {err}")),
+        }
+    }
+    if echoed != ch1 {
+        return Err(format!(
+            "the CH1 echo mismatched: sent {} bytes, got back {}",
+            ch1.len(),
+            echoed.len()
+        ));
+    }
+    // The post-HRR CH2 shape: a second ClientHello with a different SNI.
+    // The teardown may race the write: EPIPE/reset is an acceptable
+    // "closed" (the deny-side proof is the read below + the parent-side
+    // upstream-bytes assertion).
+    let _ = stream.write_all(&build_client_hello(Some(EVIL), &[]));
+    // Teardown proof: zero application bytes beyond the CH1 echo, then a
+    // clean EOF or the kernel RST (the expect_close family's contract).
+    let mut got = Vec::new();
+    match stream.read_to_end(&mut got) {
+        Ok(_) if got.is_empty() => {}
+        Ok(_) => {
+            return Err(format!(
+                "the torn-down relay returned {} extra application bytes",
+                got.len()
+            ));
+        }
+        Err(err)
+            if got.is_empty()
+                && matches!(
+                    err.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+                ) => {}
+        Err(err) => return Err(format!("read after the second hello: {err}")),
+    }
+    marker("second hello torn down");
     Ok(())
 }
 

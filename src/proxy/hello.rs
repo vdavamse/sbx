@@ -40,6 +40,23 @@
 //!    the Phase-1 spike-verified builder. `signature_algorithms` is
 //!    MANDATORY — rustls rejects a hello without it (PeerIncompatible),
 //!    pinned by `fixture_without_sigalgs_is_rejected`.
+//! 6. **The second-hello handoff (review fix)** — the SNI verdict covers
+//!    the FIRST ClientHello only, and rustls ACCEPTS a wire that pipelines
+//!    a second handshake flight as a trailing RECORD (the acceptor answers
+//!    `Ok(Some)` for the first flight and merely buffers the tail —
+//!    `rustls_accepts_a_pipelined_second_flight` pins it), so
+//!    [`inspect_tls`] denies a trailing 0x16 record itself
+//!    (`PIPELINED_FLIGHT_DETAIL`). The same-record COALESCED shape
+//!    ([CH1‖CH2] in one record) is rejected by rustls 0.23.45 itself
+//!    (`KeyEpochWithPendingFragment` — the drift alarm
+//!    `rustls_rejects_two_hellos_in_one_record`); [`hello_fills_record`] is
+//!    the defense in depth should a rustls update ever buffer that sibling
+//!    instead. A legitimate pipelined tail — middlebox CCS 0x14 per
+//!    RFC 8446 App-D.4, 0-RTT early data 0x17 — rides the replay buffer.
+//!    [`first_record_end`] marks where the inspected hello's record ends:
+//!    the SEQUENTIAL second hello (the post-HRR CH2) and tails hidden
+//!    behind a legitimate pipelined record are the relay scanner's job
+//!    (proxy module docs point 12, `crate::proxy::relay`).
 
 use std::io::Cursor;
 
@@ -68,6 +85,22 @@ const ECH_EXTENSION_TYPE: u16 = 0xfe0d;
 /// shape is deviation #4's documented denial). Single source shared by
 /// [`inspect_tls`] and its pin test.
 const WALK_FAILED_DETAIL: &str = "ClientHello extension walk failed (ECH presence unverifiable)";
+
+/// The pinned denial detail when a SECOND handshake flight is pipelined
+/// behind the ClientHello (module docs point 6, review fix): rustls
+/// accepts the first flight and merely buffers the tail, so without this
+/// check a pipelined second ClientHello would ride the replay buffer to
+/// the upstream. Only a trailing 0x16 record denies — middlebox CCS (0x14,
+/// RFC 8446 App-D.4) and 0-RTT early data (0x17) are legitimate pipelined
+/// shapes, and the relay scanner (`crate::proxy::relay`) is the backstop
+/// for anything hiding behind them.
+pub(crate) const PIPELINED_FLIGHT_DETAIL: &str =
+    "a second handshake flight is pipelined behind the ClientHello";
+
+/// The pinned denial detail for the unreachable record-framing-loss path
+/// ([`first_record_end`] answering `None` on a walked buffer) —
+/// fail-closed, never a panic (house rule).
+pub(crate) const RECORD_END_LOST_DETAIL: &str = "internal: ClientHello record framing lost";
 
 /// Per-read chunk size for the inspection loop (the caps, not this, bound
 /// the buffer).
@@ -212,6 +245,44 @@ pub(crate) fn offers_ech(raw: &[u8]) -> Option<bool> {
     }
 }
 
+/// The end offset (exclusive) of the FIRST TLS record in `raw` — the
+/// handoff point where the relay scanner starts watching (module docs
+/// point 6): the inspected ClientHello is exactly one record (a
+/// multi-record hello is denied as unwalkable, deviation #4), so
+/// `5 + length` is where any pipelined bytes begin. `None` unless `raw`
+/// starts with a COMPLETE handshake record — only reachable on a walked
+/// buffer via internal bugs, and every call site fails closed on `None`
+/// (house rule: no panics).
+pub(crate) fn first_record_end(raw: &[u8]) -> Option<usize> {
+    if raw.len() < 5 || raw[0] != RECORD_HANDSHAKE {
+        return None;
+    }
+    let end = 5usize.checked_add(u16::from_be_bytes([raw[3], raw[4]]) as usize)?;
+    (raw.len() >= end).then_some(end)
+}
+
+/// Whether `raw`'s first record contains EXACTLY ONE handshake message —
+/// the ClientHello fills its record (module docs point 6, review fix C2).
+/// Defense in depth: rustls 0.23.45 rejects the coalesced [CH1‖CH2] shape
+/// itself (`KeyEpochWithPendingFragment`), but the ECH walker's exactness
+/// covers the hello's own extension block only — if a rustls update ever
+/// buffers a same-record sibling instead of rejecting, this check is the
+/// deny that keeps the smuggled hello off the replay (and keeps
+/// `scan_from` from landing past it). `None` on a non-record shape (caller
+/// fails closed; unreachable after a successful walk). No legitimate
+/// client coalesces: there is nothing to say before the server's flight.
+pub(crate) fn hello_fills_record(raw: &[u8]) -> Option<bool> {
+    // raw[5] is the handshake type (0x01 = ClientHello); raw[6..9] the
+    // 24-bit message length. Both proven present by a successful walk —
+    // the bounds check keeps the no-panics house rule regardless.
+    if raw.len() < 9 || raw[0] != RECORD_HANDSHAKE || raw[5] != 0x01 {
+        return None;
+    }
+    let rec_len = u16::from_be_bytes([raw[3], raw[4]]) as usize;
+    let hs_len = ((raw[6] as usize) << 16) | ((raw[7] as usize) << 8) | (raw[8] as usize);
+    hs_len.checked_add(4).map(|end| end == rec_len)
+}
+
 /// Read + inspect the ClientHello on 443 (module docs points 2/3). Returns
 /// the FULL replay buffer (hello record + any pipelined bytes) on success.
 /// The decision timeout is applied by the CALLER ([`crate::proxy::decide`])
@@ -282,6 +353,33 @@ pub(crate) async fn inspect_tls<S: AsyncRead + Unpin>(
                     return Err(Rejected::SniMismatch {
                         sni,
                         name: expected.clone(),
+                    });
+                }
+                // Pipelined/coalesced second handshake flights deny (module
+                // docs point 6, review fix): rustls accepts CH1 with a
+                // buffered CH2 RECORD (the two-record pipelined shape — the
+                // trailing-0x16 check below is load-bearing for the audit
+                // line), and rejects the same-record coalescing itself
+                // (KeyEpochWithPendingFragment — hello_fills_record is the
+                // drift-proof backstop). The relay scanner is the backstop
+                // for shapes hiding behind a legitimate pipelined record.
+                // Placed LAST on purpose: the pinned denial order above is
+                // unchanged — this fires only for an otherwise-allowed
+                // hello. Only a trailing 0x16 denies; 0x14 (middlebox CCS)
+                // and 0x17 (0-RTT early data) tails are legitimate.
+                let Some(hello_end) = first_record_end(&buf) else {
+                    return Err(Rejected::HelloMalformed {
+                        detail: RECORD_END_LOST_DETAIL.to_owned(),
+                    });
+                };
+                let Some(fills) = hello_fills_record(&buf) else {
+                    return Err(Rejected::HelloMalformed {
+                        detail: RECORD_END_LOST_DETAIL.to_owned(),
+                    });
+                };
+                if !fills || buf.get(hello_end) == Some(&RECORD_HANDSHAKE) {
+                    return Err(Rejected::HelloMalformed {
+                        detail: PIPELINED_FLIGHT_DETAIL.to_owned(),
                     });
                 }
                 return Ok(buf);
@@ -560,6 +658,151 @@ mod tests {
         bytes.extend_from_slice(b"pipelined");
         let result = inspect_with(&bytes, "allowed.test", Limits::default(), false);
         assert_eq!(result.expect("must pass"), bytes);
+    }
+
+    /// A bare TLS record for the pipelined-tail tests: type + legacy
+    /// version + big-endian length + body.
+    fn record(ty: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![ty, 0x03, 0x01];
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn rustls_accepts_a_pipelined_second_flight() {
+        // The rustls fact the trailing-flight check exists for (module
+        // docs point 6, drift alarm): the acceptor answers Ok(Some) for
+        // the FIRST flight and merely buffers a pipelined second
+        // ClientHello — without the explicit check it would ride the
+        // replay buffer to the upstream.
+        let mut wire = build_client_hello(Some("allowed.test"), &[]);
+        wire.extend_from_slice(&build_client_hello(Some("evil.test"), &[]));
+        assert_eq!(
+            accept_once(&wire).expect("rustls accepts CH1 and buffers the tail"),
+            Some(Some("allowed.test".to_owned()))
+        );
+    }
+
+    #[test]
+    fn inspect_tls_pipelined_second_hello_denied() {
+        // THE regression pin the review asked for (pipelined variant):
+        // CH1 + CH2 in one flight denies with the pinned detail — the
+        // sequential (post-HRR) variant is the relay scanner's job
+        // (crate::proxy::relay tests + the integration scenario).
+        let mut wire = build_client_hello(Some("allowed.test"), &[]);
+        wire.extend_from_slice(&build_client_hello(Some("evil.test"), &[]));
+        let result = inspect_with(&wire, "allowed.test", Limits::default(), false);
+        assert_eq!(
+            result.expect_err("a pipelined second flight must deny"),
+            Rejected::HelloMalformed {
+                detail: PIPELINED_FLIGHT_DETAIL.to_owned(),
+            }
+        );
+    }
+
+    /// Reframe fixture hellos' handshake messages into ONE record — the
+    /// same-record [CH1‖CH2] coalescing shape (review fix C2).
+    fn same_record(hellos: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for h in hellos {
+            body.extend_from_slice(&h[5..]); // strip each record header
+        }
+        let mut out = vec![RECORD_HANDSHAKE, 0x03, 0x01];
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn rustls_rejects_two_hellos_in_one_record() {
+        // The C2 drift alarm (the coalesced same-record [CH1‖CH2] shape):
+        // rustls 0.23.45 REJECTS it — KeyEpochWithPendingFragment — so
+        // today the rustls error path is the load-bearing deny. If a rustls
+        // update ever starts buffering the sibling instead (the two-record
+        // pipelined shape is already merely buffered, see
+        // rustls_accepts_a_pipelined_second_flight), this alarm fires and
+        // hello_fills_record — the defense in depth behind it, pinned by
+        // hello_fills_record_pins_the_coalescing_check — becomes the
+        // load-bearing deny. Either way the shape never passes.
+        let ch1 = build_client_hello(Some("allowed.test"), &[]);
+        let ch2 = build_client_hello(Some("evil.test"), &[]);
+        let wire = same_record(&[&ch1, &ch2]);
+        match accept_once(&wire) {
+            Err(rustls::Error::PeerMisbehaved(why)) => assert_eq!(
+                format!("{why:?}"),
+                "KeyEpochWithPendingFragment",
+                "rustls rejection reason drifted — hello_fills_record is now the load-bearing deny"
+            ),
+            Ok(Some(_)) => {
+                panic!(
+                    "rustls now ACCEPTS the coalesced shape — hello_fills_record must deny it (it does; update this alarm)"
+                )
+            }
+            other => panic!("unexpected rustls outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inspect_tls_same_record_second_flight_denied() {
+        // C2 pin (end-to-end): the coalesced [CH1‖CH2] single record
+        // denies — today with rustls's own error text (the malformed-hello
+        // path); after any rustls drift, with PIPELINED_FLIGHT_DETAIL via
+        // hello_fills_record. Both are HelloMalformed; the invariant that
+        // matters is that it NEVER passes (scan_from would land past the
+        // smuggled hello).
+        let ch1 = build_client_hello(Some("allowed.test"), &[]);
+        let ch2 = build_client_hello(Some("evil.test"), &[]);
+        let wire = same_record(&[&ch1, &ch2]);
+        let result = inspect_with(&wire, "allowed.test", Limits::default(), false);
+        match result.expect_err("a same-record second flight must deny") {
+            Rejected::HelloMalformed { .. } => {}
+            other => panic!("expected a HelloMalformed denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hello_fills_record_pins_the_coalescing_check() {
+        // The helper's contract: the bare fixture fills its record; the
+        // coalesced shape does not; non-record shapes answer None (caller
+        // fails closed).
+        let hello = build_client_hello(Some("allowed.test"), &[]);
+        assert_eq!(hello_fills_record(&hello), Some(true));
+        let ch2 = build_client_hello(Some("evil.test"), &[]);
+        assert_eq!(
+            hello_fills_record(&same_record(&[&hello, &ch2])),
+            Some(false)
+        );
+        assert_eq!(hello_fills_record(b"GET / HTTP"), None);
+        assert_eq!(hello_fills_record(&[]), None);
+    }
+
+    #[test]
+    fn inspect_tls_pipelined_ccs_and_early_data_tails_pass() {
+        // The legitimate pipelined shapes (module docs point 6): a
+        // middlebox CCS (0x14, RFC 8446 App-D.4) and 0-RTT early data
+        // (0x17) behind the hello ride the replay buffer — the scanner
+        // (not this check) judges whatever follows them.
+        let mut wire = build_client_hello(Some("allowed.test"), &[]);
+        wire.extend_from_slice(&record(0x14, &[0x01]));
+        wire.extend_from_slice(&record(0x17, b"early data"));
+        let result = inspect_with(&wire, "allowed.test", Limits::default(), false);
+        assert_eq!(result.expect("legitimate tails must pass"), wire);
+    }
+
+    #[test]
+    fn first_record_end_pins_the_scanner_handoff() {
+        // The scanner handoff contract (module docs point 6): the offset
+        // is exactly the first record's end — on the bare fixture, with a
+        // pipelined tail, and fail-closed None on every non-record shape.
+        let hello = build_client_hello(Some("allowed.test"), &[]);
+        assert_eq!(first_record_end(&hello), Some(hello.len()));
+        let mut with_tail = hello.clone();
+        with_tail.extend_from_slice(b"pipelined");
+        assert_eq!(first_record_end(&with_tail), Some(hello.len()));
+        assert_eq!(first_record_end(&hello[..hello.len() - 1]), None);
+        assert_eq!(first_record_end(b"GET / HTTP/1.1"), None);
+        assert_eq!(first_record_end(&[]), None);
     }
 
     #[test]

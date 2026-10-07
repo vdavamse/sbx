@@ -13,9 +13,10 @@
 //!    `Acceptor`, never a completed handshake; 80 → httparse request line +
 //!    `Host`), the name is resolved and dialed under
 //!    [`crate::egress::guard`], the buffered bytes are replayed, and the
-//!    connection is relayed with `copy_bidirectional`. Every connection ends
-//!    in exactly ONE [`Decision`] recorded to the [`DecisionSink`] seam
-//!    (#10) BEFORE any relay byte flows.
+//!    connection is relayed (`relay::relay` — `copy_bidirectional` with
+//!    the 443 client→upstream second-hello scanner, module docs point 12).
+//!    Every connection ends in exactly ONE [`Decision`] recorded to the
+//!    [`DecisionSink`] seam (#10) BEFORE any relay byte flows.
 //! 2. **Pipeline order is load-bearing** — port → DNS map → allow list →
 //!    protocol inspection → connect. The map lookup runs BEFORE any guard
 //!    call and the fake IP is NEVER guarded: production fakes live in
@@ -54,11 +55,13 @@
 //! 6. **Caps and timeouts** — 32 KiB ClientHello, 16 KiB HTTP head, 64
 //!    headers, a 10 s decision phase (accept → protocol verdict; elapsed ⇒
 //!    the inspection future is dropped mid-read and the buffered bytes are
-//!    discarded — fail-closed), a 10 s connect phase (resolve + dial, owned
-//!    by [`GuardedConnector`]), and a 1 ms→100 ms bounded accept backoff.
-//!    The two timeout scopes never nest, so the pinned reasons never
-//!    compete. No relay idle timeout and no concurrency cap in v1 (Q7 —
-//!    revisit with #10 via [`Limits`]).
+//!    discarded — fail-closed), a 10 s connect phase (resolve + dial under
+//!    ONE shared deadline — review fix: per-phase timeouts would double the
+//!    documented worst case and make `Failed::ConnectTimeout`'s `secs`
+//!    untruthful — owned by [`GuardedConnector`]), and a 1 ms→100 ms
+//!    bounded accept backoff. The two timeout scopes never nest, so the
+//!    pinned reasons never compete. No relay idle timeout and no
+//!    concurrency cap in v1 (Q7 — revisit with #10 via [`Limits`]).
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
 //!    must not pass (Q1). TLS is PASSED THROUGH, never terminated (no CA in
@@ -68,7 +71,10 @@
 //!    tree). ECH is denied outright, GREASE-ECH false positives accepted
 //!    (Q4 — sandbox clients are CLI tools; user docs land with #10).
 //!    IPv4-only by construction (#5: IPv6 disabled, 127.0.0.1 listeners,
-//!    AF_INET nft — an AF_INET6 `SO_ORIGINAL_DST` answer is denied).
+//!    AF_INET nft — an AF_INET6 `SO_ORIGINAL_DST` answer is denied). The
+//!    relay-phase second-hello scanner (point 12) closes the post-HRR CH2
+//!    shapes; its own accepted residuals (encrypted TLS 1.2 renegotiation
+//!    hellos, legitimate HRR retries) are recorded there.
 //! 8. **Runtime model** — one current-thread runtime with the IO and time
 //!    drivers enabled (#10 hosts it). `tokio::spawn` requires `Send` even
 //!    on a current-thread runtime, so every seam is
@@ -103,9 +109,40 @@
 //!     tier in `tests/sandbox_proxy.rs` runs the real chain — `sbx __init`
 //!     netns + nft REDIRECT + fd hand-off + [`serve`] + payload roles
 //!     dialing TEST-NET-3.
+//! 12. **Relay-phase second-hello defense (review fix)** — the SNI/ECH
+//!     verdict covers the FIRST ClientHello only; a TLS 1.3
+//!     HelloRetryRequest lets the sandbox send a SECOND hello (CH2) that
+//!     the remote server completes the handshake with, and RFC 8446
+//!     §4.1.4's "the SNI MUST NOT change on retry" is only as good as the
+//!     remote stack enforcing it — this module's bar is proxy-local
+//!     fail-closed. `relay::RelayScanner` therefore keeps watching the
+//!     client→upstream direction past the replay (pipelined tail FIRST,
+//!     before any upstream byte): TLS record + handshake-message framing
+//!     is tracked across records, and any new ClientHello tears the
+//!     connection down — immediately on the type byte in the plaintext
+//!     phase (fragmentation cannot hide it), post-CCS on message
+//!     completion (ciphertext is indistinguishable from garbage framing,
+//!     so parse artifacts pass instead of breaking TLS 1.2 — a real
+//!     second hello must COMPLETE for any server to act on it). A
+//!     mid-fragment CCS tears down in both phases: CCS is the one record
+//!     type servers ignore and reassemble across, so resyncing there would
+//!     let a split CH2 complete upstream. The teardown is normal relay
+//!     lifecycle: the single [`Decision`] (Allowed) was already recorded —
+//!     NO second record. Pipelined second flights deny at inspection
+//!     itself: a trailing 0x16 record via the explicit tail check, the
+//!     same-record [CH1‖CH2] coalescing via rustls
+//!     (`KeyEpochWithPendingFragment`) with `hello_fills_record` as the
+//!     drift-proof backstop (hello.rs module docs point 6). Accepted
+//!     residuals (recorded like
+//!     Q4, relay.rs module docs point 3): an ENCRYPTED TLS 1.2
+//!     renegotiation hello is invisible to any non-terminating proxy, a
+//!     legitimate HRR retry (e.g. a 0-RTT rejection) is torn down —
+//!     sandbox clients are CLI tools that negotiate first-try — and the
+//!     deferred policy's rare false-teardown directions are pinned there.
 
 pub mod hello;
 pub(crate) mod http;
+pub(crate) mod relay;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -116,7 +153,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::egress;
@@ -165,7 +202,11 @@ pub struct Limits {
     /// the inspection future is dropped mid-read and the buffered bytes are
     /// discarded (fail-closed).
     pub decision_timeout: Duration,
-    /// Resolve + dial budget, owned by [`GuardedConnector`].
+    /// Resolve + dial budget — ONE shared deadline around the whole
+    /// guarded flow, owned by [`GuardedConnector`] (review fix: the old
+    /// per-phase timeouts let a slow resolve plus a stalled dial take 2×
+    /// this budget while `Failed::ConnectTimeout` still reported `secs`
+    /// verbatim).
     pub connect_timeout: Duration,
     /// Upper bound of the transient-accept-error backoff (1 ms doubling).
     pub accept_backoff_max: Duration,
@@ -517,7 +558,8 @@ pub type DialFn = Arc<
 /// bound: [`decide`] applies no nested timeout of its own (module docs
 /// point 6's non-nesting rule) and reports the limit verbatim as
 /// [`Failed::ConnectTimeout`]'s `secs`. [`GuardedConnector`] owns the
-/// bound (one timeout around the resolve, one around the dial).
+/// bound — ONE deadline around the whole guarded flow, so `secs` is
+/// truthful by construction (review fix).
 pub trait Connector: Send + Sync + 'static {
     /// Hand-rolled boxed future (no async-trait dep). The future MUST be
     /// `Send` (tokio::spawn on any runtime).
@@ -584,28 +626,42 @@ impl GuardedConnector {
         }
     }
 
-    // The guarded flow (the single ConnectError→Verdict mapping site lives
-    // in decide(), NOT here):
-    //   1. resolve, bounded          → Err ⇒ Timeout / Resolve
-    //   2. empty answer              ⇒ EmptyResolve
-    //   3. guard EVERY resolved addr ⇒ DialDenied (first failure denies
+    // The guarded flow under ONE deadline (review fix — resolve and dial
+    // SHARE connect_timeout; the old per-phase timeouts let a slow resolve
+    // plus a stalled dial take 2× the documented budget while
+    // Failed::ConnectTimeout still reported `secs` verbatim). The single
+    // ConnectError→Verdict mapping site lives in decide(), NOT here:
+    //   1. resolve                 → Err ⇒ Resolve
+    //   2. empty answer            ⇒ EmptyResolve
+    //   3. guard EVERY resolved    ⇒ DialDenied (first failure denies
     //      the WHOLE connection)
-    //   4. dial by name, bounded     → Err ⇒ Timeout / Connect
-    //   5. guard(peer_addr)          ⇒ DialDenied (rebinding backstop,
+    //   4. dial by name            → Err ⇒ Connect
+    //   5. guard(peer_addr)        ⇒ DialDenied (rebinding backstop,
     //      BEFORE any byte is forwarded)
+    // Elapsed at ANY point ⇒ Timeout — so the phase that overran is
+    // indistinguishable in the audit row, which is exactly what the
+    // shared-budget contract promises (`secs` is truthful by
+    // construction; `connect_budget_is_shared_between_resolve_and_dial`
+    // pins it).
     async fn inner(&self, name: Domain, port: u16) -> Result<Connected, ConnectError> {
-        let addrs =
-            match tokio::time::timeout(self.connect_timeout, (self.resolve)(name.as_str(), port))
-                .await
-            {
-                Ok(Ok(addrs)) => addrs,
-                Ok(Err(err)) => {
-                    return Err(ConnectError::Resolve {
-                        detail: err.to_string(),
-                    });
-                }
-                Err(_elapsed) => return Err(ConnectError::Timeout),
-            };
+        match tokio::time::timeout(self.connect_timeout, self.guarded_flow(name, port)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConnectError::Timeout),
+        }
+    }
+
+    // The un-timed guarded flow (the deadline is `inner`'s single scope;
+    // the decision/connect timeout scopes stay non-nesting — module docs
+    // point 6).
+    async fn guarded_flow(&self, name: Domain, port: u16) -> Result<Connected, ConnectError> {
+        let addrs = match (self.resolve)(name.as_str(), port).await {
+            Ok(addrs) => addrs,
+            Err(err) => {
+                return Err(ConnectError::Resolve {
+                    detail: err.to_string(),
+                });
+            }
+        };
         if addrs.is_empty() {
             return Err(ConnectError::EmptyResolve);
         }
@@ -617,19 +673,13 @@ impl GuardedConnector {
                 });
             }
         }
-        let (stream, peer) = match tokio::time::timeout(
-            self.connect_timeout,
-            (self.dial)(name.as_str(), port),
-        )
-        .await
-        {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(err)) => {
+        let (stream, peer) = match (self.dial)(name.as_str(), port).await {
+            Ok(pair) => pair,
+            Err(err) => {
                 return Err(ConnectError::Connect {
                     detail: err.to_string(),
                 });
             }
-            Err(_elapsed) => return Err(ConnectError::Timeout),
         };
         if let Err(denied) = egress::guard(peer.ip()) {
             return Err(ConnectError::DialDenied { addr: peer, denied });
@@ -723,10 +773,20 @@ pub async fn serve(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> io::Re
                 // (1 ms doubling → accept_backoff_max, reset on success),
                 // never an exit. EINTR is retried inside tokio.
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(proxy.limits.accept_backoff_max);
+                backoff = next_accept_backoff(backoff, proxy.limits.accept_backoff_max);
             }
         }
     }
+}
+
+/// The backoff doubling step (module docs point 10), saturating: a
+/// pathological [`Limits::accept_backoff_max`] (`pub` field #10 tunes —
+/// e.g. `u64::MAX` seconds for "effectively unbounded") must never panic
+/// the serve loop on `Duration` overflow (review fix — the pinned
+/// never-panics invariant; `accept_backoff_doubling_never_overflows` pins
+/// it).
+fn next_accept_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }
 
 /// The accepted connection's fixed context (the pipeline's inputs).
@@ -737,11 +797,14 @@ pub(crate) struct ConnCtx {
 
 /// The relay hand-off state returned by [`decide`] on the allowed path:
 /// the client stream, the FULL replay buffer (preamble + any pipelined
-/// bytes), and the guarded upstream.
+/// bytes), the guarded upstream, and — on 443 only — the replay offset
+/// where the relay scanner takes over (module docs point 12: the end of
+/// the inspected ClientHello record; `None` on the unscanned HTTP path).
 pub(crate) struct RelayStart<S> {
     pub client: S,
     pub replay: Vec<u8>,
     pub connected: Connected,
+    pub scan_from: Option<usize>,
 }
 
 /// One accepted connection: decide → record (exactly once) → replay →
@@ -785,9 +848,10 @@ pub(crate) async fn handle_connection(
     // (`exactly_one_decision_per_connection` pins it).
     proxy.sink.record(&decision);
     if let Some(RelayStart {
-        mut client,
+        client,
         replay,
         mut connected,
+        scan_from,
     }) = relay
     {
         // Replay the FULL buffer (preamble + pipelined bytes) to the
@@ -798,11 +862,12 @@ pub(crate) async fn handle_connection(
         // preamble at it and send the upstream nothing (the design
         // sketch's `client.write_all` was a typo — deviation recorded in
         // the issue notes; the suite's echo-equality assertions pin the
-        // direction). Then relay; relay errors are normal lifecycle
-        // (EOF/RST) — swallowed. Drop closes both sockets.
-        if connected.stream.write_all(&replay).await.is_ok() {
-            let _ = copy_bidirectional(&mut client, &mut connected.stream).await;
-        }
+        // direction). Then relay — on 443 through the second-hello
+        // scanner (module docs point 12). Relay errors, scanner teardowns
+        // included, are normal lifecycle (EOF/RST/torn down) — swallowed;
+        // the single Decision above is the whole audit. Drop closes both
+        // sockets.
+        let _ = relay::relay(client, &replay, scan_from, &mut connected.stream).await;
     }
 }
 
@@ -979,7 +1044,28 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
         }
     };
     // 6. Allowed — the decision carries the guarded peer actually
-    //    connected; the relay state carries the FULL replay buffer.
+    //    connected; the relay state carries the FULL replay buffer and,
+    //    on 443, the scanner handoff offset (module docs point 12).
+    let scan_from = if port == TLS_PORT {
+        // Unreachable None (inspect_tls walked the record — the ECH
+        // walker requires it fully present); fail closed anyway (house
+        // rule: no panics).
+        let Some(hello_end) = hello::first_record_end(&replay) else {
+            return (
+                decision(
+                    &ctx,
+                    Some(name),
+                    Verdict::Denied(Rejected::HelloMalformed {
+                        detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
+                    }),
+                ),
+                None,
+            );
+        };
+        Some(hello_end)
+    } else {
+        None
+    };
     (
         decision(
             &ctx,
@@ -993,6 +1079,7 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             client,
             replay,
             connected,
+            scan_from,
         }),
     )
 }
@@ -1220,6 +1307,25 @@ mod tests {
                 Ok((Box::new(near) as Upstream, sock(PUBLIC)))
             })
         })
+    }
+
+    /// A resolve that succeeds only AFTER `delay` — the slow-resolver half
+    /// of the shared-budget pin (`connect_budget_is_shared_between_resolve_
+    /// and_dial`).
+    fn resolve_slow_ok(delay: Duration, addrs: Vec<SocketAddr>) -> ResolveFn {
+        Arc::new(move |_name: &str, _port: u16| {
+            let addrs = addrs.clone();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(addrs)
+            })
+        })
+    }
+
+    /// A dial that NEVER completes — the stalled-dial half of the
+    /// shared-budget pin (only the single deadline ends it).
+    fn dial_stalled() -> DialFn {
+        Arc::new(move |_name: &str, _port: u16| Box::pin(std::future::pending()))
     }
 
     fn guarded(resolve: ResolveFn, dial: DialFn, connect_timeout: Duration) -> Arc<dyn Connector> {
@@ -1692,10 +1798,16 @@ mod tests {
             "allowed allowed.test via 93.184.216.34:443"
         );
         let RelayStart {
-            replay, connected, ..
+            replay,
+            connected,
+            scan_from,
+            ..
         } = relay.expect("the allowed path returns the relay state");
         assert_eq!(replay, hello);
         assert_eq!(connected.peer, sock(PUBLIC));
+        // The 443 relay is SCANNED (module docs point 12): the handoff is
+        // the end of the single-record fixture hello.
+        assert_eq!(scan_from, Some(hello.len()));
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), TLS_PORT)]);
     }
 
@@ -1718,8 +1830,12 @@ mod tests {
                 upstream: sock("93.184.216.34:80"),
             }
         );
-        let RelayStart { replay, .. } = relay.expect("the allowed path returns the relay state");
+        let RelayStart {
+            replay, scan_from, ..
+        } = relay.expect("the allowed path returns the relay state");
         assert_eq!(replay, head);
+        // The HTTP relay is UNSCANNED (module docs point 12: 443 only).
+        assert_eq!(scan_from, None);
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), HTTP_PORT)]);
     }
 
@@ -1827,6 +1943,49 @@ mod tests {
         assert!(
             elapsed < BOUND,
             "the timeout must bound the dial: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn connect_budget_is_shared_between_resolve_and_dial() {
+        // Review fix pin: resolve and dial share ONE connect_timeout
+        // deadline. A slow-but-successful resolve (400 ms of a 500 ms
+        // budget) followed by a STALLED dial must time out at ~1× the
+        // budget — the old per-phase shape took resolve + budget (900 ms
+        // here) while the audit row still claimed "after 0s".
+        let connect_timeout = Duration::from_millis(500);
+        let connector = guarded(
+            resolve_slow_ok(Duration::from_millis(400), vec![sock(PUBLIC)]),
+            dial_stalled(),
+            connect_timeout,
+        );
+        let limits = Limits {
+            connect_timeout,
+            ..Limits::default()
+        };
+        let proxy = allowed_proxy(connector, limits);
+        let started = Instant::now();
+        let (decision, relay) = run_decide(&proxy, "203.0.113.7:443", &tls_hello("allowed.test"));
+        let elapsed = started.elapsed();
+        assert!(relay.is_none());
+        assert_eq!(
+            decision.verdict,
+            Verdict::Error(Failed::ConnectTimeout {
+                name: dom("allowed.test"),
+                secs: 0,
+            })
+        );
+        assert_eq!(
+            decision.reason(),
+            "connect to allowed.test timed out after 0s"
+        );
+        // The deadline starts when the guarded flow starts: elapsed ≈ the
+        // budget, NOT resolve_delay + budget. The 800 ms bar discriminates
+        // (old shape: ≥ 900 ms) with CI-jitter slack on both sides.
+        assert!(elapsed >= connect_timeout, "too fast: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "resolve and dial must share ONE budget, got {elapsed:?}"
         );
     }
 
@@ -2178,6 +2337,41 @@ mod tests {
         }
         // Non-OS errors stay transient (fail-safe: backoff, not exit).
         assert!(!accept_error_is_fatal(&io::Error::other("custom")));
+    }
+
+    #[test]
+    fn accept_backoff_doubling_never_overflows() {
+        // Review fix pin: the doubling is saturating, so a pathological
+        // `accept_backoff_max` (a pub field #10 tunes — u64::MAX seconds
+        // for "effectively unbounded") can never panic the serve loop on
+        // Duration overflow (module docs point 10's never-panics
+        // invariant).
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(next_accept_backoff(huge, huge), huge);
+        assert_eq!(
+            next_accept_backoff(Duration::from_secs(u64::MAX / 2 + 1), huge),
+            huge
+        );
+        assert_eq!(
+            next_accept_backoff(Duration::from_millis(1), huge),
+            Duration::from_millis(2)
+        );
+        // The normal contract: doubling capped at the max.
+        let max = Duration::from_millis(100);
+        let mut backoff = ACCEPT_BACKOFF_START;
+        let mut seen = vec![backoff];
+        for _ in 0..20 {
+            backoff = next_accept_backoff(backoff, max);
+            seen.push(backoff);
+        }
+        assert_eq!(
+            &seen[..8],
+            [1, 2, 4, 8, 16, 32, 64, 100]
+                .iter()
+                .map(|ms| Duration::from_millis(*ms))
+                .collect::<Vec<_>>()
+        );
+        assert!(seen[8..].iter().all(|d| *d == max));
     }
 
     /// [`serve`] on its own thread + current-thread runtime; the result
