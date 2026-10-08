@@ -47,6 +47,31 @@
 //!    [`Rejected::HostInvalid`] (scheme/userinfo/brackets/IP-literal junk
 //!    all land here — the bare-hostname contract, egress.rs point 5) and
 //!    equal the DNS-map name ⇒ else [`Rejected::HostMismatch`].
+//! 6. **The connection lifetime is enforced (round-2 review fix)** — the
+//!    name binding above covers the FIRST head only; HTTP/1.1 defaults to
+//!    keep-alive, so a subsequent request with a foreign `Host` would ride
+//!    the unscanned relay to a vhost-routing server (CDN edges co-host
+//!    thousands of names per IP — an allow-list bypass needing NO server
+//!    quirk at all, since vhost routing by `Host` is the intended behavior
+//!    of fully compliant servers). [`inspect_http`] therefore REWRITES the
+//!    validated head to carry `Connection: close` before it is replayed —
+//!    inserted immediately before the final CRLF; the request line, every
+//!    client header, and every body byte stay byte-identical (POST/PUT
+//!    untouched). A pre-existing client `Connection` header is kept
+//!    verbatim: RFC 9110 combines the field's values as a list, and the
+//!    `close` token in it is decisive — RFC 9112 §9.6 obliges a conforming
+//!    server to close after responding and to NOT process further requests
+//!    on the connection. Deliberate costs: no keep-alive for sandbox HTTP
+//!    clients (every request is re-inspected and re-audited on its own
+//!    connection — fail-closed by construction), and the ONE documented
+//!    deviation from "the upstream sees the client's byte stream verbatim"
+//!    (mod.rs point 9). Recorded residuals (mod.rs point 12): a
+//!    NON-conforming server ignoring `Connection: close`, and the 443 twin
+//!    no rewrite can reach — h2 `:authority` vhost confusion after an
+//!    SNI-checked handshake (ALPN rides through uninspected; inherent to
+//!    any non-terminating proxy; #14's threat model). A full per-request
+//!    relay scanner (this module's [`crate::proxy::relay::RelayScanner`]
+//!    analogue) remains the shape for lifting the no-keep-alive cost.
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -66,6 +91,10 @@ const HEAD_TERMINATOR_MISMATCH: &str = "request head terminator mismatch";
 /// The HTTP/2 client connection preface's request-line shape (RFC 7540
 /// §3.5) — denied with its own pinned row (module docs point 2).
 const H2_PREFACE_PREFIX: &[u8] = b"PRI * HTTP/2.0";
+
+/// The header line inserted into every validated head (module docs point 6
+/// — the name binding's connection-lifetime enforcement).
+const CONNECTION_CLOSE_HEADER: &[u8] = b"Connection: close\r\n";
 
 /// Per-read chunk size for the inspection loop (the cap, not this, bounds
 /// the buffer).
@@ -100,6 +129,13 @@ pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
                     detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
                 });
             }
+            // The connection-lifetime enforcement (module docs point 6):
+            // the validated head is rewritten to carry Connection: close
+            // BEFORE it is replayed — a keep-alive follow-up with a
+            // foreign Host must not ride the unscanned relay. Runs AFTER
+            // the differential check above; the rewrite never feeds back
+            // into parse_head.
+            force_connection_close(&mut buf, head_end);
             return Ok(buf);
         }
         if buf.len() > limits.max_head_bytes {
@@ -132,6 +168,16 @@ fn find_terminator(buf: &[u8], scanned: &mut usize) -> Option<usize> {
     }
     *scanned = buf.len();
     None
+}
+
+/// Insert [`CONNECTION_CLOSE_HEADER`] before the head's final CRLF
+/// (module docs point 6). `head_end` is the index just past the located
+/// `\r\n\r\n` — always ≥ the 4-byte terminator — so the insertion point is
+/// `head_end - 2`; everything else (request line, client headers,
+/// pipelined body bytes) stays byte-identical.
+fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
+    let at = head_end - 2;
+    buf.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
 }
 
 /// The PURE head parser (module docs points 2-5; `parse_head_table` drives
@@ -599,8 +645,11 @@ mod tests {
 
     #[test]
     fn inspect_http_replays_pipelined_body() {
-        // The replay buffer carries the head AND the pipelined body bytes.
+        // The replay buffer carries the head AND the pipelined body bytes
+        // — the head with the inserted Connection: close (module docs
+        // point 6), the body byte-identical.
         let mut bytes = Vec::from(b"POST /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n".as_slice());
+        let head_end = bytes.len();
         bytes.extend_from_slice(b"body-bytes");
         let (mut client, mut peer) = duplex(64 * 1024);
         let expected = dom("allowed.test");
@@ -609,7 +658,7 @@ mod tests {
             peer.write_all(&bytes).await.expect("write");
             inspect_http(&mut client, &expected, 80, &limits).await
         });
-        assert_eq!(result.expect("must pass"), bytes);
+        assert_eq!(result.expect("must pass"), closed_at(&bytes, head_end));
     }
 
     #[test]
@@ -618,7 +667,8 @@ mod tests {
         // head to arrive in many small reads, so the \r\n\r\n terminator
         // straddles chunk boundaries — the incremental search must still
         // find it and the replay buffer must accumulate every byte
-        // exactly, whatever the split points are.
+        // exactly, whatever the split points are (plus the point-6
+        // rewrite, which is chunking-independent by construction).
         let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
         let (mut client, peer) = duplex(8);
         let expected = dom("allowed.test");
@@ -633,7 +683,7 @@ mod tests {
             writer.await.expect("writer task");
             outcome
         });
-        assert_eq!(result.expect("must pass"), head.to_vec());
+        assert_eq!(result.expect("must pass"), closed_at(head, head.len()));
     }
 
     #[test]
@@ -667,6 +717,60 @@ mod tests {
         })
     }
 
+    /// The expected replay for a validated head: `Connection: close`
+    /// inserted before the final CRLF of the head ending at `head_end`
+    /// (module docs point 6); every other byte — including any pipelined
+    /// body — identical.
+    fn closed_at(input: &[u8], head_end: usize) -> Vec<u8> {
+        let mut out = input[..head_end - 2].to_vec();
+        out.extend_from_slice(CONNECTION_CLOSE_HEADER);
+        out.extend_from_slice(&input[head_end - 2..]);
+        out
+    }
+
+    #[test]
+    fn inspect_http_forces_connection_close() {
+        // The name binding must outlive the first head (module docs point
+        // 6, round-2 review fix): HTTP/1.1 keep-alive would let a
+        // foreign-Host follow-up request ride the unscanned relay to a
+        // vhost-routing server. The validated head is therefore rewritten
+        // to carry Connection: close — byte-exact, immediately before the
+        // final CRLF — while the request line, the client headers, and the
+        // pipelined body bytes stay untouched (POST/PUT unaffected).
+        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        let result = inspect_with(head, Limits::default(), false).expect("must pass");
+        assert_eq!(
+            result,
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
+        );
+        let mut with_body = Vec::from(head.as_slice());
+        with_body.extend_from_slice(b"body");
+        let result = inspect_with(&with_body, Limits::default(), false).expect("must pass");
+        assert_eq!(result, closed_at(&with_body, head.len()));
+    }
+
+    #[test]
+    fn existing_connection_headers_do_not_defeat_close() {
+        // A client-supplied Connection header is kept VERBATIM (the
+        // rewrite is a single insertion — the differential check and the
+        // body bytes rely on that), and the inserted close token still
+        // rides the combined field list: RFC 9112 §9.6 makes `close`
+        // decisive for a conforming server even next to keep-alive. An
+        // already-present close is a harmless duplicate.
+        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: keep-alive\r\n\r\n";
+        let result = inspect_with(head, Limits::default(), false).expect("must pass");
+        assert_eq!(result, closed_at(head, head.len()));
+        assert!(
+            result
+                .windows(CONNECTION_CLOSE_HEADER.len())
+                .any(|window| window == CONNECTION_CLOSE_HEADER),
+            "the close token must ride the replay: {result:?}"
+        );
+        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+        let result = inspect_with(head, Limits::default(), false).expect("must pass");
+        assert_eq!(result, closed_at(head, head.len()));
+    }
+
     #[test]
     fn inspect_http_bare_lf_differential_denied() {
         // m1 pin: httparse terminates lines at a bare LF too; the read
@@ -674,7 +778,8 @@ mod tests {
         // containing a real \r\n\r\n parses to a SHORTER extent than the
         // located terminator — two parsers see two different requests in
         // the same bytes (the request-smuggling shape) ⇒ denied, never
-        // relayed.
+        // relayed (and never rewritten — the enforcement runs only for a
+        // validated head).
         let mut bytes = Vec::from(b"GET / HTTP/1.1\nHost: allowed.test\n\n".as_slice());
         bytes.extend_from_slice(b"POST /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
         let result = inspect_with(&bytes, Limits::default(), false);
@@ -690,13 +795,13 @@ mod tests {
         let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
         assert_eq!(
             inspect_with(head, Limits::default(), false).expect("CRLF head must pass"),
-            head.to_vec()
+            closed_at(head, head.len())
         );
         let mut with_body = head.to_vec();
         with_body.extend_from_slice(b"body");
         assert_eq!(
             inspect_with(&with_body, Limits::default(), false).expect("CRLF head + body must pass"),
-            with_body
+            closed_at(&with_body, head.len())
         );
     }
 
@@ -716,7 +821,7 @@ mod tests {
         };
         assert_eq!(
             inspect_with(head, at_cap, false).expect("len == cap must pass"),
-            head.to_vec()
+            closed_at(head, head.len())
         );
         // A complete head ONE BYTE OVER a shrunk cap, arriving in one
         // chunk: STILL accepted — the terminator is found before the cap
@@ -729,7 +834,7 @@ mod tests {
         assert_eq!(
             inspect_with(head, under, false)
                 .expect("a complete head beats the shrunk cap (terminator-first)"),
-            head.to_vec()
+            closed_at(head, head.len())
         );
         // Terminator-less bytes: exactly cap → the search ends at Eof on
         // the client's close (the cap is NOT exceeded — strict `>`);

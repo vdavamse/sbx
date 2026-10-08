@@ -54,9 +54,15 @@ SNI on 443 (rustls parser, no crypto provider, ECH denied) and the HTTP
 request line + `Host` on 80. Allowed names are resolved and dialed by
 name under the resolved-address guard — every resolved address, plus a
 connected-peer re-check as the DNS-rebinding backstop — then the
-buffered bytes are replayed and the connection is relayed; every
-connection produces exactly one audit decision with the pinned deny
-vocabulary through the sink seam #10 plugs into. `run` and `gc` are stubs
+buffered bytes are replayed and the connection is relayed, with the
+validated name binding enforced for the whole connection lifetime: HTTP
+heads are replayed with an inserted `Connection: close` (no keep-alive
+reuse past the validated request), and on 443 a relay-phase scanner
+tears the connection down on any second `ClientHello` (the post-HRR
+retry shape) — the library module docs record the accepted residuals;
+every connection produces exactly one audit decision with the pinned deny
+vocabulary through the sink seam #10 plugs into (whose `teardown` hook
+surfaces blocked relay-phase attacks). `run` and `gc` are stubs
 that exit `1` with `not implemented yet`. Exit codes: `0`
 success, `1` runtime failure (including an invalid or unreadable
 policy file), `2` usage error (clap's convention). The architecture

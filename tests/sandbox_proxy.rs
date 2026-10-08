@@ -552,19 +552,41 @@ impl DnsMap for StaticMap {
 }
 
 #[derive(Default)]
-struct RecordingSink(Mutex<Vec<Decision>>);
+struct RecordingSink {
+    decisions: Mutex<Vec<Decision>>,
+    teardowns: Mutex<Vec<String>>,
+}
 
 impl RecordingSink {
     fn recorded(&self) -> Vec<Decision> {
-        self.0.lock().expect("sink lock").clone()
+        self.decisions.lock().expect("sink lock").clone()
+    }
+    fn teardowns(&self) -> Vec<String> {
+        self.teardowns.lock().expect("sink lock").clone()
     }
 }
 
 impl DecisionSink for RecordingSink {
     fn record(&self, decision: &Decision) {
-        self.0.lock().expect("sink lock").push(decision.clone());
+        self.decisions
+            .lock()
+            .expect("sink lock")
+            .push(decision.clone());
+    }
+    fn teardown(&self, _decision: &Decision, detail: &str) {
+        self.teardowns
+            .lock()
+            .expect("sink lock")
+            .push(detail.to_owned());
     }
 }
+
+/// The pinned relay teardown detail for a second ClientHello
+/// (`sbx::proxy::relay`'s `TORN_DOWN_SECOND_HELLO` — pub(crate) there, so
+/// the literal is duplicated here under the same contract as the exact
+/// deny-reason strings; the unit tier pins the constant itself).
+const TORN_DOWN_SECOND_HELLO_DETAIL: &str =
+    "relay torn down: second TLS ClientHello after the inspected handshake";
 
 type ConnectorLog = Arc<Mutex<Vec<String>>>;
 
@@ -883,6 +905,7 @@ fn spawn_serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<ServeHandle, 
 struct NetnsRun {
     payload: PayloadOutcome,
     decisions: Vec<Decision>,
+    teardowns: Vec<String>,
     connector_log: Vec<String>,
     dial_ran: bool,
     echo_addr: Option<SocketAddr>,
@@ -996,6 +1019,7 @@ fn run_netns(
     Ok(NetnsRun {
         payload,
         decisions: sink.recorded(),
+        teardowns: sink.teardowns(),
         connector_log: log_of(&log),
         dial_ran: dial_ran.load(Ordering::SeqCst),
         echo_addr,
@@ -1292,6 +1316,14 @@ fn http_relay_payload() -> Vec<u8> {
     b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nbody".to_vec()
 }
 
+/// The exact bytes the proxy replays upstream for [`http_relay_payload`]:
+/// the validated head with `Connection: close` inserted before the final
+/// CRLF (http.rs module docs point 6 — the name binding's
+/// connection-lifetime enforcement), the body byte-identical.
+fn http_relay_expected() -> Vec<u8> {
+    b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\nbody".to_vec()
+}
+
 /// AC allowed host works (443): the ClientHello + pipelined bytes pass
 /// through the real REDIRECT, are replayed verbatim to the echo upstream,
 /// and the echo comes back — with exactly one Allowed decision, the
@@ -1334,6 +1366,12 @@ fn scenario_tls_allowed_relay_443() -> Result<(), String> {
             run.decisions[0].orig_dst
         ));
     }
+    if !run.teardowns.is_empty() {
+        return Err(format!(
+            "a clean relay must never trip the teardown hook: {:?}",
+            run.teardowns
+        ));
+    }
     if run.connector_log != [format!("{ALLOWED}:443")] {
         return Err(format!(
             "the connector must see exactly one by-name request: {:?}",
@@ -1348,8 +1386,10 @@ fn scenario_tls_allowed_relay_443() -> Result<(), String> {
 /// ClientHello on the wire (the post-HRR CH2 shape, sent only once the
 /// CH1 echo proves the relay phase is live) tears the relay down — the
 /// upstream sees EXACTLY the first hello and never one byte of the
-/// second, the single Allowed decision is the whole audit (the teardown
-/// is normal relay lifecycle), and the payload observes the close.
+/// second, the single Allowed decision stays the only `record` (the
+/// teardown is normal relay lifecycle), the teardown hook carries the
+/// pinned second-hello detail (round-2 review fix — a blocked attack is
+/// not audit-invisible), and the payload observes the close.
 fn scenario_tls_second_hello_torn_down() -> Result<(), String> {
     let run = run_netns(
         "pt-tls-second-hello",
@@ -1382,6 +1422,15 @@ fn scenario_tls_second_hello_torn_down() -> Result<(), String> {
         },
         &format!("allowed {ALLOWED} via {upstream}"),
     )?;
+    // The teardown hook pin (round-2 review fix): exactly one teardown,
+    // with the pinned second-hello detail — and NOT a second decision.
+    if run.teardowns != [TORN_DOWN_SECOND_HELLO_DETAIL.to_owned()] {
+        return Err(format!(
+            "the blocked attack must surface on the sink's teardown hook with the pinned \
+             detail: {:?}",
+            run.teardowns
+        ));
+    }
     if run.connector_log != [format!("{ALLOWED}:443")] {
         return Err(format!(
             "the connector must see exactly one by-name request: {:?}",
@@ -1392,7 +1441,9 @@ fn scenario_tls_second_hello_torn_down() -> Result<(), String> {
 }
 
 /// AC allowed host works (80): the HTTP head + pipelined body relay
-/// end-to-end with one Allowed decision.
+/// end-to-end with one Allowed decision — the upstream sees the head with
+/// the inserted `Connection: close` (http.rs module docs point 6) and the
+/// body byte-identical.
 fn scenario_http_allowed_relay_80() -> Result<(), String> {
     let run = run_netns(
         "pt-http-ok",
@@ -1403,7 +1454,7 @@ fn scenario_http_allowed_relay_80() -> Result<(), String> {
         EchoSpec::ExpectHit,
     )?;
     assert_payload_success(&run.payload, &["relay ok"])?;
-    let expected = http_relay_payload();
+    let expected = http_relay_expected();
     match run.echo {
         Some(EchoOutcome::Hit(ref bytes)) if *bytes == expected => {}
         Some(EchoOutcome::Failed(ref err)) => {
@@ -1411,9 +1462,15 @@ fn scenario_http_allowed_relay_80() -> Result<(), String> {
         }
         ref other => {
             return Err(format!(
-                "the echo server must receive the EXACT head + body: {other:?}"
+                "the echo server must receive the EXACT rewritten head + body: {other:?}"
             ));
         }
+    }
+    if !run.teardowns.is_empty() {
+        return Err(format!(
+            "a clean relay must never trip the teardown hook: {:?}",
+            run.teardowns
+        ));
     }
     let upstream = run.echo_addr.expect("echo server was spawned");
     assert_single_decision(
@@ -1624,9 +1681,12 @@ fn scenario_port_not_in_policy_netns() -> Result<(), String> {
 fn child_main(role: &str) -> ExitCode {
     let result = match role {
         "probe-userns" => role_probe_userns(),
-        "pt-tls-ok" => role_relay(&tls_relay_payload(), TEST3, 443),
+        "pt-tls-ok" => {
+            let payload = tls_relay_payload();
+            role_relay(&payload, &payload, TEST3, 443)
+        }
         "pt-tls-second-hello" => role_second_hello(),
-        "pt-http-ok" => role_relay(&http_relay_payload(), TEST3, 80),
+        "pt-http-ok" => role_relay(&http_relay_payload(), &http_relay_expected(), TEST3, 80),
         "pt-tls-sni-mismatch" => {
             let hello = build_client_hello(Some(EVIL), &[]);
             role_expect_close(TEST3, 443, Some(&hello))
@@ -1683,7 +1743,7 @@ fn role_probe_userns() -> Result<(), String> {
 /// The relay roles: connect under the real REDIRECT, write the payload,
 /// `shutdown(Write)` (the half-duplex echo contract), then require the
 /// echo back byte-for-byte — proving the replay carried every byte.
-fn role_relay(payload: &[u8], ip: Ipv4Addr, port: u16) -> Result<(), String> {
+fn role_relay(payload: &[u8], expected_echo: &[u8], ip: Ipv4Addr, port: u16) -> Result<(), String> {
     let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
     let mut stream =
         TcpStream::connect_timeout(&addr, BOUND).map_err(|e| format!("connect {addr}: {e}"))?;
@@ -1700,10 +1760,14 @@ fn role_relay(payload: &[u8], ip: Ipv4Addr, port: u16) -> Result<(), String> {
     stream
         .read_to_end(&mut echoed)
         .map_err(|e| format!("read from {addr}: {e}"))?;
-    if echoed != payload {
+    // `expected_echo` differs from `payload` exactly on the HTTP path:
+    // the proxy replays the validated head with Connection: close
+    // inserted (http.rs module docs point 6).
+    if echoed != expected_echo {
         return Err(format!(
-            "echo mismatch on {addr}: sent {} bytes, got back {} ({echoed:?})",
+            "echo mismatch on {addr}: sent {} bytes, expected {} back, got {} ({echoed:?})",
             payload.len(),
+            expected_echo.len(),
             echoed.len()
         ));
     }

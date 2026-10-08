@@ -35,11 +35,18 @@
 //! on 80 — then resolves and dials BY NAME under [`egress::guard`] (every
 //! resolved address, plus the connected `peer_addr()` re-check as the
 //! DNS-rebinding backstop), replays the buffered bytes, and relays
-//! bidirectionally — on 443 with the client→upstream bytes still watched
-//! by the relay-phase scanner: a SECOND `ClientHello` (the post-HRR retry
-//! shape) tears the connection down. Every connection ends in exactly one
-//! [`proxy::Decision`] recorded to the [`proxy::DecisionSink`] seam (#10)
-//! with the pinned deny vocabulary; everything fails closed. [`policy`]
+//! bidirectionally — the validated name binding enforced for the whole
+//! connection lifetime: on 80 the validated head is replayed with an
+//! inserted `Connection: close` (a keep-alive foreign-`Host` follow-up
+//! cannot ride the relay), and on 443 the client→upstream bytes stay
+//! watched by the relay-phase scanner — a SECOND `ClientHello` (the
+//! post-HRR retry shape) tears the connection down, within the recorded
+//! residuals the library module docs list honestly (e.g. an ENCRYPTED
+//! renegotiation hello — invisible to any non-terminating proxy). Every
+//! connection ends in exactly one [`proxy::Decision`] recorded to the
+//! [`proxy::DecisionSink`] seam (#10) with the pinned deny vocabulary —
+//! whose `teardown` hook surfaces relay-phase teardowns so a blocked
+//! attack is not audit-invisible; everything fails closed. [`policy`]
 //! deserialization now validates on EVERY path — the old point-5 asymmetry
 //! is resolved (TODO(#6)(a), landed with issue #6). `run` and `gc` remain
 //! stubs that exit 1. Tracking issue #20 describes the architecture; the

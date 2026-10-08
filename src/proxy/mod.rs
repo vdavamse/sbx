@@ -92,7 +92,12 @@
 //!    twice, and the acceptor is dropped after inspection. Post-ClientHello
 //!    pipelined bytes the acceptor internally buffers therefore survive in
 //!    the replay buffer (`inspect_tls_replays_pipelined_bytes` pins it),
-//!    and the upstream sees the client's byte stream verbatim.
+//!    and the upstream sees the client's byte stream verbatim — with ONE
+//!    documented deviation (round-2 review fix): on port 80 the validated
+//!    head is replayed with an inserted `Connection: close` (http.rs module
+//!    docs point 6 — the name binding's connection-lifetime enforcement;
+//!    request line, client headers, and every body byte stay
+//!    byte-identical).
 //! 10. **Accept-loop resilience** — proxy death = sandbox death (fdpass),
 //!     so transient accept errors (EMFILE/ENFILE/ECONNABORTED/ENOBUFS/
 //!     ENOMEM …) get bounded exponential backoff and NEVER an exit; only a
@@ -123,22 +128,47 @@
 //!     phase (fragmentation cannot hide it), post-CCS on message
 //!     completion (ciphertext is indistinguishable from garbage framing,
 //!     so parse artifacts pass instead of breaking TLS 1.2 — a real
-//!     second hello must COMPLETE for any server to act on it). A
-//!     mid-fragment CCS tears down in both phases: CCS is the one record
-//!     type servers ignore and reassemble across, so resyncing there would
-//!     let a split CH2 complete upstream. The teardown is normal relay
+//!     second hello must COMPLETE for any server to act on it). Resync
+//!     NEVER wipes hello-shaped state (round-2/3 review fixes): servers
+//!     ignore SEVERAL record classes mid-reassembly and keep the fragment
+//!     across them — CCS, warning `user_canceled` alerts, and rejected-
+//!     0-RTT early data (rustls/OpenSSL-verified) — so a mid-fragment CCS
+//!     tears down in both phases, an interrupting record passes with the
+//!     hello-shaped state RETAINED, and post-CCS a handshake record
+//!     arriving while a message is still open (a continuation) tears down:
+//!     no legitimate post-CCS client flight fragments a handshake message,
+//!     so the masked split CH2 dies at its first continuation chunk —
+//!     withheld from the server — at ANY server reassembly bound (no
+//!     length gate can be fail-closed: OpenSSL reassembles to INT_MAX−4).
+//!     The teardown is normal relay
 //!     lifecycle: the single [`Decision`] (Allowed) was already recorded —
-//!     NO second record. Pipelined second flights deny at inspection
+//!     NO second record — but its pinned detail IS reported to
+//!     [`DecisionSink::teardown`] (default no-op; #10 logs it alongside
+//!     the JSONL row) so a blocked attack is not audit-invisible behind
+//!     its `allowed …` line. Pipelined second flights deny at inspection
 //!     itself: a trailing 0x16 record via the explicit tail check, the
 //!     same-record [CH1‖CH2] coalescing via rustls
 //!     (`KeyEpochWithPendingFragment`) with `hello_fills_record` as the
 //!     drift-proof backstop (hello.rs module docs point 6). Accepted
-//!     residuals (recorded like
-//!     Q4, relay.rs module docs point 3): an ENCRYPTED TLS 1.2
-//!     renegotiation hello is invisible to any non-terminating proxy, a
-//!     legitimate HRR retry (e.g. a 0-RTT rejection) is torn down —
-//!     sandbox clients are CLI tools that negotiate first-try — and the
-//!     deferred policy's rare false-teardown directions are pinned there.
+//!     residuals (recorded like Q4; the full list with probabilities is
+//!     relay.rs module docs point 3): an ENCRYPTED TLS 1.2 renegotiation
+//!     hello is invisible to any non-terminating proxy; a legitimate HRR
+//!     retry (e.g. a 0-RTT rejection) is torn down — sandbox clients are
+//!     CLI tools that negotiate first-try; a TLS 1.3 client OMITTING the
+//!     middlebox-compat CCS (RFC 8446 App-D.4 MAY; mainstream stacks send
+//!     it) is torn down at its first post-Finished record; a client 0x16
+//!     sent while a 0x01-leading encrypted-Finished phantom is open
+//!     (~1/256 of connections; TLS 1.2 renegotiation — extinct — or a
+//!     TLS 1.3 client KeyUpdate) trips the continuation deny; and the
+//!     deferred policy's rare false-teardown directions (~2^-19) are
+//!     pinned there. The port-80 analogue of the name-binding lifetime
+//!     problem is closed by enforcement, not scanning: the validated head
+//!     is replayed with an inserted `Connection: close` (http.rs module
+//!     docs point 6) — residuals: a NON-conforming server ignoring it,
+//!     and the 443 twin no rewrite can reach: h2 `:authority` vhost
+//!     confusion after an SNI-checked handshake (ALPN rides through
+//!     uninspected — inherent to any non-terminating proxy; #14's threat
+//!     model).
 
 pub mod hello;
 pub(crate) mod http;
@@ -354,7 +384,9 @@ impl Rejected {
                 format!("non-TLS traffic on port 443 (first byte {first_byte:#04x})")
             }
             Rejected::HelloTooLarge { cap } => {
-                format!("TLS ClientHello exceeds the {cap}-byte cap")
+                format!(
+                    "buffered TLS ClientHello (with any pipelined bytes) exceeds the {cap}-byte cap"
+                )
             }
             Rejected::HelloMalformed { detail } => {
                 format!("malformed TLS ClientHello: {detail}")
@@ -488,6 +520,16 @@ pub trait DecisionSink: Send + Sync + 'static {
     /// panic aborts the connection task with the decision unrecorded). #10:
     /// buffer JSONL, flush best-effort.
     fn record(&self, decision: &Decision);
+
+    /// Relay-phase teardown AFTER an Allowed decision — the second-hello
+    /// defense tripped (relay.rs module docs point 5): `detail` is one of
+    /// relay's two pinned teardown strings. Default: no-op. #10: log it
+    /// alongside the decision's JSONL row — without it, a blocked attack's
+    /// only production trace would be its `allowed …` line (round-2 review
+    /// fix). SYNC + CHEAP + NON-BLOCKING + must-not-panic. This is NOT a
+    /// second [`Self::record`] — the exactly-one-Decision invariant is
+    /// untouched (`exactly_one_decision_per_connection`).
+    fn teardown(&self, _decision: &Decision, _detail: &str) {}
 }
 
 /// A bidirectional byte stream usable as an upstream (relay endpoint).
@@ -857,17 +899,27 @@ pub(crate) async fn handle_connection(
         // Replay the FULL buffer (preamble + pipelined bytes) to the
         // UPSTREAM: the inspection consumed those bytes FROM THE CLIENT,
         // so forwarding them upstream is what makes the upstream see the
-        // client's byte stream verbatim (module docs point 9). Writing
-        // them back to the client instead would echo the client's own
-        // preamble at it and send the upstream nothing (the design
-        // sketch's `client.write_all` was a typo — deviation recorded in
-        // the issue notes; the suite's echo-equality assertions pin the
-        // direction). Then relay — on 443 through the second-hello
-        // scanner (module docs point 12). Relay errors, scanner teardowns
-        // included, are normal lifecycle (EOF/RST/torn down) — swallowed;
-        // the single Decision above is the whole audit. Drop closes both
-        // sockets.
-        let _ = relay::relay(client, &replay, scan_from, &mut connected.stream).await;
+        // client's byte stream — verbatim on 443, and on 80 with the ONE
+        // documented deviation: the validated head carries the inserted
+        // `Connection: close` (http.rs module docs point 6; module docs
+        // point 9). Writing them back to the client instead would echo
+        // the client's own preamble at it and send the upstream nothing
+        // (the design sketch's `client.write_all` was a typo — deviation
+        // recorded in the issue notes; the suite's echo-equality
+        // assertions pin the direction). Then relay — on 443 through the
+        // second-hello scanner (module docs point 12). A scanner teardown
+        // is reported to the sink's teardown hook (round-2 review fix —
+        // a blocked attack must not be audit-invisible behind its
+        // `allowed …` line); the single Decision above stays the only
+        // `record`. Transport errors and clean EOFs are normal lifecycle
+        // — swallowed; no idle timeout in v1 (module docs point 6). Drop
+        // closes both sockets.
+        match relay::relay(client, &replay, scan_from, &mut connected.stream).await {
+            Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(&decision, detail),
+            // Clean end or transport error (EOF/RST/broken pipe): normal
+            // relay lifecycle — swallowed.
+            Ok(relay::RelayEnd::Finished) | Err(_) => {}
+        }
     }
 }
 
@@ -1190,6 +1242,35 @@ mod tests {
         fn record(&self, decision: &Decision) {
             self.0.lock().expect("sink lock").push(decision.clone());
         }
+        // `teardown` deliberately NOT overridden here: the unit tier never
+        // reaches a relay teardown (the loopback F8 tier cannot present
+        // port 443), so the default no-op is the exercised path — pinned
+        // by `sink_teardown_default_is_noop`. The end-to-end wiring
+        // (handle_connection → sink.teardown with the pinned detail) is
+        // pinned by the suite's `tls-second-hello-torn-down` scenario.
+    }
+
+    #[test]
+    fn sink_teardown_default_is_noop() {
+        // The teardown hook ships with a default no-op (round-2 review
+        // fix): existing sinks — #10's until it logs teardowns — stay
+        // correct unchanged, and calling the hook on them does nothing
+        // and never panics.
+        struct MinimalSink;
+        impl DecisionSink for MinimalSink {
+            fn record(&self, _decision: &Decision) {}
+        }
+        let decision = Decision {
+            client: sock("203.0.113.1:1000"),
+            orig_dst: Some(v4("203.0.113.7:443")),
+            name: Some(dom("allowed.test")),
+            verdict: Verdict::Allowed {
+                name: dom("allowed.test"),
+                upstream: sock(PUBLIC),
+            },
+        };
+        MinimalSink.teardown(&decision, relay::TORN_DOWN_SECOND_HELLO);
+        MinimalSink.teardown(&decision, relay::TORN_DOWN_FRAMING);
     }
 
     /// A connector that must never be called: it counts attempts and
@@ -1431,7 +1512,7 @@ mod tests {
             ),
             (
                 Rejected::HelloTooLarge { cap: 32768 },
-                "TLS ClientHello exceeds the 32768-byte cap",
+                "buffered TLS ClientHello (with any pipelined bytes) exceeds the 32768-byte cap",
             ),
             (
                 Rejected::HelloMalformed {
@@ -1833,7 +1914,14 @@ mod tests {
         let RelayStart {
             replay, scan_from, ..
         } = relay.expect("the allowed path returns the relay state");
-        assert_eq!(replay, head);
+        // The validated head carries the inserted `Connection: close`
+        // (http.rs module docs point 6 — the name binding's
+        // connection-lifetime enforcement); everything else is
+        // byte-identical.
+        assert_eq!(
+            replay,
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
+        );
         // The HTTP relay is UNSCANNED (module docs point 12: 443 only).
         assert_eq!(scan_from, None);
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), HTTP_PORT)]);
