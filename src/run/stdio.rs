@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -79,8 +79,16 @@ impl OutputBudget {
     }
 
     /// The diagnostic sink ends mid-line: sbx must start its own line with a newline.
+    ///
+    /// Never blocks: a pump stuck in `forward` holds the tail lock for an unbounded
+    /// write, and teardown must stay bounded by the drain deadline. A busy lock means
+    /// a write is in flight, so assume mid-line (an extra newline is harmless).
     pub(crate) fn sink_partial(&self) -> bool {
-        let tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+        let tail = match self.tail.try_lock() {
+            Ok(tail) => tail,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return true,
+        };
         matches!(*tail, Some(last) if last != b'\n')
     }
 
@@ -266,6 +274,16 @@ impl Pumps {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sink_partial_never_blocks_on_a_stuck_forward() {
+        let budget = super::OutputBudget::new(10);
+        let held = budget.tail.lock().unwrap();
+        // A forward stuck mid-write holds the lock; teardown must not wait for it.
+        assert!(budget.sink_partial());
+        drop(held);
+        assert!(!budget.sink_partial());
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
