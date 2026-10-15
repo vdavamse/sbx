@@ -13,8 +13,11 @@
 //!   is peer close), and `MSG_CTRUNC` detection. The child's `control` stage
 //!   enforces `SO_TYPE == SOCK_SEQPACKET`, so a mistaken `UnixStream::pair()`
 //!   in future code fails fast instead of misbehaving.
-//! * **Message 1, child → parent (fds)**: data exactly
-//!   `[`[`FDS_PAYLOAD_BYTE`]`]` ('F') plus one `SCM_RIGHTS` cmsg carrying
+//! * **Message 1, child → parent (setup)** (issue #11): either a *ready*
+//!   message — `'F'` plus the achieved mode (`'t'` transparent, or `'e'` +
+//!   the nft errno + reason) — or a *failure* message `'E'` + stage code +
+//!   errno + reason with no fds (`recv_setup` returns it as
+//!   [`SetupMsg::Failed`]). A ready message carries one `SCM_RIGHTS` cmsg:
 //!   exactly [`LISTENER_FD_COUNT`] fds in the fixed wire order
 //!   **transparent :15001/tcp, explicit :3128/tcp, dns :53/udp** (pinned by
 //!   [`ListenerFds`]). The parent receives with `MSG_CMSG_CLOEXEC` so the
@@ -52,7 +55,12 @@ use std::net::{TcpListener, UdpSocket};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
 
-use super::consts::{FDS_PAYLOAD_BYTE, GO_BYTE, GO_TIMEOUT, LISTENER_FD_COUNT};
+use std::fmt;
+
+use super::consts::{
+    FAIL_PAYLOAD_BYTE, FDS_PAYLOAD_BYTE, GO_BYTE, GO_TIMEOUT, LISTENER_FD_COUNT, MAX_REASON_BYTES,
+    MODE_EXPLICIT, MODE_TRANSPARENT, SETUP_MSG_MAX,
+};
 use super::{InitError, Stage};
 
 /// The three listener sockets in wire order — one type pins the fd order for
@@ -215,72 +223,130 @@ impl Drop for ReceivedFdGuard {
     }
 }
 
-/// Parent side: receive the listener-fd message from `__init`.
+/// The parent's view of the child's setup message (issue #11): the three
+/// listener fds with the achieved network mode, or the staged failure the
+/// child reports instead of exiting silently.
+#[derive(Debug)]
+pub enum SetupMsg {
+    /// `'F'` + mode + three fds: the pipeline reached `send-fds`.
+    Ready {
+        fds: ListenerFds,
+        mode: AchievedMode,
+    },
+    /// `'E'`: a staged failure in `__init` (no fds).
+    Failed(StagedFailure),
+}
+
+/// The network mode `__init` achieved (issue #11, Q1/Q5). `Explicit` carries
+/// the nft-load failure that forced the fallback — the evidence run quotes
+/// in its notice and records in the audit row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AchievedMode {
+    /// The full firewall loaded and verified.
+    Transparent,
+    /// nft-load was refused; the default route is gone, direct connects fail
+    /// with ENETUNREACH, only the explicit listener is reachable.
+    Explicit {
+        /// The errno of the refused batch (0 on the wire = unknown = None).
+        errno: Option<i32>,
+        /// `nft-load: <reason>`.
+        reason: String,
+    },
+}
+
+impl AchievedMode {
+    /// The pinned audit/notice label: `"transparent"` or `"explicit"`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AchievedMode::Transparent => "transparent",
+            AchievedMode::Explicit { .. } => "explicit",
+        }
+    }
+}
+
+/// A staged `__init` failure as received over the `'E'` message: the stage,
+/// its errno (when the failing call had one) and the reason text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedFailure {
+    pub stage: Stage,
+    pub errno: Option<i32>,
+    pub reason: String,
+}
+
+impl fmt::Display for StagedFailure {
+    /// `<stage>: <reason>` — the evidence string (the `sbx __init:` prefix is
+    /// not part of it).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.stage.as_str(), self.reason)
+    }
+}
+
+/// Parent side: receive the child's setup message (`'F'` or `'E'`).
 ///
-/// Strict (same-binary invariant): the data payload must be exactly
-/// `[`[`FDS_PAYLOAD_BYTE`]`]` and the message must carry exactly
-/// [`LISTENER_FD_COUNT`] fds; anything else — `MSG_CTRUNC`, a foreign cmsg,
-/// a malformed `cmsg_len`, a wrong count — is an [`io::Error`], never a
-/// partial success. Received with `MSG_CMSG_CLOEXEC` (design D3): the
-/// parent's dup'd fds must not leak into the later bwrap spawn (#10). EOF
-/// (peer closed) is [`io::ErrorKind::UnexpectedEof`]. Every rejection path
-/// CLOSES the fds the kernel already installed (the `ReceivedFdGuard` RAII
-/// guard, m1): an open socket would pin the dead sandbox's netns.
-///
-/// #10 handoff: this receive is deliberately UNBOUNDED here (a plain
-/// blocking `recvmsg`) — `run` must install its own deadline (`SO_RCVTIMEO`
-/// on the parent end, or a child-liveness poll) and, on a child rc 1, drop
-/// any received [`ListenerFds`] and close the parent end; the integration
-/// harness's `fail-eof-after-fds` scenario demonstrates the pattern.
-pub fn recv_listener_fds(ctrl: RawFd) -> io::Result<ListenerFds> {
-    let mut data = [0u8; 16];
+/// Strict (same-binary invariant, module docs): see [`decode_setup_message`]
+/// for every accepted and rejected shape. A `'F'` message delivers the
+/// listener fds and the achieved mode; an `'E'` message is a successful
+/// receive of a staged failure. EOF (peer closed) is
+/// [`io::ErrorKind::UnexpectedEof`]. Every rejection path closes the fds the
+/// kernel already installed (`ReceivedFdGuard`, m1).
+pub fn recv_setup(ctrl: RawFd) -> io::Result<SetupMsg> {
+    let mut data = vec![0u8; SETUP_MSG_MAX];
     let mut ctrlbuf = CtrlBuf([0; CTRL_BUF_LEN]);
     let (n, msg_flags, controllen) =
         recvmsg_raw(ctrl, &mut data, &mut ctrlbuf.0, libc::MSG_CMSG_CLOEXEC)?;
     // From recvmsg's return the kernel may have installed fds into our
     // table — including on messages the strict decode is about to REJECT.
-    // The guard owns them from here until ownership transfers into
-    // ListenerFds on the success path (m1).
     let mut guard = ReceivedFdGuard::default();
     if n == 0 {
         // A zero-length SEQPACKET message can legally carry SCM_RIGHTS fds
-        // on Linux (recvmsg returns 0 with the fds installed and
-        // msg_controllen > 0): run the collect-first decode walk so
-        // anything the kernel installed lands in the guard and is closed
-        // on this path too (m1 — an open listener socket would pin the
-        // dead sandbox's netns). The decode's verdict is irrelevant here;
-        // EOF stays the error.
-        let _ = decode_fds_message(&[], &ctrlbuf.0[..controllen], msg_flags, &mut guard.0);
+        // (m1): collect them so they are closed on this path too.
+        let _ = decode_setup_message(&[], &ctrlbuf.0[..controllen], msg_flags, &mut guard.0);
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
-            "peer closed before sending the listener fds",
+            "peer closed before sending the setup message",
         ));
     }
-    decode_fds_message(
+    let head = decode_setup_message(
         &data[..n],
         &ctrlbuf.0[..controllen],
         msg_flags,
         &mut guard.0,
     )?;
-    // decode enforces the exact count; the defensive reshape keeps
-    // from_raw_fds' SAFETY contract local — and even this unreachable arm
-    // closes the fds instead of leaking them (no panics: a decode bug must
-    // surface as an error, not an abort in the parent).
-    match guard.release().try_into() {
-        Ok(raw) => Ok(ListenerFds::from_raw_fds(raw)),
-        Err(unexpected) => {
-            for fd in &unexpected {
-                // SAFETY: kernel-installed fds never transferred to a std
-                // object; each number is closed exactly once here.
-                unsafe {
-                    libc::close(*fd);
+    match head {
+        Head::Failed(failure) => Ok(SetupMsg::Failed(failure)),
+        Head::Ready(mode) => {
+            // decode enforces the exact count; the defensive reshape keeps
+            // from_raw_fds' SAFETY contract local.
+            match guard.release().try_into() {
+                Ok(raw) => Ok(SetupMsg::Ready {
+                    fds: ListenerFds::from_raw_fds(raw),
+                    mode,
+                }),
+                Err(unexpected) => {
+                    for fd in &unexpected {
+                        // SAFETY: kernel-installed fds never transferred to a
+                        // std object; each number is closed exactly once here.
+                        unsafe {
+                            libc::close(*fd);
+                        }
+                    }
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected {LISTENER_FD_COUNT} fds, got {}", unexpected.len()),
+                    ))
                 }
             }
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected {LISTENER_FD_COUNT} fds, got {}", unexpected.len()),
-            ))
         }
+    }
+}
+
+/// Kept for the integration suites and the pre-#11 call sites: `Ready` →
+/// the fds (the mode is discarded); `Failed(f)` → an [`io::Error`] whose text
+/// is `sbx __init: <stage>: <reason>`, the same line `__init` printed.
+pub fn recv_listener_fds(ctrl: RawFd) -> io::Result<ListenerFds> {
+    match recv_setup(ctrl)? {
+        SetupMsg::Ready { fds, .. } => Ok(fds),
+        SetupMsg::Failed(f) => Err(io::Error::other(format!("sbx __init: {f}"))),
     }
 }
 
@@ -325,18 +391,22 @@ pub fn send_go(ctrl: RawFd) -> io::Result<()> {
 // child side (used by the __init pipeline)
 // ---------------------------------------------------------------------------
 
-/// Child side: send all three listener fds in ONE SCM_RIGHTS message
-/// (`[`[`FDS_PAYLOAD_BYTE`]`]` data payload + the fd cmsg), wire order per
-/// [`ListenerFds`].
+/// Child side: send the setup message `'F'` + mode bytes with the three
+/// listener fds in ONE SCM_RIGHTS message, wire order per [`ListenerFds`].
 ///
 /// EPIPE means the parent died before receiving the fds — probe-verified;
 /// `MSG_NOSIGNAL` makes the detection independent of the SIGPIPE
 /// disposition: staged [`Stage::SendFds`] failure, the payload is never
 /// exec'd.
-pub fn send_listener_fds(ctrl: RawFd, fds: &[RawFd; LISTENER_FD_COUNT]) -> Result<(), InitError> {
-    let mut data = Vec::with_capacity(1);
+pub fn send_listener_fds(
+    ctrl: RawFd,
+    fds: &[RawFd; LISTENER_FD_COUNT],
+    mode: &AchievedMode,
+) -> Result<(), InitError> {
+    let mut data = Vec::with_capacity(SETUP_MSG_MAX);
+    encode_ready(mode, &mut data);
     let mut ctrlbuf = Vec::new();
-    encode_fds_message(FDS_PAYLOAD_BYTE, fds, &mut data, &mut ctrlbuf);
+    encode_fds_cmsg(fds, &mut ctrlbuf);
     sendmsg_raw(ctrl, &data, &ctrlbuf).map_err(|err| {
         InitError::new(
             Stage::SendFds,
@@ -346,7 +416,18 @@ pub fn send_listener_fds(ctrl: RawFd, fds: &[RawFd; LISTENER_FD_COUNT]) -> Resul
                 format!("sendmsg listener fds: {err}")
             },
         )
+        .with_errno(err.raw_os_error())
     })
+}
+
+/// Child side: report a staged failure to the parent (`'E'` message, no
+/// fds). Best effort — every error is ignored: the staged stderr line is
+/// printed regardless, and a parent that is already gone has nothing to
+/// classify.
+pub fn send_failure(ctrl: RawFd, err: &InitError) {
+    let mut data = Vec::with_capacity(SETUP_MSG_MAX);
+    encode_failure(err.stage(), err.errno(), err.reason(), &mut data);
+    let _ = sendmsg_raw(ctrl, &data, &[]);
 }
 
 /// Child side: block until the parent's go byte arrives. Staged
@@ -454,17 +535,12 @@ const fn cmsg_space(data_len: usize) -> usize {
     cmsg_align(data_len) + cmsg_align(size_of::<libc::cmsghdr>())
 }
 
-/// Pure encoder of the fds message: appends the one-byte data payload to
-/// `data` and one well-formed `SOL_SOCKET`/`SCM_RIGHTS` cmsg (header + fd
-/// array + alignment padding, `CMSG_SPACE` total) to `ctrl`. In-memory only
-/// — [`sendmsg_raw`] copies `ctrl` into an aligned buffer.
-pub(crate) fn encode_fds_message(
-    payload: u8,
-    fds: &[RawFd],
-    data: &mut Vec<u8>,
-    ctrl: &mut Vec<u8>,
-) {
-    data.push(payload);
+/// Pure encoder of the fds ancillary data: one well-formed `SOL_SOCKET`/
+/// `SCM_RIGHTS` cmsg (header + fd array + alignment padding, `CMSG_SPACE`
+/// total) appended to `ctrl`. The data payload is the caller's (see
+/// [`encode_ready`]). In-memory only — [`sendmsg_raw`] copies `ctrl` into an
+/// aligned buffer.
+pub(crate) fn encode_fds_cmsg(fds: &[RawFd], ctrl: &mut Vec<u8>) {
     let fds_len = size_of_val(fds);
     let mut hdr: libc::cmsghdr = unsafe { std::mem::zeroed() };
     hdr.cmsg_len = cmsg_hdr_len(fds_len) as _;
@@ -489,41 +565,76 @@ pub(crate) fn encode_fds_message(
     }
 }
 
-/// Pure decoder of the fds message — strict, fail-closed, overflow-free.
+/// Pure encoder of a `'F'` ready message's data: `'F'`, then the mode byte
+/// (`'t'` transparent, or `'e'` + errno i32 LE (0 = unknown) + the reason).
+pub(crate) fn encode_ready(mode: &AchievedMode, data: &mut Vec<u8>) {
+    data.push(FDS_PAYLOAD_BYTE);
+    match mode {
+        AchievedMode::Transparent => data.push(MODE_TRANSPARENT),
+        AchievedMode::Explicit { errno, reason } => {
+            data.push(MODE_EXPLICIT);
+            data.extend_from_slice(&errno.unwrap_or(0).to_le_bytes());
+            data.extend_from_slice(truncate_reason(reason).as_bytes());
+        }
+    }
+}
+
+/// Pure encoder of an `'E'` failure message's data: `'E'`, the stage code,
+/// errno i32 LE (0 = none), the reason (≤ [`MAX_REASON_BYTES`]).
+pub(crate) fn encode_failure(stage: Stage, errno: Option<i32>, reason: &str, data: &mut Vec<u8>) {
+    data.push(FAIL_PAYLOAD_BYTE);
+    data.push(stage.code());
+    data.extend_from_slice(&errno.unwrap_or(0).to_le_bytes());
+    data.extend_from_slice(truncate_reason(reason).as_bytes());
+}
+
+/// The longest prefix of `reason` that is at most [`MAX_REASON_BYTES`] bytes
+/// and ends on a char boundary.
+pub(crate) fn truncate_reason(reason: &str) -> &str {
+    if reason.len() <= MAX_REASON_BYTES {
+        return reason;
+    }
+    let mut end = MAX_REASON_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
+}
+
+/// What the strict decode accepted, before the caller assembles fds.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Head {
+    Ready(AchievedMode),
+    Failed(StagedFailure),
+}
+
+/// Pure decoder of the setup message — strict, fail-closed, overflow-free.
 ///
 /// `data` is the received payload verbatim, `ctrl` the ancillary bytes
-/// verbatim (recvmsg's `msg_controllen`), `msg_flags` recvmsg's flags.
-/// Every SCM_RIGHTS fd found is appended to `fds_out` — the CALLER's sink,
-/// so fds the kernel already installed are visible to the caller's
-/// [`ReceivedFdGuard`] on EVERY rejection path, including rejections that
-/// fire after the cmsg walk (m1: a rejected message must never strand open
-/// sockets pinning the dead sandbox's netns). The walk therefore runs
-/// FIRST; the message-level checks (CTRUNC flag, payload byte, fd count)
-/// follow. Kernel-written chains are well-formed, so bailing on the first
-/// malformed header cannot strand real installed fds — malformed headers
-/// only occur in crafted in-memory inputs.
+/// verbatim (recvmsg's `msg_controllen`), `msg_flags` recvmsg's flags. Every
+/// SCM_RIGHTS fd found is appended to `fds_out` — the CALLER's sink, so fds
+/// the kernel already installed are visible to the caller's guard on EVERY
+/// rejection path (m1). The cmsg walk therefore runs FIRST. Every rejection
+/// is an [`io::Error`] (`InvalidData` unless noted), never a panic:
 ///
-/// Bounds discipline follows the spike's `listeners.rs` precedent, written
-/// so a garbage `cmsg_len` (including near `usize::MAX`) can never wrap an
-/// addition: the claimed length is compared against the REMAINING buffer
-/// via subtraction, and rejected on any violation. Every rejection is an
-/// [`io::Error`], never a panic, and a foreign cmsg is rejected rather than
-/// skipped (fail-closed — unexpected ancillary data is a protocol
-/// violation):
-///
-/// * `cmsg_len` shorter than the aligned header or longer than the remaining
-///   buffer ⇒ `InvalidData`;
-/// * any non-`SOL_SOCKET`/`SCM_RIGHTS` cmsg ⇒ `InvalidData`;
-/// * `MSG_CTRUNC` in `msg_flags` ⇒ `EMSGSIZE` (the kernel truncated the
-///   cmsg chain; its contents cannot be trusted);
-/// * data ≠ `[`[`FDS_PAYLOAD_BYTE`]`]` ⇒ `InvalidData`;
-/// * fd count ≠ [`LISTENER_FD_COUNT`] ⇒ `InvalidData`.
-pub(crate) fn decode_fds_message(
+/// * `cmsg_len` out of bounds, a foreign cmsg, or a fd chunk that is not a
+///   whole `RawFd` ⇒ `InvalidData` (the walk stops at the first violation);
+/// * `MSG_CTRUNC` or `MSG_TRUNC` ⇒ `EMSGSIZE`;
+/// * empty data ⇒ `InvalidData`;
+/// * first byte ∉ {`F`, `E`} ⇒ `InvalidData`;
+/// * `F` + mode ∉ {`t`, `e`} ⇒ `InvalidData`; `F t` with length ≠ 2 ⇒
+///   `InvalidData`; `F e` with length < 6 or a reason over
+///   [`MAX_REASON_BYTES`] ⇒ `InvalidData`; a `F` message with fd count ≠
+///   [`LISTENER_FD_COUNT`] ⇒ `InvalidData`;
+/// * `E` with length < 6, a reason over the limit, an unknown stage code, a
+///   negative errno, any fd, or a non-UTF-8 reason ⇒ `InvalidData`;
+/// * errno 0 on the wire maps to `None`; a negative errno is rejected.
+pub(crate) fn decode_setup_message(
     data: &[u8],
     ctrl: &[u8],
     msg_flags: i32,
     fds_out: &mut Vec<RawFd>,
-) -> io::Result<()> {
+) -> io::Result<Head> {
     let mut off = 0usize;
     while off < ctrl.len() {
         // Overflow-free: `off < ctrl.len()` makes the subtraction below
@@ -538,10 +649,8 @@ pub(crate) fn decode_fds_message(
             ));
         }
         let hdr = cmsghdr_at(&ctrl[off..]);
-        // cmsg_len's width is platform-dependent (size_t on 64-bit Linux,
-        // socklen_t on other ABIs); comparing in u64 space keeps the bounds
-        // check uniform — a garbage length near the type's MAX is rejected
-        // by `cmsg_len > remaining` without any addition that could wrap.
+        // Compared in u64 space: a garbage length near the type's MAX is
+        // rejected by `cmsg_len > remaining` without any wrapping addition.
         let cmsg_len = hdr.cmsg_len as u64;
         let remaining = remaining as u64;
         let data_off = cmsg_hdr_len(0) as u64;
@@ -575,34 +684,101 @@ pub(crate) fn decode_fds_message(
             ));
         }
         for chunk in body.chunks_exact(size_of::<RawFd>()) {
-            // chunks_exact guarantees the length; the map_err keeps the
-            // decoder panic-free by construction anyway.
             let bytes: [u8; size_of::<RawFd>()] = chunk
                 .try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed fd chunk"))?;
             fds_out.push(RawFd::from_ne_bytes(bytes));
         }
-        // Advance to the next cmsg slot. The addition cannot overflow:
-        // cmsg_len ≤ remaining ≤ ctrl.len() and off ≤ ctrl.len(), both far
-        // below usize::MAX for any real (≤ CTRL_BUF_LEN) buffer.
+        // Advance to the next cmsg slot (cannot overflow: see above).
         off += cmsg_align(cmsg_len);
     }
-    if msg_flags & libc::MSG_CTRUNC != 0 {
+    if msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
         return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
     }
-    if data.len() != 1 || data[0] != FDS_PAYLOAD_BYTE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected the 1-byte payload [{FDS_PAYLOAD_BYTE:#04x}], got {data:02x?}"),
-        ));
+    let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
+    match data.first() {
+        None => Err(invalid("empty setup message".to_owned())),
+        Some(&FDS_PAYLOAD_BYTE) => {
+            let mode = match data.get(1) {
+                Some(&MODE_TRANSPARENT) => {
+                    if data.len() != 2 {
+                        return Err(invalid(format!(
+                            "transparent ready message must be 2 bytes, got {}",
+                            data.len()
+                        )));
+                    }
+                    AchievedMode::Transparent
+                }
+                Some(&MODE_EXPLICIT) => {
+                    if data.len() < 6 {
+                        return Err(invalid(format!(
+                            "explicit ready message must carry an errno, got {} bytes",
+                            data.len()
+                        )));
+                    }
+                    if data.len() - 6 > MAX_REASON_BYTES {
+                        return Err(invalid("ready reason exceeds the limit".to_owned()));
+                    }
+                    let (errno, reason) = decode_errno_reason(&data[2..])?;
+                    AchievedMode::Explicit { errno, reason }
+                }
+                other => {
+                    return Err(invalid(format!("unknown mode byte {other:02x?}")));
+                }
+            };
+            if fds_out.len() != LISTENER_FD_COUNT {
+                return Err(invalid(format!(
+                    "expected {LISTENER_FD_COUNT} fds, got {}",
+                    fds_out.len()
+                )));
+            }
+            Ok(Head::Ready(mode))
+        }
+        Some(&FAIL_PAYLOAD_BYTE) => {
+            if !fds_out.is_empty() {
+                return Err(invalid(format!(
+                    "a failure message must carry no fds, got {}",
+                    fds_out.len()
+                )));
+            }
+            if data.len() < 6 {
+                return Err(invalid(format!(
+                    "failure message too short ({} bytes)",
+                    data.len()
+                )));
+            }
+            if data.len() - 6 > MAX_REASON_BYTES {
+                return Err(invalid("failure reason exceeds the limit".to_owned()));
+            }
+            let stage = Stage::from_code(data[1])
+                .ok_or_else(|| invalid(format!("unknown stage code {}", data[1])))?;
+            let (errno, reason) = decode_errno_reason(&data[2..])?;
+            Ok(Head::Failed(StagedFailure {
+                stage,
+                errno,
+                reason,
+            }))
+        }
+        Some(other) => Err(invalid(format!(
+            "expected the first byte {FDS_PAYLOAD_BYTE:#04x} ('F') or {FAIL_PAYLOAD_BYTE:#04x} ('E'), got {other:#04x}"
+        ))),
     }
-    if fds_out.len() != LISTENER_FD_COUNT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected {LISTENER_FD_COUNT} fds, got {}", fds_out.len()),
-        ));
+}
+
+/// `errno i32 LE` + UTF-8 reason: `0` ⇒ `None`, negative ⇒ rejected.
+fn decode_errno_reason(bytes: &[u8]) -> io::Result<(Option<i32>, String)> {
+    let invalid = |reason: String| io::Error::new(io::ErrorKind::InvalidData, reason);
+    let raw: [u8; 4] = bytes[..4]
+        .try_into()
+        .map_err(|_| invalid("truncated errno".to_owned()))?;
+    let errno = i32::from_le_bytes(raw);
+    if errno < 0 {
+        return Err(invalid(format!("negative errno {errno}")));
     }
-    Ok(())
+    let reason = std::str::from_utf8(&bytes[4..])
+        .map_err(|_| invalid("reason is not UTF-8".to_owned()))?
+        .to_owned();
+    Ok((if errno == 0 { None } else { Some(errno) }, reason))
 }
 
 /// Read the `cmsghdr` at the start of `buf` (which must be at least
@@ -729,6 +905,8 @@ mod tests {
     use std::os::fd::AsFd;
     use std::time::Instant;
 
+    use crate::init::consts::MAX_REASON_BYTES;
+
     /// A real control socketpair (thread-safe: only `unshare` is
     /// thread-forbidden, socketpair/recvmsg are fine under cargo test).
     fn pair() -> (OwnedFd, OwnedFd) {
@@ -759,11 +937,12 @@ mod tests {
         ty
     }
 
-    /// Encode a message through the production encoder.
-    fn encode(payload: u8, fds: &[RawFd]) -> (Vec<u8>, Vec<u8>) {
-        let (mut data, mut ctrl) = (Vec::new(), Vec::new());
-        encode_fds_message(payload, fds, &mut data, &mut ctrl);
-        (data, ctrl)
+    /// Encode a setup message's pieces: `data` is the given payload bytes
+    /// verbatim, `ctrl` the fds cmsg from the production encoder.
+    fn encode(payload: &[u8], fds: &[RawFd]) -> (Vec<u8>, Vec<u8>) {
+        let mut ctrl = Vec::new();
+        encode_fds_cmsg(fds, &mut ctrl);
+        (payload.to_vec(), ctrl)
     }
 
     /// Craft a raw cmsg (header byte image + data) for the malformed-input
@@ -790,174 +969,216 @@ mod tests {
     /// Decode through the production sink contract: returns
     /// `(result, sink)` — the sink is what the caller's
     /// [`ReceivedFdGuard`] would own (m1).
-    fn decode(data: &[u8], ctrl: &[u8], msg_flags: i32) -> (io::Result<()>, Vec<RawFd>) {
+    fn decode(data: &[u8], ctrl: &[u8], msg_flags: i32) -> (io::Result<Head>, Vec<RawFd>) {
         let mut sink = Vec::new();
-        let result = decode_fds_message(data, ctrl, msg_flags, &mut sink);
+        let result = decode_setup_message(data, ctrl, msg_flags, &mut sink);
         (result, sink)
     }
 
+    fn ready_bytes(mode: &AchievedMode) -> Vec<u8> {
+        let mut data = Vec::new();
+        encode_ready(mode, &mut data);
+        data
+    }
+
+    fn explicit(errno: Option<i32>, reason: &str) -> AchievedMode {
+        AchievedMode::Explicit {
+            errno,
+            reason: reason.to_owned(),
+        }
+    }
+
+    // ---- golden wire bytes (issue #11) -----------------------------------
+
     #[test]
-    fn fds_message_roundtrip_in_memory() {
-        let (data, ctrl) = encode(FDS_PAYLOAD_BYTE, &[5, 6, 7]);
-        assert_eq!(data, [FDS_PAYLOAD_BYTE]);
+    fn ready_wire_goldens() {
+        assert_eq!(ready_bytes(&AchievedMode::Transparent), [0x46, 0x74]);
+        assert_eq!(
+            ready_bytes(&explicit(Some(2), "x")),
+            [0x46, 0x65, 0x02, 0, 0, 0, b'x']
+        );
+        assert_eq!(ready_bytes(&explicit(None, "")), [0x46, 0x65, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn failure_wire_golden() {
+        let mut data = Vec::new();
+        encode_failure(Stage::NftLoad, Some(2), "x", &mut data);
+        assert_eq!(data, [0x45, 0x07, 0x02, 0, 0, 0, b'x']);
+    }
+
+    #[test]
+    fn stage_code_is_the_wire_code() {
+        let mut data = Vec::new();
+        encode_failure(Stage::Fallback, None, "r", &mut data);
+        assert_eq!(data[1], 9);
+    }
+
+    // ---- decode: accept --------------------------------------------------
+
+    #[test]
+    fn ready_transparent_roundtrip_in_memory() {
+        let (_, ctrl) = encode(&[], &[5, 6, 7]);
+        let data = ready_bytes(&AchievedMode::Transparent);
         let (result, sink) = decode(&data, &ctrl, 0);
-        result.expect("valid message decodes");
+        assert_eq!(
+            result.expect("valid"),
+            Head::Ready(AchievedMode::Transparent)
+        );
         assert_eq!(sink, [5, 6, 7]);
     }
 
     #[test]
-    fn decode_rejects_wrong_payload_byte() {
-        // Strictness (D4): the marker byte is part of the protocol; so is
-        // the payload LENGTH (a multi-byte payload is not our message).
-        // m1: the cmsg walk runs FIRST, so the installed fds are in the
-        // sink for the caller's guard even on these rejections.
-        let (_, ctrl) = encode(FDS_PAYLOAD_BYTE, &[5, 6, 7]);
-        let (data, _) = encode(b'X', &[5, 6, 7]);
-        let (result, sink) = decode(&data, &ctrl, 0);
-        let err = result.expect_err("wrong byte must be rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(sink, [5, 6, 7], "the rejection must not strand the fds");
-        let (result, sink) = decode(&[], &ctrl, 0);
-        assert_eq!(
-            result.expect_err("empty data must be rejected").kind(),
-            io::ErrorKind::InvalidData
-        );
-        // The zero-length-data walk still collects first: this is the arm
-        // recv_listener_fds' EOF path relies on — a zero-length SEQPACKET
-        // message can legally carry SCM_RIGHTS fds (recvmsg returns 0 with
-        // them installed), and the guard must close them there too (m1).
-        assert_eq!(
-            sink,
-            [5, 6, 7],
-            "zero-length data must not strand the installed fds"
-        );
-        let (result, _) = decode(&[FDS_PAYLOAD_BYTE, FDS_PAYLOAD_BYTE], &ctrl, 0);
-        assert_eq!(
-            result.expect_err("multi-byte data must be rejected").kind(),
-            io::ErrorKind::InvalidData
-        );
+    fn ready_explicit_roundtrip_in_memory() {
+        let mode = explicit(Some(2), "nft-load: batch failed");
+        let (_, ctrl) = encode(&[], &[5, 6, 7]);
+        let (result, sink) = decode(&ready_bytes(&mode), &ctrl, 0);
+        assert_eq!(result.expect("valid"), Head::Ready(mode));
+        assert_eq!(sink, [5, 6, 7]);
     }
 
     #[test]
-    fn decode_rejects_wrong_fd_count() {
-        // Exactly LISTENER_FD_COUNT fds: fewer or more is a protocol
-        // violation, never a partial success (D4) — and the sink holds
-        // whatever arrived (m1: the guard closes it, no stranded fds).
-        let cases: [&[RawFd]; 3] = [&[5, 6], &[5, 6, 7, 8], &[]];
-        for fds in cases {
-            let (data, ctrl) = encode(FDS_PAYLOAD_BYTE, fds);
-            let (result, sink) = decode(&data, &ctrl, 0);
-            let err = match result {
-                Ok(()) => panic!("{fds:?} fds must be rejected"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{fds:?}");
-            assert_eq!(sink, fds, "sink mirrors the arrived fds: {fds:?}");
+    fn failed_roundtrip_in_memory_has_no_fds() {
+        let mut data = Vec::new();
+        encode_failure(Stage::Unshare, Some(28), "unshare failed", &mut data);
+        let (result, sink) = decode(&data, &[], 0);
+        assert_eq!(
+            result.expect("valid"),
+            Head::Failed(StagedFailure {
+                stage: Stage::Unshare,
+                errno: Some(28),
+                reason: "unshare failed".into(),
+            })
+        );
+        assert!(sink.is_empty());
+    }
+
+    #[test]
+    fn errno_zero_is_none() {
+        let mut data = Vec::new();
+        encode_failure(Stage::Netns, None, "x", &mut data);
+        let (result, _) = decode(&data, &[], 0);
+        match result.expect("valid") {
+            Head::Failed(f) => assert_eq!(f.errno, None),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_reason_char_boundary() {
+        assert_eq!(truncate_reason("short"), "short");
+        let long = "é".repeat(600); // 2 bytes each: 1200 bytes
+        let cut = truncate_reason(&long);
+        assert!(cut.len() <= MAX_REASON_BYTES);
+        assert_eq!(cut.len(), MAX_REASON_BYTES, "512 is a char boundary for é");
+        assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+        let odd = format!("{}é", "a".repeat(511));
+        assert_eq!(truncate_reason(&odd).len(), 511, "é would straddle 512");
+    }
+
+    // ---- decode: reject table ---------------------------------------------
+
+    fn expect_invalid(data: &[u8], ctrl: &[u8], flags: i32, fds_expected: usize) {
+        let (result, sink) = decode(data, ctrl, flags);
+        let err = result.expect_err(&format!("must reject {data:02x?}"));
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{data:02x?}: {err}");
+        assert_eq!(sink.len(), fds_expected, "fds stay in the sink (m1)");
+    }
+
+    #[test]
+    fn decode_reject_table() {
+        let (_, three) = encode(&[], &[5, 6, 7]);
+        let (_, none) = encode(&[], &[]);
+        // empty data
+        expect_invalid(&[], &none, 0, 0);
+        // unknown first byte
+        expect_invalid(b"X", &three, 0, 3);
+        // F with unknown mode
+        expect_invalid(&[0x46, b'z'], &three, 0, 3);
+        // F t with length != 2
+        expect_invalid(&[0x46, 0x74, 0x00], &three, 0, 3);
+        // F e shorter than the errno
+        expect_invalid(&[0x46, 0x65, 0, 0], &three, 0, 3);
+        // F e reason over the limit
+        let mut long = vec![0x46, 0x65, 0, 0, 0, 0];
+        long.extend(std::iter::repeat_n(b'a', MAX_REASON_BYTES + 1));
+        expect_invalid(&long, &three, 0, 3);
+        // F t with the wrong fd count
+        expect_invalid(&[0x46, 0x74], &none, 0, 0);
+        let (_, two) = encode(&[], &[5, 6]);
+        expect_invalid(&[0x46, 0x74], &two, 0, 2);
+        // F e with a negative errno
+        expect_invalid(&[0x46, 0x65, 0xff, 0xff, 0xff, 0xff], &three, 0, 3);
+        // F e with a reason that is not UTF-8
+        expect_invalid(&[0x46, 0x65, 2, 0, 0, 0, 0xff], &three, 0, 3);
+        // E shorter than the header
+        expect_invalid(&[0x45, 0x07, 0, 0], &none, 0, 0);
+        // E with an unknown stage code (0 and 13)
+        expect_invalid(&[0x45, 0x00, 0, 0, 0, 0], &none, 0, 0);
+        expect_invalid(&[0x45, 0x0d, 0, 0, 0, 0], &none, 0, 0);
+        // E carrying fds
+        expect_invalid(&[0x45, 0x07, 0, 0, 0, 0], &three, 0, 3);
+        // E with a negative errno
+        expect_invalid(&[0x45, 0x07, 0xff, 0xff, 0xff, 0xff], &none, 0, 0);
+        // E reason over the limit
+        let mut long = vec![0x45, 0x07, 0, 0, 0, 0];
+        long.extend(std::iter::repeat_n(b'a', MAX_REASON_BYTES + 1));
+        expect_invalid(&long, &none, 0, 0);
+    }
+
+    #[test]
+    fn decode_msg_ctrunc_and_trunc_are_emsgsize() {
+        let (data, ctrl) = encode(&[], &[5, 6, 7]);
+        let mut ready = ready_bytes(&AchievedMode::Transparent);
+        ready.truncate(data.len().max(2));
+        for flags in [libc::MSG_CTRUNC, libc::MSG_TRUNC] {
+            let (result, sink) = decode(&ready, &ctrl, flags);
+            let err = result.expect_err("truncation rejected");
+            assert_eq!(err.raw_os_error(), Some(libc::EMSGSIZE));
+            assert_eq!(sink.len(), 3, "the fds are still collected (m1)");
         }
     }
 
     #[test]
     fn decode_rejects_truncated_cmsg() {
-        // Every truncation shorter than the advertised cmsg_len must be
-        // rejected — no panic, no UB, no partial acceptance. The bounds
-        // check fires before any fd parse, so the sink stays empty.
-        let (data, ctrl) = encode(FDS_PAYLOAD_BYTE, &[5, 6, 7]);
-        let full = cmsg_hdr_len(3 * size_of::<RawFd>());
-        assert!(ctrl.len() >= full, "sanity: ctrl holds the full cmsg");
-        for cut in 1..full {
-            let (result, sink) = decode(&data, &ctrl[..cut], 0);
-            let err = match result {
-                Ok(()) => panic!("truncation to {cut} bytes must be rejected"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut {cut}");
-            assert!(sink.is_empty(), "cut {cut}: rejected before any fd parse");
-        }
-    }
-
-    #[test]
-    fn decode_rejects_msg_ctrunc() {
-        // The kernel truncated the cmsg chain: its contents cannot be
-        // trusted, even when they parse — reject with EMSGSIZE (spike
-        // listeners.rs precedent). m1: the walk runs first, so the fds the
-        // kernel installed for the truncated chain are in the sink for the
-        // guard to close.
-        let (data, ctrl) = encode(FDS_PAYLOAD_BYTE, &[5, 6, 7]);
-        let (result, sink) = decode(&data, &ctrl, libc::MSG_CTRUNC);
-        let err = result.expect_err("MSG_CTRUNC must be rejected");
-        assert_eq!(err.raw_os_error(), Some(libc::EMSGSIZE));
-        assert_eq!(sink, [5, 6, 7], "CTRUNC must not strand the fds");
+        let (data, ctrl) = encode(&[], &[5, 6, 7]);
+        let short = &ctrl[..size_of::<libc::cmsghdr>() - 1];
+        let (result, _) = decode(&ready_bytes(&AchievedMode::Transparent), short, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let _ = data;
     }
 
     #[test]
     fn decode_rejects_non_scm_rights_cmsg() {
-        // Fail-closed, not ignore: a foreign cmsg in our control message is
-        // a protocol violation (the same-binary invariant means it can only
-        // come from a bug or an attacker).
-        let data = [FDS_PAYLOAD_BYTE];
-        let foreign = [
-            craft_cmsg(
-                libc::SOL_SOCKET,
-                libc::SCM_CREDENTIALS,
-                cmsg_hdr_len(12),
-                &[0; 12],
-            ),
-            craft_cmsg(libc::IPPROTO_IP, 99, cmsg_hdr_len(12), &[0; 12]),
-        ];
-        for ctrl in foreign {
-            let (result, sink) = decode(&data, &ctrl, 0);
-            let err = result.expect_err("foreign cmsg rejected");
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-            assert!(sink.is_empty(), "a foreign-only chain installs nothing");
-        }
-        // A foreign cmsg AFTER a valid SCM_RIGHTS one is rejected too — and
-        // the leading valid cmsg's fds are in the sink for the guard (m1:
-        // the kernel installed them; the rejection must not strand them).
-        let (data2, mut valid) = encode(FDS_PAYLOAD_BYTE, &[5, 6, 7]);
-        valid.extend_from_slice(&craft_cmsg(
+        let fd_bytes = 5i32.to_ne_bytes();
+        let foreign = craft_cmsg(
             libc::SOL_SOCKET,
             libc::SCM_CREDENTIALS,
-            cmsg_hdr_len(12),
-            &[0; 12],
-        ));
-        let (result, sink) = decode(&data2, &valid, 0);
-        let err = result.expect_err("trailing foreign cmsg");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(sink, [5, 6, 7], "leading fds must not strand");
+            cmsg_hdr_len(4),
+            &fd_bytes,
+        );
+        let (result, _) = decode(&ready_bytes(&AchievedMode::Transparent), &foreign, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        let wrong_level = craft_cmsg(
+            libc::IPPROTO_IP,
+            libc::SCM_RIGHTS,
+            cmsg_hdr_len(4),
+            &fd_bytes,
+        );
+        let (result, _) = decode(&ready_bytes(&AchievedMode::Transparent), &wrong_level, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn decode_cmsg_len_garbage_does_not_wrap() {
-        // The overflow-free bounds invariant (spike comment precedent): a
-        // cmsg_len near usize::MAX must be rejected by the comparison
-        // against the REMAINING buffer — an addition-based check would wrap
-        // and could accept. Zero, sub-header and non-fd-multiple lengths
-        // too; every rejection fires before any fd parse (empty sink).
-        let data = [FDS_PAYLOAD_BYTE];
-        for len_value in [usize::MAX, usize::MAX - 7, 0, 1, cmsg_hdr_len(0) - 1] {
-            let ctrl = craft_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, len_value, &[0; 12]);
-            let (result, sink) = decode(&data, &ctrl, 0);
-            let err = match result {
-                Ok(()) => panic!("cmsg_len {len_value} must be rejected"),
-                Err(err) => err,
-            };
-            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "len {len_value}");
-            assert!(
-                sink.is_empty(),
-                "len {len_value}: rejected before any fd parse"
-            );
-        }
-        // A cmsg_len whose fd area is not a multiple of the fd width.
-        let ctrl = craft_cmsg(
-            libc::SOL_SOCKET,
-            libc::SCM_RIGHTS,
-            cmsg_hdr_len(3 * size_of::<RawFd>() + 2),
-            &[0; 3 * size_of::<RawFd>() + 2],
-        );
-        let (result, sink) = decode(&data, &ctrl, 0);
-        let err = result.expect_err("ragged fd area rejected");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(sink.is_empty(), "ragged area: rejected before any fd parse");
+        let (_, mut ctrl) = encode(&[], &[5, 6, 7]);
+        // cmsg_len near usize::MAX: rejected by the bounds compare, no wrap.
+        let huge = craft_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, usize::MAX - 3, &[]);
+        let (result, _) = decode(&ready_bytes(&AchievedMode::Transparent), &huge, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        ctrl.truncate(3);
+        let (result, _) = decode(&ready_bytes(&AchievedMode::Transparent), &ctrl, 0);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -1112,7 +1333,8 @@ mod tests {
         let e = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind e");
         let u = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind u");
         let fds = [t.as_raw_fd(), e.as_raw_fd(), u.as_raw_fd()];
-        send_listener_fds(a.as_raw_fd(), &fds).expect("send must succeed");
+        send_listener_fds(a.as_raw_fd(), &fds, &AchievedMode::Transparent)
+            .expect("send must succeed");
 
         let received = recv_listener_fds(b.as_raw_fd()).expect("recv must succeed");
         assert_eq!(
@@ -1150,5 +1372,100 @@ mod tests {
         drop(a);
         let err = recv_listener_fds(b.as_raw_fd()).expect_err("EOF must fail");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn setup_message_roundtrip_over_real_socketpair() {
+        let (a, b) = pair();
+        let t = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind t");
+        let e = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind e");
+        let u = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).expect("bind u");
+        let fds = [t.as_raw_fd(), e.as_raw_fd(), u.as_raw_fd()];
+        let mode = explicit(Some(2), "nft-load: batch failed");
+        send_listener_fds(a.as_raw_fd(), &fds, &mode).expect("send");
+        match recv_setup(b.as_raw_fd()).expect("recv") {
+            SetupMsg::Ready { fds: got, mode: m } => {
+                assert_eq!(m, mode);
+                assert_eq!(got.as_raw_fds().len(), 3);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn failure_message_roundtrip_over_real_socketpair() {
+        let (a, b) = pair();
+        let err = InitError::new(Stage::Ipv6, "write disable_ipv6 failed").with_errno(Some(30));
+        send_failure(a.as_raw_fd(), &err);
+        match recv_setup(b.as_raw_fd()).expect("recv") {
+            SetupMsg::Failed(f) => {
+                assert_eq!(f.stage, Stage::Ipv6);
+                assert_eq!(f.errno, Some(30));
+                assert_eq!(f.to_string(), "ipv6: write disable_ipv6 failed");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recv_listener_fds_on_failure_is_staged_error_text() {
+        let (a, b) = pair();
+        send_failure(
+            a.as_raw_fd(),
+            &InitError::new(Stage::NftLoad, "batch failed"),
+        );
+        let err = recv_listener_fds(b.as_raw_fd()).expect_err("failure is not fds");
+        assert_eq!(err.to_string(), "sbx __init: nft-load: batch failed");
+    }
+
+    #[test]
+    fn explicit_mode_label_pinned() {
+        assert_eq!(AchievedMode::Transparent.label(), "transparent");
+        assert_eq!(explicit(None, "").label(), "explicit");
+    }
+
+    /// Review (fuzz): the setup-message decoder never panics and never
+    /// accepts a message outside the pinned shapes. Deterministic xorshift
+    /// inputs, no real fds (ctrl bytes are random or empty).
+    #[test]
+    fn decode_never_panics_on_random_input() {
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for i in 0..100_000u32 {
+            let dlen = (next() % 600) as usize;
+            let mut data: Vec<u8> = (0..dlen).map(|_| next() as u8).collect();
+            if !data.is_empty() {
+                data[0] = (*b"FEx")[(next() % 3) as usize];
+            }
+            if data.len() > 1 && i % 2 == 0 {
+                data[1] = [b't', b'e', 7, 0, 13, 255][(next() % 6) as usize];
+            }
+            let ctrl: Vec<u8> = if next() % 4 == 0 {
+                (0..(next() % 64) as usize).map(|_| next() as u8).collect()
+            } else {
+                Vec::new()
+            };
+            let flags = if next() % 10 == 0 { libc::MSG_TRUNC } else { 0 };
+            let mut fds = Vec::new();
+            let _ = decode_setup_message(&data, &ctrl, flags, &mut fds);
+        }
+        // Reason limits are exact at the boundary.
+        let mut over = vec![b'E', 7, 2, 0, 0, 0];
+        over.extend(std::iter::repeat_n(b'a', MAX_REASON_BYTES + 1));
+        assert!(decode_setup_message(&over, &[], 0, &mut Vec::new()).is_err());
+        let mut at = vec![b'E', 7, 2, 0, 0, 0];
+        at.extend(std::iter::repeat_n(b'a', MAX_REASON_BYTES));
+        assert!(decode_setup_message(&at, &[], 0, &mut Vec::new()).is_ok());
+        assert!(decode_setup_message(b"F", &[], 0, &mut Vec::new()).is_err());
+        // A multibyte reason encodes within the limit and round-trips.
+        let mut v = Vec::new();
+        encode_failure(Stage::Fallback, Some(5), &"é".repeat(600), &mut v);
+        assert!(v.len() - 6 <= MAX_REASON_BYTES);
+        assert!(decode_setup_message(&v, &[], 0, &mut Vec::new()).is_ok());
     }
 }

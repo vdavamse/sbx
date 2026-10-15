@@ -15,9 +15,14 @@
 //!    `== 1`), and killed through its pidfd. Waiting on that pidfd proves the whole
 //!    pid namespace is gone. bwrap is reaped last, the pumps are drained, and the
 //!    exit row is written.
+//!    (Issue #11: the network-mode refusal happens at S14. `__init` reports its
+//!    achieved mode or a staged failure over the control socket; a refusal is
+//!    rc 125 with the shared classifier's text and the `sbx check` hint, and an
+//!    explicit fallback prints one notice and is recorded as `net_mode`.)
 //! 4. **Exit codes.** The command's own code; 124 timeout; 125 sbx failure;
 //!    128+N terminated by signal N (sbx's own signal or a signalled payload that
-//!    bwrap relayed); 2 usage (clap). A payload that itself exits 124/125 is
+//!    bwrap relayed); 2 usage (clap). A policy whose network mode the host
+//!    cannot provide is 125 (issue #11). A payload that itself exits 124/125 is
 //!    indistinguishable by rc alone — the audit `outcome` disambiguates.
 //! 5. **Signals.** SIGTERM, SIGINT, SIGHUP and SIGQUIT are collected by signalfd
 //!    (no handlers). A signal the caller left ignored stays ignored. On receipt the
@@ -29,6 +34,8 @@
 //!    sees a tty on fds 0–2.
 //! 7. **Audit.** `--audit` writes one JSON object per line (schema: notes §5),
 //!    append-only, 0600, regular file only, never inside the session directory.
+//!    The exit row's last key `net_mode` (issue #11) is the achieved network
+//!    mode (`transparent` or `explicit`), or null when setup never completed.
 //!    A write failure is fail-closed (Q7). The exit row is always last. No fsync.
 //! 8. **Supervision.** A failing or panicking network task, a dead network thread
 //!    or an audit failure ends the run with 125 (the latch wakes the main loop).
@@ -66,18 +73,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::bwrap::etc::session_layout;
-use crate::bwrap::version::{BWRAP_MIN, find_bwrap, parse_version};
+use crate::bwrap::version::{BwrapStatus, classify_version_output, find_bwrap};
 use crate::bwrap::{Build, build};
 use crate::dns::{DnsLimits, DnsServer, FakeIpMap};
+use crate::host::facts::RunFacts;
 use crate::init::fdpass;
-use crate::init::fdpass::ListenerFds;
+use crate::init::fdpass::{AchievedMode, ListenerFds};
 use crate::policy::Policy;
 use crate::proxy::Proxy;
 use sys::pollfd;
 
 use audit::{AuditLog, exit_row, open_audit, ts};
 use lifecycle::{Cause, Pid1, Sandbox, main_loop, teardown};
-use mode::{PROVIDED_MODE, check_mode, effective_network};
+use mode::{effective_network, fallback_notice, refusal};
 use plan::{
     absolutize, audit_inside_session, effective_timeout, exit_code, lexical_normalize, passed_env,
     sbx_diagnostic,
@@ -117,6 +125,8 @@ pub struct RunArgs {
     pub audit: Option<PathBuf>,
     /// The payload argv, verbatim (Q9).
     pub cmd: Vec<OsString>,
+    /// Hidden fail-only test driver, forwarded to `__init` (issue #11, Q6).
+    pub test_break_rules: bool,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -211,6 +221,9 @@ struct Conclusion {
     cap: u64,
     /// The forwarded stderr ends mid-line: start sbx's lines on a fresh line.
     stderr_partial: bool,
+    /// The network mode the sandbox actually got (`transparent` | `explicit`);
+    /// `None` when setup never completed (issue #11, Q5).
+    net_mode: Option<&'static str>,
 }
 
 /// The final step of every run that got past S5: M1 (an audit write failure
@@ -225,6 +238,7 @@ fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: 
             t0.elapsed(),
             facts.truncated,
             facts.poisoned,
+            facts.net_mode,
         ));
         mark_audit_failure(&mut outcome, audit);
     }
@@ -306,6 +320,7 @@ fn report_failure(reason: &str, t0: Instant, audit: Option<&AuditLog>) -> ExitCo
             t0.elapsed(),
             false,
             false,
+            None,
         ));
     }
     write_diagnostics(false, &[format!("sbx run: {reason}")]);
@@ -402,13 +417,10 @@ fn check_bwrap_version(
         .wait()
         .map_err(|err| RunError::new(format!("cannot collect bwrap --version: {err}")))?;
     let text = String::from_utf8_lossy(&out).into_owned();
-    match parse_version(&text) {
-        Some(version) if status.success() && version >= BWRAP_MIN => Ok(()),
-        _ => Err(RunError::new(format!(
-            "unsupported bwrap version {:?}; need >= 0.8.0",
-            text.lines().next().unwrap_or("")
-        ))
-        .into()),
+    // The shared gate (issue #11): the refusal text is BwrapStatus's, pinned.
+    match classify_version_output(bwrap, status.success(), status.code(), &text).run_reason() {
+        None => Ok(()),
+        Some(reason) => Err(RunError::new(reason).into()),
     }
 }
 
@@ -469,7 +481,6 @@ fn execute(
         .iter()
         .map(|p| p.as_path().to_path_buf())
         .collect();
-    check_mode(policy.network.mode, PROVIDED_MODE)?;
     let timeout = effective_timeout(args.timeout, policy.limits.timeout);
     let deadline = deadline_from(t0, timeout);
     let session = lexical_normalize(&absolutize(&args.session_dir)?);
@@ -515,9 +526,8 @@ fn execute(
     *audit_slot = Some(audit.clone());
 
     // S6: bwrap discovery and version gate.
-    let bwrap = find_bwrap().ok_or_else(|| {
-        RunError::new("bwrap not found (install bubblewrap >= 0.8.0 or set SBX_BWRAP)")
-    })?;
+    let bwrap = find_bwrap()
+        .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
     check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
 
     // S7: env pass-through and the session layout.
@@ -548,9 +558,16 @@ fn execute(
     let info_fd = sys::clear_cloexec(info_write.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
     let (stdin, stdin_piped) = stdin_mode();
-    let mut child = init_command(child_fd, info_fd, &launch, stdin)
-        .spawn()
-        .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    let mut child = init_command(
+        child_fd,
+        info_fd,
+        policy.network.mode,
+        args.test_break_rules,
+        &launch,
+        stdin,
+    )
+    .spawn()
+    .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
     drop(child_end);
     drop(info_write);
 
@@ -578,6 +595,8 @@ fn execute(
     let mut pumps: Option<Pumps> = None;
 
     // S13–S17. Any failure here is a Cause::Setup and goes through teardown.
+    // The achieved network mode, recorded on the exit row (issue #11, Q5).
+    let mut net_mode: Option<&'static str> = None;
     let startup = (|| -> Result<(), Cause> {
         pumps = Some(
             Pumps::start(
@@ -591,7 +610,9 @@ fn execute(
                 )))
             })?,
         );
-        // S14: wait for the listener fds from __init.
+        // S14: wait for the listener fds from __init. A staged failure refuses
+        // the run (rc 125) with the shared classifier's text; an explicit
+        // fallback runs with a notice and is recorded as `net_mode`.
         let fds: ListenerFds = match wait_for_fds(
             parent_end.as_fd(),
             sb.child_pidfd.as_fd(),
@@ -599,7 +620,28 @@ fn execute(
             deadline,
             t0 + SETUP_TIMEOUT,
         ) {
-            SetupEnd::Fds(fds) => fds,
+            SetupEnd::Ready { fds, mode } => {
+                // Review #2: the parent refuses an explicit result the policy
+                // cannot accept, whatever `--min-mode` said.
+                if let Some(err) = mode::achieved_refusal(policy.network.mode, &mode) {
+                    return Err(Cause::Setup(err));
+                }
+                net_mode = Some(mode.label());
+                if let AchievedMode::Explicit { reason, .. } = &mode {
+                    write_diagnostics(false, &[fallback_notice(reason, policy.network.mode)]);
+                }
+                fds
+            }
+            SetupEnd::Refused(failure) => {
+                // Let __init finish its own staged stderr line before teardown
+                // kills and reaps it.
+                let _ = sys::wait_readable(sb.child_pidfd.as_fd(), INFO_GRACE);
+                return Err(Cause::Setup(refusal(
+                    policy.network.mode,
+                    &failure,
+                    &RunFacts::read(),
+                )));
+            }
             SetupEnd::Signal(sig) => return Err(Cause::Signal(sig)),
             SetupEnd::TimedOut => return Err(Cause::Timeout(timeout)),
             SetupEnd::SetupTimedOut => {
@@ -669,6 +711,7 @@ fn execute(
             poisoned: map.poisoned(),
             stragglers,
             cap: policy.limits.output_bytes,
+            net_mode,
         },
     )
 }

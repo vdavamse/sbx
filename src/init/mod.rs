@@ -2,7 +2,7 @@
 //! namespace setup, nftables rules, listener fd hand-off, payload exec.
 //!
 //! 1. **Stage order is load-bearing.** [`Stage`] enumerates the pipeline
-//!    order: the `control` stage validates the inherited socketpair end
+//!    order (`fallback`, issue #11, sits between `nft-verify` and `send-fds`): the `control` stage validates the inherited socketpair end
 //!    *before* any namespace work (fast, deterministic, namespace- and
 //!    privilege-independent failure — which is what makes the CI build-job
 //!    smoke runnable on any runner); listeners bind *before* the nftables
@@ -33,8 +33,11 @@
 //!    only stderr output — never exit 101.
 //! 5. **Protocol strictness is free.** Parent (`run`, #10) and child are
 //!    always the *same binary* — `run` re-execs `current_exe` — so the
-//!    control protocol validates exact bytes ('F' payload, 'G' go, exactly
-//!    three fds) with no version negotiation (design D4).
+//!    control protocol validates exact bytes ('F' + mode or 'E' failure, 'G'
+//!    go, exactly three fds on a ready message) with no version negotiation
+//!    (design D4). Since issue #11 a staged failure in the setup stages is
+//!    reported as an `'E'` message before the staged stderr line (run
+//!    classifies it; the stderr text is unchanged).
 //! 6. **Exec hygiene: fds AND runtime state (spike risks R5/R6).** The
 //!    control fd (`--fd N`) is deliberately *not* CLOEXEC — it must survive
 //!    the re-exec from `run` — so it is closed explicitly before the payload
@@ -63,9 +66,17 @@
 //!    `IP_RECVORIGDSTADDR` for #9, `GO_TIMEOUT` for #10). Control-socket EOF
 //!    means *exec time* (the child closes its end before exec), NOT sandbox
 //!    death — #10's liveness check is `Child::wait`.
+//!
+//! 8. **Network mode fallback (issue #11, Q1).** `--min-mode` is the weakest
+//!    mode the caller accepts (the policy's own). The full nftables firewall
+//!    is always tried first; only an atomic `nft-load` refusal with a policy
+//!    of explicit or none falls back: the default route is removed and the
+//!    routing table read back (fail closed), and the achieved mode is
+//!    reported. `nft-verify` and every other stage stay fatal.
 
 pub mod consts;
 pub mod fdpass;
+pub mod probe;
 // Private: implementation detail of the pipeline below. `fdpass` (the
 // parent-side API #10 drives) and `consts` (the cross-issue constant
 // surface) are the module's public face. (They were declared `pub` while
@@ -82,6 +93,9 @@ use std::os::fd::RawFd;
 use std::process::ExitCode;
 
 use netlink_socket2::NetlinkSocket;
+
+use crate::policy::NetworkMode;
+pub use fdpass::AchievedMode;
 
 /// The setup stage a failure occurred in — the `<stage>` of every
 /// `sbx __init: <stage>: <reason>` message.
@@ -107,6 +121,10 @@ pub enum Stage {
     NftLoad,
     /// Verifying the loaded ruleset against the kernel's own dump.
     NftVerify,
+    /// Explicit fallback: default-route removal + routing read-back (issue
+    /// #11). Only reached when the nft batch was refused and the policy
+    /// allows the explicit mode.
+    Fallback,
     /// Handing the listener fds to the parent over SCM_RIGHTS.
     SendFds,
     /// Blocking on the parent's go byte.
@@ -130,12 +148,73 @@ impl Stage {
             Stage::Listeners => "listeners",
             Stage::NftLoad => "nft-load",
             Stage::NftVerify => "nft-verify",
+            Stage::Fallback => "fallback",
             Stage::SendFds => "send-fds",
             Stage::WaitGo => "wait-go",
             Stage::Exec => "exec",
         }
     }
+
+    /// Wire code for the `'E'` setup-failure message (issue #11). Exhaustive
+    /// match, pinned by `stage_codes_pinned`: Control=1, Unshare=2, Idmap=3,
+    /// Netns=4, Ipv6=5, Listeners=6, NftLoad=7, NftVerify=8, Fallback=9,
+    /// SendFds=10, WaitGo=11, Exec=12.
+    pub fn code(self) -> u8 {
+        match self {
+            Stage::Control => 1,
+            Stage::Unshare => 2,
+            Stage::Idmap => 3,
+            Stage::Netns => 4,
+            Stage::Ipv6 => 5,
+            Stage::Listeners => 6,
+            Stage::NftLoad => 7,
+            Stage::NftVerify => 8,
+            Stage::Fallback => 9,
+            Stage::SendFds => 10,
+            Stage::WaitGo => 11,
+            Stage::Exec => 12,
+        }
+    }
+
+    /// Inverse of [`Stage::code`]; unknown codes are `None`.
+    pub fn from_code(code: u8) -> Option<Stage> {
+        ALL_STAGES.iter().copied().find(|s| s.code() == code)
+    }
+
+    /// Stages whose failure `__init` reports to the parent with an `'E'`
+    /// message: the pipeline's middle, `Unshare..=Fallback`. Control (the
+    /// fd itself is unusable), SendFds/WaitGo (the channel is the problem)
+    /// and Exec (the control fd is already closed by fd hygiene) are not.
+    pub fn reports_to_parent(self) -> bool {
+        matches!(
+            self,
+            Stage::Unshare
+                | Stage::Idmap
+                | Stage::Netns
+                | Stage::Ipv6
+                | Stage::Listeners
+                | Stage::NftLoad
+                | Stage::NftVerify
+                | Stage::Fallback
+        )
+    }
 }
+
+/// Every stage in pipeline order (codes 1..=12).
+pub const ALL_STAGES: [Stage; 12] = [
+    Stage::Control,
+    Stage::Unshare,
+    Stage::Idmap,
+    Stage::Netns,
+    Stage::Ipv6,
+    Stage::Listeners,
+    Stage::NftLoad,
+    Stage::NftVerify,
+    Stage::Fallback,
+    Stage::SendFds,
+    Stage::WaitGo,
+    Stage::Exec,
+];
 
 /// A staged setup failure: which [`Stage`] failed, and why.
 ///
@@ -147,6 +226,10 @@ impl Stage {
 pub struct InitError {
     stage: Stage,
     reason: String,
+    /// The OS errno behind the failure, when the failing call had one
+    /// (issue #11). Carried on the `'E'` message and consumed by the
+    /// host classifier; never part of `Display`.
+    errno: Option<i32>,
 }
 
 impl InitError {
@@ -155,7 +238,20 @@ impl InitError {
         Self {
             stage,
             reason: reason.into(),
+            errno: None,
         }
+    }
+
+    /// Attach the OS errno of the failing call (issue #11). `Display` is
+    /// unchanged.
+    pub fn with_errno(mut self, errno: Option<i32>) -> Self {
+        self.errno = errno;
+        self
+    }
+
+    /// The OS errno behind the failure, if any.
+    pub fn errno(&self) -> Option<i32> {
+        self.errno
     }
 
     /// The stage that failed.
@@ -196,13 +292,7 @@ impl std::error::Error for InitError {}
 /// own — the [`ExitCode::SUCCESS`] arm is unreachable in practice (the
 /// pipeline only returns `Ok` if `execvp` returns, which success never
 /// does).
-pub fn run_init(
-    fd: RawFd,
-    keep_fd: Option<RawFd>,
-    parent_pid: Option<i32>,
-    test_break_rules: bool,
-    cmd: Vec<OsString>,
-) -> ExitCode {
+pub fn run_init(args: InitArgs) -> ExitCode {
     // Issue #10 (E10): `run` blocks TERM/INT/HUP/QUIT for its signalfd, and
     // std's Command does NOT reset the blocked mask across spawn. `__init` is
     // single-threaded, so resetting its thread mask resets the process mask;
@@ -222,13 +312,18 @@ pub fn run_init(
     // — sbx has no panic=abort). AssertUnwindSafety: the pipeline is a pure
     // sequence of syscalls over Copy/owned inputs; a poisoned intermediate
     // state cannot be observed because we abort (rc 1) after a catch.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pipeline(fd, keep_fd, parent_pid, test_break_rules, &cmd)
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pipeline(&args)));
     std::panic::set_hook(previous_hook);
     match result {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(err)) => {
+            // Issue #11: the parent classifies staged failures from the 'E'
+            // message (no stderr parsing). Best effort — the staged stderr
+            // line below is printed regardless, so standalone use is
+            // unchanged.
+            if err.stage().reports_to_parent() {
+                fdpass::send_failure(args.fd, &err);
+            }
             eprintln!("{err}");
             ExitCode::FAILURE
         }
@@ -239,20 +334,41 @@ pub fn run_init(
     }
 }
 
+/// Arguments of the `__init` pipeline (issue #11 grew the old positional
+/// list; the struct keeps call sites readable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitArgs {
+    /// The control socket fd (`--fd`).
+    pub fd: RawFd,
+    /// The bwrap info pipe to keep across the exec (`--keep-fd`, issue #10).
+    pub keep_fd: Option<RawFd>,
+    /// Expected parent pid (`--parent-pid`, m6).
+    pub parent_pid: Option<i32>,
+    /// The weakest network mode the caller accepts — the policy's own mode
+    /// (`--min-mode`). `Transparent` (the default for direct callers and
+    /// every existing test) disables the explicit fallback.
+    pub min_mode: NetworkMode,
+    /// Hidden fail-only test driver (`--test-break-rules`).
+    pub test_break_rules: bool,
+    /// The payload argv, exec'd last.
+    pub cmd: Vec<OsString>,
+}
+
+/// Whether a policy whose mode is `min_mode` accepts the explicit fallback
+/// (issue #11, Q1): explicit and none do, transparent does not.
+pub(crate) fn fallback_allowed(min_mode: NetworkMode) -> bool {
+    min_mode != NetworkMode::Transparent
+}
+
 /// The full stage sequence — THE ORDER IS LOAD-BEARING (module docs point
 /// 1). Each stage call constructs its own staged errors; this fn only
 /// sequences them. Returns `Err(exec_payload(..))` when exec fails; `Ok`
 /// would mean execvp returned success, which is impossible.
-fn pipeline(
-    fd: RawFd,
-    keep_fd: Option<RawFd>,
-    parent_pid: Option<i32>,
-    test_break_rules: bool,
-    cmd: &[OsString],
-) -> Result<(), InitError> {
-    arm_parent_death(parent_pid)?; // m6: first, so a dying parent takes us with it
+fn pipeline(args: &InitArgs) -> Result<(), InitError> {
+    let fd = args.fd;
+    arm_parent_death(args.parent_pid)?; // m6: first, so a dying parent takes us with it
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
-    if let Some(keep) = keep_fd {
+    if let Some(keep) = args.keep_fd {
         validate_keep_fd(keep, fd)?; // Stage::Control too (issue #10, Q13)
     }
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
@@ -264,21 +380,40 @@ fn pipeline(
     // unshare, hence bound to the NEW netns; SOCK_CLOEXEC (crate default)
     // ⇒ it dies at exec.
     let mut sock = NetlinkSocket::new();
-    let stats = rules::load(&mut sock, test_break_rules)?; // Stage::NftLoad (ERESTART retry ≤5)
-    // D20: LoadStats is retained for #10's startup/audit notes; success is
-    // silent (D6), so the child has no consumer yet — the explicit read
-    // keeps the forward-looking fields warning-free without allow() churn.
-    let _ = (stats.genid, stats.attempts);
-    rules::verify_dump(&mut sock)?; // Stage::NftVerify — Q7(a): production ALWAYS verifies
-    fdpass::send_listener_fds(fd, &listeners.as_raw_fds())?; // Stage::SendFds
+    // Issue #11 (Q1): the full firewall is always tried first. Only an
+    // atomic `nft-load` refusal (nothing committed) may fall back to the
+    // explicit mode, and only when the policy allows it. `nft-verify` and
+    // every other stage stay fatal.
+    let mode = match rules::load(&mut sock, args.test_break_rules) {
+        Ok(stats) => {
+            // D20: LoadStats is retained for #10's startup/audit notes; success is
+            // silent (D6), so the child has no consumer yet — the explicit read
+            // keeps the forward-looking fields warning-free without allow() churn.
+            let _ = (stats.genid, stats.attempts);
+            rules::verify_dump(&mut sock)?; // Stage::NftVerify — Q7(a): production ALWAYS verifies
+            AchievedMode::Transparent
+        }
+        Err(err) if err.stage() == Stage::NftLoad && fallback_allowed(args.min_mode) => {
+            // Atomic batch: nothing was committed. Remove the default route
+            // so direct connects fail fast (E1/E2), verify it is gone, and
+            // report WHY transparent was not achieved.
+            netns::remove_default_route()?; // Stage::Fallback (read-back verified)
+            AchievedMode::Explicit {
+                errno: err.errno(),
+                reason: format!("{}: {}", err.stage().as_str(), err.reason()),
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    fdpass::send_listener_fds(fd, &listeners.as_raw_fds(), &mode)?; // Stage::SendFds
     fdpass::wait_go(fd)?; // Stage::WaitGo (SO_RCVTIMEO = GO_TIMEOUT, strict 'G')
     // Close our copies before hygiene (the parent's SCM_RIGHTS dups keep
     // the sockets alive); CLOEXEC would kill them at exec anyway — the
     // fd_hygiene scan below is defense in depth.
     drop(listeners);
     drop(sock);
-    fd_hygiene(fd, keep_fd);
-    Err(exec_payload(cmd)) // Stage::Exec — returns ONLY on failure
+    fd_hygiene(fd, args.keep_fd);
+    Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
 }
 
 /// Validate `--fd` before any namespace work: a bad control fd fails fast
@@ -604,22 +739,21 @@ mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+    fn args(fd: RawFd, keep_fd: Option<RawFd>, parent_pid: Option<i32>) -> InitArgs {
+        InitArgs {
+            fd,
+            keep_fd,
+            parent_pid,
+            min_mode: NetworkMode::Transparent,
+            test_break_rules: false,
+            cmd: vec![OsString::from("/bin/true")],
+        }
+    }
+
     /// Every stage, in pipeline order. Kept next to the pinned-name match so
     /// adding a variant without extending both fails the suite.
-    fn all_stages() -> [Stage; 11] {
-        [
-            Stage::Control,
-            Stage::Unshare,
-            Stage::Idmap,
-            Stage::Netns,
-            Stage::Ipv6,
-            Stage::Listeners,
-            Stage::NftLoad,
-            Stage::NftVerify,
-            Stage::SendFds,
-            Stage::WaitGo,
-            Stage::Exec,
-        ]
+    fn all_stages() -> [Stage; 12] {
+        ALL_STAGES
     }
 
     #[test]
@@ -637,12 +771,49 @@ mod tests {
                 Stage::Listeners => "listeners",
                 Stage::NftLoad => "nft-load",
                 Stage::NftVerify => "nft-verify",
+                Stage::Fallback => "fallback",
                 Stage::SendFds => "send-fds",
                 Stage::WaitGo => "wait-go",
                 Stage::Exec => "exec",
             };
             assert_eq!(stage.as_str(), expected);
         }
+    }
+
+    #[test]
+    fn stage_codes_pinned() {
+        for (i, stage) in all_stages().into_iter().enumerate() {
+            assert_eq!(stage.code() as usize, i + 1, "{stage:?}");
+            assert_eq!(Stage::from_code(stage.code()), Some(stage));
+        }
+        assert_eq!(Stage::from_code(0), None);
+        assert_eq!(Stage::from_code(13), None);
+    }
+
+    #[test]
+    fn reports_to_parent_table() {
+        for stage in all_stages() {
+            let want = !matches!(
+                stage,
+                Stage::Control | Stage::SendFds | Stage::WaitGo | Stage::Exec
+            );
+            assert_eq!(stage.reports_to_parent(), want, "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn init_error_errno_builder() {
+        let err = InitError::new(Stage::Unshare, "unshare failed").with_errno(Some(28));
+        assert_eq!(err.errno(), Some(28));
+        assert_eq!(err.to_string(), "sbx __init: unshare: unshare failed");
+        assert_eq!(InitError::new(Stage::Unshare, "x").errno(), None);
+    }
+
+    #[test]
+    fn fallback_allowed_table() {
+        assert!(!fallback_allowed(NetworkMode::Transparent));
+        assert!(fallback_allowed(NetworkMode::Explicit));
+        assert!(fallback_allowed(NetworkMode::None));
     }
 
     #[test]
@@ -826,8 +997,7 @@ mod tests {
     fn pipeline_bad_keep_fd_stages_control() {
         // The control fd is validated first; a bad control fd with a keep fd
         // present still stages Control, before any namespace work.
-        let err = pipeline(999, Some(2), None, false, &[OsString::from("/bin/true")])
-            .expect_err("bad control fd must abort first");
+        let err = pipeline(&args(999, Some(2), None)).expect_err("bad control fd must abort first");
         assert_eq!(err.stage(), Stage::Control);
     }
 
@@ -835,8 +1005,7 @@ mod tests {
     fn pipeline_bad_control_fd_stages_error() {
         // The pipeline's first act is control-fd validation, BEFORE unshare
         // — so this is safe in a test thread and pins the stage attribution.
-        let err = pipeline(999, None, None, false, &[OsString::from("/bin/true")])
-            .expect_err("fd 999 must abort the pipeline");
+        let err = pipeline(&args(999, None, None)).expect_err("fd 999 must abort the pipeline");
         assert_eq!(err.stage(), Stage::Control);
         assert!(err.to_string().starts_with("sbx __init: control:"), "{err}");
     }
@@ -853,6 +1022,6 @@ mod tests {
         // rationale) — the hook swap is restore-on-return by construction,
         // and the staged-prefix shape is pinned by the integration suite's
         // fail-* scenarios and the CI smoke's `sbx __init: control:` grep.
-        let _code = run_init(999, None, None, false, vec![OsString::from("/bin/true")]);
+        let _code = run_init(args(999, None, None));
     }
 }

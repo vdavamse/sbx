@@ -47,6 +47,7 @@ fn bind(tcp_redir: u16, tcp_explicit: u16, udp_dns: u16) -> Result<ListenerFds, 
                 Stage::Listeners,
                 format!("bind 127.0.0.1:{tcp_redir}/tcp: {e}"),
             )
+            .with_errno(e.raw_os_error())
         })?;
     let explicit = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_explicit))
         .map_err(|e| {
@@ -54,12 +55,14 @@ fn bind(tcp_redir: u16, tcp_explicit: u16, udp_dns: u16) -> Result<ListenerFds, 
                 Stage::Listeners,
                 format!("bind 127.0.0.1:{tcp_explicit}/tcp: {e}"),
             )
+            .with_errno(e.raw_os_error())
         })?;
     let dns = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, udp_dns)).map_err(|e| {
         InitError::new(
             Stage::Listeners,
             format!("bind 127.0.0.1:{udp_dns}/udp: {e}"),
         )
+        .with_errno(e.raw_os_error())
     })?;
     Ok(ListenerFds::new(transparent, explicit, dns))
 }

@@ -33,6 +33,9 @@ pub(crate) struct ExitFields {
     duration_ms: u64,
     output_truncated: bool,
     dns_poisoned: bool,
+    /// Issue #11: the achieved network mode (`transparent` | `explicit`), or
+    /// null when setup never completed. Additive; the last key of the row.
+    net_mode: Option<&'static str>,
 }
 
 /// One audit row. Field order IS the schema (§5 rows 1–12, then the exit-only
@@ -166,6 +169,7 @@ pub(crate) fn exit_row(
     duration: Duration,
     truncated: bool,
     poisoned: bool,
+    net_mode: Option<&'static str>,
 ) -> Row {
     let mut row = Row::blank(ts, "exit");
     row.reason = Some(exit_reason(o));
@@ -176,6 +180,7 @@ pub(crate) fn exit_row(
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         output_truncated: truncated,
         dns_poisoned: poisoned,
+        net_mode,
     });
     row
 }
@@ -605,10 +610,11 @@ mod tests {
                 &Outcome::Exited(0),
                 d(1234),
                 false,
-                false
+                false,
+                None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":1234,\"output_truncated\":false,\"dns_poisoned\":false}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":1234,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
             )
         );
         assert_eq!(
@@ -617,10 +623,11 @@ mod tests {
                 &Outcome::TimedOut(Duration::from_secs(120)),
                 d(120_004),
                 false,
-                false
+                false,
+                None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"timed out after 2m\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":124,\"outcome\":\"timeout\",\"signal\":null,\"duration_ms\":120004,\"output_truncated\":false,\"dns_poisoned\":false}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"timed out after 2m\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":124,\"outcome\":\"timeout\",\"signal\":null,\"duration_ms\":120004,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
             )
         );
         assert_eq!(
@@ -629,10 +636,11 @@ mod tests {
                 &Outcome::Terminated(15),
                 d(5000),
                 true,
-                false
+                false,
+                None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"terminated by SIGTERM\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":143,\"outcome\":\"terminated\",\"signal\":15,\"duration_ms\":5000,\"output_truncated\":true,\"dns_poisoned\":false}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"terminated by SIGTERM\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":143,\"outcome\":\"terminated\",\"signal\":15,\"duration_ms\":5000,\"output_truncated\":true,\"dns_poisoned\":false,\"net_mode\":null}}\n"
             )
         );
         assert_eq!(
@@ -641,10 +649,11 @@ mod tests {
                 &Outcome::Failed("network service failed: transparent proxy panicked: boom".into()),
                 d(17),
                 false,
-                false
+                false,
+                None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"network service failed: transparent proxy panicked: boom\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":125,\"outcome\":\"failed\",\"signal\":null,\"duration_ms\":17,\"output_truncated\":false,\"dns_poisoned\":false}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"network service failed: transparent proxy panicked: boom\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":125,\"outcome\":\"failed\",\"signal\":null,\"duration_ms\":17,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
             )
         );
     }
@@ -831,6 +840,7 @@ mod tests {
             Duration::ZERO,
             false,
             false,
+            None,
         ));
         assert!(log.failure().is_some());
         assert!(matches!(latch.take(), Some(Fault::Audit(_))));
@@ -841,6 +851,7 @@ mod tests {
             Duration::ZERO,
             false,
             false,
+            None,
         ));
         assert!(latch.take().is_none());
     }
@@ -866,6 +877,7 @@ mod tests {
             Duration::ZERO,
             false,
             false,
+            None,
         ));
         // A row racing in after finish is dropped.
         DecisionSink::record(&*log, &c);
@@ -893,8 +905,39 @@ mod tests {
             Duration::ZERO,
             false,
             false,
+            None,
         ));
         assert!(log.failure().is_none());
         assert!(latch.take().is_none());
+    }
+
+    #[test]
+    fn exit_row_net_mode_golden() {
+        // Issue #11 (Q5): the achieved mode is the last key of the exit row.
+        let d = Duration::from_millis;
+        assert_eq!(
+            json(&exit_row(
+                TS.into(),
+                &Outcome::Exited(0),
+                d(7),
+                false,
+                false,
+                Some("transparent")
+            )),
+            format!(
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":7,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":\"transparent\"}}\n"
+            )
+        );
+        assert!(
+            json(&exit_row(
+                TS.into(),
+                &Outcome::Exited(0),
+                d(7),
+                false,
+                false,
+                Some("explicit")
+            ))
+            .ends_with(",\"net_mode\":\"explicit\"}\n")
+        );
     }
 }

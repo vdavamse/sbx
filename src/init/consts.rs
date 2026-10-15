@@ -44,7 +44,26 @@ pub const LISTENER_FD_COUNT: usize = 3;
 /// Data payload of the child→parent fds message: marker and version in one
 /// byte. Strict-checked (design D4): parent and child are always the same
 /// binary, so any other byte is a protocol violation, not a negotiation.
+/// First byte of the child's ready message (`'F'`); the mode byte follows
+/// (issue #11: `'t'` transparent or `'e'` explicit + errno + reason).
 pub const FDS_PAYLOAD_BYTE: u8 = b'F';
+
+/// First byte of the child's failure message (`'E'`, issue #11): the stage
+/// code, errno and reason of a staged failure; no fds.
+pub const FAIL_PAYLOAD_BYTE: u8 = b'E';
+
+/// Mode byte of a transparent ready message (`'F' 't'`).
+pub const MODE_TRANSPARENT: u8 = b't';
+
+/// Mode byte of an explicit ready message (`'F' 'e'`).
+pub const MODE_EXPLICIT: u8 = b'e';
+
+/// The longest reason text carried on the setup channel (issue #11).
+pub const MAX_REASON_BYTES: usize = 512;
+
+/// The parent's receive buffer for one setup message: the header bytes plus
+/// the longest reason, with headroom (issue #11).
+pub const SETUP_MSG_MAX: usize = 1024;
 
 /// Data payload of the parent→child go message — releasing the payload exec.
 /// Strict-checked like [`FDS_PAYLOAD_BYTE`].
@@ -106,6 +125,11 @@ mod tests {
         assert_eq!(DNS_UDP_PORT, 53);
         assert_eq!(LISTENER_FD_COUNT, 3);
         assert_eq!(FDS_PAYLOAD_BYTE, b'F');
+        assert_eq!(FAIL_PAYLOAD_BYTE, b'E');
+        assert_eq!(MODE_TRANSPARENT, b't');
+        assert_eq!(MODE_EXPLICIT, b'e');
+        assert_eq!(MAX_REASON_BYTES, 512);
+        assert_eq!(SETUP_MSG_MAX, 1024);
         assert_eq!(GO_BYTE, b'G');
         assert_eq!(GO_TIMEOUT, Duration::from_secs(30));
     }

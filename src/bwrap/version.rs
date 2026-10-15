@@ -73,6 +73,93 @@ fn parse_component(text: &str) -> Option<u32> {
     text.parse().ok()
 }
 
+/// The outcome of the bwrap gate (issue #11): one value shared by `sbx run`
+/// (S6 refusal text) and `sbx check` (the `bwrap` report item).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BwrapStatus {
+    /// A usable bwrap at `path`, version `version` (>= [`BWRAP_MIN`]).
+    Ok {
+        path: PathBuf,
+        version: (u32, u32, u32),
+    },
+    /// No bwrap on the search path (SBX_BWRAP, PATH, fixed fallbacks).
+    NotFound,
+    /// The binary was found but `--version` could not be started.
+    SpawnFailed { path: PathBuf, error: String },
+    /// `--version` ran but the result is not usable.
+    Unsupported {
+        path: PathBuf,
+        first_line: String,
+        why: Unsupported,
+    },
+}
+
+/// Why a found bwrap is unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unsupported {
+    /// Parsed, but older than [`BWRAP_MIN`].
+    TooOld((u32, u32, u32)),
+    /// Not the `bubblewrap X.Y[.Z]` grammar.
+    Unparseable,
+    /// `--version` exited non-zero (`None` = killed by a signal).
+    ExitStatus(Option<i32>),
+}
+
+/// Pure classifier of a finished `--version` run. Precedence: a non-zero
+/// exit wins; then an unparseable line; then a version below the minimum.
+/// `first_line` is the first stdout line (possibly empty).
+pub fn classify_version_output(
+    path: &Path,
+    exit_ok: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+) -> BwrapStatus {
+    let first_line = stdout.lines().next().unwrap_or("").to_owned();
+    let unsupported = |why| BwrapStatus::Unsupported {
+        path: path.to_path_buf(),
+        first_line: first_line.clone(),
+        why,
+    };
+    if !exit_ok {
+        return unsupported(Unsupported::ExitStatus(exit_code));
+    }
+    match parse_version(stdout) {
+        None => unsupported(Unsupported::Unparseable),
+        Some(version) if version < BWRAP_MIN => unsupported(Unsupported::TooOld(version)),
+        Some(version) => BwrapStatus::Ok {
+            path: path.to_path_buf(),
+            version,
+        },
+    }
+}
+
+impl BwrapStatus {
+    /// The usable binary's path — `Some` only for [`BwrapStatus::Ok`].
+    pub fn usable_path(&self) -> Option<&Path> {
+        match self {
+            BwrapStatus::Ok { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// `sbx run`'s S6 refusal text (pinned byte-for-byte): `None` for a usable
+    /// bwrap.
+    pub fn run_reason(&self) -> Option<String> {
+        match self {
+            BwrapStatus::Ok { .. } => None,
+            BwrapStatus::NotFound => {
+                Some("bwrap not found (install bubblewrap >= 0.8.0 or set SBX_BWRAP)".to_owned())
+            }
+            BwrapStatus::SpawnFailed { path, error } => {
+                Some(format!("cannot run {path:?} --version: {error}"))
+            }
+            BwrapStatus::Unsupported { first_line, .. } => Some(format!(
+                "unsupported bwrap version {first_line:?}; need >= 0.8.0"
+            )),
+        }
+    }
+}
+
 /// Locate the bwrap binary (module docs point 2): `SBX_BWRAP` override →
 /// `PATH` scan → fixed fallbacks. `None` when nothing is found — callers
 /// SKIP (integration tests) or report (#11), never guess.
@@ -140,6 +227,79 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classify_version_output_table() {
+        let p = Path::new("/usr/bin/bwrap");
+        assert_eq!(
+            classify_version_output(p, true, Some(0), "bubblewrap 0.9.0\n"),
+            BwrapStatus::Ok {
+                path: p.to_path_buf(),
+                version: (0, 9, 0)
+            }
+        );
+        assert_eq!(
+            classify_version_output(p, true, Some(0), "bubblewrap 0.7.9\n"),
+            BwrapStatus::Unsupported {
+                path: p.to_path_buf(),
+                first_line: "bubblewrap 0.7.9".into(),
+                why: Unsupported::TooOld((0, 7, 9)),
+            }
+        );
+        assert!(matches!(
+            classify_version_output(p, true, Some(0), "bubblewrap 0.9.0-1\n"),
+            BwrapStatus::Unsupported {
+                why: Unsupported::Unparseable,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_version_output(p, false, Some(1), "bubblewrap 0.9.0\n"),
+            BwrapStatus::Unsupported {
+                why: Unsupported::ExitStatus(Some(1)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_version_output(p, false, None, ""),
+            BwrapStatus::Unsupported {
+                why: Unsupported::ExitStatus(None),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_version_output(p, true, Some(0), ""),
+            BwrapStatus::Unsupported {
+                why: Unsupported::Unparseable,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn run_reason_pinned() {
+        assert_eq!(
+            BwrapStatus::NotFound.run_reason().as_deref(),
+            Some("bwrap not found (install bubblewrap >= 0.8.0 or set SBX_BWRAP)")
+        );
+        let spawn = BwrapStatus::SpawnFailed {
+            path: PathBuf::from("/x/bwrap"),
+            error: "No such file".into(),
+        };
+        assert_eq!(
+            spawn.run_reason().as_deref(),
+            Some("cannot run \"/x/bwrap\" --version: No such file")
+        );
+        let old = classify_version_output(Path::new("/b"), true, Some(0), "bubblewrap 0.7.9");
+        assert_eq!(
+            old.run_reason().as_deref(),
+            Some("unsupported bwrap version \"bubblewrap 0.7.9\"; need >= 0.8.0")
+        );
+        assert_eq!(old.usable_path(), None);
+        let ok = classify_version_output(Path::new("/b"), true, Some(0), "bubblewrap 0.9.0");
+        assert_eq!(ok.run_reason(), None);
+        assert_eq!(ok.usable_path(), Some(Path::new("/b")));
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

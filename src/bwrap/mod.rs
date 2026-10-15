@@ -446,6 +446,99 @@ fn contains_nul(value: &OsStr) -> bool {
     value.as_bytes().contains(&0)
 }
 
+/// Where the probe's payload (sbx itself) is bound inside the nested
+/// sandbox (issue #11).
+pub const PROBE_PAYLOAD_DEST: &str = "/.sbx-probe";
+
+/// The host probe's nested launch (issue #11, `sbx __init --probe`): the SAME
+/// namespace and hardening flag constants as [`build`], the usr-merge shims
+/// (all four — the probe has no policy binds to skip them for), the host's
+/// `/usr` read-only, sbx itself as the payload (`--version`, no dependency on
+/// `/usr/bin/true`), and optionally a fresh `/proc` — the one mount that
+/// fails on masked-/proc hosts. Pure. Nothing here is policy-derived.
+pub fn probe_argv(bwrap: &Path, payload: &Path, with_proc: bool) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![bwrap.as_os_str().to_os_string()];
+    argv.extend(
+        argv::NAMESPACE_FLAGS
+            .iter()
+            .map(|flag| OsString::from(*flag)),
+    );
+    argv.extend(
+        argv::HARDENING_FLAGS
+            .iter()
+            .map(|flag| OsString::from(*flag)),
+    );
+    argv.push(OsString::from("--clearenv"));
+    for (dest, target) in argv::USR_MERGE_SHIMS {
+        argv.extend(["--symlink", target, dest].map(OsString::from));
+    }
+    argv.extend(["--ro-bind-try", "/usr", "/usr"].map(OsString::from));
+    argv.push(OsString::from("--ro-bind"));
+    argv.push(payload.as_os_str().to_os_string());
+    argv.push(OsString::from(PROBE_PAYLOAD_DEST));
+    if with_proc {
+        argv.extend(["--proc", "/proc"].map(OsString::from));
+    }
+    argv.extend(["--dev", "/dev", "--", PROBE_PAYLOAD_DEST, "--version"].map(OsString::from));
+    argv
+}
+
+/// The infrastructure `/etc` paths every sandbox binds (`--host` pre-check).
+pub fn infra_etc_paths() -> &'static [&'static str] {
+    &argv::INFRA_ETC
+}
+
+/// The `/etc` files sbx generates itself (`--host` pre-check: a deny entry
+/// equal to one of these masks a generated file).
+pub fn generated_etc_paths() -> [&'static str; 3] {
+    ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+}
+
+#[cfg(test)]
+mod probe_argv_tests {
+    use super::*;
+
+    #[test]
+    fn probe_argv_golden() {
+        let with_proc = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), true);
+        let expected = "/usr/bin/bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try --disable-userns --cap-drop ALL --die-with-parent --new-session --hostname sandbox --clearenv --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind-try /usr /usr --ro-bind /opt/sbx /.sbx-probe --proc /proc --dev /dev -- /.sbx-probe --version";
+        let got: Vec<String> = with_proc
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got.join(" "), expected);
+        let without = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), false);
+        let without_text: Vec<String> = without
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            without_text.join(" "),
+            expected.replace(" --proc /proc", "")
+        );
+    }
+
+    #[test]
+    fn probe_argv_shares_flags_with_build() {
+        let argv = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), false);
+        let want: Vec<OsString> = argv::NAMESPACE_FLAGS
+            .iter()
+            .chain(argv::HARDENING_FLAGS.iter())
+            .map(|f| OsString::from(*f))
+            .collect();
+        assert_eq!(&argv[1..1 + want.len()], want.as_slice());
+    }
+
+    #[test]
+    fn etc_path_tables_pinned() {
+        assert_eq!(
+            generated_etc_paths(),
+            ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+        );
+        assert_eq!(infra_etc_paths().len(), 7);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

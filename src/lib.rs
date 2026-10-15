@@ -59,7 +59,10 @@
 //! deserialization now validates on EVERY path — the old point-5 asymmetry
 //! is resolved (TODO(#6)(a), landed with issue #6). `run` is real since
 //! issue #10 (see [`run`]: the sandbox lifecycle, exit codes, audit log);
-//! `gc` remains a stub that exits 1. Tracking issue #20 describes the architecture; the
+//! `gc` remains a stub that exits 1. `check` (issue #11) reports the host:
+//! [`host`] classifies what the sandbox needs (user namespaces, the
+//! nftables redirect, bwrap, …) from a probe that runs the very same setup
+//! stages, and `run` shares that classifier for its refusals (rc 125). Tracking issue #20 describes the architecture; the
 //! issue #1 spike (`spikes/nft-load`) proved the unprivileged
 //! nftables-loading approach `sbx __init` ships.
 
@@ -67,6 +70,7 @@ pub mod bwrap;
 pub mod cli;
 pub mod dns;
 pub mod egress;
+pub mod host;
 pub mod init;
 pub mod policy;
 pub mod proxy;

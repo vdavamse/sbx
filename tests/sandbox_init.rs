@@ -236,6 +236,26 @@ fn scenarios() -> Vec<Scenario> {
             gate: Gate::Bwrap,
             run: scenario_full_chain_bwrap,
         },
+        Scenario {
+            name: "fallback-break-rules",
+            gate: Gate::Userns,
+            run: scenario_fallback_break_rules,
+        },
+        Scenario {
+            name: "probe-json",
+            gate: Gate::Userns,
+            run: scenario_probe_json,
+        },
+        Scenario {
+            name: "probe-break-rules",
+            gate: Gate::Userns,
+            run: scenario_probe_break_rules,
+        },
+        Scenario {
+            name: "probe-bwrap",
+            gate: Gate::Bwrap,
+            run: scenario_probe_bwrap,
+        },
     ]
 }
 
@@ -1032,8 +1052,23 @@ fn scenario_fail_exec() -> Result<(), String> {
 /// with the child, so nothing persists to check.
 fn scenario_fail_break_rules() -> Result<(), String> {
     let sp = spawn_init("marker", &["--test-break-rules"], &payload_self()?)?;
-    // The child dies at nft-load, BEFORE send-fds: do not recv (that would
-    // block) — just reap.
+    // Issue #11: the child reports the staged failure over the control
+    // socket ('E', stage code 7 = nft-load, errno 2) BEFORE it prints its
+    // line and exits. The message is a successful receive; the stderr line
+    // below is unchanged.
+    let parent_end = sp
+        .parent_end
+        .as_ref()
+        .ok_or("spawn has no parent control end")?
+        .as_raw_fd();
+    match fdpass::recv_setup(parent_end).map_err(|e| format!("recv_setup: {e}"))? {
+        fdpass::SetupMsg::Failed(f) => {
+            if f.stage != sbx::init::Stage::NftLoad || f.errno != Some(2) {
+                return Err(format!("'E' message: {f:?} (expected nft-load errno 2)"));
+            }
+        }
+        other => return Err(format!("expected an 'E' message, got {other:?}")),
+    }
     let out = finish(sp, "fail-break-rules child")?;
     assert_staged_failure(&out, "sbx __init: nft-load:")
 }
@@ -1042,11 +1077,24 @@ fn scenario_fail_break_rules() -> Result<(), String> {
 /// `--fd` and a missing command are ALL clap rc 2 (no staged prefix, no
 /// payload); rc 1 stays exclusively for staged setup failures (D7/D8).
 fn scenario_usage_contract() -> Result<(), String> {
-    let cases: [Vec<&str>; 4] = [
+    let cases: [Vec<&str>; 7] = [
         vec!["__init"],
         vec!["__init", "--fd", "abc", "--", "/bin/true"],
         vec!["__init", "--fd=-1", "--", "/bin/true"],
         vec!["__init", "--fd", "3"],
+        // Issue #11: --probe takes no pipeline argument, and --fd is needed
+        // without --probe; --min-mode is a closed set.
+        vec!["__init", "--probe", "--fd", "3"],
+        vec!["__init", "--probe", "--", "/bin/true"],
+        vec![
+            "__init",
+            "--fd",
+            "3",
+            "--min-mode",
+            "bogus",
+            "--",
+            "/bin/true",
+        ],
     ];
     for args in cases {
         let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
@@ -1160,6 +1208,248 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
 // child side: role dispatch + roles
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// issue #11: the explicit fallback, the probe, the refusal wire message
+// ---------------------------------------------------------------------------
+
+/// Payload for `fallback-break-rules`: with the default route removed a direct
+/// connect fails fast with ENETUNREACH (E2), while the explicit listener on
+/// 127.0.0.1:3128 still accepts (the parent serves it).
+fn role_check_noroute() -> Result<(), String> {
+    let t0 = Instant::now();
+    match TcpStream::connect_timeout(&SocketAddr::from((TEST3, 443)), BOUND) {
+        Err(e) if e.raw_os_error() == Some(libc::ENETUNREACH) => {
+            let elapsed = t0.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                return Err(format!("ENETUNREACH took {elapsed:?} (expected < 1 s)"));
+            }
+            marker("tcp_enetunreach");
+        }
+        other => {
+            return Err(format!(
+                "direct tcp connect: {other:?} (expected ENETUNREACH)"
+            ));
+        }
+    }
+    let udp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|e| format!("udp bind: {e}"))?;
+    match udp.send_to(b"x", SocketAddrV4::new(TEST3, DROP_PORT)) {
+        Err(e) if e.raw_os_error() == Some(libc::ENETUNREACH) => marker("udp_enetunreach"),
+        other => return Err(format!("direct udp send: {other:?} (expected ENETUNREACH)")),
+    }
+    // IPv6 is disabled in the sandbox netns: EADDRNOTAVAIL (review; measured).
+    match TcpStream::connect_timeout(
+        &SocketAddr::from((
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7),
+            443,
+        )),
+        BOUND,
+    ) {
+        Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => marker("tcp6_eaddrnotavail"),
+        other => {
+            return Err(format!(
+                "direct IPv6 connect: {other:?} (expected EADDRNOTAVAIL)"
+            ));
+        }
+    }
+    TcpStream::connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, EXPLICIT_TCP_PORT))
+        .map_err(|e| format!("explicit listener connect: {e}"))?;
+    marker("explicit_ok");
+    Ok(())
+}
+
+/// AC (issue #11, Q1): the no-nft `__init` variant. `--min-mode explicit` +
+/// a refused nft batch → the setup still completes; the 'F' message carries
+/// the explicit mode with the nft-load errno and reason; the payload's direct
+/// connects fail with ENETUNREACH and the explicit listener is served.
+fn scenario_fallback_break_rules() -> Result<(), String> {
+    let sp = spawn_init(
+        "check-noroute",
+        &["--min-mode", "explicit", "--test-break-rules"],
+        &payload_self()?,
+    )?;
+    let parent_end = sp
+        .parent_end
+        .as_ref()
+        .ok_or("spawn has no parent control end")?
+        .as_raw_fd();
+    let (fds, mode) =
+        match fdpass::recv_setup(parent_end).map_err(|e| format!("recv_setup: {e}"))? {
+            fdpass::SetupMsg::Ready { fds, mode } => (fds, mode),
+            other => return Err(format!("expected a ready message, got {other:?}")),
+        };
+    match &mode {
+        fdpass::AchievedMode::Explicit { errno, reason } => {
+            if *errno != Some(2) || !reason.starts_with("nft-load: batch failed") {
+                return Err(format!(
+                    "explicit mode evidence: errno {errno:?} reason {reason:?}"
+                ));
+            }
+        }
+        other => return Err(format!("expected the explicit fallback, got {other:?}")),
+    }
+    let fdpass::ListenerFds {
+        transparent,
+        explicit,
+        dns,
+    } = fds;
+    // No nft redirect exists in this mode, so SO_ORIGINAL_DST is not
+    // applicable: accept once and answer with a fixed line.
+    let server = std::thread::spawn(move || -> Result<(), String> {
+        explicit
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking: {e}"))?;
+        let deadline = Instant::now() + BOUND;
+        loop {
+            match explicit.accept() {
+                Ok((stream, _)) => {
+                    let mut w = &stream;
+                    writeln!(w, "OK tag=explicit").map_err(|e| format!("serve write: {e}"))?;
+                    return Ok(());
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("explicit listener: no connection within 5 s".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("explicit accept: {e}")),
+            }
+        }
+    });
+    send_go(&sp)?;
+    let served = server
+        .join()
+        .map_err(|_| "serve thread panicked".to_owned())?;
+    let out = finish(sp, "check-noroute payload")?;
+    served?;
+    drop((transparent, dns));
+    assert_success(
+        &out,
+        &[
+            "tcp_enetunreach",
+            "udp_enetunreach",
+            "tcp6_eaddrnotavail",
+            "explicit_ok",
+        ],
+    )
+}
+
+/// Runs `sbx __init --probe …` with the same empty environment `check` uses.
+fn run_probe_child(extra: &[&str]) -> Result<(i32, String, String), String> {
+    let out = Command::new(env!("CARGO_BIN_EXE_sbx"))
+        .args(["__init", "--probe"])
+        .args(extra)
+        .env_clear()
+        .output()
+        .map_err(|e| format!("spawn __init --probe: {e}"))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
+const PROBE_NAMES: [&str; 10] = [
+    "unshare",
+    "idmap",
+    "netns",
+    "ipv6",
+    "listeners",
+    "nft-load",
+    "nft-verify",
+    "fallback",
+    "bwrap-run",
+    "bwrap-proc",
+];
+
+/// AC (issue #11, T3): `__init --probe` runs the real stages, prints one JSON
+/// line with the ten steps in order, and exits 0; without `--bwrap` the two
+/// bwrap steps are skipped.
+fn scenario_probe_json() -> Result<(), String> {
+    let (rc, stdout, stderr) = run_probe_child(&[])?;
+    if rc != 0 {
+        return Err(format!("probe rc {rc}\nstderr: {stderr}"));
+    }
+    if stdout.lines().count() != 1 {
+        return Err(format!("probe output must be one line: {stdout:?}"));
+    }
+    let report: sbx::init::probe::ProbeReport =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("probe JSON: {e}"))?;
+    let names: Vec<&str> = report.steps.iter().map(|s| s.step.as_str()).collect();
+    if names != PROBE_NAMES {
+        return Err(format!("steps {names:?}"));
+    }
+    for step in &report.steps {
+        let want = if step.step.starts_with("bwrap-") {
+            sbx::init::probe::StepStatus::Skip
+        } else {
+            sbx::init::probe::StepStatus::Ok
+        };
+        if step.status != want {
+            return Err(format!(
+                "{}: {:?} ({:?})",
+                step.step, step.status, step.reason
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// AC (issue #11, Q6): the hidden `--test-break-rules` makes only the nft-load
+/// step fail (errno 2); nft-verify is skipped and the fallback still proves
+/// the route removal.
+fn scenario_probe_break_rules() -> Result<(), String> {
+    let (rc, stdout, stderr) = run_probe_child(&["--test-break-rules"])?;
+    if rc != 0 {
+        return Err(format!("probe rc {rc}\nstderr: {stderr}"));
+    }
+    let report: sbx::init::probe::ProbeReport =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("probe JSON: {e}"))?;
+    let by = |name: &str| {
+        report
+            .steps
+            .iter()
+            .find(|s| s.step == name)
+            .ok_or_else(|| format!("no step {name}"))
+    };
+    let load = by("nft-load")?;
+    if load.status != sbx::init::probe::StepStatus::Fail || load.errno != Some(2) {
+        return Err(format!("nft-load: {load:?}"));
+    }
+    if by("nft-verify")?.status != sbx::init::probe::StepStatus::Skip {
+        return Err("nft-verify must be skipped".into());
+    }
+    if by("fallback")?.status != sbx::init::probe::StepStatus::Ok {
+        return Err("fallback must succeed after a refused batch".into());
+    }
+    Ok(())
+}
+
+/// AC (issue #11, T4): with a usable bwrap the probe's two nested launches
+/// (control and `--proc`) both succeed inside the probe's namespaces.
+fn scenario_probe_bwrap() -> Result<(), String> {
+    let bwrap = sbx::bwrap::version::find_bwrap().ok_or("bwrap disappeared")?;
+    let bwrap_arg = bwrap.to_string_lossy().into_owned();
+    let (rc, stdout, stderr) = run_probe_child(&["--bwrap", &bwrap_arg])?;
+    if rc != 0 {
+        return Err(format!("probe rc {rc}\nstderr: {stderr}"));
+    }
+    let report: sbx::init::probe::ProbeReport =
+        serde_json::from_str(stdout.trim()).map_err(|e| format!("probe JSON: {e}"))?;
+    for name in ["bwrap-run", "bwrap-proc"] {
+        let step = report
+            .steps
+            .iter()
+            .find(|s| s.step == name)
+            .ok_or_else(|| format!("no step {name}"))?;
+        if step.status != sbx::init::probe::StepStatus::Ok {
+            return Err(format!("{name}: {step:?}"));
+        }
+    }
+    Ok(())
+}
+
 fn child_main(role: &str) -> ExitCode {
     let result = match role {
         "probe-userns" => role_probe_userns(),
@@ -1173,6 +1463,7 @@ fn child_main(role: &str) -> ExitCode {
         "check-mutation" => role_check_mutation(false),
         "check-mutation-bwrap" => role_check_mutation(true),
         "check-bwrap-chain" => role_check_bwrap_chain(),
+        "check-noroute" => role_check_noroute(),
         other => Err(format!("unknown {ROLE_ENV} {other:?}")),
     };
     match result {
