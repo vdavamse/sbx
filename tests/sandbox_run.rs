@@ -13,7 +13,7 @@
 //! namespaces are unavailable; CI installs bubblewrap, so they always run there.
 //! Any FAIL exits 1.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -88,6 +88,13 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
     };
     match role {
         "exit" => arg(0).parse::<u8>().unwrap_or(1),
+        // #12: writes a marker into the session's work dir (/work).
+        "mark" => match fs::write("/work/marker", b"marked") {
+            Ok(()) => 0,
+            Err(_) => 1,
+        },
+        // #12: a hostile tree in /work (see `hostile_tree`).
+        "hostile-tree" => hostile_tree(&arg(0)),
         "argv" => {
             for a in args {
                 println!("ARG {}", hex(a.as_bytes()));
@@ -747,6 +754,21 @@ fn scenarios() -> Vec<Scenario> {
             name: "refused-ro-proc-sys-125",
             gate: Bwrap,
             run: refused_ro_proc_sys_125,
+        },
+        Scenario {
+            name: "gc-skips-live-run",
+            gate: Bwrap,
+            run: gc_skips_live_run,
+        },
+        Scenario {
+            name: "gc-hostile-payload-tree",
+            gate: Bwrap,
+            run: gc_hostile_payload_tree,
+        },
+        Scenario {
+            name: "run-vs-gc-race",
+            gate: Bwrap,
+            run: run_vs_gc_race,
         },
     ]
 }
@@ -2777,4 +2799,256 @@ fn refused_ro_proc_sys_125() -> Result<(), String> {
         &done,
         "cannot disable IPv6 in the sandbox network namespace: /proc/sys is read-only (EROFS",
     )
+}
+
+// ---- #12: `sbx gc` against live and hostile sessions ----------------------------
+
+/// Sets a directory's mtime to `ago` in the past (the session activity signal).
+fn backdate_dir(p: &Path, ago: Duration) -> Result<(), String> {
+    let when = std::time::SystemTime::now() - ago;
+    fs::File::open(p)
+        .and_then(|f| f.set_times(fs::FileTimes::new().set_modified(when)))
+        .map_err(|e| format!("backdate {p:?}: {e}"))
+}
+
+/// `sbx gc --older-than 1s <root>`, optionally with a lowered RLIMIT_NOFILE.
+fn gc_proc(root: &Path, rlimit: Option<u64>) -> Result<Proc, String> {
+    let args: Vec<OsString> = vec![
+        "gc".into(),
+        "--older-than".into(),
+        "1s".into(),
+        root.as_os_str().to_owned(),
+    ];
+    Proc::spawn(&args, move |cmd| {
+        if let Some(n) = rlimit {
+            // SAFETY: the closure only calls setrlimit (async-signal-safe).
+            unsafe {
+                cmd.pre_exec(move || {
+                    let lim = libc::rlimit {
+                        rlim_cur: n,
+                        rlim_max: n,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    })
+}
+
+/// A live `run` holds its session's lock: gc must skip it silently, keep it
+/// intact, and collect it once the run has ended and the session is old.
+fn gc_skips_live_run() -> Result<(), String> {
+    let dir = scratch("gclive");
+    let root = dir.join("root");
+    fs::create_dir_all(&root).expect("mkdir root");
+    let session = root.join("s");
+    let policy = Pol::new("ready-sleep").write(&dir);
+    let run = Proc::spawn(&sbx_args(&policy, &session, &[], &payload(&["60"])), |_| {})?;
+    run.wait_stdout("READY")?;
+    backdate_dir(&session, Duration::from_secs(86_400))?;
+
+    let gc1 = gc_proc(&root, None)?.finish(Duration::from_secs(30))?;
+    expect_rc(&gc1, 0)?;
+    if !(gc1.stdout.is_empty() && gc1.stderr.is_empty()) {
+        return Err(format!(
+            "gc must be silent on a live session: {:?} {:?}",
+            gc1.stdout, gc1.stderr
+        ));
+    }
+    if !session.join("sbx.lock").exists() {
+        return Err("gc touched a live session".into());
+    }
+
+    // SAFETY: signalling our own child process by pid.
+    unsafe { libc::kill(run.child.id() as libc::pid_t, libc::SIGTERM) };
+    let done = run.finish(Duration::from_secs(30))?;
+    expect_rc(&done, 143)?;
+    // The run touched the directory on exit: make it old again.
+    backdate_dir(&session, Duration::from_secs(86_400))?;
+
+    let gc2 = gc_proc(&root, None)?.finish(Duration::from_secs(30))?;
+    expect_rc(&gc2, 0)?;
+    let want = format!("removed {:?}\n", session);
+    if gc2.stdout != want {
+        return Err(format!("gc stdout {:?} (want {want:?})", gc2.stdout));
+    }
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Builds a hostile tree under /work, all from inside the sandbox: nested
+/// modes 000/100/500, a 1500-deep chain, a FIFO, a non-UTF-8 name, symlinks to
+/// a host canary and to `/`, a hard link, and decoy `sbx.lock` and
+/// `.sbx-gc-hoist.1` names. Returns 0 after printing TREE-DONE.
+fn hostile_tree(canary: &str) -> u8 {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let w = Path::new("/work");
+    let step = || -> std::io::Result<()> {
+        let c = w.join("h/a/b/c");
+        fs::create_dir_all(c.join("leaf"))?;
+        fs::write(c.join("leaf/file"), b"x")?;
+        // Deepest first: each chmod still has search permission on its path.
+        fs::set_permissions(&c, fs::Permissions::from_mode(0o500))?;
+        fs::set_permissions(w.join("h/a/b"), fs::Permissions::from_mode(0o100))?;
+        fs::set_permissions(w.join("h/a"), fs::Permissions::from_mode(0o000))?;
+        let mut deep = w.join("deep");
+        fs::create_dir(&deep)?;
+        for _ in 0..1500 {
+            deep.push("d");
+            fs::create_dir(&deep)?;
+        }
+        fs::write(deep.join("file"), b"x")?;
+        let fifo = std::ffi::CString::new(w.join("fifo").as_os_str().as_bytes())
+            .expect("no NUL in the fifo path");
+        // SAFETY: mkfifo with a valid NUL-terminated path.
+        if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        fs::write(w.join(OsStr::from_bytes(b"n\xff")), b"x")?;
+        symlink(canary, w.join("escape"))?;
+        symlink("/", w.join("rootlink"))?;
+        fs::write(w.join("orig"), b"x")?;
+        fs::hard_link(w.join("orig"), w.join("hl"))?;
+        fs::create_dir(w.join("decoy"))?;
+        fs::write(w.join("decoy/sbx.lock"), b"")?;
+        fs::write(w.join("decoy/.sbx-gc-hoist.1"), b"")?;
+        Ok(())
+    };
+    match step() {
+        Ok(()) => {
+            println!("TREE-DONE");
+            let _ = std::io::stdout().flush();
+            0
+        }
+        Err(err) => {
+            eprintln!("hostile-tree: {err}");
+            1
+        }
+    }
+}
+
+/// A hostile payload tree (escaping symlinks, mode 000 dirs, a 1500-deep
+/// chain) is removed by gc with RLIMIT_NOFILE=32, and nothing outside the
+/// session is touched.
+fn gc_hostile_payload_tree() -> Result<(), String> {
+    let dir = scratch("hostile");
+    let canary_dir = dir.join("canary");
+    fs::create_dir_all(&canary_dir).expect("canary dir");
+    fs::write(canary_dir.join("keep"), b"keep").expect("canary file");
+    let root = dir.join("root");
+    fs::create_dir_all(&root).expect("mkdir root");
+    let session = root.join("s");
+    let policy = Pol::new("hostile-tree").write(&dir);
+    let canary = canary_dir.to_string_lossy().into_owned();
+    let run = run_sbx(&sbx_args(&policy, &session, &[], &payload(&[&canary])))?;
+    expect_rc(&run, 0)?;
+    if !run.stdout.contains("TREE-DONE") {
+        return Err(format!("payload did not finish the tree: {:?}", run.stdout));
+    }
+    backdate_dir(&session, Duration::from_secs(86_400))?;
+
+    let gc = gc_proc(&root, Some(32))?.finish(Duration::from_secs(60))?;
+    expect_rc(&gc, 0)?;
+    let want = format!("removed {:?}\n", session);
+    if gc.stdout != want {
+        return Err(format!(
+            "gc stdout {:?} (want {want:?}); stderr {:?}",
+            gc.stdout, gc.stderr
+        ));
+    }
+    if fs::read(canary_dir.join("keep")).map_err(|e| e.to_string())? != b"keep" {
+        return Err("the canary outside the session was modified".into());
+    }
+    let left: Vec<String> = fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    if left.iter().any(|n| n == "s" || n.starts_with(".sbx-gc.")) {
+        return Err(format!("ROOT still holds {left:?}"));
+    }
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// `run` and `gc` race on one old session, 20 times. Invariants: a refused run
+/// is 125 with a lock or binding message; a run that succeeded left its
+/// marker; gc is 0, or 1 only with the Q13 line; and a final gc leaves no
+/// tombstone behind. The outcome counts are printed, so a run shows that both
+/// sides actually raced.
+fn run_vs_gc_race() -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("race");
+    let root = dir.join("root");
+    fs::create_dir_all(&root).expect("mkdir root");
+    let session = root.join("s");
+    let policy = Pol::new("mark").write(&dir);
+    let (mut run_ok, mut run_refused, mut gc_ok, mut gc_recreated) = (0u32, 0u32, 0u32, 0u32);
+    for iter in 0..20 {
+        let _ = fs::remove_dir_all(&session);
+        fs::create_dir(&session).map_err(|e| e.to_string())?;
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+        fs::write(session.join("sbx.lock"), b"").map_err(|e| e.to_string())?;
+        backdate_dir(&session, Duration::from_secs(86_400))?;
+
+        let run = Proc::spawn(&sbx_args(&policy, &session, &[], &payload(&[])), |_| {})?;
+        // Sweep the gc start across the run's startup (0 to ~5 ms) so the two
+        // overlap at different points: before the lock, during it, after it.
+        std::thread::sleep(Duration::from_micros(250 * iter as u64));
+        let gc = gc_proc(&root, None)?;
+        let run = run.finish(Duration::from_secs(60))?;
+        let gc = gc.finish(Duration::from_secs(60))?;
+
+        match run.rc {
+            0 => {
+                run_ok += 1;
+                if !session.join("work/marker").exists() {
+                    return Err(format!("iter {iter}: run succeeded but left no marker"));
+                }
+            }
+            125 => {
+                let known = run.stderr.contains("session directory is in use")
+                    || run
+                        .stderr
+                        .contains("was removed or replaced while it was being locked");
+                if !known {
+                    return Err(format!(
+                        "iter {iter}: unexpected 125 stderr {:?}",
+                        run.stderr
+                    ));
+                }
+                run_refused += 1;
+            }
+            other => return Err(format!("iter {iter}: run rc {other}: {:?}", run.stderr)),
+        }
+        match gc.rc {
+            0 => gc_ok += 1,
+            1 if gc
+                .stderr
+                .contains("a concurrent sbx run recreated entries during removal") =>
+            {
+                gc_recreated += 1;
+            }
+            other => return Err(format!("iter {iter}: gc rc {other}: {:?}", gc.stderr)),
+        }
+    }
+    println!(
+        "  run-vs-gc-race outcomes: run ok {run_ok}, run refused {run_refused}, gc ok {gc_ok}, gc recreated {gc_recreated}"
+    );
+    let done = gc_proc(&root, None)?.finish(Duration::from_secs(60))?;
+    expect_rc(&done, 0)?;
+    let left: Vec<String> = fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    if left.iter().any(|n| n.starts_with(".sbx-gc.")) {
+        return Err(format!("tombstones survived the final gc: {left:?}"));
+    }
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
 }

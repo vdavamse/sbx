@@ -41,7 +41,9 @@
 //!    or an audit failure ends the run with 125 (the latch wakes the main loop).
 //! 9. **Concurrency and session.** Each run has its own netns, DNS pool and
 //!    listeners. Two runs on one session directory are refused (`sbx.lock`,
-//!    flock). The session mtime is touched at start and end (#12).
+//!    flock). The session mtime is touched at start and end (#12). A session
+//!    that `sbx gc` tombstones while the run is locking is detected and refused
+//!    (125).
 //! 10. **Limitations.** Connections still open at exit get no `close` row. The
 //!     audit log is not fsynced. Background-terminal stdin is /dev/null. Parent
 //!     death: `__init` arms `PR_SET_PDEATHSIG = SIGKILL` right after its signal

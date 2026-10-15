@@ -1,25 +1,25 @@
 //! Command-line interface for `sbx`.
 //!
 //! Issue #2 froze the documented flag surface; issue #3 replaced the
-//! `check` stub; issue #5 made `__init` real; issue #10 made `run` real. The
-//! remaining stub subcommands parse their full interface, then report `not
-//! implemented yet` and exit 1 until later issues replace the stub bodies
-//! without CLI churn:
+//! `check` stub; issue #5 made `__init` real; issue #10 made `run` real;
+//! issue #12 made `gc` real. Every subcommand is real:
 //!
 //! - `run`    — sandbox lifecycle, egress proxy, audit log (real since #10)
 //! - `check`  — host capability report (issue #11), policy validation and
 //!   JSON Schema (real since #3)
-//! - `gc`     — session-directory garbage collection (#12)
+//! - `gc`     — session-directory garbage collection (real since #12)
 //! - `__init` — re-exec'd namespace helper (real since #5; hidden — #10's
 //!   `run` is its only production caller)
 //!
-//! Exit-code contract: 0 = success, 1 = stub/runtime failure
+//! Exit-code contract: 0 = success, 1 = runtime failure
 //! ([`ExitCode::FAILURE`]) — for `check`, an invalid or unreadable policy
-//! file; for `__init`, a staged setup failure (`sbx __init: <stage>:
-//! <reason>`, the payload never started) — 2 = usage error (clap's own
-//! convention). For `run` (issue #10): the command's own code; 124 timeout;
-//! 125 sbx failure; 128+N terminated by signal N; 2 usage. See the `run`
-//! module docs, point 4.
+//! file; for `__init`, a staged setup failure (`sbx __init: <stage>: <reason>`,
+//! the payload never started); for `gc`, a refused ROOT or any per-session
+//! failure — 2 = usage error (clap's own convention). For `run` (issue #10):
+//! the command's own code; 124 timeout; 125 sbx failure; 128+N terminated by
+//! signal N; 2 usage. See the `run` module docs, point 4. For `gc` (issue #12):
+//! 0 = every eligible session handled, 1 = ROOT refused or any per-session
+//! failure, 2 = usage.
 
 use std::ffi::OsString;
 use std::os::fd::RawFd;
@@ -162,6 +162,10 @@ pub enum Cmd {
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         older_than: Duration,
 
+        /// Print what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+
         /// Session root directory to scan.
         #[arg(value_name = "ROOT")]
         root: PathBuf,
@@ -294,11 +298,11 @@ pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
 /// ANY setup failure is rc 1 with `sbx __init: <stage>: <reason>` on
 /// stderr and the payload never starts; usage errors stay clap's rc 2.
 ///
-/// Stub contract (issue #2) for the remaining subcommands: a successfully
-/// parsed `run` or `gc` prints `sbx <sub>: not implemented yet` to stderr
-/// and returns [`ExitCode::FAILURE`] (1) — deliberately distinct from
-/// clap's exit 2 for usage errors, and without the exit-101 + backtrace a
-/// panic would produce.
+/// `gc` contract (issue #12): `gc --older-than D [--dry-run] ROOT` removes
+/// expired session directories under ROOT and reports one line per entry on
+/// stdout (`removed "<path>"` or `would remove "<path>"`). A refused ROOT or any
+/// per-session failure is rc 1 with `sbx gc: <path>: <reason>` on stderr. The
+/// zero duration and other usage errors are rc 2 (clap). See [`crate::gc`].
 pub fn run() -> ExitCode {
     // Catches invalid clap configuration (bad defaults, duplicate names,
     // conflicting attributes) at startup. Despite the name, this is NOT
@@ -348,7 +352,15 @@ pub fn run() -> ExitCode {
             json,
             test_break_rules,
         }),
-        Cmd::Gc { .. } => not_implemented("gc"),
+        Cmd::Gc {
+            older_than,
+            dry_run,
+            root,
+        } => crate::gc::gc(crate::gc::GcArgs {
+            root,
+            older_than,
+            dry_run,
+        }),
         Cmd::Init {
             fd,
             keep_fd,
@@ -407,12 +419,6 @@ fn check(path: PathBuf) -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-/// Uniform stub behavior: message on stderr, exit code 1.
-fn not_implemented(sub: &str) -> ExitCode {
-    eprintln!("sbx {sub}: not implemented yet");
-    ExitCode::FAILURE
 }
 
 #[cfg(test)]
@@ -591,12 +597,41 @@ mod tests {
         let cli = Cli::try_parse_from(["sbx", "gc", "--older-than", "7d", "/var/tmp/root"])
             .expect("gc invocation must parse");
         match cli.command {
-            Cmd::Gc { older_than, root } => {
+            Cmd::Gc {
+                older_than,
+                root,
+                dry_run,
+            } => {
                 assert_eq!(older_than, Duration::from_secs(7 * 24 * 3600));
                 assert_eq!(root, Path::new("/var/tmp/root"));
+                assert!(!dry_run);
             }
             other => panic!("expected Cmd::Gc, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn gc_parses_dry_run() {
+        let cli = Cli::try_parse_from(["sbx", "gc", "--dry-run", "--older-than", "1h", "/r"])
+            .expect("gc --dry-run must parse");
+        match cli.command {
+            Cmd::Gc { dry_run, root, .. } => {
+                assert!(dry_run);
+                assert_eq!(root, Path::new("/r"));
+            }
+            other => panic!("expected Cmd::Gc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gc_help_lists_dry_run() {
+        let mut cmd = Cli::command();
+        let gc = cmd.find_subcommand_mut("gc").expect("gc subcommand exists");
+        let help = gc.render_help().to_string();
+        assert!(
+            help.contains("--dry-run"),
+            "gc help must list --dry-run:\n{help}"
+        );
     }
 
     // ---- error paths -------------------------------------------------

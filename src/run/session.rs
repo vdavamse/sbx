@@ -4,10 +4,14 @@
 //! open file description; the kernel releases it at process exit, and the fd is
 //! CLOEXEC so the payload never inherits it. The directory mtime is touched at
 //! the start and the end of a run — the activity signal #12's `gc` reads.
+//! After locking, `verify_bound` re-checks that the lock and the directory are
+//! still the ones `sbx gc` would see (#12 T6): `gc` tombstones a locked, expired
+//! session by rename and unlinks its lock later.
 
+use std::ffi::CString;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -23,6 +27,15 @@ impl SessionLock {
     /// `materialize` so a losing concurrent run never rewrites the winner's
     /// live `/etc` files.
     pub(crate) fn acquire(path: &Path) -> Result<Self, RunError> {
+        // #12: a directory named like a `sbx gc` tombstone would be taken for
+        // one by a concurrent gc (it renames sessions to that shape). Refused.
+        if let Some(base) = path.file_name() {
+            if crate::gc::is_tombstone_name(base.as_encoded_bytes()) {
+                return Err(RunError::new(format!(
+                    "session directory {path:?} has a name reserved for `sbx gc` tombstones"
+                )));
+            }
+        }
         crate::bwrap::etc::check_session_dir(path).map_err(RunError::new)?;
         DirBuilder::new()
             .recursive(true)
@@ -86,6 +99,7 @@ impl SessionLock {
                 RunError::new(format!("cannot lock session directory {path:?}: {err}"))
             });
         }
+        verify_bound(path, &dir, &lock)?;
         let this = Self { dir, _lock: lock };
         this.touch().map_err(|err| {
             RunError::new(format!("cannot update session directory {path:?}: {err}"))
@@ -109,6 +123,74 @@ impl SessionLock {
             .metadata()?
             .modified()
     }
+}
+
+/// #12 T6: `sbx gc` renames a locked, expired session to a tombstone and
+/// later unlinks its sbx.lock. A run that opened the directory before that
+/// rename can then create and flock a fresh lock in the tombstone (or flock
+/// the unlinked old one). After locking, the lock must still be linked, still
+/// be the directory's `sbx.lock`, and the directory must still sit at `path`.
+fn verify_bound(path: &Path, dir: &OwnedFd, lock: &OwnedFd) -> Result<(), RunError> {
+    let replaced = || {
+        RunError::new(format!(
+            "session directory {path:?} was removed or replaced while it was being locked (concurrent sbx gc?)"
+        ))
+    };
+    let stat_err =
+        |err: io::Error| RunError::new(format!("cannot stat session directory {path:?}: {err}"));
+    let lock_st = fstat_fd(lock.as_fd()).map_err(stat_err)?;
+    if lock_st.st_nlink == 0 {
+        return Err(replaced());
+    }
+    let name = CString::new(LOCK_FILE).expect("constant has no NUL");
+    let named = match fstatat_lock(dir.as_fd(), &name) {
+        Ok(st) => st,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(replaced()),
+        Err(err) => return Err(stat_err(err)),
+    };
+    if (named.st_dev, named.st_ino) != (lock_st.st_dev, lock_st.st_ino) {
+        return Err(replaced());
+    }
+    let dir_st = fstat_fd(dir.as_fd()).map_err(stat_err)?;
+    let at_path = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Err(replaced()),
+        Err(err) => return Err(stat_err(err)),
+    };
+    if (at_path.dev(), at_path.ino()) != (dir_st.st_dev, dir_st.st_ino) {
+        return Err(replaced());
+    }
+    Ok(())
+}
+
+fn fstat_fd(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: fstat writes one `struct stat` into `st`, which we own.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so the struct is fully initialized.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)`: relative to the directory fd, so
+/// a renamed directory is detected rather than followed by path.
+fn fstatat_lock(dir: BorrowedFd<'_>, name: &CString) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `name` is NUL-terminated; fstatat writes into `st`, which we own.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat succeeded, so the struct is fully initialized.
+    Ok(unsafe { st.assume_init() })
 }
 
 #[cfg(test)]
@@ -234,5 +316,105 @@ mod tests {
         assert!(now.duration_since(got).unwrap_or_default().as_secs() < 60);
         drop(lock);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Open the directory and its lock the way `acquire` does, without
+    /// locking, so a test can move the directory under them.
+    fn open_pair(path: &Path) -> (OwnedFd, OwnedFd) {
+        let dir = OwnedFd::from(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .expect("open dir"),
+        );
+        let lock = OwnedFd::from(
+            OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path.join(LOCK_FILE))
+                .expect("open lock"),
+        );
+        (dir, lock)
+    }
+
+    fn pinned(path: &Path) -> String {
+        format!(
+            "session directory {path:?} was removed or replaced while it was being locked (concurrent sbx gc?)"
+        )
+    }
+
+    #[test]
+    fn verify_bound_ok_for_fresh_acquire() {
+        let dir = unique_dir("bound-ok");
+        let lock = SessionLock::acquire(&dir).expect("acquire");
+        let (d, l) = open_pair(&dir);
+        verify_bound(&dir, &d, &l).expect("an intact pair is bound");
+        drop(lock);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_bound_detects_renamed_dir() {
+        let dir = unique_dir("bound-rename");
+        SessionLock::acquire(&dir).map(drop).expect("acquire");
+        let (d, l) = open_pair(&dir);
+        let moved = dir.with_extension("tomb");
+        std::fs::rename(&dir, &moved).expect("rename");
+        let err = verify_bound(&dir, &d, &l).expect_err("renamed dir");
+        assert_eq!(err.reason(), pinned(&dir));
+        std::fs::remove_dir_all(&moved).ok();
+    }
+
+    #[test]
+    fn verify_bound_detects_unlinked_lock() {
+        let dir = unique_dir("bound-unlink");
+        SessionLock::acquire(&dir).map(drop).expect("acquire");
+        let (d, l) = open_pair(&dir);
+        std::fs::remove_file(dir.join(LOCK_FILE)).expect("unlink lock");
+        let err = verify_bound(&dir, &d, &l).expect_err("unlinked lock");
+        assert_eq!(err.reason(), pinned(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_bound_detects_replaced_lock() {
+        let dir = unique_dir("bound-replace");
+        SessionLock::acquire(&dir).map(drop).expect("acquire");
+        let (d, l) = open_pair(&dir);
+        std::fs::remove_file(dir.join(LOCK_FILE)).expect("unlink lock");
+        std::fs::write(dir.join(LOCK_FILE), b"").expect("new lock");
+        let err = verify_bound(&dir, &d, &l).expect_err("replaced lock");
+        assert_eq!(err.reason(), pinned(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn acquire_after_tombstone_creates_fresh_session() {
+        let dir = unique_dir("bound-fresh");
+        SessionLock::acquire(&dir).map(drop).expect("acquire");
+        let moved = dir.with_extension("tomb");
+        std::fs::rename(&dir, &moved).expect("rename away");
+        SessionLock::acquire(&dir).expect("a fresh session at the old path");
+        assert!(dir.join(LOCK_FILE).exists());
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&moved).ok();
+    }
+
+    #[test]
+    fn acquire_refuses_tombstone_shaped_name() {
+        // m4: `sbx gc` tombstones are `.sbx-gc.<pid>.<nonce>`; a session with
+        // that name would be mistaken for one.
+        let dir = std::env::temp_dir()
+            .join(format!("sbx-run-session-{}-tomb", std::process::id()))
+            .join(".sbx-gc.42.0123456789abcdef");
+        let err = SessionLock::acquire(&dir)
+            .err()
+            .expect("tombstone-shaped name must be refused");
+        assert_eq!(
+            err.reason(),
+            format!("session directory {dir:?} has a name reserved for `sbx gc` tombstones")
+        );
+        assert!(!dir.exists(), "refused before anything is created");
     }
 }
