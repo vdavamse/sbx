@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -21,8 +21,11 @@ pub(crate) struct OutputBudget {
     truncated: AtomicBool,
     /// Set when `Pumps::finish` returns: no pump may forward anything after that (m8).
     closed: AtomicBool,
-    /// The forwarded stderr ends mid-line: sbx must start its own line with a newline.
-    stderr_partial: AtomicBool,
+    /// stdout and stderr are one open file (`2>&1`, the same pipe): one sink.
+    shared: AtomicBool,
+    /// The last byte written to the diagnostic sink (stderr, or the shared sink).
+    /// Writes to a shared sink are serialised under this lock, so it is exact.
+    tail: Mutex<Option<u8>>,
 }
 
 impl OutputBudget {
@@ -31,7 +34,8 @@ impl OutputBudget {
             remaining: AtomicU64::new(cap),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            stderr_partial: AtomicBool::new(false),
+            shared: AtomicBool::new(false),
+            tail: Mutex::new(None),
         })
     }
 
@@ -61,13 +65,27 @@ impl OutputBudget {
         self.truncated.load(Ordering::SeqCst)
     }
 
-    /// Records the last byte forwarded to stderr (review 3: framing of sbx's lines).
-    pub(crate) fn note_stderr_tail(&self, last: u8) {
-        self.stderr_partial.store(last != b'\n', Ordering::SeqCst);
+    /// Writes forwarded payload bytes to `dst`. Stderr writes always record the tail
+    /// (diagnostics go there); when stdout and stderr are one sink, every write does,
+    /// under the tail lock, so the tail is the true end of the shared stream.
+    pub(crate) fn forward(&self, dst: RawFd, data: &[u8]) -> io::Result<()> {
+        if dst != 2 && !self.shared.load(Ordering::SeqCst) {
+            return write_all_fd(dst, data);
+        }
+        let mut tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+        write_all_fd(dst, data)?;
+        *tail = data.last().copied();
+        Ok(())
     }
 
-    pub(crate) fn stderr_partial(&self) -> bool {
-        self.stderr_partial.load(Ordering::SeqCst)
+    /// The diagnostic sink ends mid-line: sbx must start its own line with a newline.
+    pub(crate) fn sink_partial(&self) -> bool {
+        let tail = self.tail.lock().unwrap_or_else(PoisonError::into_inner);
+        matches!(*tail, Some(last) if last != b'\n')
+    }
+
+    pub(crate) fn set_shared(&self) {
+        self.shared.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn close(&self) {
@@ -90,6 +108,19 @@ fn read_fd(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
         }
+    }
+}
+
+/// Whether two fds are one open file (`2>&1`, one pipe, one log file).
+fn same_sink(a: RawFd, b: RawFd) -> bool {
+    // SAFETY: fstat on fds we were handed; the stat buffers are zero-initialised.
+    unsafe {
+        let mut sa: libc::stat = std::mem::zeroed();
+        let mut sb: libc::stat = std::mem::zeroed();
+        libc::fstat(a, &mut sa) == 0
+            && libc::fstat(b, &mut sb) == 0
+            && sa.st_dev == sb.st_dev
+            && sa.st_ino == sb.st_ino
     }
 }
 
@@ -129,14 +160,9 @@ pub(crate) fn pump(src: OwnedFd, dst: RawFd, budget: Arc<OutputBudget>, done: mp
             break; // the run is concluding: forward nothing more (m8)
         }
         let grant = budget.take(n as u64) as usize;
-        if grant > 0 {
-            if write_all_fd(dst, &buf[..grant]).is_err() {
-                // Caller side gone: stop and drop the read end, so the payload sees EPIPE.
-                break;
-            }
-            if dst == 2 {
-                budget.note_stderr_tail(buf[grant - 1]);
-            }
+        // Caller side gone: stop and drop the read end, so the payload sees EPIPE.
+        if grant > 0 && budget.forward(dst, &buf[..grant]).is_err() {
+            break;
         }
     }
     drop(src);
@@ -182,6 +208,9 @@ impl Pumps {
         budget: Arc<OutputBudget>,
         stdin_piped: bool,
     ) -> io::Result<Self> {
+        if same_sink(1, 2) {
+            budget.set_shared();
+        }
         let (tx, rx) = mpsc::channel();
         let stdout = child
             .stdout
@@ -230,7 +259,7 @@ impl Pumps {
         self.budget.close();
         PumpEnd {
             truncated: self.budget.truncated(),
-            stderr_partial: self.budget.stderr_partial(),
+            stderr_partial: self.budget.sink_partial(),
         }
     }
 }

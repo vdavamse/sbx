@@ -182,7 +182,11 @@ the end of every run, which is the activity signal `gc` (#12) reads.
 
 **Audit log.** `--audit F` appends one JSON object per line to `F`. The file is
 created with mode 0600, must be a regular file (never a symlink, FIFO or
-directory), and must not be inside the session directory. Every row has the
+directory) owned by the current user with a single hard link, and must not be
+inside the session directory or any path the policy mounts (`ro` or `rw`), by
+lexical and by real (symlink-resolved) location. Several runs may share one
+file: each row is appended under an advisory `flock`, and a run that cannot get
+the lock within 250 ms fails closed (125, `audit log write failed: …`). Every row has the
 same keys in the same order:
 
 `ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,

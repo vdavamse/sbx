@@ -592,6 +592,26 @@ fn scenarios() -> Vec<Scenario> {
             run: shared_audit_two_writers,
         },
         Scenario {
+            name: "audit-under-policy-ro-125",
+            gate: Always,
+            run: audit_under_policy_ro_125,
+        },
+        Scenario {
+            name: "audit-lock-held-fails-closed",
+            gate: Bwrap,
+            run: audit_lock_held_fails_closed,
+        },
+        Scenario {
+            name: "partial-stderr-framing-merged",
+            gate: Bwrap,
+            run: partial_stderr_framing_merged,
+        },
+        Scenario {
+            name: "output-cap-merged",
+            gate: Bwrap,
+            run: output_cap_merged,
+        },
+        Scenario {
             name: "partial-stderr-framing",
             gate: Bwrap,
             run: partial_stderr_framing,
@@ -698,6 +718,7 @@ struct Pol {
     timeout: &'static str,
     output_bytes: u64,
     rw: Vec<String>,
+    ro_extra: Vec<String>,
     role: Option<String>,
     env_set: Vec<(String, String)>,
     env_pass: Vec<String>,
@@ -712,6 +733,7 @@ impl Pol {
             timeout: "30s",
             output_bytes: 1 << 20,
             rw: Vec::new(),
+            ro_extra: Vec::new(),
             role: Some(role.to_owned()),
             env_set: Vec::new(),
             env_pass: Vec::new(),
@@ -748,8 +770,14 @@ impl Pol {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}],"rw":[{rw}],"deny":[]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
+            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
             mode = self.mode,
+            ro_extra = self
+                .ro_extra
+                .iter()
+                .map(|p| format!(",{p:?}"))
+                .collect::<Vec<_>>()
+                .join(""),
             rw = self
                 .rw
                 .iter()
@@ -2299,6 +2327,174 @@ fn shared_audit_two_writers() -> Result<(), String> {
         .count();
     if b_rows != 1 {
         return Err(format!("run B's exit row was erased or torn: {content:?}"));
+    }
+    Ok(())
+}
+
+/// Round 2 (1b): `--audit` under a policy `ro` path is refused too: the payload can see it.
+fn audit_under_policy_ro_125() -> Result<(), String> {
+    let dir = scratch("roaudit");
+    let ro = dir.join("ro");
+    fs::create_dir_all(&ro).expect("mkdir");
+    let mut pol = Pol::new("exit");
+    pol.ro_extra = vec![ro.to_str().expect("utf8").to_owned()];
+    let policy = pol.write(&dir);
+    let audit = ro.join("a.jsonl");
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--audit", audit.to_str().expect("utf8")],
+        &payload(&["0"]),
+    );
+    let r = expect_refusal(&args, "--audit must not be inside a policy filesystem path");
+    let created = audit.exists();
+    let _ = fs::remove_dir_all(&dir);
+    r?;
+    if created {
+        return Err("the audit file was created under the ro path".into());
+    }
+    Ok(())
+}
+
+/// Round 2 (1a): another process holds `flock` on the shared audit file. The run must not
+/// stall: after the bounded wait it fails closed (125), and it still answers SIGTERM.
+fn audit_lock_held_fails_closed() -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let dir = scratch("lockheld");
+    let audit = dir.join("shared.jsonl");
+    let holder = fs::File::create(&audit).expect("create");
+    // SAFETY: flock on a file this test owns; held until `holder` drops.
+    if unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err("test could not take the flock".into());
+    }
+    let policy = Pol::new("ready-sleep").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--audit", audit.to_str().expect("utf8")],
+        &payload(&["30"]),
+    );
+    let proc_ = Proc::spawn(&args, |_| {})?;
+    proc_.wait_stdout("READY")?;
+    let started = Instant::now();
+    // SAFETY: signalling our own child process by pid.
+    unsafe { libc::kill(proc_.child.id() as libc::pid_t, libc::SIGTERM) };
+    let done = proc_.finish(Duration::from_secs(10))?;
+    let took = started.elapsed();
+    drop(holder);
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 125)?;
+    expect_stderr(&done, "audit log write failed:")?;
+    expect_stderr(&done, "locked by another process")?;
+    if took > Duration::from_secs(5) {
+        return Err(format!("the held lock stalled the teardown for {took:?}"));
+    }
+    Ok(())
+}
+
+/// Result of a run whose stdout and stderr are ONE pipe (`2>&1`).
+struct Merged {
+    rc: Option<i32>,
+    text: String,
+}
+
+fn run_merged(args: &[OsString]) -> Result<Merged, String> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes two fds into the array; each is owned exactly once below.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err("pipe2 failed".into());
+    }
+    // SAFETY: fresh fds from pipe2.
+    let (read, write) = unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    };
+    let write2 = write.try_clone().map_err(|e| e.to_string())?;
+    let reader = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = fs::File::from(read).read_to_end(&mut buf);
+        buf
+    });
+    let status = Command::new(SBX)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(write))
+        .stderr(Stdio::from(write2))
+        .status()
+        .map_err(|e| format!("spawn sbx: {e}"))?;
+    let buf = reader.join().map_err(|_| "reader panicked".to_owned())?;
+    Ok(Merged {
+        rc: status.code(),
+        text: String::from_utf8_lossy(&buf).into_owned(),
+    })
+}
+
+/// Round 2 (2): `2>&1` — the partial payload stdout line must not be glued to sbx's line.
+fn partial_stderr_framing_merged() -> Result<(), String> {
+    let dir = scratch("mergedframe");
+    let policy = Pol::new("exit").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--timeout", "1s"],
+        &[
+            OsString::from("/usr/bin/bash"),
+            OsString::from("-c"),
+            OsString::from("printf progress; sleep 30"),
+        ],
+    );
+    let m = run_merged(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    if m.rc != Some(124) {
+        return Err(format!("rc {:?}, want 124", m.rc));
+    }
+    if m.text != "progress\nsbx run: timed out after 1s\n" {
+        return Err(format!(
+            "merged diagnostic glued to the payload: {:?}",
+            m.text
+        ));
+    }
+    Ok(())
+}
+
+/// Counts payload `x` bytes in text that may end with sbx's own lines.
+fn x_before_diagnostics(text: &str) -> usize {
+    // sbx's `sbx run: …` line contains an `x` ("sbx"): it is never counted.
+    let body = match text.find("sbx run: ") {
+        Some(at) if at == 0 || text.as_bytes()[at - 1] == b'\n' => &text[..at],
+        _ => text,
+    };
+    body.bytes().filter(|b| *b == b'x').count()
+}
+
+/// Round 2 (2): the output cap with `2>&1`: payload bytes counted on the merged stream.
+fn output_cap_merged() -> Result<(), String> {
+    let dir = scratch("capmerged");
+    let mut pol = Pol::new("flood");
+    pol.output_bytes = 1000;
+    let policy = pol.write(&dir);
+    let args = sbx_args(&policy, &dir.join("s"), &[], &payload(&["10000"]));
+    let m = run_merged(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    if m.rc != Some(0) {
+        return Err(format!("rc {:?}, want 0", m.rc));
+    }
+    let x = x_before_diagnostics(&m.text);
+    if x != 1000 {
+        return Err(format!("forwarded {x} payload bytes, want 1000"));
+    }
+    let notice = "sbx run: output truncated at 1000 bytes (limits.output_bytes)\n";
+    if !m.text.ends_with(notice) {
+        return Err(format!(
+            "truncation notice missing: {:?}",
+            &m.text[m.text.len().saturating_sub(120)..]
+        ));
+    }
+    let head = &m.text[..m.text.len() - notice.len()];
+    if !head.is_empty() && !head.ends_with('\n') {
+        return Err("notice glued to a payload line on the merged stream".into());
     }
     Ok(())
 }

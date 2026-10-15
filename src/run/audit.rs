@@ -4,11 +4,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Serialize;
 
@@ -236,6 +236,38 @@ pub(crate) fn open_audit(path: &Path) -> Result<File, RunError> {
     Ok(file)
 }
 
+/// How long one row waits for the shared file's lock before the run fails closed
+/// (review 1, round 2). Bounded: another process holding `flock` on the shared
+/// file must not stall this run's proxy and resolver, nor its timeout or signals.
+pub(crate) const LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// Takes `flock(LOCK_EX)` without blocking: retried in small steps for at most
+/// `LOCK_WAIT`, then reported as a failure (the caller fails the run closed).
+fn lock_bounded(fd: RawFd) -> Result<(), String> {
+    let start = Instant::now();
+    loop {
+        // SAFETY: flock on the fd this log owns; LOCK_NB never blocks.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        let retry = matches!(
+            err.raw_os_error(),
+            Some(libc::EWOULDBLOCK) | Some(libc::EINTR)
+        );
+        if !retry {
+            return Err(err.to_string());
+        }
+        if start.elapsed() >= LOCK_WAIT {
+            return Err(format!(
+                "the audit file is locked by another process (waited {} ms)",
+                LOCK_WAIT.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 struct AuditState {
     file: File,
     /// The first write failure, verbatim (M1: fail closed, reported by the caller).
@@ -277,10 +309,7 @@ impl AuditLog {
     /// or an error truncates the file back to that offset, so no torn row is left.
     fn append(file: &File, bytes: &[u8]) -> Result<(), String> {
         let fd = file.as_raw_fd();
-        // SAFETY: flock on the fd this log owns; LOCK_EX waits for other writers.
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error().to_string());
-        }
+        lock_bounded(fd)?;
         let result = (|| {
             let pre = file.metadata().map_err(|err| err.to_string())?.len();
             // O_APPEND: this write lands at the real EOF, which the lock keeps stable.

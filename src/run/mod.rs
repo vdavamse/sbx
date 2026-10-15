@@ -461,6 +461,14 @@ fn execute(
         .iter()
         .map(|p| p.as_path().to_path_buf())
         .collect();
+    // Round 2: the payload sees the ro paths too, so the audit log may not live under
+    // one of those either (its rows, or a lock held there, would be the payload's).
+    let ro_roots: Vec<PathBuf> = policy
+        .filesystem
+        .ro
+        .iter()
+        .map(|p| p.as_path().to_path_buf())
+        .collect();
     check_mode(policy.network.mode, PROVIDED_MODE)?;
     let timeout = effective_timeout(args.timeout, policy.limits.timeout);
     let deadline = deadline_from(t0, timeout);
@@ -480,6 +488,11 @@ fn execute(
                 return Err(refused(Writable::PolicyRw, path).into());
             }
         }
+        for root in &ro_roots {
+            if audit_inside_session(path, root) {
+                return Err(refused(Writable::PolicyRo, path).into());
+            }
+        }
     }
 
     // S4: the session lock comes before materialize and before any audit row.
@@ -490,7 +503,7 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot create the fault latch: {err}")))?;
     let audit_file = match &audit_path {
         Some(path) => {
-            let roots = writable_roots(&session, &rw_roots)?;
+            let roots = writable_roots(&session, &rw_roots, &ro_roots)?;
             check_real_audit_location(path, &roots)?;
             let file = open_audit(path)?;
             check_opened_audit_location(&file, &roots)?;
@@ -665,6 +678,7 @@ fn execute(
 enum Writable {
     Session,
     PolicyRw,
+    PolicyRo,
 }
 
 fn refused(kind: Writable, path: &Path) -> RunError {
@@ -675,12 +689,19 @@ fn refused(kind: Writable, path: &Path) -> RunError {
         Writable::PolicyRw => RunError::new(format!(
             "--audit must not be inside a writable policy path ({path:?})"
         )),
+        Writable::PolicyRo => RunError::new(format!(
+            "--audit must not be inside a policy filesystem path ({path:?})"
+        )),
     }
 }
 
 /// The canonical writable roots: the session directory and every policy `rw` path
 /// that exists (a missing rw path cannot contain the log).
-fn writable_roots(session: &Path, rw: &[PathBuf]) -> Result<Vec<(Writable, PathBuf)>, RunError> {
+fn writable_roots(
+    session: &Path,
+    rw: &[PathBuf],
+    ro: &[PathBuf],
+) -> Result<Vec<(Writable, PathBuf)>, RunError> {
     let real_session = std::fs::canonicalize(session).map_err(|err| {
         RunError::new(format!(
             "cannot resolve session directory {session:?}: {err}"
@@ -690,6 +711,11 @@ fn writable_roots(session: &Path, rw: &[PathBuf]) -> Result<Vec<(Writable, PathB
     for path in rw {
         if let Ok(real) = std::fs::canonicalize(path) {
             roots.push((Writable::PolicyRw, real));
+        }
+    }
+    for path in ro {
+        if let Ok(real) = std::fs::canonicalize(path) {
+            roots.push((Writable::PolicyRo, real));
         }
     }
     Ok(roots)
