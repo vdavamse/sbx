@@ -1133,6 +1133,7 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
         command: &command,
         cwd: None,
         passed_env: &passed_env,
+        info_fd: None,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 

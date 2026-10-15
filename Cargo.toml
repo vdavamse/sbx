@@ -77,3 +77,10 @@ harness = false
 [[test]]
 name = "sandbox_proxy"
 harness = false
+
+# Issue #10 integration suite: spawns the real `sbx run` (and the test binary
+# itself as the payload role) — hand-rolled SKIP-with-message runner, like the
+# other harness = false suites.
+[[test]]
+name = "sandbox_run"
+harness = false

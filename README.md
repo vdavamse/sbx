@@ -23,15 +23,16 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#9). The CLI parses the full documented
-interface, and `check` is real: it validates a policy file against the
+**In progress** (issues #2–#10). The CLI parses the full documented
+interface, `check` is real, and `run` is real (issue #10, see
+[Running commands](#running-commands)): it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
 The library also carries the egress decision core (issue #4): the
 domain allow-list matcher and the resolved-address guard that the proxy
 and fake-IP resolver (#7–#9) call. The explicit HTTP proxy (#8)
 serves `CONNECT` and absolute-form requests on the explicit listener with
-the same policy and inspectors; #10 wires both listeners into `sbx run`.
+the same policy and inspectors; `sbx run` (#10) serves both listeners.
 The fake-IP DNS resolver is real (issue #9): A queries for allow-listed names
 get a per-run address from `198.18.0.0/15` that the transparent proxy maps back
 to the name; AAAA gets an empty answer, every other name NXDOMAIN, and nothing
@@ -69,10 +70,12 @@ tears the connection down on any second `ClientHello` (the post-HRR
 retry shape) — the library module docs record the accepted residuals;
 every connection produces exactly one audit decision with the pinned deny
 vocabulary through the sink seam #10 plugs into (whose `teardown` hook
-surfaces blocked relay-phase attacks). `run` and `gc` are stubs
-that exit `1` with `not implemented yet`. Exit codes: `0`
-success, `1` runtime failure (including an invalid or unreadable
-policy file), `2` usage error (clap's convention). The architecture
+surfaces blocked relay-phase attacks). `sbx run` is the sandbox
+lifecycle (issue #10): timeouts, signals, stdio pumps, the output cap and the
+JSONL audit log; its exit codes are in [Running commands](#running-commands).
+`gc` is still a stub that exits `1` with `not implemented yet`. For `check`
+and `__init`: `0` success, `1` runtime failure (including an invalid or
+unreadable policy file), `2` usage error (clap's convention). The architecture
 and issue roadmap live in tracking issue #20. `spikes/` holds
 standalone experiment packages that are excluded from the Cargo
 workspace.
@@ -92,7 +95,7 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout 120s] [--audit FILE] -- COMMAND [ARGS...]
+        [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
 sbx check --policy policy.json
 sbx check --print-schema
 sbx gc --older-than 7d ROOT
@@ -100,7 +103,9 @@ sbx gc --older-than 7d ROOT
 
 Durations are human format (`500ms`, `90s`, `2h`, `7d`) and must be
 greater than zero — a zero `--older-than` cutoff would match every session,
-and a zero `--timeout` is ambiguous. `--timeout` defaults to `120s`.
+and a zero `--timeout` is ambiguous. `--timeout` defaults to the policy's
+`limits.timeout`, and the effective timeout is the smaller of the two (the
+CLI value can shorten the policy limit, never extend it).
 Everything after `--` in `sbx run` is the command, verbatim, including
 hyphenated arguments.
 
@@ -109,6 +114,112 @@ hyphenated arguments.
 policy JSON Schema (draft 2020-12) to stdout; the two flags are mutually
 exclusive. Policy files follow schema version 1 — see
 [`examples/`](examples/).
+
+## Running commands
+
+`sbx run --policy P --session-dir D [--cwd C] [--timeout T] [--audit F] -- CMD…`
+runs `CMD` verbatim (no shell, arguments byte-exact) inside the bwrap sandbox
+built from the policy. Inside the sandbox a private network namespace carries
+sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
+
+**Exit codes**
+
+| Situation | rc | audit `outcome` | stderr (sbx's own line) |
+|---|---|---|---|
+| the command exits N | N | `exited` | none |
+| the command is killed by a signal (bwrap reports it as 128+N) | 128+N | `exited` | none |
+| `--timeout` / policy `limits.timeout` elapsed | 124 | `timeout` | `sbx run: timed out after 90s` |
+| sbx received SIGTERM / SIGINT / SIGHUP / SIGQUIT | 143 / 130 / 129 / 131 | `terminated` | `sbx run: terminated by SIGTERM` |
+| an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
+| a usage error | 2 | — | clap's message |
+
+A payload that exits 124, 125 or 128+N is indistinguishable from sbx's own
+codes by exit status alone; the audit `outcome` says which it was. A failure
+after the payload started (for example `execvp` of a missing binary, rc 1) keeps
+the status of the failing stage and is printed by that stage.
+
+**Timeouts.** The clock starts when `run` starts, so sandbox setup counts.
+Setup itself is limited to 30 seconds. On timeout or on a signal sbx SIGKILLs
+the whole sandbox at once: the command gets no grace period.
+
+**Signals.** sbx watches SIGTERM, SIGINT, SIGHUP and SIGQUIT. A signal the
+caller left ignored stays ignored. Any other fatal signal (SIGUSR1, SIGALRM…)
+kills sbx with its default action, and the sandbox then dies with it. Job-control
+stop (SIGTSTP) is not handled.
+
+A non-interactive shell starts background jobs (`sbx run … &`) with SIGINT and
+SIGQUIT ignored (POSIX). Those dispositions are inherited, so such a sandbox
+ignores Ctrl-C-style signals as well, like `nohup`. Send SIGTERM, or reset the
+disposition in the script before starting `sbx run`.
+
+**Standard streams.** The payload's stdout and stderr are always pipes, so it
+never sees a terminal on fds 0–2. stdin is inherited when it is not a terminal.
+When it is a terminal that is sbx's foreground group, sbx pumps it. A background
+terminal stdin is `/dev/null`, so a background read cannot stop sbx.
+
+**Output cap.** `limits.output_bytes` bounds stdout and stderr combined. The
+excess is drained and discarded (the command is not killed). When the cap is hit
+sbx prints `sbx run: output truncated at N bytes (limits.output_bytes)` as its
+last line, and the exit row records `output_truncated: true`. If the caller closes
+sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
+
+**Session directory.** `--session-dir` is created with mode 0700 and must be
+owned by the current user. Only one run may use a session at a time: a lock on
+`sbx.lock` inside it is held for the whole run, and a second run fails with
+`session directory is in use`. The directory's mtime is updated at the start and
+the end of every run, which is the activity signal `gc` (#12) reads.
+
+**Audit log.** `--audit F` appends one JSON object per line to `F`. The file is
+created with mode 0600, must be a regular file (never a symlink, FIFO or
+directory), and must not be inside the session directory. Every row has the
+same keys in the same order:
+
+`ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,
+`port`, `bytes` (`{"up","down"}` on `close`), `reason`, `via`, `verdict`,
+`rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
+`duration_ms`, `output_truncated` and `dns_poisoned`.
+
+```json
+{"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}
+{"ts":"2026-10-15T18:23:01.123Z","event":"connect","host":"github.com","sni":"github.com","port":443,"bytes":null,"reason":"allowed github.com via 140.82.121.4:443","via":"transparent","verdict":"allowed","rcode":null,"qtype":null,"client":"10.255.255.1:40000"}
+{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false}
+```
+
+Rows are in event order: a connection's `connect`, then `deny` (teardown) if
+any, then `close`. The `exit` row is always last. A connection still open when
+the run ends gets no `close` row. The log is not fsynced. If a write fails
+mid-run the run fails closed (rc 125, `sbx run: audit log write failed: …`).
+
+**Network.** Only ports 443 (TLS, SNI-checked) and 80 (HTTP, `Host`-checked)
+are inspected; any other listed port is denied. ECH and GREASE-ECH are denied. In
+transparent mode sbx sets no proxy environment variables. In explicit mode the
+payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+`NO_PROXY` and their lowercase twins) pointing at the explicit listener. The
+explicit proxy's response table is in the `proxy::explicit` module docs (200 for
+an allowed CONNECT; 400, 403, 502 and 504 otherwise).
+
+**Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
+discovery), and unprivileged user namespaces. The integration suite
+(`tests/sandbox_run.rs`) runs every scenario; on hosts without bwrap or userns
+it prints SKIP for the sandboxed scenarios.
+
+**Startup overhead (issue #10 AC3).** Measured with
+`hyperfine -N --warmup 10 --runs 100` on the release static-musl build (static-pie,
+as shipped), from a native Linux filesystem, with a user-space bubblewrap 0.9.0
+(`SBX_BWRAP`), the policy `ro ["/usr"]`, transparent mode, empty allow list:
+
+| command | median | p90 |
+|---|---|---|
+| `/usr/bin/bash -c true` | 1.50 ms | 1.76 ms |
+| `sbx run … -- /usr/bin/bash -c true` | 11.15 ms | 12.01 ms |
+
+Overhead ≈ 9.7 ms, under the 25 ms target. Measure from a native filesystem:
+on WSL2 the Windows drive (`/mnt/c`, a 9p mount without page caching) adds
+about 14 ms to every exec of the binary (the same build measured there:
+34–37 ms median). A trivial static-pie binary starts in 0.4 ms, and the sbx
+binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
+build is not the cost. CI runs on ext4 and reports the number on every run
+(report-only, with a warning at ≥ 25 ms).
 
 ## Build
 

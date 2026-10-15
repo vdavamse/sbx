@@ -145,7 +145,7 @@ pub fn session_layout(session_dir: &Path) -> SessionLayout {
 /// Absoluteness is NOT checked here — [`super::build`] row 3 owns that
 /// rule for the argv path, and a relative (but canonical) `session_dir`
 /// stays `materialize`'s documented caller choice.
-pub(super) fn check_session_dir(dir: &Path) -> Result<(), String> {
+pub(crate) fn check_session_dir(dir: &Path) -> Result<(), String> {
     // Root aliases first: components() collapses "//" and normalizes "."
     // away, so [RootDir] exactly == every spelling of the host root.
     if dir.components().eq(std::iter::once(Component::RootDir)) {

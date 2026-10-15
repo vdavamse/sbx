@@ -33,6 +33,8 @@
 //!    shutdown). Both trait seams run on the single runtime thread: they
 //!    must be sync, cheap, non-blocking, and must not panic (a panicking
 //!    sink aborts that connection task with the decision unrecorded).
+//!    The `closed` hook (issue #10, T9) reports each relayed connection's
+//!    upstream byte counts once, after the relay ends.
 //! 4. **Fail-closed everywhere** — every path that is not an explicit
 //!    allow denies: `SO_ORIGINAL_DST` failure (no verifiable destination ⇒
 //!    no traffic), unknown fake IP, unlisted port, unlisted name, a
@@ -741,6 +743,15 @@ pub trait DecisionSink: Send + Sync + 'static {
     /// second [`Self::record`] — the exactly-one-Decision invariant is
     /// untouched (`exactly_one_decision_per_connection`).
     fn teardown(&self, _decision: &Decision, _detail: &str) {}
+
+    /// Relay end of a connection whose Allowed decision reached the relay phase
+    /// (issue #10, T9): `up` = bytes accepted by the upstream (replay buffer
+    /// included), `down` = bytes read from the upstream. Exactly once per relayed
+    /// connection, AFTER `teardown` (if it fired), on EVERY relay end. Never
+    /// called for Denied/Error, nor for a relay still running at runtime stop.
+    /// Default: no-op. SYNC + CHEAP + NON-BLOCKING + must-not-panic. NOT a
+    /// second `record`.
+    fn closed(&self, _decision: &Decision, _up: u64, _down: u64) {}
 }
 
 /// A bidirectional byte stream usable as an upstream (relay endpoint).
@@ -1169,22 +1180,27 @@ pub(crate) async fn relay_tail<C>(
 ) where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let scan_from = match mode {
-        RelayMode::Scanned { scan_from } => Some(scan_from),
-        RelayMode::Plain | RelayMode::CloseOnUpstreamEof => None,
-    };
-    if let RelayMode::CloseOnUpstreamEof = mode {
+    let mut counted = relay::Counted::new(&mut *upstream);
+    match mode {
         // Explicit-only; the transparent relay never sees this mode.
         // Clean end or transport error: normal relay lifecycle — swallowed.
-        let _ = relay::relay_until_upstream_eof(client, replay, upstream).await;
-        return;
+        RelayMode::CloseOnUpstreamEof => {
+            let _ = relay::relay_until_upstream_eof(client, replay, &mut counted).await;
+        }
+        RelayMode::Scanned { .. } | RelayMode::Plain => {
+            let scan_from = match mode {
+                RelayMode::Scanned { scan_from } => Some(scan_from),
+                _ => None,
+            };
+            match relay::relay(client, replay, scan_from, &mut counted).await {
+                Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
+                // Clean end or transport error (EOF/RST/broken pipe): normal relay
+                // lifecycle — swallowed.
+                Ok(relay::RelayEnd::Finished) | Err(_) => {}
+            }
+        }
     }
-    match relay::relay(client, replay, scan_from, upstream).await {
-        Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
-        // Clean end or transport error (EOF/RST/broken pipe): normal relay
-        // lifecycle — swallowed.
-        Ok(relay::RelayEnd::Finished) | Err(_) => {}
-    }
+    proxy.sink.closed(decision, counted.up(), counted.down());
 }
 
 /// `getsockopt(SO_ORIGINAL_DST)` on an ACCEPTED socket of the redirected
@@ -1537,6 +1553,214 @@ mod tests {
         // by `sink_teardown_default_is_noop`. The end-to-end wiring
         // (handle_connection → sink.teardown with the pinned detail) is
         // pinned by the suite's `tls-second-hello-torn-down` scenario.
+    }
+
+    use tokio::io::AsyncReadExt as _;
+
+    /// Ordered sink for the T9 close-hook tests (issue #10): every hook call
+    /// appended as a short string, in call order.
+    #[derive(Default)]
+    struct OrderSink {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl OrderSink {
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("events lock").clone()
+        }
+    }
+
+    impl DecisionSink for OrderSink {
+        fn record(&self, _decision: &Decision) {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push("record".into());
+        }
+        fn teardown(&self, _decision: &Decision, detail: &str) {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(format!("teardown:{detail}"));
+        }
+        fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(format!("closed:{up}:{down}"));
+        }
+    }
+
+    fn order_proxy(sink: Arc<OrderSink>) -> Arc<Proxy> {
+        let network = policy::Network {
+            mode: policy::NetworkMode::Transparent,
+            allow: vec![dom("allowed.test")],
+            ports: vec![TLS_PORT, HTTP_PORT],
+        };
+        let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
+        Proxy::new(
+            &network,
+            Arc::new(map),
+            sink,
+            never_connector().0,
+            Limits::default(),
+        )
+    }
+
+    fn allowed_decision() -> Decision {
+        Decision {
+            client: sock(SANDBOX_CLIENT),
+            via: Via::Transparent {
+                orig_dst: Some(v4("198.18.0.1:443")),
+            },
+            name: Some(dom("allowed.test")),
+            verdict: Verdict::Allowed {
+                name: dom("allowed.test"),
+                upstream: sock(PUBLIC),
+            },
+        }
+    }
+
+    #[test]
+    fn closed_once_with_bytes_after_plain_relay() {
+        // Issue #10, T9: `up` = replay + client body (as the upstream accepted),
+        // `down` = upstream bytes read; exactly one `closed`, after the relay.
+        let sink = Arc::new(OrderSink::default());
+        let proxy = order_proxy(sink.clone());
+        let decision = allowed_decision();
+        let (up_near, mut up_far) = duplex(4096);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (mut client_far, client) = duplex(4096);
+        let replay: &[u8] = b"HEAD\r\n\r\n";
+        block_on(async {
+            let far = tokio::spawn(async move {
+                let mut got = vec![0u8; replay.len() + 5];
+                up_far.read_exact(&mut got).await.expect("upstream read");
+                up_far
+                    .write_all(b"BYE!!!!!!!")
+                    .await
+                    .expect("upstream write");
+                up_far.shutdown().await.expect("upstream shutdown");
+                got
+            });
+            client_far.write_all(b"BODY!").await.expect("client write");
+            client_far.shutdown().await.expect("client shutdown");
+            relay_tail(
+                &proxy,
+                &decision,
+                client,
+                replay,
+                RelayMode::Plain,
+                &mut upstream,
+            )
+            .await;
+            let got = far.await.expect("far task");
+            assert_eq!(got, b"HEAD\r\n\r\nBODY!");
+        });
+        // down = the 10 upstream bytes ("BYE!!!!!!!").
+        assert_eq!(sink.events(), vec!["closed:13:10".to_owned()]);
+    }
+
+    #[test]
+    fn teardown_then_closed_on_second_hello() {
+        // The inspected ClientHello is replayed upstream; a SECOND ClientHello
+        // tears the relay down. `closed` follows `teardown`, and the withheld
+        // second hello is never counted as `up`.
+        let sink = Arc::new(OrderSink::default());
+        let proxy = order_proxy(sink.clone());
+        let decision = allowed_decision();
+        let ch1 = tls_hello("allowed.test");
+        let ch2 = tls_hello("allowed.test");
+        let ch1_len = ch1.len();
+        let (up_near, mut up_far) = duplex(64 * 1024);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (mut client_far, client) = duplex(64 * 1024);
+        block_on(async {
+            let far = tokio::spawn(async move {
+                let mut got = vec![0u8; ch1.len()];
+                up_far.read_exact(&mut got).await.expect("upstream read");
+                got.len()
+            });
+            client_far.write_all(&ch2).await.expect("client write");
+            relay_tail(
+                &proxy,
+                &decision,
+                client,
+                &tls_hello("allowed.test"),
+                RelayMode::Scanned {
+                    scan_from: tls_hello("allowed.test").len(),
+                },
+                &mut upstream,
+            )
+            .await;
+            far.await.expect("far task");
+        });
+        let events = sink.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[0],
+            format!("teardown:{}", relay::TORN_DOWN_SECOND_HELLO)
+        );
+        // up = the replayed first hello only; the withheld second hello is not counted.
+        assert_eq!(events[1], format!("closed:{}:0", ch1_len), "{events:?}");
+    }
+
+    #[test]
+    fn closed_counts_upstream_only_in_close_on_eof_mode() {
+        // The explicit forward path: the (rewritten) head is replayed upstream,
+        // then upstream EOF ends the exchange. Proxy response bytes never count.
+        let sink = Arc::new(OrderSink::default());
+        let proxy = order_proxy(sink.clone());
+        let decision = allowed_decision();
+        let head: &[u8] = b"GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let (up_near, mut up_far) = duplex(4096);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (_client_far, client) = duplex(4096);
+        block_on(async {
+            let far = tokio::spawn(async move {
+                let mut got = vec![0u8; head.len()];
+                up_far.read_exact(&mut got).await.expect("upstream read");
+                up_far.write_all(b"OK").await.expect("upstream write");
+                up_far.shutdown().await.expect("upstream shutdown");
+            });
+            relay_tail(
+                &proxy,
+                &decision,
+                client,
+                head,
+                RelayMode::CloseOnUpstreamEof,
+                &mut upstream,
+            )
+            .await;
+            far.await.expect("far task");
+        });
+        assert_eq!(sink.events(), vec![format!("closed:{}:2", head.len())]);
+    }
+
+    #[test]
+    fn closed_not_called_for_denied_decisions() {
+        // A Denied decision never reaches the relay phase: no `close` row.
+        let sink = Arc::new(OrderSink::default());
+        let proxy = order_proxy(sink.clone());
+        let (decision, relay_state) = run_decide(&proxy, "203.0.113.7:443", b"");
+        assert!(relay_state.is_none());
+        assert!(matches!(decision.verdict, Verdict::Denied(_)));
+        assert!(
+            !sink.events().iter().any(|e| e.starts_with("closed")),
+            "{:?}",
+            sink.events()
+        );
+    }
+
+    #[test]
+    fn sink_closed_default_is_noop() {
+        // A sink that only implements `record` inherits a no-op `closed`.
+        struct MinimalSink;
+        impl DecisionSink for MinimalSink {
+            fn record(&self, _decision: &Decision) {}
+        }
+        let decision = allowed_decision();
+        MinimalSink.closed(&decision, 1, 2);
     }
 
     #[test]

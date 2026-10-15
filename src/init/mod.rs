@@ -51,6 +51,11 @@
 //!    before the `execvp` — the payload would otherwise inherit broken
 //!    `cmd | head`-style pipe semantics — and re-ignores `SIGPIPE` on the
 //!    failure return so the staged diagnostics stay EPIPE-safe.
+//!    Issue #10 adds two things. The hidden `--keep-fd N` (the bwrap info pipe
+//!    `run` hands through) is the only fd above 2 that survives hygiene, and
+//!    it is validated before any namespace work. The signal mask is reset
+//!    first thing: std does not reset the blocked mask across spawn, and
+//!    `run` blocks TERM/INT/HUP/QUIT for its signalfd.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
 //!    (`control_socketpair` → `prepare_child_end` → spawn →
 //!    `recv_listener_fds` → serve (#7/#8/#9) → `send_go`); [`consts`] is the
@@ -191,7 +196,18 @@ impl std::error::Error for InitError {}
 /// own — the [`ExitCode::SUCCESS`] arm is unreachable in practice (the
 /// pipeline only returns `Ok` if `execvp` returns, which success never
 /// does).
-pub fn run_init(fd: RawFd, test_break_rules: bool, cmd: Vec<OsString>) -> ExitCode {
+pub fn run_init(
+    fd: RawFd,
+    keep_fd: Option<RawFd>,
+    parent_pid: Option<i32>,
+    test_break_rules: bool,
+    cmd: Vec<OsString>,
+) -> ExitCode {
+    // Issue #10 (E10): `run` blocks TERM/INT/HUP/QUIT for its signalfd, and
+    // std's Command does NOT reset the blocked mask across spawn. `__init` is
+    // single-threaded, so resetting its thread mask resets the process mask;
+    // bwrap and the payload then start with an empty mask. FIRST statement.
+    reset_signal_mask();
     // m3: the default panic hook prints `thread 'main' panicked …` to
     // stderr BEFORE catch_unwind hands us the payload — that noise would
     // precede (and break the pinned prefix of) the staged `sbx __init:
@@ -207,7 +223,7 @@ pub fn run_init(fd: RawFd, test_break_rules: bool, cmd: Vec<OsString>) -> ExitCo
     // sequence of syscalls over Copy/owned inputs; a poisoned intermediate
     // state cannot be observed because we abort (rc 1) after a catch.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pipeline(fd, test_break_rules, &cmd)
+        pipeline(fd, keep_fd, parent_pid, test_break_rules, &cmd)
     }));
     std::panic::set_hook(previous_hook);
     match result {
@@ -227,8 +243,18 @@ pub fn run_init(fd: RawFd, test_break_rules: bool, cmd: Vec<OsString>) -> ExitCo
 /// 1). Each stage call constructs its own staged errors; this fn only
 /// sequences them. Returns `Err(exec_payload(..))` when exec fails; `Ok`
 /// would mean execvp returned success, which is impossible.
-fn pipeline(fd: RawFd, test_break_rules: bool, cmd: &[OsString]) -> Result<(), InitError> {
+fn pipeline(
+    fd: RawFd,
+    keep_fd: Option<RawFd>,
+    parent_pid: Option<i32>,
+    test_break_rules: bool,
+    cmd: &[OsString],
+) -> Result<(), InitError> {
+    arm_parent_death(parent_pid)?; // m6: first, so a dying parent takes us with it
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
+    if let Some(keep) = keep_fd {
+        validate_keep_fd(keep, fd)?; // Stage::Control too (issue #10, Q13)
+    }
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
     netns::write_id_maps(ids)?; // Stage::Idmap
     netns::configure_netns()?; // Stage::Netns
@@ -251,7 +277,7 @@ fn pipeline(fd: RawFd, test_break_rules: bool, cmd: &[OsString]) -> Result<(), I
     // fd_hygiene scan below is defense in depth.
     drop(listeners);
     drop(sock);
-    fd_hygiene(fd);
+    fd_hygiene(fd, keep_fd);
     Err(exec_payload(cmd)) // Stage::Exec — returns ONLY on failure
 }
 
@@ -352,7 +378,7 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> String {
 /// dies at exec anyway. The end-to-end proof is the integration suite's
 /// `check-net` role asserting fds == {0,1,2} after exec (D13 — in-process
 /// closing tests are thread-hostile under parallel cargo test).
-fn fd_hygiene(control: RawFd) {
+fn fd_hygiene(control: RawFd, keep: Option<RawFd>) {
     // SAFETY: closing an fd this process owns; EBADF (already closed) is
     // ignored by design.
     unsafe {
@@ -361,7 +387,7 @@ fn fd_hygiene(control: RawFd) {
     let Some(fds) = scan_fds_above_stdio() else {
         return;
     };
-    for fd in fds {
+    for fd in fds_to_close(fds, keep) {
         // SAFETY: single-threaded process; the number came from our own
         // /proc/self/fd; EBADF is tolerated (the scan's dirfd may already
         // be closed, or a RAII drop beat us to it).
@@ -369,6 +395,104 @@ fn fd_hygiene(control: RawFd) {
             libc::close(fd);
         }
     }
+    if let Some(keep) = keep {
+        // Defense in depth (issue #10): the kept fd must survive execvp even
+        // if the caller forgot to clear CLOEXEC on it.
+        // SAFETY: F_SETFD on a fd validated by validate_keep_fd.
+        unsafe {
+            libc::fcntl(keep, libc::F_SETFD, 0);
+        }
+    }
+}
+
+/// Issue #10 (Q13): `--keep-fd` is the bwrap info pipe `run` hands through.
+/// Validated in the control stage so a bad value fails before any namespace
+/// work. The write end must be a pipe open for writing (bwrap writes the
+/// `child-pid` JSON there); a forged pid cannot be produced by the payload
+/// because bwrap closes the info fd before the payload exists (E3) and `run`
+/// verifies PPid/NSpid anyway.
+fn validate_keep_fd(keep: RawFd, control: RawFd) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if keep <= 2 {
+        return Err(fail(format!("--keep-fd {keep} must be greater than 2")));
+    }
+    if keep == control {
+        return Err(fail(format!("--keep-fd {keep} must differ from --fd")));
+    }
+    // SAFETY: fstat/fcntl on a number we were handed; the result is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(keep, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--keep-fd {keep} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(fail(format!("--keep-fd {keep} is not a pipe")));
+    }
+    let flags = unsafe { libc::fcntl(keep, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(fail(format!("--keep-fd {keep} is not open for writing")));
+    }
+    Ok(())
+}
+
+/// Pure core of [`fd_hygiene`]'s close set: the scanned fds minus `keep`
+/// (the one fd that survives the re-exec on purpose; issue #10).
+fn fds_to_close(scan: Vec<RawFd>, keep: Option<RawFd>) -> Vec<RawFd> {
+    scan.into_iter().filter(|fd| Some(*fd) != keep).collect()
+}
+
+/// Issue #10 (E10): empty the calling thread's signal mask. `__init` is
+/// single-threaded, so this is the process mask. The return value is ignored on
+/// purpose: SIG_SETMASK with a valid empty set and a NULL old-set pointer cannot
+/// fail (EINVAL is only for a bad `how`), and there is no caller to report to.
+fn reset_signal_mask() {
+    // SAFETY: an empty sigset_t is initialised with sigemptyset before use;
+    // SIG_SETMASK with a NULL old-set pointer is always valid.
+    unsafe {
+        let mut empty: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut empty);
+        let _ = libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+    }
+}
+
+/// m6: `PR_SET_PDEATHSIG = SIGKILL`, so the sandbox chain dies with `run` even if
+/// `run` dies before it could tear down. If the parent is already gone (the
+/// prctl would have fired for a parent that died earlier), or differs from the
+/// expected pid, refuse to continue. Staged as a control error.
+fn arm_parent_death(expected_parent: Option<i32>) -> Result<(), InitError> {
+    // SAFETY: prctl with plain integer arguments; no pointers.
+    if unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(InitError::new(
+            Stage::Control,
+            format!(
+                "cannot arm parent-death signal: {}",
+                std::io::Error::last_os_error()
+            ),
+        ));
+    }
+    if let Some(expected) = expected_parent {
+        // SAFETY: getppid takes no arguments and cannot fail.
+        let actual = unsafe { libc::getppid() };
+        if actual != expected {
+            return Err(InitError::new(
+                Stage::Control,
+                format!(
+                    "parent process changed before setup (expected pid {expected}, found {actual})"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Pure collector for [`fd_hygiene`] (unit-testable without closing
@@ -636,10 +760,82 @@ mod tests {
     }
 
     #[test]
+    fn arm_parent_death_checks_the_parent_pid() {
+        // m6: the expected parent must be the actual one; a pid that cannot be our
+        // parent is refused with the pinned message.
+        // SAFETY: getppid takes no arguments and cannot fail.
+        let actual = unsafe { libc::getppid() };
+        arm_parent_death(Some(actual)).expect("the real parent is accepted");
+        let err = arm_parent_death(Some(i32::MAX))
+            .expect_err("a wrong parent pid must be refused")
+            .to_string();
+        assert!(
+            err.starts_with("sbx __init: control: parent process changed before setup"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validate_keep_fd_table() {
+        // Pinned reasons (issue #10 §4.2); each rejection is staged Control.
+        let msg = |k: RawFd, c: RawFd| validate_keep_fd(k, c).expect_err("must reject").to_string();
+        let c = 999; // control fd: never equal to the keep fds under test
+        assert_eq!(
+            msg(2, c),
+            "sbx __init: control: --keep-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(c, c),
+            "sbx __init: control: --keep-fd 999 must differ from --fd"
+        );
+        assert_eq!(
+            msg(998, c),
+            "sbx __init: control: --keep-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        // A regular file is open but not a pipe.
+        let file = std::fs::File::open("/proc/self/status").expect("open");
+        use std::os::fd::AsRawFd;
+        let raw = file.as_raw_fd();
+        assert_eq!(
+            msg(raw, c),
+            format!("sbx __init: control: --keep-fd {raw} is not a pipe")
+        );
+        // A read-only pipe end is a pipe but not writable.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        assert_eq!(
+            msg(rd, c),
+            format!("sbx __init: control: --keep-fd {rd} is not open for writing")
+        );
+        assert!(validate_keep_fd(wr, c).is_ok());
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+    }
+
+    #[test]
+    fn fds_to_close_skips_keep() {
+        assert_eq!(fds_to_close(vec![3, 5, 9], Some(5)), vec![3, 9]);
+        assert_eq!(fds_to_close(vec![3, 5], None), vec![3, 5]);
+        assert_eq!(fds_to_close(vec![5], Some(7)), vec![5]);
+    }
+
+    #[test]
+    fn pipeline_bad_keep_fd_stages_control() {
+        // The control fd is validated first; a bad control fd with a keep fd
+        // present still stages Control, before any namespace work.
+        let err = pipeline(999, Some(2), None, false, &[OsString::from("/bin/true")])
+            .expect_err("bad control fd must abort first");
+        assert_eq!(err.stage(), Stage::Control);
+    }
+
+    #[test]
     fn pipeline_bad_control_fd_stages_error() {
         // The pipeline's first act is control-fd validation, BEFORE unshare
         // — so this is safe in a test thread and pins the stage attribution.
-        let err = pipeline(999, false, &[OsString::from("/bin/true")])
+        let err = pipeline(999, None, None, false, &[OsString::from("/bin/true")])
             .expect_err("fd 999 must abort the pipeline");
         assert_eq!(err.stage(), Stage::Control);
         assert!(err.to_string().starts_with("sbx __init: control:"), "{err}");
@@ -657,6 +853,6 @@ mod tests {
         // rationale) — the hook swap is restore-on-return by construction,
         // and the staged-prefix shape is pinned by the integration suite's
         // fail-* scenarios and the CI smoke's `sbx __init: control:` grep.
-        let _code = run_init(999, false, vec![OsString::from("/bin/true")]);
+        let _code = run_init(999, None, None, false, vec![OsString::from("/bin/true")]);
     }
 }

@@ -8,7 +8,7 @@
 //!  2  --unshare-user --unshare-pid --unshare-ipc --unshare-uts
 //!     --unshare-cgroup-try                        ← never --unshare-net
 //!  3  --disable-userns --cap-drop ALL --die-with-parent --new-session
-//!     --hostname sandbox
+//!     --hostname sandbox [--info-fd N]           ← `--info-fd` iff Build.info_fd
 //!  4  --clearenv
 //!  5  --symlink usr/bin /bin      ┐ the four usr-merge shims, in this
 //!     --symlink usr/sbin /sbin    │ fixed order, each SKIPPED when ANY
@@ -170,6 +170,12 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
         "sandbox",
     ] {
         argv.push(OsString::from(flag));
+    }
+    // 3a. `--info-fd N` (issue #10, Q13): bwrap reports its pid-1 pid here.
+    //     Emitted only when `info_fd` is Some; row 15 validated N > 2.
+    if let Some(fd) = input.info_fd {
+        argv.push(OsString::from("--info-fd"));
+        argv.push(OsString::from(fd.to_string()));
     }
 
     // 4. The environment is built exclusively from the explicit --setenv
@@ -521,6 +527,7 @@ mod tests {
             command,
             cwd,
             passed_env,
+            info_fd: None,
         };
         build(&input)
             .expect("golden inputs must build")
@@ -640,6 +647,37 @@ mod tests {
             .flat_map(|part| part.iter())
             .map(OsString::from)
             .collect()
+    }
+
+    #[test]
+    fn golden_info_fd_after_hostname() {
+        // Issue #10 (Q13): `Some(9)` == HEAD with `--info-fd 9` directly after
+        // `--hostname sandbox`, every other element identical.
+        let policy = example("default.json");
+        let env = env_map(&[("LANG", "C.UTF-8")]);
+        let base = golden_argv(&policy, &env);
+        let command = os(&["/bin/echo", "hi"]);
+        let input = Build {
+            policy: &policy,
+            session_dir: Path::new(SESSION_DIR),
+            bwrap_path: Path::new(BWRAP),
+            command: &command,
+            cwd: None,
+            passed_env: &env,
+            info_fd: Some(9),
+        };
+        let with = build(&input)
+            .expect("golden inputs must build")
+            .argv()
+            .to_vec();
+        let hostname = base
+            .iter()
+            .position(|a| a == "--hostname")
+            .expect("--hostname present");
+        let mut expected = base.clone();
+        expected.splice(hostname + 2..hostname + 2, os(&["--info-fd", "9"]));
+        assert_eq!(with, expected);
+        assert_eq!(with.iter().filter(|a| *a == "--info-fd").count(), 1);
     }
 
     #[test]
@@ -1368,6 +1406,41 @@ mod tests {
         }
 
         #[test]
+        fn prop_info_fd_iff_some(
+            policy_json in prop_policy_json(),
+            command in prop_command(),
+            info_fd in proptest::option::of(3..=1000i32),
+        ) {
+            // Issue #10 (Q13): `--info-fd N` occurs exactly once iff info_fd is
+            // Some(N), and the value that follows is N.
+            let policy = prop_policy(&policy_json);
+            let empty = BTreeMap::new();
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &empty,
+                info_fd,
+            };
+            let argv = build(&input)
+                .expect("generated inputs must build")
+                .argv()
+                .to_vec();
+            let count = argv.iter().filter(|a| a.as_os_str() == OsStr::new("--info-fd")).count();
+            prop_assert_eq!(count, usize::from(info_fd.is_some()));
+            if let Some(fd) = info_fd {
+                let pos = argv
+                    .iter()
+                    .position(|a| a.as_os_str() == OsStr::new("--info-fd"))
+                    .expect("--info-fd present");
+                let want = fd.to_string();
+                prop_assert_eq!(argv[pos + 1].to_str(), Some(want.as_str()));
+            }
+        }
+
+        #[test]
         fn prop_allow_list_purity(
             policy_json in prop_policy_json(),
             command in prop_command(),
@@ -1695,6 +1768,7 @@ mod tests {
                 command: &command,
                 cwd: None,
                 passed_env: &empty,
+                info_fd: None,
             };
             let err = build(&input)
                 .expect_err("an injected NUL byte must be rejected")
