@@ -81,7 +81,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{Limits, Rejected, canonicalize_host};
+use super::{Limits, NameSource, Rejected, canonicalize_host, redact_for_audit};
 use crate::policy::Domain;
 
 /// The head terminator — the read loop stops after the first occurrence.
@@ -92,7 +92,7 @@ const HEAD_TERMINATOR: [u8; 4] = *b"\r\n\r\n";
 /// head plus CRLF junk is two different requests to two different parsers
 /// — the request-smuggling differential, denied fail-closed. Single source
 /// shared by [`inspect_http`] and its pin test.
-const HEAD_TERMINATOR_MISMATCH: &str = "request head terminator mismatch";
+pub(crate) const HEAD_TERMINATOR_MISMATCH: &str = "request head terminator mismatch";
 
 /// The HTTP/2 client connection preface's request-line shape (RFC 7540
 /// §3.5) — denied with its own pinned row (module docs point 2).
@@ -106,15 +106,19 @@ const CONNECTION_CLOSE_HEADER: &[u8] = b"Connection: close\r\n";
 /// the buffer).
 const READ_CHUNK: usize = 4096;
 
-/// Read + inspect the HTTP request head on 80 (module docs point 1).
-/// Returns the FULL replay buffer (head + any pipelined body bytes) on
-/// success.
-pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
+/// The buffered request head: every byte read so far (head + any pipelined
+/// bytes) and the offset where the head terminator ends.
+pub(crate) struct Head {
+    pub buf: Vec<u8>,
+    pub head_end: usize,
+}
+
+/// Read until the head terminator (issue #8 seam): the byte cap and EOF
+/// bound the loop; the caller owns the decision timeout.
+pub(crate) async fn read_head<S: AsyncRead + Unpin>(
     client: &mut S,
-    expected: &Domain,
-    orig_port: u16,
     limits: &Limits,
-) -> Result<Vec<u8>, Rejected> {
+) -> Result<Head, Rejected> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; READ_CHUNK];
     // Bytes already ruled out as a terminator start; the search resumes
@@ -122,27 +126,7 @@ pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
     let mut scanned = 0usize;
     loop {
         if let Some(head_end) = find_terminator(&buf, &mut scanned) {
-            // parse_head returns the consumed head length; the FULL buffer
-            // (head + pipelined body) is the replay.
-            let consumed = parse_head(&buf, expected, orig_port, limits.max_http_headers)?;
-            // The parser and the terminator search MUST agree on where the
-            // head ends (module docs point 1): httparse tolerates bare-LF
-            // line endings, the search does not, and a differential means
-            // two parsers see two different requests in the same bytes —
-            // the smuggling shape, denied fail-closed, never relayed.
-            if consumed != head_end {
-                return Err(Rejected::HttpMalformed {
-                    detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
-                });
-            }
-            // The connection-lifetime enforcement (module docs point 6):
-            // the validated head is rewritten to carry Connection: close
-            // BEFORE it is replayed — a keep-alive follow-up with a
-            // foreign Host must not ride the unscanned relay. Runs AFTER
-            // the differential check above; the rewrite never feeds back
-            // into parse_head.
-            force_connection_close(&mut buf, head_end);
-            return Ok(buf);
+            return Ok(Head { buf, head_end });
         }
         if buf.len() > limits.max_head_bytes {
             return Err(Rejected::HeadTooLarge {
@@ -160,9 +144,10 @@ pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
     }
 }
 
-/// The index just past the first `\r\n\r\n` in `buf`, with an incremental
-/// search: `scanned` tracks the frontier already ruled out and is rewound
-/// by the 3-byte overlap on every call.
+/// Locate the `\r\n\r\n` terminator in `buf`, returning the offset just
+/// past it. `scanned` records how far the buffer was already ruled out, so
+/// the next call resumes 3 bytes earlier (a terminator straddling two
+/// reads is still found) instead of rescanning from the start.
 fn find_terminator(buf: &[u8], scanned: &mut usize) -> Option<usize> {
     let from = scanned.saturating_sub(3);
     if let Some(rel) = buf
@@ -186,14 +171,92 @@ fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
     buf.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
 }
 
-/// The PURE head parser (module docs points 2-5; `parse_head_table` drives
-/// it over byte slices directly). `head` may carry pipelined bytes past
-/// the terminator — httparse reports the consumed head length, which this
-/// returns on success.
+/// The per-request check inputs (issue #8, Q4): the name to match, the
+/// port, the [`NameSource`] for wording and redaction, and whether the
+/// strict framing rules apply (explicit paths only — transparent :80 keeps
+/// the #7 behaviour, follow-up F2).
+pub(crate) struct HeadCheck<'a> {
+    pub expected: &'a Domain,
+    pub port: u16,
+    pub source: NameSource,
+    pub strict_framing: bool,
+}
+
+/// Read + inspect the HTTP request head on 80 (module docs point 1).
+/// Returns the FULL replay buffer (head + any pipelined body bytes) on
+/// success. This is [`inspect_http_with`] for the transparent path (#7
+/// behaviour, pinned).
+pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
+    client: &mut S,
+    expected: &Domain,
+    orig_port: u16,
+    limits: &Limits,
+) -> Result<Vec<u8>, Rejected> {
+    let check = HeadCheck {
+        expected,
+        port: orig_port,
+        source: NameSource::DnsMap,
+        strict_framing: false,
+    };
+    inspect_http_with(client, &check, limits).await
+}
+
+/// Read, validate and frame-check one request head, then force
+/// `Connection: close` (issue #8 seam; #7's `inspect_http` is the DnsMap
+/// wrapper). Returns the FULL buffer (head + pipelined bytes) to replay.
+pub(crate) async fn inspect_http_with<S: AsyncRead + Unpin>(
+    client: &mut S,
+    check: &HeadCheck<'_>,
+    limits: &Limits,
+) -> Result<Vec<u8>, Rejected> {
+    let Head { mut buf, head_end } = read_head(client, limits).await?;
+    // parse_head_with returns the consumed head length; the FULL buffer
+    // (head + pipelined body) is the replay.
+    let consumed = parse_head_with(&buf, check, limits.max_http_headers)?;
+    // The parser and the terminator search MUST agree on where the head
+    // ends (module docs point 1): httparse tolerates bare-LF line endings,
+    // the search does not, and a differential means two parsers see two
+    // different requests in the same bytes — the smuggling shape, denied
+    // fail-closed, never relayed.
+    if consumed != head_end {
+        return Err(Rejected::HttpMalformed {
+            detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
+        });
+    }
+    // The connection-lifetime enforcement (module docs point 6): the
+    // validated head is rewritten to carry Connection: close BEFORE it is
+    // replayed. Runs AFTER the differential check above; the rewrite never
+    // feeds back into parse_head_with.
+    force_connection_close(&mut buf, head_end);
+    Ok(buf)
+}
+
+/// The #7 entry point (DnsMap wording, lenient framing) — kept as a thin
+/// wrapper so the #7 head pins are unchanged. Test-only: production goes
+/// through [`inspect_http_with`].
+#[cfg(test)]
 pub(crate) fn parse_head(
     head: &[u8],
     expected: &Domain,
     orig_port: u16,
+    max_headers: usize,
+) -> Result<usize, Rejected> {
+    let check = HeadCheck {
+        expected,
+        port: orig_port,
+        source: NameSource::DnsMap,
+        strict_framing: false,
+    };
+    parse_head_with(head, &check, max_headers)
+}
+
+/// The PURE head parser (module docs points 2-5; `parse_head_table` drives
+/// it over byte slices directly). `head` may carry pipelined bytes past
+/// the terminator — httparse reports the consumed head length, which this
+/// returns on success.
+pub(crate) fn parse_head_with(
+    head: &[u8],
+    check: &HeadCheck<'_>,
     max_headers: usize,
 ) -> Result<usize, Rejected> {
     // httparse's Header is Copy; a runtime-sized slot count needs the Vec
@@ -228,7 +291,8 @@ pub(crate) fn parse_head(
         });
     };
     if method == "CONNECT" {
-        // That is #8's job — never the transparent port.
+        // That is #8's job — never the transparent port (and never inside
+        // an explicit tunnel: the tunnel carries one origin request).
         return Err(Rejected::ConnectMethod);
     }
     let Some(target) = request.path else {
@@ -236,27 +300,53 @@ pub(crate) fn parse_head(
             detail: "missing request-target".to_owned(),
         });
     };
-    check_target(target, expected, orig_port)?;
-    check_host(request.headers, expected, orig_port)?;
+    check_target(target, check.expected, check.port, check.source)?;
+    check_host(
+        request.headers,
+        check.expected,
+        check.port,
+        check.source,
+        true,
+    )?;
+    if check.strict_framing {
+        check_framing(request.headers, request.version.unwrap_or(1))?;
+    }
     Ok(consumed)
 }
 
-/// The request-target rules (module docs point 4).
-fn check_target(target: &str, expected: &Domain, orig_port: u16) -> Result<(), Rejected> {
+/// Client text in a non-DnsMap reason goes through [`redact_for_audit`]
+/// (issue #8, D4); DnsMap rows keep #7's verbatim wording.
+pub(crate) fn for_source(source: NameSource, raw: &str) -> String {
+    match source {
+        NameSource::DnsMap => raw.to_owned(),
+        NameSource::ConnectTarget | NameSource::RequestTarget => redact_for_audit(raw),
+    }
+}
+
+pub(crate) fn check_target(
+    target: &str,
+    expected: &Domain,
+    port: u16,
+    source: NameSource,
+) -> Result<(), Rejected> {
     // Origin-form or asterisk-form: accepted as-is — NO URL/path rules in
     // v1 (#17 owns verb/path filtering).
     if target == "*" || target.starts_with('/') {
         return Ok(());
     }
     let mismatch = || Rejected::TargetMismatch {
-        target: target.to_owned(),
+        target: for_source(source, target),
         name: expected.clone(),
+        source,
     };
     let Some((scheme, rest)) = target.split_once("://") else {
         // Neither origin-form, asterisk, nor absolute-form: unverifiable
         // ⇒ fail-closed.
         return Err(Rejected::HttpMalformed {
-            detail: format!("unrecognized request-target form {target:?}"),
+            detail: format!(
+                "unrecognized request-target form {:?}",
+                for_source(source, target)
+            ),
         });
     };
     if !scheme.eq_ignore_ascii_case("http") {
@@ -267,12 +357,14 @@ fn check_target(target: &str, expected: &Domain, orig_port: u16) -> Result<(), R
     // The authority is everything before the first path/query/fragment
     // delimiter.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    // The optional :port must equal the original destination port (Q5's
-    // rule for the target side); every mismatch shape — wrong port,
-    // non-digit suffix, junk host — is the single TargetMismatch variant.
+    // The optional :port must equal the destination port (Q5's rule for the
+    // target side); every mismatch shape — wrong port, non-digit suffix,
+    // junk host — is the single TargetMismatch variant.
     let host_part = match authority.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            let port_matches = port.parse::<u16>().is_ok_and(|p| p == orig_port);
+        Some((host, digits))
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let port_matches = digits.parse::<u16>().is_ok_and(|p| p == port);
             if !port_matches {
                 return Err(mismatch());
             }
@@ -286,18 +378,26 @@ fn check_target(target: &str, expected: &Domain, orig_port: u16) -> Result<(), R
     }
 }
 
-/// The `Host` header rules, in the pinned order (module docs point 5).
-fn check_host(
+/// Exactly one `Host` header (or none, when `require` is false — the D1
+/// HTTP/1.0 CONNECT case only), its optional port suffix equal to `port`,
+/// and its name equal to `expected`.
+pub(crate) fn check_host(
     headers: &[httparse::Header<'_>],
     expected: &Domain,
-    orig_port: u16,
+    port: u16,
+    source: NameSource,
+    require: bool,
 ) -> Result<(), Rejected> {
     let mut values = headers
         .iter()
         .filter(|header| header.name.eq_ignore_ascii_case("host"))
         .map(|header| header.value);
     let Some(raw) = values.next() else {
-        return Err(Rejected::HostMissing);
+        return if require {
+            Err(Rejected::HostMissing)
+        } else {
+            Ok(())
+        };
     };
     if values.next().is_some() {
         return Err(Rejected::HostMultiple);
@@ -308,21 +408,24 @@ fn check_host(
     };
     let value = value.trim_matches(|c: char| c == ' ' || c == '\t');
     // Q5: strip exactly ONE optional :<digits> suffix; it must equal the
-    // ORIGINAL destination port. A non-digit suffix ("[::1]", "8x") is
-    // left to Domain::parse ⇒ HostInvalid.
+    // port. A non-digit suffix ("[::1]", "8x") is left to Domain::parse ⇒
+    // HostInvalid.
     let host_part = match value.rsplit_once(':') {
-        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            let Ok(port) = port.parse::<u16>() else {
+        Some((host, digits))
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let Ok(got) = digits.parse::<u16>() else {
                 // Overflow (e.g. ":99999"): the full value is not a bare
                 // hostname either — fail-closed.
                 return Err(Rejected::HostInvalid {
-                    value: value.to_owned(),
+                    value: for_source(source, value),
                 });
             };
-            if port != orig_port {
+            if got != port {
                 return Err(Rejected::HostPortMismatch {
-                    got: port,
-                    want: orig_port,
+                    got,
+                    want: port,
+                    source,
                 });
             }
             host
@@ -331,22 +434,163 @@ fn check_host(
     };
     let Some(host) = canonicalize_host(host_part) else {
         return Err(Rejected::HostInvalid {
-            value: host_part.to_owned(),
+            value: for_source(source, host_part),
         });
     };
     if host != *expected {
         return Err(Rejected::HostMismatch {
             host,
             name: expected.clone(),
+            source,
         });
     }
     Ok(())
+}
+
+/// The framing a request declares (issue #8, explicit paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framing {
+    /// No body.
+    None,
+    /// A `Content-Length` body of this many bytes.
+    Length(u64),
+    /// A `chunked` body (must be the final coding).
+    Chunked,
+}
+
+pub(crate) const FRAMING_CL_AND_TE: &str = "both Content-Length and Transfer-Encoding are present";
+pub(crate) const FRAMING_DUPLICATE_CL: &str = "multiple Content-Length headers";
+pub(crate) const FRAMING_INVALID_CL: &str = "Content-Length is not a single decimal length";
+pub(crate) const FRAMING_TE_NOT_CHUNKED: &str =
+    "Transfer-Encoding does not end in a single final chunked coding";
+pub(crate) const FRAMING_TE_HTTP10: &str = "Transfer-Encoding in an HTTP/1.0 request";
+
+/// The strict framing table (issue #8, Q8): deny every shape whose body
+/// boundary two parsers could disagree on. Checked in this pinned order.
+pub(crate) fn check_framing(
+    headers: &[httparse::Header<'_>],
+    minor_version: u8,
+) -> Result<Framing, Rejected> {
+    let mut cl = headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("content-length"));
+    let cl_first = cl.next();
+    let cl_count = usize::from(cl_first.is_some()) + cl.count();
+    let te: Vec<&[u8]> = headers
+        .iter()
+        .filter(|h| h.name.eq_ignore_ascii_case("transfer-encoding"))
+        .map(|h| h.value)
+        .collect();
+    let ambiguous = |detail: &'static str| Rejected::AmbiguousFraming { detail };
+    // (1) more than one Content-Length header.
+    if cl_count > 1 {
+        return Err(ambiguous(FRAMING_DUPLICATE_CL));
+    }
+    // (2) the one Content-Length must be 1–20 ASCII digits (OWS-trimmed)
+    //     and fit a u64 — rejects "5, 5", "+5", "-5", overflow.
+    let length = match cl_first {
+        Some(header) => {
+            let raw = trim_ows(header.value);
+            let well_formed =
+                !raw.is_empty() && raw.len() <= 20 && raw.iter().all(|b| b.is_ascii_digit());
+            let parsed = if well_formed {
+                std::str::from_utf8(raw)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            } else {
+                None
+            };
+            match parsed {
+                Some(n) => Some(n),
+                None => return Err(ambiguous(FRAMING_INVALID_CL)),
+            }
+        }
+        None => None,
+    };
+    // (3) both Content-Length and Transfer-Encoding.
+    if length.is_some() && !te.is_empty() {
+        return Err(ambiguous(FRAMING_CL_AND_TE));
+    }
+    // (4) Transfer-Encoding in an HTTP/1.0 request.
+    if !te.is_empty() && minor_version == 0 {
+        return Err(ambiguous(FRAMING_TE_HTTP10));
+    }
+    // (5) every TE token across all TE headers: the list must end in
+    //     `chunked`, exactly once.
+    if !te.is_empty() {
+        let mut tokens: Vec<&[u8]> = Vec::new();
+        for value in &te {
+            for token in value.split(|b| *b == b',') {
+                tokens.push(trim_ows(token));
+            }
+        }
+        let is_chunked = |t: &[u8]| t.eq_ignore_ascii_case(b"chunked");
+        let ends_chunked = tokens.last().is_some_and(|t| is_chunked(t));
+        let chunked_count = tokens.iter().filter(|t| is_chunked(t)).count();
+        if !ends_chunked || chunked_count != 1 {
+            return Err(ambiguous(FRAMING_TE_NOT_CHUNKED));
+        }
+        return Ok(Framing::Chunked);
+    }
+    Ok(match length {
+        Some(n) => Framing::Length(n),
+        None => Framing::None,
+    })
+}
+
+/// Trim optional whitespace (SP / HTAB) from both ends of a header value.
+pub(crate) fn trim_ows(raw: &[u8]) -> &[u8] {
+    let start = raw
+        .iter()
+        .position(|b| *b != b' ' && *b != b'\t')
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|b| *b != b' ' && *b != b'\t')
+        .map_or(start, |i| i + 1);
+    &raw[start..end]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::{AsyncWriteExt, duplex};
+
+    /// The `read_head` extent is the head terminator the parser must agree
+    /// with (issue #8, T1 seam): for every shape, `read_head`'s `head_end`
+    /// equals `parse_head`'s consumed length, and the pipelined tail survives
+    /// in the buffer.
+    #[test]
+    fn read_head_extent_matches_inspect_http() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let expected = Domain::parse("allowed.test").expect("fixture");
+            let limits = Limits::default();
+            let shapes: [&[u8]; 3] = [
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nPIPELINED",
+                b"GET /a HTTP/1.1\r\nHost: allowed.test\r\nX: y\r\n\r\n",
+            ];
+            for raw in shapes {
+                let (mut near, mut far) = duplex(4096);
+                far.write_all(raw).await.expect("write");
+                let head = read_head(&mut near, &limits).await.expect("head read");
+                let terminator = raw
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .expect("terminated")
+                    + 4;
+                assert_eq!(head.head_end, terminator, "read_head extent");
+                let consumed =
+                    parse_head(&head.buf, &expected, 80, limits.max_http_headers).expect("parses");
+                assert_eq!(consumed, head.head_end, "parser agrees with the search");
+                assert!(head.buf.len() >= head.head_end);
+            }
+        });
+    }
 
     /// Hand-rolled current-thread block_on (the tokio `macros` feature is
     /// deliberately NOT enabled — proxy module docs point 8).
@@ -421,6 +665,7 @@ mod tests {
             Err(Rejected::HostPortMismatch {
                 got: 8080,
                 want: 80,
+                source: NameSource::DnsMap,
             })
         );
     }
@@ -562,6 +807,7 @@ mod tests {
                         .expect("line shape")
                         .to_owned(),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
                 "{line:?}"
             );
@@ -579,6 +825,7 @@ mod tests {
             Err(Rejected::TargetMismatch {
                 target: "http://allowed.test:8080/".to_owned(),
                 name: dom("allowed.test"),
+                source: NameSource::DnsMap,
             })
         );
     }
@@ -908,17 +1155,23 @@ mod tests {
                 Rejected::HostMismatch {
                     host: dom("notallowed.test"),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
             ),
             (
                 b"GET / HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n".as_slice(),
-                Rejected::HostPortMismatch { got: 443, want: 80 },
+                Rejected::HostPortMismatch {
+                    got: 443,
+                    want: 80,
+                    source: NameSource::DnsMap,
+                },
             ),
             (
                 b"GET http://evil.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n".as_slice(),
                 Rejected::TargetMismatch {
                     target: "http://evil.test/".to_owned(),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
             ),
             (

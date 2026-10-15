@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::pin::Pin;
@@ -57,8 +57,8 @@ use sbx::init::fdpass;
 use sbx::policy::{self, Domain};
 use sbx::proxy::hello::build_client_hello;
 use sbx::proxy::{
-    ConnectError, Connected, Connector, Decision, DecisionSink, DialFn, DnsMap, GuardedConnector,
-    Limits, Proxy, Rejected, ResolveFn, Verdict,
+    ConnectError, Connected, Connector, Decision, DecisionSink, DialFn, DnsMap, ExplicitKind,
+    GuardedConnector, Limits, NameSource, Proxy, Rejected, ResolveFn, Verdict, Via,
 };
 
 /// Env var selecting the child role (single parameter; targets are
@@ -139,6 +139,12 @@ fn main() -> ExitCode {
 /// inline so it can print its SKIP-guidance outcome.)
 #[derive(Clone, Copy)]
 enum Gate {
+    /// Runs everywhere (the explicit proxy needs no kernel feature).
+    Always,
+    /// Opt-in real-network tier: `SBX_PT_NETWORK=1`.
+    Network,
+    /// Host-netns tier that needs these tools on PATH.
+    Tools(&'static [&'static str]),
     /// The host must support the `SO_ORIGINAL_DST` conntrack lookup (the
     /// F8 host-netns tier).
     OrigDst,
@@ -149,15 +155,23 @@ enum Gate {
 impl Gate {
     fn satisfied(self, userns_ok: bool, origdst_ok: bool) -> bool {
         match self {
+            Gate::Always => true,
+            Gate::Network => std::env::var("SBX_PT_NETWORK").as_deref() == Ok("1"),
+            Gate::Tools(list) => missing_tools(list).is_empty(),
             Gate::OrigDst => origdst_ok,
             Gate::Userns => userns_ok,
         }
     }
 
-    fn skip_reason(self) -> &'static str {
+    fn skip_reason(self) -> String {
         match self {
-            Gate::OrigDst => ORIGDST_SKIP,
-            Gate::Userns => USERNS_SKIP,
+            Gate::Always => "always runs".to_owned(),
+            Gate::Network => "set SBX_PT_NETWORK=1 to run the real-network tier".to_owned(),
+            Gate::Tools(list) => {
+                format!("tool(s) unavailable: {}", missing_tools(list).join(", "))
+            }
+            Gate::OrigDst => ORIGDST_SKIP.to_owned(),
+            Gate::Userns => USERNS_SKIP.to_owned(),
         }
     }
 }
@@ -191,6 +205,146 @@ fn scenarios() -> Vec<Scenario> {
             name: "hostnet-not-allowed",
             gate: Gate::OrigDst,
             run: scenario_hostnet_not_allowed,
+        },
+        Scenario {
+            name: "explicit-connect-443-relay",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_443_relay,
+        },
+        Scenario {
+            name: "explicit-connect-pipelined-hello",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_pipelined_hello,
+        },
+        Scenario {
+            name: "explicit-connect-second-hello-torn-down",
+            gate: Gate::Always,
+            run: scenario_explicit_second_hello_torn_down,
+        },
+        Scenario {
+            name: "explicit-connect-80-http-inspected",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_80_inspected,
+        },
+        Scenario {
+            name: "explicit-forward-get-rewritten",
+            gate: Gate::Always,
+            run: scenario_explicit_forward_get_rewritten,
+        },
+        Scenario {
+            name: "explicit-upstream-eof-closes",
+            gate: Gate::Always,
+            run: scenario_explicit_upstream_eof_closes,
+        },
+        Scenario {
+            name: "explicit-resolve-fail-502",
+            gate: Gate::Always,
+            run: scenario_explicit_resolve_fail_502,
+        },
+        Scenario {
+            name: "tool-curl-connect-https",
+            gate: Gate::Tools(&["curl", "python3"]),
+            run: scenario_tool_curl_connect_https,
+        },
+        Scenario {
+            name: "tool-curl-absolute-form",
+            gate: Gate::Tools(&["curl", "python3"]),
+            run: scenario_tool_curl_absolute_form,
+        },
+        Scenario {
+            name: "tool-git-https-clone",
+            gate: Gate::Tools(&["git", "python3", "openssl"]),
+            run: scenario_tool_git_https_clone,
+        },
+        Scenario {
+            name: "tool-pip-connect",
+            gate: Gate::Tools(&["pip", "python3", "openssl"]),
+            run: scenario_tool_pip_connect,
+        },
+        Scenario {
+            name: "tool-npm-connect",
+            gate: Gate::Tools(&["npm", "python3", "openssl"]),
+            run: scenario_tool_npm_connect,
+        },
+        Scenario {
+            name: "tool-openssl-servername-other-denied",
+            gate: Gate::Tools(&["openssl", "python3"]),
+            run: scenario_tool_openssl_other_denied,
+        },
+        Scenario {
+            name: "tool-openssl-servername-match-allowed",
+            gate: Gate::Tools(&["openssl", "python3"]),
+            run: scenario_tool_openssl_match_allowed,
+        },
+        Scenario {
+            name: "netns-explicit-connect-relay",
+            gate: Gate::Userns,
+            run: scenario_netns_explicit_connect_relay,
+        },
+        Scenario {
+            name: "netns-explicit-sni-mismatch",
+            gate: Gate::Userns,
+            run: scenario_netns_explicit_sni_mismatch,
+        },
+        Scenario {
+            name: "network-curl-pypi",
+            gate: Gate::Network,
+            run: scenario_network_curl_pypi,
+        },
+        Scenario {
+            name: "network-git-clone-hello-world",
+            gate: Gate::Network,
+            run: scenario_network_git_clone,
+        },
+        Scenario {
+            name: "network-pip-download-six",
+            gate: Gate::Network,
+            run: scenario_network_pip_download,
+        },
+        Scenario {
+            name: "network-npm-view-left-pad",
+            gate: Gate::Network,
+            run: scenario_network_npm_view,
+        },
+        Scenario {
+            name: "network-openssl-servername-other-denied",
+            gate: Gate::Network,
+            run: scenario_network_openssl_other_denied,
+        },
+        Scenario {
+            name: "explicit-connect-not-allowed-403",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_not_allowed,
+        },
+        Scenario {
+            name: "explicit-connect-ip-literal-400",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_ip_literal,
+        },
+        Scenario {
+            name: "explicit-connect-sni-mismatch-silent",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_sni_mismatch,
+        },
+        Scenario {
+            name: "explicit-forward-host-mismatch-403",
+            gate: Gate::Always,
+            run: scenario_explicit_forward_host_mismatch,
+        },
+        Scenario {
+            name: "explicit-forward-https-400",
+            gate: Gate::Always,
+            run: scenario_explicit_forward_https,
+        },
+        Scenario {
+            name: "explicit-port-not-in-policy-403",
+            gate: Gate::Always,
+            run: scenario_explicit_port_denied,
+        },
+        Scenario {
+            name: "explicit-serve-stop",
+            gate: Gate::Always,
+            run: scenario_explicit_serve_stop,
         },
         Scenario {
             name: "hostnet-no-inspector",
@@ -874,6 +1028,15 @@ impl ServeHandle {
 /// Start [`sbx::proxy::serve`] on a dedicated thread — the listener moves
 /// in; the returned handle tears down via the pinned shutdown path.
 fn spawn_serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<ServeHandle, String> {
+    spawn_serve_kind(listener, proxy, false)
+}
+
+/// `explicit = true` serves the explicit listener (issue #8) instead.
+fn spawn_serve_kind(
+    listener: TcpListener,
+    proxy: Arc<Proxy>,
+    explicit: bool,
+) -> Result<ServeHandle, String> {
     let stopper = listener
         .try_clone()
         .map_err(|e| format!("try_clone: {e}"))?;
@@ -884,7 +1047,13 @@ fn spawn_serve(listener: TcpListener, proxy: Arc<Proxy>) -> Result<ServeHandle, 
             .build()
             .expect("current-thread runtime");
         let result = runtime
-            .block_on(sbx::proxy::serve(listener, proxy))
+            .block_on(async {
+                if explicit {
+                    sbx::proxy::serve_explicit(listener, proxy).await
+                } else {
+                    sbx::proxy::serve(listener, proxy).await
+                }
+            })
             .map(|never| match never {});
         let _ = tx.send(result);
     });
@@ -938,6 +1107,9 @@ fn run_netns(
         explicit,
         dns,
     } = recv_fds(sp_guard.borrow())?;
+    // Explicit roles (issue #8) reach the explicit listener, which is served
+    // BEFORE the go byte alongside the transparent one (Q9 shape).
+    let explicit_role = role.starts_with("explicit-");
 
     let sink = Arc::new(RecordingSink::default());
     let log = connector_log();
@@ -992,6 +1164,12 @@ fn run_netns(
     );
 
     // THE go guarantee (fdpass): serving starts BEFORE the go byte.
+    let explicit_serve = if explicit_role {
+        Some(spawn_serve_kind(explicit, Arc::clone(&proxy), true)?)
+    } else {
+        drop(explicit);
+        None
+    };
     let serve = spawn_serve(transparent, proxy)?;
     let go = send_go(sp_guard.borrow());
     // finish() disarms the guard on the normal path; a go-byte failure
@@ -1001,14 +1179,19 @@ fn run_netns(
     // Teardown ALWAYS runs (a failed payload must not leak the serve
     // thread into the next scenario's spawn window — R6).
     let serve_stop = serve.stop();
+    let explicit_stop = explicit_serve.map(ServeHandle::stop).transpose();
     let echo_outcome = echo_server
         .map(|srv| srv.into_outcome(matches!(echo, EchoSpec::ExpectMiss)))
         .transpose();
     // The explicit + dns fds are held until the payload is reaped, then
     // dropped here (no listener-gone races while the payload runs).
-    drop((explicit, dns));
+    drop(dns);
 
     let payload = payload?;
+    match explicit_stop? {
+        Some(Err(_)) | None => {}
+        Some(Ok(())) => return Err("explicit serve returned Ok — impossible".to_owned()),
+    }
     // serve must exit with the shutdown error (the exact EINVAL errno is
     // pinned by the unit tier and hostnet-serve-stop; Ok is impossible —
     // serve returns Infallible on the loop path).
@@ -1092,6 +1275,19 @@ fn run_hostnet(
     ports_fn: impl FnOnce(u16) -> Vec<u16>,
     client: HostnetClient,
 ) -> Result<HostnetRun, String> {
+    run_hostnet_mode(false, allow, map, ports_fn, client)
+}
+
+/// [`run_hostnet`] over either listener: `explicit = true` serves
+/// `serve_explicit` (issue #8) — no `SO_ORIGINAL_DST`, the DNS map is
+/// never consulted, and the request target alone names the destination.
+fn run_hostnet_mode(
+    explicit: bool,
+    allow: &[&str],
+    map: &[(Ipv4Addr, &str)],
+    ports_fn: impl FnOnce(u16) -> Vec<u16>,
+    client: HostnetClient,
+) -> Result<HostnetRun, String> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|e| format!("bind: {e}"))?;
     let addr = listener
@@ -1119,7 +1315,7 @@ fn run_hostnet(
     );
     // Stays BLOCKING on purpose — serve flips it (the fdpass contract;
     // pinned by the unit tier's serve_flips_nonblocking_itself).
-    let serve = spawn_serve(listener, proxy)?;
+    let serve = spawn_serve_kind(listener, proxy, explicit)?;
 
     let connects = !matches!(client, HostnetClient::Absent);
     let mut received = Vec::new();
@@ -1188,7 +1384,7 @@ fn scenario_hostnet_unknown_fake_ip() -> Result<(), String> {
             run.received
         ));
     }
-    let orig = run.decisions[0].orig_dst;
+    let orig = run.decisions[0].orig_dst();
     if orig != Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, run.port)) {
         return Err(format!(
             "F8 own-address orig_dst: got {orig:?}, want 127.0.0.1:{}",
@@ -1283,6 +1479,177 @@ fn scenario_hostnet_exactly_one_decision() -> Result<(), String> {
 
 /// The teardown contract: with no client at all, `shutdown` ends `serve`
 /// bounded and with the pinned EINVAL error (the #10/suite stop mechanism).
+/// The pinned explicit wire bytes (issue #8, Q5), written as literals: the
+/// crate's constants are `pub(crate)` and not visible to this suite.
+const EXPLICIT_200: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+const EXPLICIT_400: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+const EXPLICIT_403: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// One explicit deny-tier exchange: the client sends `request`, reads to
+/// EOF-or-reset, and the single decision is returned in `run.decisions`.
+fn explicit_exchange(allow: &[&str], request: Vec<u8>) -> Result<HostnetRun, String> {
+    run_hostnet_mode(
+        true,
+        allow,
+        &[],
+        |_| vec![443, 80, 8080],
+        HostnetClient::Send(request),
+    )
+}
+
+fn connect_head(target: &str) -> Vec<u8> {
+    format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").into_bytes()
+}
+
+/// A policy-denied CONNECT (name not on the allow list): 403 before any
+/// tunnel, zero bytes of the 200, the connector never called.
+fn scenario_explicit_connect_not_allowed() -> Result<(), String> {
+    let run = explicit_exchange(&[ALLOWED], connect_head("notallowed.test:443"))?;
+    if run.received != EXPLICIT_403 {
+        return Err(format!(
+            "the client must see exactly the pinned 403: {:?}",
+            String::from_utf8_lossy(&run.received)
+        ));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::NotAllowed {
+            name: Domain::parse(NOTALLOWED).expect("fixture"),
+        }),
+        "notallowed.test is not in the policy allow list",
+    )?;
+    if run.decisions[0].via
+        != (Via::Explicit {
+            kind: ExplicitKind::Connect,
+            port: Some(443),
+        })
+    {
+        return Err(format!(
+            "via must be explicit-connect: {:?}",
+            run.decisions[0].via
+        ));
+    }
+    Ok(())
+}
+
+/// An IP-literal CONNECT target: 400, the reason carries the redacted
+/// target and the pinned detail.
+fn scenario_explicit_connect_ip_literal() -> Result<(), String> {
+    let run = explicit_exchange(&[ALLOWED], connect_head("93.184.216.34:443"))?;
+    if run.received != EXPLICIT_400 {
+        return Err(format!("expected the pinned 400: {:?}", run.received));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::ConnectTargetInvalid {
+            target: "93.184.216.34:443".to_owned(),
+            detail: "IP literals are not allowed; use a domain name",
+        }),
+        "CONNECT target \"93.184.216.34:443\" is invalid: IP literals are not allowed; use a domain name",
+    )
+}
+
+/// SNI differs from the CONNECT target after an allowed CONNECT: the
+/// client sees the 200 and nothing else (post-200 silence, Q5), and the
+/// inspect-before-connect lock means the connector is never called.
+fn scenario_explicit_connect_sni_mismatch() -> Result<(), String> {
+    let mut request = connect_head("allowed.test:443");
+    request.extend_from_slice(&build_client_hello(Some("other.test"), &[]));
+    let run = explicit_exchange(&[ALLOWED], request)?;
+    if run.received != EXPLICIT_200 {
+        return Err(format!(
+            "after the 200 a post-tunnel denial must be a bare close: {:?}",
+            String::from_utf8_lossy(&run.received)
+        ));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::SniMismatch {
+            sni: Domain::parse("other.test").expect("fixture"),
+            name: Domain::parse(ALLOWED).expect("fixture"),
+            source: NameSource::ConnectTarget,
+        }),
+        "SNI other.test does not match the CONNECT target name allowed.test",
+    )
+}
+
+/// Absolute-form Host mismatch: 403, the reason names the request-target.
+fn scenario_explicit_forward_host_mismatch() -> Result<(), String> {
+    let run = explicit_exchange(
+        &[ALLOWED],
+        b"GET http://allowed.test/ HTTP/1.1\r\nHost: evil.test\r\n\r\n".to_vec(),
+    )?;
+    if run.received != EXPLICIT_403 {
+        return Err(format!("expected the pinned 403: {:?}", run.received));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::HostMismatch {
+            host: Domain::parse("evil.test").expect("fixture"),
+            name: Domain::parse(ALLOWED).expect("fixture"),
+            source: NameSource::RequestTarget,
+        }),
+        "HTTP Host evil.test does not match the request-target name allowed.test",
+    )
+}
+
+/// `https://` absolute-form: 400, TLS belongs on CONNECT.
+fn scenario_explicit_forward_https() -> Result<(), String> {
+    let run = explicit_exchange(
+        &[ALLOWED],
+        b"GET https://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n".to_vec(),
+    )?;
+    if run.received != EXPLICIT_400 {
+        return Err(format!("expected the pinned 400: {:?}", run.received));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::TargetSchemeUnsupported {
+            scheme: "https".to_owned(),
+        }),
+        "absolute-form request target scheme \"https\" is not supported (http:// only; use CONNECT for TLS)",
+    )
+}
+
+/// A CONNECT to a port outside `network.ports`: 403 with the port reason.
+fn scenario_explicit_port_denied() -> Result<(), String> {
+    let run = run_hostnet_mode(
+        true,
+        &[ALLOWED],
+        &[],
+        |_| vec![443, 80],
+        HostnetClient::Send(connect_head("allowed.test:22")),
+    )?;
+    if run.received != EXPLICIT_403 {
+        return Err(format!("expected the pinned 403: {:?}", run.received));
+    }
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::PortNotAllowed { port: 22 }),
+        "port 22 is not in the policy port list",
+    )
+}
+
+/// `serve_explicit` shares the accept loop: a shutdown ends it with the
+/// same pinned EINVAL teardown as the transparent listener.
+fn scenario_explicit_serve_stop() -> Result<(), String> {
+    let run = run_hostnet_mode(true, &[], &[], |_| vec![], HostnetClient::Absent)?;
+    if !run.decisions.is_empty() {
+        return Err(format!("no connection ⇒ no decisions: {:?}", run.decisions));
+    }
+    let err = run
+        .serve_result
+        .expect_err("shutdown must end serve_explicit with an error");
+    if err.raw_os_error() != Some(libc::EINVAL) {
+        return Err(format!(
+            "expected the pinned EINVAL teardown path, got {err}"
+        ));
+    }
+    Ok(())
+}
+
 fn scenario_hostnet_serve_stop() -> Result<(), String> {
     let run = run_hostnet(&[], &[], |_| vec![], HostnetClient::Absent)?;
     if !run.decisions.is_empty() {
@@ -1360,10 +1727,10 @@ fn scenario_tls_allowed_relay_443() -> Result<(), String> {
         },
         &format!("allowed {ALLOWED} via {upstream}"),
     )?;
-    if run.decisions[0].orig_dst != Some(SocketAddrV4::new(TEST3, 443)) {
+    if run.decisions[0].orig_dst() != Some(SocketAddrV4::new(TEST3, 443)) {
         return Err(format!(
             "orig_dst must be the real pre-DNAT destination: {:?}",
-            run.decisions[0].orig_dst
+            run.decisions[0].orig_dst()
         ));
     }
     if !run.teardowns.is_empty() {
@@ -1481,10 +1848,10 @@ fn scenario_http_allowed_relay_80() -> Result<(), String> {
         },
         &format!("allowed {ALLOWED} via {upstream}"),
     )?;
-    if run.decisions[0].orig_dst != Some(SocketAddrV4::new(TEST3, 80)) {
+    if run.decisions[0].orig_dst() != Some(SocketAddrV4::new(TEST3, 80)) {
         return Err(format!(
             "orig_dst must be the real pre-DNAT destination: {:?}",
-            run.decisions[0].orig_dst
+            run.decisions[0].orig_dst()
         ));
     }
     if run.connector_log != [format!("{ALLOWED}:80")] {
@@ -1513,6 +1880,7 @@ fn scenario_sni_mismatch_denied() -> Result<(), String> {
         &Verdict::Denied(Rejected::SniMismatch {
             sni: Domain::parse(EVIL).expect("fixture"),
             name: Domain::parse(ALLOWED).expect("fixture"),
+            source: NameSource::DnsMap,
         }),
         "SNI evil.test does not match the DNS-map name allowed.test",
     )?;
@@ -1616,10 +1984,10 @@ fn scenario_unknown_fake_ip_netns() -> Result<(), String> {
         &Verdict::Denied(Rejected::UnknownFakeIp { ip: TEST3_UNMAPPED }),
         "unknown fake IP 203.0.113.9 (no DNS-map entry)",
     )?;
-    if run.decisions[0].orig_dst != Some(SocketAddrV4::new(TEST3_UNMAPPED, 443)) {
+    if run.decisions[0].orig_dst() != Some(SocketAddrV4::new(TEST3_UNMAPPED, 443)) {
         return Err(format!(
             "orig_dst must be the dialed unmapped twin: {:?}",
-            run.decisions[0].orig_dst
+            run.decisions[0].orig_dst()
         ));
     }
     Ok(())
@@ -1710,6 +2078,22 @@ fn child_main(role: &str) -> ExitCode {
             role_expect_close(TEST3, 443, Some(&hello))
         }
         "pt-denied-port" => role_expect_close(TEST3, 443, None),
+        "explicit-connect-relay" => role_explicit_exact(
+            &[
+                connect_head("allowed.test:443"),
+                build_client_hello(Some(ALLOWED), &[]),
+            ]
+            .concat(),
+            &[EXPLICIT_200, &build_client_hello(Some(ALLOWED), &[])].concat(),
+        ),
+        "explicit-sni-mismatch" => role_explicit_exact(
+            &[
+                connect_head("allowed.test:443"),
+                build_client_hello(Some(EVIL), &[]),
+            ]
+            .concat(),
+            EXPLICIT_200,
+        ),
         other => Err(format!("unknown {ROLE_ENV} {other:?}")),
     };
     match result {
@@ -1876,5 +2260,1348 @@ fn role_expect_close(ip: Ipv4Addr, port: u16, payload: Option<&[u8]>) -> Result<
         Err(e) => return Err(format!("read from {addr}: {e}")),
     }
     marker(&format!("closed without application bytes on {addr}"));
+    Ok(())
+}
+
+// ============================================================================
+// Issue #8 — explicit proxy: allowed-path, tools, userns and network tiers.
+// ============================================================================
+
+const EXPLICIT_PORT: u16 = 3128;
+const TOOL_BOUND: Duration = Duration::from_secs(30);
+
+/// Missing tools from `list` (empty = all present). A tool is present when
+/// `<tool> --version` (openssl: `openssl version`) runs and exits 0.
+fn missing_tools(list: &'static [&'static str]) -> Vec<&'static str> {
+    // Probe inside the isolated env the scenarios run in, so a tool that
+    // cannot start under that env reports SKIP, not a proxy FAIL.
+    let home = Scratch::new("probe").expect("probe home");
+    list.iter()
+        .copied()
+        .filter(|tool| {
+            // openssl has no `--version`; pip runs as `python3 -m pip`.
+            let mut probe = match *tool {
+                "pip" => {
+                    let mut cmd = Command::new("python3");
+                    cmd.args(["-m", "pip", "--version"]);
+                    cmd
+                }
+                "openssl" => {
+                    let mut cmd = Command::new("openssl");
+                    cmd.arg("version");
+                    cmd
+                }
+                other => {
+                    let mut cmd = Command::new(other);
+                    cmd.arg("--version");
+                    cmd
+                }
+            };
+            isolated(&mut probe, &home.0);
+            probe
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| !status.success())
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+/// A temporary directory removed on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Result<Self, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!("sbx-pt-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).map_err(|e| format!("mkdir {}: {e}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The upstream fixture child: a python3 TLS server (allowed.test cert)
+/// and a plain HTTP server over one docroot, logging `REQ <requestline>`.
+const UPSTREAM_PY: &str = r#"
+import http.server, os, socketserver, ssl, sys, threading
+d = sys.argv[1]
+class H(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *a, **k):
+        super().__init__(*a, directory=d, **k)
+    def log_message(self, fmt, *args):
+        sys.stderr.write("REQ " + self.requestline + "\n")
+        sys.stderr.flush()
+class S(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+tls = S(("127.0.0.1", 0), H)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(os.path.join(d, "cert.pem"), os.path.join(d, "key.pem"))
+tls.socket = ctx.wrap_socket(tls.socket, server_side=True)
+plain = S(("127.0.0.1", 0), H)
+sys.stdout.write("PORTS %d %d\n" % (tls.server_address[1], plain.server_address[1]))
+sys.stdout.flush()
+threading.Thread(target=tls.serve_forever, daemon=True).start()
+plain.serve_forever()
+"#;
+
+const SIMPLE_INDEX: &str = "<a href=\"/simple/sbx-probe/\">sbx-probe</a>";
+const PROBE_NPM: &str = "{\"name\":\"sbx-probe\",\"dist-tags\":{\"latest\":\"0.1.0\"},\"versions\":{\"0.1.0\":{\"name\":\"sbx-probe\",\"version\":\"0.1.0\"}}}";
+
+/// Run `cmd` with a deadline, collecting stdout and stderr.
+struct ToolOut {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_bounded(mut cmd: Command, what: &str, limit: Duration) -> Result<ToolOut, String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("{what}: spawn: {e}"))?;
+    let out = reader_thread(child.stdout.take().expect("piped stdout"));
+    let err = reader_thread(child.stderr.take().expect("piped stderr"));
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{what}: exceeded {limit:?}"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("{what}: wait: {e}")),
+        }
+    };
+    Ok(ToolOut {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
+/// The tool env isolation (design §5): nothing from the user's config.
+/// Everything is cleared, then re-added: PATH, a fresh HOME/XDG cache, git
+/// with no system or global config, pip with no config file, and no proxy
+/// variables except the ones a scenario sets.
+fn isolated(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("XDG_CACHE_HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "sbx")
+        .env("GIT_AUTHOR_EMAIL", "sbx@example.test")
+        .env("GIT_COMMITTER_NAME", "sbx")
+        .env("GIT_COMMITTER_EMAIL", "sbx@example.test")
+        .env("PIP_CONFIG_FILE", "/dev/null")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "");
+    // Passed through ONLY when the runner set it: a pyenv `python3` shim on
+    // PATH resolves its interpreter from this root, which the isolated HOME
+    // would otherwise hide. Never a guessed location.
+    if let Some(root) = std::env::var_os("PYENV_ROOT") {
+        cmd.env("PYENV_ROOT", root);
+    }
+}
+
+/// The python upstream fixture plus its docroot (cert, repo, index files).
+struct Upstreams {
+    dir: Scratch,
+    child: Option<Child>,
+    logs: Option<JoinHandle<String>>,
+    tls: u16,
+    plain: u16,
+}
+
+impl Upstreams {
+    fn start() -> Result<Self, String> {
+        let dir = Scratch::new("up")?;
+        make_docroot(&dir.0)?;
+        let mut child = Command::new("python3")
+            .arg("-I")
+            .arg("-c")
+            .arg(UPSTREAM_PY)
+            .arg(&dir.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn python3 upstream: {e}"))?;
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(stdout);
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+            // Drain to EOF so the child never blocks on stdout.
+            let _ = io::copy(&mut reader, &mut io::sink());
+        });
+        let line = rx
+            .recv_timeout(BOUND * 2)
+            .map_err(|_| "python3 upstream printed no PORTS line".to_owned())?;
+        let mut parts = line.split_whitespace();
+        let (Some("PORTS"), Some(tls), Some(plain)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(format!("bad PORTS line {line:?}"));
+        };
+        let tls = tls.parse().map_err(|e| format!("tls port: {e}"))?;
+        let plain = plain.parse().map_err(|e| format!("plain port: {e}"))?;
+        let logs = child.stderr.take().map(reader_thread);
+        Ok(Self {
+            dir,
+            child: Some(child),
+            logs,
+            tls,
+            plain,
+        })
+    }
+
+    fn cert(&self) -> std::path::PathBuf {
+        self.dir.0.join("cert.pem")
+    }
+
+    /// Kill the fixture and return its request log.
+    fn finish(mut self) -> String {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.logs
+            .take()
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default()
+    }
+
+    fn routing(&self) -> Arc<dyn Connector> {
+        Arc::new(Routing(vec![(443, addr(self.tls)), (80, addr(self.plain))]))
+    }
+}
+
+impl Drop for Upstreams {
+    /// Early-error paths must not leak the python fixture (RAII kill+wait).
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn addr(port: u16) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+}
+
+fn make_docroot(dir: &std::path::Path) -> Result<(), String> {
+    let run = |args: &[&str], cwd: &std::path::Path| -> Result<(), String> {
+        let status = Command::new(args[0])
+            .args(&args[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("{}: {e}", args[0]))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{:?} failed: {status}", args))
+        }
+    };
+    run(
+        &[
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "key.pem",
+            "-out",
+            "cert.pem",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=allowed.test",
+            "-addext",
+            "subjectAltName=DNS:allowed.test",
+        ],
+        dir,
+    )?;
+    std::fs::write(dir.join("index.html"), "sbx-explicit-ok\n").map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir.join("simple/sbx-probe")).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("simple/sbx-probe/index.html"), SIMPLE_INDEX)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("sbx-probe"), PROBE_NPM).map_err(|e| e.to_string())?;
+    // A dumb-HTTP git repo with one commit.
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).map_err(|e| e.to_string())?;
+    std::fs::write(src.join("README"), "sbx-git-ok\n").map_err(|e| e.to_string())?;
+    run(&["git", "init", "-q"], &src)?;
+    run(&["git", "add", "README"], &src)?;
+    // The fixture commit carries its own identity: the isolated tool env (and
+    // a CI runner) has no global git config, so no author is auto-detected.
+    run(
+        &[
+            "git",
+            "-c",
+            "user.name=sbx-test",
+            "-c",
+            "user.email=sbx-test@invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "probe",
+        ],
+        &src,
+    )?;
+    run(&["git", "clone", "-q", "--bare", ".", "../repo.git"], &src)?;
+    run(&["git", "-C", "../repo.git", "update-server-info"], &src)?;
+    Ok(())
+}
+
+/// Routes CONNECT/forward dials to fixture or echo listeners by port.
+struct Routing(Vec<(u16, SocketAddr)>);
+
+impl Connector for Routing {
+    fn connect(
+        &self,
+        _name: &Domain,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Connected, ConnectError>> + Send + '_>> {
+        let target = self.0.iter().find(|(p, _)| *p == port).map(|(_, a)| *a);
+        Box::pin(async move {
+            let Some(target) = target else {
+                return Err(ConnectError::Connect {
+                    detail: format!("no route for port {port}"),
+                });
+            };
+            let stream = tokio::net::TcpStream::connect(target).await.map_err(|e| {
+                ConnectError::Connect {
+                    detail: e.to_string(),
+                }
+            })?;
+            let _ = stream.set_nodelay(true);
+            let peer = stream.peer_addr().map_err(|e| ConnectError::Connect {
+                detail: e.to_string(),
+            })?;
+            Ok(Connected {
+                stream: Box::new(stream),
+                peer,
+            })
+        })
+    }
+}
+
+/// Records `name:port` for every dial, then delegates.
+struct Logged {
+    inner: Arc<dyn Connector>,
+    log: ConnectorLog,
+}
+
+impl Connector for Logged {
+    fn connect(
+        &self,
+        name: &Domain,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Connected, ConnectError>> + Send + '_>> {
+        self.log
+            .lock()
+            .expect("connector log")
+            .push(format!("{}:{port}", name.as_str()));
+        self.inner.connect(name, port)
+    }
+}
+
+/// A serving explicit listener on 127.0.0.1:0 (host netns).
+struct Explicit {
+    addr: SocketAddr,
+    sink: Arc<RecordingSink>,
+    log: ConnectorLog,
+    serve: ServeHandle,
+}
+
+fn start_explicit(
+    allow: &[&str],
+    ports: &[u16],
+    connector: Arc<dyn Connector>,
+) -> Result<Explicit, String> {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| format!("bind: {e}"))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    let sink = Arc::new(RecordingSink::default());
+    let log = connector_log();
+    let network = policy_network(allow, ports);
+    let proxy = Proxy::new(
+        &network,
+        Arc::new(StaticMap::new(&[])),
+        sink.clone(),
+        Arc::new(Logged {
+            inner: connector,
+            log: Arc::clone(&log),
+        }),
+        Limits::default(),
+    );
+    let serve = spawn_serve_kind(listener, proxy, true)?;
+    Ok(Explicit {
+        addr,
+        sink,
+        log,
+        serve,
+    })
+}
+
+struct Finished {
+    decisions: Vec<Decision>,
+    teardowns: Vec<String>,
+    dials: Vec<String>,
+}
+
+impl Explicit {
+    fn finish(self) -> Result<Finished, String> {
+        let serve_result = self.serve.stop()?;
+        match serve_result {
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => {}
+            other => return Err(format!("serve_explicit teardown: {other:?}")),
+        }
+        Ok(Finished {
+            decisions: self.sink.recorded(),
+            teardowns: self.sink.teardowns(),
+            dials: log_of(&self.log),
+        })
+    }
+}
+
+fn client_to(target: SocketAddr) -> Result<TcpStream, String> {
+    let stream = TcpStream::connect_timeout(&target, BOUND).map_err(|e| format!("connect: {e}"))?;
+    stream
+        .set_read_timeout(Some(BOUND))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    Ok(stream)
+}
+
+/// Read to EOF; a reset is a normal end (the proxy may drop the socket).
+fn read_to_eof(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    match stream.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(out),
+        Err(e) => Err(format!("client read: {e}")),
+    }
+}
+
+fn expect_echo(echo: Option<EchoOutcome>) -> Result<Vec<u8>, String> {
+    match echo {
+        Some(EchoOutcome::Hit(bytes)) => Ok(bytes),
+        other => Err(format!("the echo server must be hit: {other:?}")),
+    }
+}
+
+fn allowed_decision(decisions: &[Decision], via: Via, upstream: SocketAddr) -> Result<(), String> {
+    let want = Verdict::Allowed {
+        name: Domain::parse(ALLOWED).expect("fixture"),
+        upstream,
+    };
+    if decisions.len() != 1 {
+        return Err(format!("exactly one decision: {decisions:?}"));
+    }
+    if decisions[0].verdict != want {
+        return Err(format!("verdict: {:?}", decisions[0].verdict));
+    }
+    if decisions[0].via != via {
+        return Err(format!("via: {:?}", decisions[0].via));
+    }
+    Ok(())
+}
+
+/// Start an echo upstream and a routed explicit proxy around it.
+fn echo_explicit(
+    mode: EchoMode,
+    ports: &[u16],
+) -> Result<(EchoServer, Explicit, SocketAddr), String> {
+    let echo = spawn_echo_server(mode)?;
+    let target = echo.addr;
+    let routes = Arc::new(Routing(ports.iter().map(|p| (*p, target)).collect()));
+    let explicit = start_explicit(&[ALLOWED], ports, routes)?;
+    Ok((echo, explicit, target))
+}
+
+/// The DIRECT CONNECT-443 relay (design 1): the upstream receives exactly
+/// the ClientHello (the CONNECT head is consumed), echoes it back through
+/// the tunnel after the `200`.
+fn scenario_explicit_connect_443_relay() -> Result<(), String> {
+    let hello = build_client_hello(Some(ALLOWED), &[]);
+    let (echo, explicit, target) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(&[connect_head("allowed.test:443"), hello.clone()].concat())
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let finished = explicit.finish()?;
+    if upstream != hello {
+        return Err(format!(
+            "upstream must see exactly the hello: {} bytes",
+            upstream.len()
+        ));
+    }
+    if received != [EXPLICIT_200, hello.as_slice()].concat() {
+        return Err(format!(
+            "client bytes: {} (want 200 + hello)",
+            received.len()
+        ));
+    }
+    allowed_decision(
+        &finished.decisions,
+        Via::Explicit {
+            kind: ExplicitKind::Connect,
+            port: Some(443),
+        },
+        target,
+    )?;
+    if finished.dials != [format!("{ALLOWED}:443")] {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// Pipelined bytes after the ClientHello reach the upstream in order
+/// (design 2): the replay is hello ++ tail, relayed verbatim.
+fn scenario_explicit_connect_pipelined_hello() -> Result<(), String> {
+    let hello = build_client_hello(Some(ALLOWED), &[]);
+    let tail = b"PIPELINED-TAIL".to_vec();
+    let (echo, explicit, _) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(
+            &[
+                connect_head("allowed.test:443"),
+                hello.clone(),
+                tail.clone(),
+            ]
+            .concat(),
+        )
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    explicit.finish()?;
+    let want = [hello.as_slice(), tail.as_slice()].concat();
+    if upstream != want {
+        return Err(format!(
+            "the upstream must see hello ++ tail: {} bytes",
+            upstream.len()
+        ));
+    }
+    if received != [EXPLICIT_200, want.as_slice()].concat() {
+        return Err("client bytes must be 200 ++ echo of hello ++ tail".to_owned());
+    }
+    Ok(())
+}
+
+/// A second ClientHello on the relay (design 3, the second-hello defense):
+/// the upstream sees exactly the first hello, the teardown hook reports the
+/// pinned detail, and the single Allowed decision stays the only record.
+fn scenario_explicit_second_hello_torn_down() -> Result<(), String> {
+    let hello1 = build_client_hello(Some(ALLOWED), &[]);
+    let hello2 = build_client_hello(Some("other.test"), &[]);
+    let (echo, explicit, target) = echo_explicit(EchoMode::Immediate, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(&[connect_head("allowed.test:443"), hello1.clone()].concat())
+        .map_err(|e| format!("write: {e}"))?;
+    // Signal-driven (no fixed sleep): CH1's echo proves the relay is live.
+    let want_echo = [EXPLICIT_200, hello1.as_slice()].concat();
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while seen.len() < want_echo.len() {
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read CH1 echo: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        seen.extend_from_slice(&chunk[..n]);
+    }
+    if seen != want_echo {
+        return Err("CH1 echo must arrive before the second hello".to_owned());
+    }
+    stream
+        .write_all(&hello2)
+        .map_err(|e| format!("write CH2: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let _ = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let finished = explicit.finish()?;
+    if upstream != hello1 {
+        return Err(format!(
+            "upstream saw {} bytes, must be exactly CH1",
+            upstream.len()
+        ));
+    }
+    if finished.teardowns != [TORN_DOWN_SECOND_HELLO_DETAIL.to_owned()] {
+        return Err(format!("teardown hook: {:?}", finished.teardowns));
+    }
+    allowed_decision(
+        &finished.decisions,
+        Via::Explicit {
+            kind: ExplicitKind::Connect,
+            port: Some(443),
+        },
+        target,
+    )
+}
+
+/// CONNECT :80 — the tunnelled HTTP head is inspected and forwarded with
+/// `Connection: close` (design 7).
+fn scenario_explicit_connect_80_inspected() -> Result<(), String> {
+    let (echo, explicit, _) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(
+            &[
+                connect_head("allowed.test:80"),
+                b"GET /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n".to_vec(),
+            ]
+            .concat(),
+        )
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let finished = explicit.finish()?;
+    let text = String::from_utf8_lossy(&upstream).into_owned();
+    if !text.starts_with("GET /x HTTP/1.1\r\nHost: allowed.test\r\n")
+        || !text.contains("Connection: close\r\n")
+    {
+        return Err(format!("upstream request: {text:?}"));
+    }
+    if received.len() < EXPLICIT_200.len() || &received[..EXPLICIT_200.len()] != EXPLICIT_200 {
+        return Err("the client must see the 200 first".to_owned());
+    }
+    if received[EXPLICIT_200.len()..] != upstream[..] {
+        return Err("the client must receive the echo after the 200".to_owned());
+    }
+    if finished.dials != [format!("{ALLOWED}:80")] {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// Absolute-form GET: the upstream receives the rebuilt origin-form head
+/// with `Connection: close` and no `Proxy-*` (design 8, exact bytes).
+fn scenario_explicit_forward_get_rewritten() -> Result<(), String> {
+    let (echo, explicit, target) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(
+            b"GET http://allowed.test/p?q#f HTTP/1.1\r\nHost: allowed.test\r\nProxy-Connection: keep-alive\r\n\r\n",
+        )
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let finished = explicit.finish()?;
+    let want = b"GET /p?q HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+    if upstream != want {
+        return Err(format!(
+            "upstream bytes: {:?}",
+            String::from_utf8_lossy(&upstream)
+        ));
+    }
+    if received != want {
+        return Err(
+            "forward responses carry no CONNECT 200: the client sees the echo only".to_owned(),
+        );
+    }
+    allowed_decision(
+        &finished.decisions,
+        Via::Explicit {
+            kind: ExplicitKind::Forward,
+            port: Some(80),
+        },
+        target,
+    )
+}
+
+/// The upstream answers then closes WITHOUT the client half-closing: the
+/// upstream EOF ends the exchange and the client sees EOF (design 13).
+fn scenario_explicit_upstream_eof_closes() -> Result<(), String> {
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| format!("bind: {e}"))?;
+    let upstream_addr = listener
+        .local_addr()
+        .map_err(|e| format!("local_addr: {e}"))?;
+    let server = std::thread::spawn(move || -> Result<(), String> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("nonblocking: {e}"))?;
+        let deadline = Instant::now() + BOUND;
+        let (mut conn, _) = loop {
+            match listener.accept() {
+                Ok(pair) => break pair,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("the upstream was never dialed".to_owned());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(format!("accept: {e}")),
+            }
+        };
+        conn.set_nonblocking(false).map_err(|e| e.to_string())?;
+        conn.set_read_timeout(Some(BOUND))
+            .map_err(|e| e.to_string())?;
+        let mut head = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = conn
+                .read(&mut chunk)
+                .map_err(|e| format!("upstream read: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&chunk[..n]);
+        }
+        conn.write_all(response)
+            .map_err(|e| format!("upstream write: {e}"))?;
+        Ok(())
+    });
+    let explicit = start_explicit(
+        &[ALLOWED],
+        &[80],
+        Arc::new(Routing(vec![(80, upstream_addr)])),
+    )?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(b"GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    server
+        .join()
+        .map_err(|_| "upstream thread panicked".to_owned())??;
+    explicit.finish()?;
+    if received != response {
+        return Err(format!(
+            "client bytes: {:?}",
+            String::from_utf8_lossy(&received)
+        ));
+    }
+    Ok(())
+}
+
+/// Resolution failure on an ALLOWED name, forward path: 502 with the
+/// pinned empty-body shape, and the connector never dials (design 14).
+fn scenario_explicit_resolve_fail_502() -> Result<(), String> {
+    let resolve: ResolveFn = Arc::new(|_name: &str, _port: u16| {
+        Box::pin(async { Err(io::Error::other("scripted resolve failure")) })
+    });
+    let dial: DialFn = Arc::new(|_name: &str, _port: u16| {
+        Box::pin(async { Err(io::Error::other("the dial must not run")) })
+    });
+    let connector: Arc<dyn Connector> = Arc::new(GuardedConnector::new(
+        resolve,
+        dial,
+        Limits::default().connect_timeout,
+    ));
+    let explicit = start_explicit(&[ALLOWED], &[80], connector)?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(b"GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let finished = explicit.finish()?;
+    if received != EXPLICIT_502 {
+        return Err(format!(
+            "client bytes: {:?}",
+            String::from_utf8_lossy(&received)
+        ));
+    }
+    if finished.decisions.len() != 1 {
+        return Err(format!("one decision: {:?}", finished.decisions));
+    }
+    if finished.decisions[0].reason()
+        != "DNS resolution failed for allowed.test: scripted resolve failure"
+    {
+        return Err(format!("reason: {}", finished.decisions[0].reason()));
+    }
+    Ok(())
+}
+
+const EXPLICIT_502: &[u8] =
+    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+// ---- tools tier ------------------------------------------------------------
+
+/// curl over CONNECT: the upstream is reached only through the proxy.
+fn scenario_tool_curl_connect_https() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "--cacert"]).arg(up.cert()).args([
+        "-x",
+        &format!("http://127.0.0.1:{}", explicit.addr.port()),
+        "https://allowed.test/",
+    ]);
+    isolated(&mut cmd, &up.dir.0);
+    let out = run_bounded(cmd, "curl CONNECT", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    let logs = up.finish();
+    if !out.status.success() || out.stdout != "sbx-explicit-ok\n" {
+        return Err(format!("curl: {:?} stderr={}", out.status, out.stderr));
+    }
+    if finished.dials != [format!("{ALLOWED}:443")] {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    if !logs.contains("REQ GET / HTTP/1.1") {
+        return Err(format!("upstream never saw the request: {logs}"));
+    }
+    if finished.decisions.len() != 1
+        || !matches!(finished.decisions[0].verdict, Verdict::Allowed { .. })
+    {
+        return Err(format!("decisions: {:?}", finished.decisions));
+    }
+    Ok(())
+}
+
+/// curl absolute-form to port 80: the upstream sees origin-form, never the
+/// absolute URL (design 17).
+fn scenario_tool_curl_absolute_form() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-x"])
+        .arg(format!("http://127.0.0.1:{}", explicit.addr.port()))
+        .arg("http://allowed.test/");
+    isolated(&mut cmd, &up.dir.0);
+    let out = run_bounded(cmd, "curl absolute-form", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    let logs = up.finish();
+    if !out.status.success() || out.stdout != "sbx-explicit-ok\n" {
+        return Err(format!("curl: {:?} stderr={}", out.status, out.stderr));
+    }
+    if !logs.contains("REQ GET / HTTP/1.1") || logs.contains("GET http://") {
+        return Err(format!("the upstream must see origin-form only: {logs}"));
+    }
+    if finished.dials != [format!("{ALLOWED}:80")] {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// git over HTTPS through the proxy: a real dumb-HTTP clone.
+fn scenario_tool_git_https_clone() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let clone_dir = up.dir.0.join("clone");
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "https://allowed.test/repo.git"])
+        .arg(&clone_dir);
+    isolated(&mut cmd, &up.dir.0);
+    cmd.env(
+        "HTTPS_PROXY",
+        format!("http://127.0.0.1:{}", explicit.addr.port()),
+    )
+    .env("GIT_SSL_CAINFO", up.cert());
+    let out = run_bounded(cmd, "git clone", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if !out.status.success() {
+        up.finish();
+        return Err(format!("git clone: {:?} stderr={}", out.status, out.stderr));
+    }
+    // Read BEFORE finish(): dropping the fixture removes its scratch dir.
+    let readme = std::fs::read_to_string(clone_dir.join("README")).map_err(|e| {
+        format!(
+            "{e}; status={:?}; clone dir {:?}; stderr={}; stdout={}",
+            out.status,
+            clone_dir.display(),
+            out.stderr,
+            out.stdout
+        )
+    })?;
+    if readme != "sbx-git-ok\n" {
+        return Err(format!("cloned README: {readme:?}"));
+    }
+    if finished
+        .dials
+        .iter()
+        .all(|d| d != &format!("{ALLOWED}:443"))
+    {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// pip against an HTTPS index through the proxy. Criterion: the index page
+/// request reaches the upstream through a CONNECT tunnel (the fixture index
+/// links to no wheel, so pip's own exit status is NOT the success signal).
+fn scenario_tool_pip_connect() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-m",
+        "pip",
+        "download",
+        "--no-deps",
+        "--disable-pip-version-check",
+        "--index-url",
+    ])
+    .arg("https://allowed.test/simple/")
+    .arg("--cert")
+    .arg(up.cert())
+    .arg("--proxy")
+    .arg(format!("http://127.0.0.1:{}", explicit.addr.port()))
+    .args(["-d"])
+    .arg(up.dir.0.join("pipout"))
+    .arg("sbx-probe");
+    isolated(&mut cmd, &up.dir.0);
+    let _out = run_bounded(cmd, "pip download", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    let logs = up.finish();
+    if !logs.contains("REQ GET /simple/sbx-probe/ HTTP/1.1") {
+        return Err(format!(
+            "pip never reached the index through the proxy: {logs}"
+        ));
+    }
+    if finished
+        .dials
+        .iter()
+        .all(|d| d != &format!("{ALLOWED}:443"))
+    {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// npm view over HTTPS through the proxy (registry JSON from the fixture).
+fn scenario_tool_npm_connect() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("npm");
+    cmd.args([
+        "view",
+        "sbx-probe",
+        "version",
+        "--userconfig",
+        "/dev/null",
+        "--cache",
+    ])
+    .arg(up.dir.0.join("npm-cache"))
+    .arg("--registry")
+    .arg("https://allowed.test/");
+    isolated(&mut cmd, &up.dir.0);
+    cmd.env(
+        "HTTPS_PROXY",
+        format!("http://127.0.0.1:{}", explicit.addr.port()),
+    )
+    .env("NODE_EXTRA_CA_CERTS", up.cert());
+    let out = run_bounded(cmd, "npm view", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    let logs = up.finish();
+    if !out.status.success() || !out.stdout.contains("0.1.0") {
+        return Err(format!(
+            "npm view: {:?} stdout={} stderr={}",
+            out.status, out.stdout, out.stderr
+        ));
+    }
+    if !logs.contains("REQ GET /sbx-probe HTTP/1.1") {
+        return Err(format!(
+            "the registry fetch must go through the proxy: {logs}"
+        ));
+    }
+    if finished
+        .dials
+        .iter()
+        .all(|d| d != &format!("{ALLOWED}:443"))
+    {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// THE AC, verbatim (issue #8): `openssl s_client -proxy … -servername
+/// other.com` is denied with the exact SNI-mismatch reason, and the
+/// connector is never called.
+fn scenario_tool_openssl_other_denied() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("openssl");
+    cmd.args(["s_client", "-proxy"])
+        .arg(format!("127.0.0.1:{}", explicit.addr.port()))
+        .args([
+            "-connect",
+            "allowed.test:443",
+            "-servername",
+            "other.com",
+            "-CAfile",
+        ])
+        .arg(up.cert());
+    isolated(&mut cmd, &up.dir.0);
+    let out = run_bounded(cmd, "openssl s_client other.com", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    up.finish();
+    if out.status.success() {
+        return Err("a mismatched SNI must not complete a handshake".to_owned());
+    }
+    if finished.decisions.len() != 1 {
+        return Err(format!("exactly one decision: {:?}", finished.decisions));
+    }
+    let want = Verdict::Denied(Rejected::SniMismatch {
+        sni: Domain::parse("other.com").expect("fixture"),
+        name: Domain::parse(ALLOWED).expect("fixture"),
+        source: NameSource::ConnectTarget,
+    });
+    if finished.decisions[0].verdict != want {
+        return Err(format!("verdict: {:?}", finished.decisions[0].verdict));
+    }
+    if finished.decisions[0].reason()
+        != "SNI other.com does not match the CONNECT target name allowed.test"
+    {
+        return Err(format!("reason: {}", finished.decisions[0].reason()));
+    }
+    if !finished.dials.is_empty() {
+        return Err(format!(
+            "the connector must never be called: {:?}",
+            finished.dials
+        ));
+    }
+    Ok(())
+}
+
+/// The matching SNI completes the handshake through the proxy (AC's pair).
+fn scenario_tool_openssl_match_allowed() -> Result<(), String> {
+    let up = Upstreams::start()?;
+    let explicit = start_explicit(&[ALLOWED], &[443, 80], up.routing())?;
+    let mut cmd = Command::new("openssl");
+    cmd.args(["s_client", "-proxy"])
+        .arg(format!("127.0.0.1:{}", explicit.addr.port()))
+        .args([
+            "-connect",
+            "allowed.test:443",
+            "-servername",
+            "allowed.test",
+            "-verify_return_error",
+            "-CAfile",
+        ])
+        .arg(up.cert());
+    isolated(&mut cmd, &up.dir.0);
+    let out = run_bounded(cmd, "openssl s_client allowed", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    up.finish();
+    let text = format!("{}{}", out.stdout, out.stderr);
+    if !text.contains("Verify return code: 0 (ok)") {
+        return Err(format!("the handshake must verify: {text}"));
+    }
+    if finished.dials != [format!("{ALLOWED}:443")] {
+        return Err(format!("connector log: {:?}", finished.dials));
+    }
+    if finished.decisions.len() != 1 {
+        return Err(format!("exactly one decision: {:?}", finished.decisions));
+    }
+    match &finished.decisions[0].verdict {
+        Verdict::Allowed { name, .. } if name.as_str() == ALLOWED => {}
+        other => return Err(format!("verdict: {other:?}")),
+    }
+    if finished.decisions[0].via
+        != (Via::Explicit {
+            kind: ExplicitKind::Connect,
+            port: Some(443),
+        })
+    {
+        return Err(format!("via: {:?}", finished.decisions[0].via));
+    }
+    Ok(())
+}
+
+// ---- userns tier -----------------------------------------------------------
+
+/// Both fds served before the go byte; the explicit CONNECT relays to the
+/// echo upstream and the transparent sink records nothing (design 23).
+fn scenario_netns_explicit_connect_relay() -> Result<(), String> {
+    let run = run_netns(
+        "explicit-connect-relay",
+        &[],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHit,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok"])?;
+    if run
+        .decisions
+        .iter()
+        .any(|d| matches!(d.via, Via::Transparent { .. }))
+    {
+        return Err(format!(
+            "the transparent sink must record zero: {:?}",
+            run.decisions
+        ));
+    }
+    let hello = build_client_hello(Some(ALLOWED), &[]);
+    match run.echo {
+        Some(EchoOutcome::Hit(ref bytes)) if *bytes == hello => {}
+        ref other => {
+            return Err(format!(
+                "the echo must receive exactly the hello: {other:?}"
+            ));
+        }
+    }
+    let upstream = run.echo_addr.expect("echo spawned");
+    allowed_decision(
+        &run.decisions,
+        Via::Explicit {
+            kind: ExplicitKind::Connect,
+            port: Some(443),
+        },
+        upstream,
+    )
+}
+
+/// SNI mismatch inside the netns: `200` then a bare close, zero dials.
+fn scenario_netns_explicit_sni_mismatch() -> Result<(), String> {
+    let run = run_netns(
+        "explicit-sni-mismatch",
+        &[],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Never,
+        EchoSpec::None,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok"])?;
+    if run
+        .decisions
+        .iter()
+        .any(|d| matches!(d.via, Via::Transparent { .. }))
+    {
+        return Err(format!(
+            "the transparent sink must record zero: {:?}",
+            run.decisions
+        ));
+    }
+    if run.dial_ran || !run.connector_log.is_empty() {
+        return Err(format!(
+            "the connector must never run: {:?}",
+            run.connector_log
+        ));
+    }
+    if run.decisions.len() != 1 {
+        return Err(format!("exactly one decision: {:?}", run.decisions));
+    }
+    Ok(())
+}
+
+// ---- network tier (opt-in: SBX_PT_NETWORK=1) -------------------------------
+
+fn network_proxy(allow: &[&str]) -> Result<Explicit, String> {
+    let system: Arc<dyn Connector> =
+        Arc::new(GuardedConnector::system(Limits::default().connect_timeout));
+    start_explicit(allow, &[443], system)
+}
+
+fn scenario_network_curl_pypi() -> Result<(), String> {
+    let explicit = network_proxy(&["pypi.org"])?;
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-o", "/dev/null", "-w", "%{http_code}", "-x"])
+        .arg(format!("http://127.0.0.1:{}", explicit.addr.port()))
+        .arg("https://pypi.org/simple/six/");
+    let home = Scratch::new("net-curl")?;
+    isolated(&mut cmd, &home.0);
+    let out = run_bounded(cmd, "network curl", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if out.stdout.trim() != "200" {
+        return Err(format!(
+            "curl status: {:?} stdout={} stderr={}",
+            out.status, out.stdout, out.stderr
+        ));
+    }
+    if finished.decisions.len() != 1
+        || !matches!(finished.decisions[0].verdict, Verdict::Allowed { .. })
+    {
+        return Err(format!("decisions: {:?}", finished.decisions));
+    }
+    Ok(())
+}
+
+fn scenario_network_git_clone() -> Result<(), String> {
+    let explicit = network_proxy(&["github.com"])?;
+    let home = Scratch::new("net-git")?;
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "clone",
+        "-q",
+        "--depth",
+        "1",
+        "https://github.com/octocat/Hello-World.git",
+    ])
+    .arg(home.0.join("hello"));
+    isolated(&mut cmd, &home.0);
+    cmd.env(
+        "HTTPS_PROXY",
+        format!("http://127.0.0.1:{}", explicit.addr.port()),
+    );
+    let out = run_bounded(cmd, "network git clone", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if !out.status.success() {
+        return Err(format!("git clone: {:?} stderr={}", out.status, out.stderr));
+    }
+    if finished
+        .decisions
+        .iter()
+        .all(|d| !matches!(d.verdict, Verdict::Allowed { .. }))
+    {
+        return Err(format!("no allowed decision: {:?}", finished.decisions));
+    }
+    Ok(())
+}
+
+fn scenario_network_pip_download() -> Result<(), String> {
+    let explicit = network_proxy(&["pypi.org", "files.pythonhosted.org"])?;
+    let home = Scratch::new("net-pip")?;
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-m",
+        "pip",
+        "download",
+        "--no-deps",
+        "--disable-pip-version-check",
+        "six==1.16.0",
+        "-d",
+    ])
+    .arg(home.0.join("wheels"))
+    .arg("--proxy")
+    .arg(format!("http://127.0.0.1:{}", explicit.addr.port()));
+    isolated(&mut cmd, &home.0);
+    let out = run_bounded(cmd, "network pip", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if !out.status.success() {
+        return Err(format!("pip: {:?} stderr={}", out.status, out.stderr));
+    }
+    if finished
+        .decisions
+        .iter()
+        .all(|d| !matches!(d.verdict, Verdict::Allowed { .. }))
+    {
+        return Err(format!("no allowed decision: {:?}", finished.decisions));
+    }
+    Ok(())
+}
+
+fn scenario_network_npm_view() -> Result<(), String> {
+    let explicit = network_proxy(&["registry.npmjs.org"])?;
+    let home = Scratch::new("net-npm")?;
+    let mut cmd = Command::new("npm");
+    cmd.args([
+        "view",
+        "left-pad",
+        "version",
+        "--userconfig",
+        "/dev/null",
+        "--cache",
+    ])
+    .arg(home.0.join("cache"))
+    .args(["--registry", "https://registry.npmjs.org/"]);
+    isolated(&mut cmd, &home.0);
+    cmd.env(
+        "HTTPS_PROXY",
+        format!("http://127.0.0.1:{}", explicit.addr.port()),
+    );
+    let out = run_bounded(cmd, "network npm view", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if !out.status.success() || out.stdout.trim().is_empty() {
+        return Err(format!("npm view: {:?} stderr={}", out.status, out.stderr));
+    }
+    if finished
+        .decisions
+        .iter()
+        .all(|d| !matches!(d.verdict, Verdict::Allowed { .. }))
+    {
+        return Err(format!("no allowed decision: {:?}", finished.decisions));
+    }
+    Ok(())
+}
+
+fn scenario_network_openssl_other_denied() -> Result<(), String> {
+    let explicit = network_proxy(&["pypi.org"])?;
+    let home = Scratch::new("net-ossl")?;
+    let mut cmd = Command::new("openssl");
+    cmd.args(["s_client", "-proxy"])
+        .arg(format!("127.0.0.1:{}", explicit.addr.port()))
+        .args(["-connect", "pypi.org:443", "-servername", "other.com"]);
+    isolated(&mut cmd, &home.0);
+    let out = run_bounded(cmd, "network openssl other", TOOL_BOUND)?;
+    let finished = explicit.finish()?;
+    if out.status.success() {
+        return Err("mismatched SNI must not complete".to_owned());
+    }
+    let want = "SNI other.com does not match the CONNECT target name pypi.org";
+    if finished.decisions.len() != 1 || finished.decisions[0].reason() != want {
+        return Err(format!("decisions: {:?}", finished.decisions));
+    }
+    if !finished.dials.is_empty() {
+        return Err(format!("the dial must never run: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// Child side of the explicit userns roles (issue #8): connect to the
+/// explicit listener inside the netns, send `request`, half-close, and
+/// require the exact `expected` bytes back.
+fn role_explicit_exact(request: &[u8], expected: &[u8]) -> Result<(), String> {
+    let target = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, EXPLICIT_PORT));
+    let mut stream =
+        TcpStream::connect_timeout(&target, BOUND).map_err(|e| format!("connect {target}: {e}"))?;
+    stream
+        .set_read_timeout(Some(BOUND))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream
+        .write_all(request)
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown(Write): {e}"))?;
+    let mut got = Vec::new();
+    stream
+        .read_to_end(&mut got)
+        .map_err(|e| format!("read: {e}"))?;
+    if got != expected {
+        return Err(format!(
+            "explicit bytes mismatch: got {} bytes, want {}",
+            got.len(),
+            expected.len()
+        ));
+    }
+    marker("relay ok explicit");
     Ok(())
 }

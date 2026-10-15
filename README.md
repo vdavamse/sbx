@@ -23,13 +23,16 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#7). The CLI parses the full documented
+**In progress** (issues #2–#8). The CLI parses the full documented
 interface, and `check` is real: it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
 The library also carries the egress decision core (issue #4): the
 domain allow-list matcher and the resolved-address guard that the proxy
-and fake-IP resolver (#7–#9) will call. The internal `__init` helper is
+and fake-IP resolver (#7–#9) will call. The explicit HTTP proxy (#8)
+serves `CONNECT` and absolute-form requests on the explicit listener with
+the same policy and inspectors; #10 wires both listeners into `sbx run`.
+The internal `__init` helper is
 real (issue #5): `sbx run` (#10) will re-exec it with one end of a
 control socketpair, and it unshares user + network namespaces, brings
 loopback up as `10.255.255.1` with a default route into the sandbox,

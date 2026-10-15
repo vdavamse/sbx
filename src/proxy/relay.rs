@@ -166,11 +166,13 @@
 //!    are scanned; the HTTP path passes `scan_from: None` and keeps the
 //!    plain `copy_bidirectional` shape.
 
+use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
 
 /// The pinned teardown detail: a ClientHello (handshake type 0x01) after
 /// the inspected one — plaintext-phase (immediate, on the type byte), or
@@ -614,6 +616,85 @@ where
             Ok(RelayEnd::Finished)
         }
     }
+}
+
+/// The wall-clock budget for the post-deny drain (issue #8, D5): the
+/// client gets this long to finish its own write before we hang up.
+pub(crate) const LINGER_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The drain byte cap for [`linger_close`] (issue #8, D5).
+pub(crate) const LINGER_MAX_BYTES: usize = 64 * 1024;
+
+/// Close a socket after writing a deny response without an RST eating the
+/// response (issue #8, D5): shut the write side, then read and discard
+/// until EOF, [`LINGER_MAX_BYTES`], or [`LINGER_TIMEOUT`]. Errors are
+/// ignored — the caller drops the socket either way.
+pub(crate) async fn linger_close<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) {
+    let _ = stream.shutdown().await;
+    let drain = async {
+        let mut sink = [0u8; 4096];
+        let mut total = 0usize;
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= LINGER_MAX_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(LINGER_TIMEOUT, drain).await;
+}
+
+/// The explicit CONNECT-80 / absolute-form relay (issue #8, Q6/D7): the
+/// request was rewritten to `Connection: close`, so the response's end is
+/// the upstream's EOF. Replays the FULL buffer upstream, then copies both
+/// ways. The client→upstream direction half-closes the upstream on client
+/// EOF; upstream EOF ends the whole exchange (both sockets close).
+pub(crate) async fn relay_until_upstream_eof<C, U>(
+    client: C,
+    replay: &[u8],
+    upstream: &mut U,
+) -> io::Result<RelayEnd>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    upstream.write_all(replay).await?;
+    let (mut client_r, mut client_w) = tokio::io::split(client);
+    let (mut up_r, mut up_w) = tokio::io::split(&mut *upstream);
+    let mut down = Box::pin(tokio::io::copy(&mut up_r, &mut client_w));
+    let mut up = Box::pin(async {
+        tokio::io::copy(&mut client_r, &mut up_w).await?;
+        up_w.shutdown().await
+    });
+    let mut up_done = false;
+    let down_result = poll_fn(|cx| {
+        if let Poll::Ready(result) = down.as_mut().poll(cx) {
+            return Poll::Ready(result.map(|_| ()));
+        }
+        if !up_done {
+            if let Poll::Ready(result) = up.as_mut().poll(cx) {
+                up_done = true;
+                if let Err(err) = result {
+                    return Poll::Ready(Err(err));
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await;
+    drop(down);
+    drop(up);
+    // Upstream EOF (or a transport error) ends the exchange.
+    down_result?;
+    let _ = client_w.shutdown().await;
+    let mut client = client_r.unsplit(client_w);
+    linger_close(&mut client).await;
+    Ok(RelayEnd::Finished)
 }
 
 #[cfg(test)]
