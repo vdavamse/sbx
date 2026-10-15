@@ -1084,6 +1084,188 @@ mod tests {
         );
     }
 
+    /// Records every `closed` call (issue #10, T9).
+    #[derive(Default)]
+    struct ClosedSink(Mutex<Vec<(u64, u64)>>);
+
+    impl DecisionSink for ClosedSink {
+        fn record(&self, _decision: &Decision) {}
+        fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+            self.0.lock().expect("closed lock").push((up, down));
+        }
+    }
+
+    /// The explicit path never consults the DNS map.
+    struct NoNames;
+
+    impl DnsMap for NoNames {
+        fn name_for(&self, _ip: Ipv4Addr) -> Option<Domain> {
+            None
+        }
+    }
+
+    #[test]
+    fn connect_443_closed_bytes_exclude_proxy_response() {
+        // T9: the 200 the proxy writes to the client is never counted as
+        // upstream traffic. `up` is the replayed hello, `down` the upstream's bytes.
+        block_on(async {
+            let hello_bytes = hello("allowed.test");
+            let far_slot: Arc<Mutex<Option<DuplexStream>>> = Arc::new(Mutex::new(None));
+            let slot = Arc::clone(&far_slot);
+            let dial: DialFn = Arc::new(move |_name: &str, _port: u16| {
+                let slot = Arc::clone(&slot);
+                Box::pin(async move {
+                    let (near, far) = duplex(4096);
+                    *slot.lock().expect("slot lock") = Some(far);
+                    Ok((Box::new(near) as Upstream, sock(PUBLIC)))
+                })
+            });
+            let resolve: ResolveFn =
+                Arc::new(|_name: &str, _port: u16| Box::pin(async { Ok(vec![sock(PUBLIC)]) }));
+            let limits = Limits {
+                decision_timeout: Duration::from_secs(5),
+                ..Limits::default()
+            };
+            let connector: Arc<dyn Connector> =
+                Arc::new(GuardedConnector::new(resolve, dial, limits.connect_timeout));
+            let network = policy::Network {
+                mode: policy::NetworkMode::Transparent,
+                allow: vec![dom("allowed.test")],
+                ports: vec![443],
+            };
+            let sink = Arc::new(ClosedSink::default());
+            let proxy = Proxy::new(&network, Arc::new(NoNames), sink.clone(), connector, limits);
+
+            let (mut peer, mut client): (DuplexStream, DuplexStream) = duplex(64 * 1024);
+            let mut bytes = connect("allowed.test:443");
+            bytes.extend_from_slice(&hello_bytes);
+            peer.write_all(&bytes).await.expect("client write");
+            // Half-close the client side: the relay ends only when BOTH directions
+            // end (copy_bidirectional), so the client must send EOF after the
+            // upstream finished. Without it the test relay would wait forever.
+            peer.shutdown().await.expect("client half-close");
+            let decided = decide_explicit(&mut client, sock(CLIENT), &proxy).await;
+            let relay = decided.relay.expect("allowed 443 carries relay state");
+            let mut far = far_slot
+                .lock()
+                .expect("slot lock")
+                .take()
+                .expect("upstream dialed");
+            let expected_up = hello_bytes.len();
+            let far_task = tokio::spawn(async move {
+                let mut got = vec![0u8; expected_up];
+                far.read_exact(&mut got).await.expect("upstream read");
+                far.write_all(b"UP").await.expect("upstream write");
+                far.shutdown().await.expect("upstream shutdown");
+            });
+            let ExplicitRelay {
+                replay,
+                mut connected,
+                mode,
+            } = relay;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                crate::proxy::relay_tail(
+                    &proxy,
+                    &decided.decision,
+                    client,
+                    &replay,
+                    mode,
+                    &mut connected.stream,
+                ),
+            )
+            .await
+            .expect("relay must end after both halves close");
+            far_task.await.expect("far task");
+
+            let mut out = Vec::new();
+            peer.read_to_end(&mut out).await.expect("client read");
+            assert!(out.starts_with(RESPONSE_CONNECT_ESTABLISHED), "{out:?}");
+            assert_eq!(
+                *sink.0.lock().expect("closed lock"),
+                vec![(hello_bytes.len() as u64, 2)]
+            );
+        });
+    }
+
+    #[test]
+    fn relay_waits_for_client_half_close() {
+        // T9: the 200 the proxy writes to the client is never counted as
+        // upstream traffic. `up` is the replayed hello, `down` the upstream's bytes.
+        block_on(async {
+            let hello_bytes = hello("allowed.test");
+            let far_slot: Arc<Mutex<Option<DuplexStream>>> = Arc::new(Mutex::new(None));
+            let slot = Arc::clone(&far_slot);
+            let dial: DialFn = Arc::new(move |_name: &str, _port: u16| {
+                let slot = Arc::clone(&slot);
+                Box::pin(async move {
+                    let (near, far) = duplex(4096);
+                    *slot.lock().expect("slot lock") = Some(far);
+                    Ok((Box::new(near) as Upstream, sock(PUBLIC)))
+                })
+            });
+            let resolve: ResolveFn =
+                Arc::new(|_name: &str, _port: u16| Box::pin(async { Ok(vec![sock(PUBLIC)]) }));
+            let limits = Limits {
+                decision_timeout: Duration::from_secs(5),
+                ..Limits::default()
+            };
+            let connector: Arc<dyn Connector> =
+                Arc::new(GuardedConnector::new(resolve, dial, limits.connect_timeout));
+            let network = policy::Network {
+                mode: policy::NetworkMode::Transparent,
+                allow: vec![dom("allowed.test")],
+                ports: vec![443],
+            };
+            let sink = Arc::new(ClosedSink::default());
+            let proxy = Proxy::new(&network, Arc::new(NoNames), sink.clone(), connector, limits);
+
+            let (mut peer, mut client): (DuplexStream, DuplexStream) = duplex(64 * 1024);
+            let mut bytes = connect("allowed.test:443");
+            bytes.extend_from_slice(&hello_bytes);
+            peer.write_all(&bytes).await.expect("client write");
+            let decided = decide_explicit(&mut client, sock(CLIENT), &proxy).await;
+            let relay = decided.relay.expect("allowed 443 carries relay state");
+            let mut far = far_slot
+                .lock()
+                .expect("slot lock")
+                .take()
+                .expect("upstream dialed");
+            let expected_up = hello_bytes.len();
+            let far_task = tokio::spawn(async move {
+                let mut got = vec![0u8; expected_up];
+                far.read_exact(&mut got).await.expect("upstream read");
+                far.write_all(b"UP").await.expect("upstream write");
+                far.shutdown().await.expect("upstream shutdown");
+            });
+            let ExplicitRelay {
+                replay,
+                mut connected,
+                mode,
+            } = relay;
+            // Without client EOF the relay must NOT end once the upstream is done:
+            // copy_bidirectional ends only when both directions end (v1 has no idle
+            // timeout; the task lives until the client closes or sbx tears down).
+            let ended = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                crate::proxy::relay_tail(
+                    &proxy,
+                    &decided.decision,
+                    client,
+                    &replay,
+                    mode,
+                    &mut connected.stream,
+                ),
+            )
+            .await;
+            assert!(ended.is_err(), "relay ended without client EOF");
+            far_task.await.expect("far task");
+
+            // The relay was dropped at the timeout: no close row yet.
+            assert!(sink.0.lock().expect("closed lock").is_empty());
+        });
+    }
+
     #[test]
     fn decide_explicit_connect_443_allowed_relay_state() {
         block_on(async {

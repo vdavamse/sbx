@@ -1,12 +1,12 @@
 //! Command-line interface for `sbx`.
 //!
 //! Issue #2 froze the documented flag surface; issue #3 replaced the
-//! `check` stub; issue #5 made `__init` real. The remaining stub subcommands
-//! parse their full interface, then report `not implemented yet` and exit 1
-//! until later issues replace the stub bodies behind [`run`] without CLI
-//! churn:
+//! `check` stub; issue #5 made `__init` real; issue #10 made `run` real. The
+//! remaining stub subcommands parse their full interface, then report `not
+//! implemented yet` and exit 1 until later issues replace the stub bodies
+//! without CLI churn:
 //!
-//! - `run`    — sandbox lifecycle, egress proxy, audit log (#10, #7, #8)
+//! - `run`    — sandbox lifecycle, egress proxy, audit log (real since #10)
 //! - `check`  — policy validation + JSON Schema (real since #3)
 //! - `gc`     — session-directory garbage collection (#12)
 //! - `__init` — re-exec'd namespace helper (real since #5; hidden — #10's
@@ -16,7 +16,9 @@
 //! ([`ExitCode::FAILURE`]) — for `check`, an invalid or unreadable policy
 //! file; for `__init`, a staged setup failure (`sbx __init: <stage>:
 //! <reason>`, the payload never started) — 2 = usage error (clap's own
-//! convention).
+//! convention). For `run` (issue #10): the command's own code; 124 timeout;
+//! 125 sbx failure; 128+N terminated by signal N; 2 usage. See the `run`
+//! module docs, point 4.
 
 use std::ffi::OsString;
 use std::os::fd::RawFd;
@@ -94,14 +96,10 @@ pub enum Cmd {
         #[arg(long, value_name = "PATH")]
         cwd: Option<PathBuf>,
 
-        /// Kill the command after this long (e.g. 90s, 2h, 7d).
-        #[arg(
-            long,
-            value_name = "DURATION",
-            default_value = "120s",
-            value_parser = parse_duration
-        )]
-        timeout: Duration,
+        /// Kill the command after this long (e.g. 90s, 2h); default and upper
+        /// bound: the policy's limits.timeout.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
 
         /// Audit log file (JSON Lines).
         #[arg(long, value_name = "FILE")]
@@ -160,6 +158,22 @@ pub enum Cmd {
         #[arg(long, value_name = "FD", value_parser = parse_control_fd)]
         fd: RawFd,
 
+        /// (hidden) The bwrap `--info-fd` pipe write end `run` hands through.
+        //
+        // Issue #10 (Q13): `run` passes its bwrap info pipe here so the fd
+        // survives fd_hygiene for exactly one hop. Validated in the control
+        // stage (init::validate_keep_fd) before any namespace work.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
+        keep_fd: Option<RawFd>,
+
+        /// (hidden) The pid of the `run` process that spawned us (m6): __init sets
+        /// PR_SET_PDEATHSIG and refuses to continue if its parent is not this pid.
+        //
+        // Optional so direct `__init` callers (the integration suites) keep working;
+        // `run` always passes it.
+        #[arg(long, value_name = "PID", hide = true, value_parser = parse_control_fd)]
+        parent_pid: Option<i32>,
+
         /// (hidden) Test-only: load a deliberately broken ruleset batch.
         //
         // Fail-only by construction (Q4(a)): it can make setup FAIL (the
@@ -214,7 +228,21 @@ pub fn run() -> ExitCode {
 
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Run { .. } => not_implemented("run"),
+        Cmd::Run {
+            policy,
+            session_dir,
+            cwd,
+            timeout,
+            audit,
+            cmd,
+        } => crate::run::run(crate::run::RunArgs {
+            policy,
+            session_dir,
+            cwd,
+            timeout,
+            audit,
+            cmd,
+        }),
         Cmd::Check {
             policy,
             print_schema,
@@ -222,9 +250,11 @@ pub fn run() -> ExitCode {
         Cmd::Gc { .. } => not_implemented("gc"),
         Cmd::Init {
             fd,
+            keep_fd,
+            parent_pid,
             test_break_rules,
             cmd,
-        } => crate::init::run_init(fd, test_break_rules, cmd),
+        } => crate::init::run_init(fd, keep_fd, parent_pid, test_break_rules, cmd),
     }
 }
 
@@ -308,7 +338,7 @@ mod tests {
                 assert_eq!(policy, Path::new("p.json"));
                 assert_eq!(session_dir, Path::new("/tmp/s"));
                 assert_eq!(cwd.as_deref(), Some(Path::new("/w")));
-                assert_eq!(timeout, Duration::from_secs(90));
+                assert_eq!(timeout, Some(Duration::from_secs(90)));
                 assert_eq!(audit.as_deref(), Some(Path::new("a.jsonl")));
                 // Hyphenated args survive verbatim; the `--` separator itself
                 // is consumed by clap and never reaches cmd.
@@ -319,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn run_defaults_timeout_to_120s() {
+    fn run_timeout_absent_is_none() {
         let cli = Cli::try_parse_from([
             "sbx",
             "run",
@@ -339,7 +369,7 @@ mod tests {
                 cmd,
                 ..
             } => {
-                assert_eq!(timeout, Duration::from_secs(120));
+                assert_eq!(timeout, None);
                 assert_eq!(cwd, None);
                 assert_eq!(audit, None);
                 assert_eq!(cmd, ["true"]);
@@ -579,9 +609,78 @@ mod tests {
                 fd,
                 test_break_rules,
                 cmd,
+                ..
             } => (fd, test_break_rules, cmd),
             other => panic!("expected Cmd::Init, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn init_parses_keep_fd() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--keep-fd",
+            "9",
+            "--",
+            "/bin/true",
+        ])
+        .expect("--keep-fd must parse");
+        match cli.command {
+            Cmd::Init { keep_fd, .. } => assert_eq!(keep_fd, Some(9)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_parses_parent_pid() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--parent-pid",
+            "4242",
+            "--",
+            "/bin/true",
+        ])
+        .expect("--parent-pid must parse");
+        match cli.command {
+            Cmd::Init { parent_pid, .. } => assert_eq!(parent_pid, Some(4242)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_keep_fd_hidden_in_help() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand("__init")
+            .expect("__init subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--keep-fd"), "{help}");
+    }
+
+    #[test]
+    fn init_rejects_negative_keep_fd() {
+        let err = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--keep-fd",
+            "-1",
+            "--",
+            "/bin/true",
+        ])
+        .expect_err("negative --keep-fd must be rejected");
+        assert!(
+            err.to_string().contains("-1") || err.to_string().contains("keep-fd"),
+            "{err}"
+        );
     }
 
     #[test]

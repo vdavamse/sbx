@@ -61,6 +61,9 @@
 //!    every `--setenv` (bubblewrap.c v0.9.0 `xsetenv("PWD", new_cwd, 1)`),
 //!    so a policy `env.set {"PWD": …}` is silently clobbered (pinned by
 //!    the `secret-env-absent` integration scenario).
+//!    Issue #10 adds the second encoding site: `sbx run` spawns
+//!    `/proc/self/exe __init … -- <argv>` with `env_clear()` in
+//!    `run::spawn::init_command`.
 //! 6. **No `--unshare-net`, ever** — the network namespace belongs to
 //!    `sbx __init` (#5): bwrap joins the inherited netns where the
 //!    nftables rules and listeners already live. A proptest invariant pins
@@ -69,7 +72,9 @@
 //!    --unshare-ipc --unshare-uts --unshare-cgroup-try` (never host
 //!    `/proc`; `cgroup-try` tolerates hosts without a cgroup ns) and
 //!    `--disable-userns --cap-drop ALL --die-with-parent --new-session
-//!    --hostname sandbox`. `--disable-userns` needs bwrap ≥ 0.8
+//!    --hostname sandbox [--info-fd N]` (`--info-fd` only when
+//!    `Build::info_fd` is set — issue #10's pid-1 discovery, Q13).
+//!    `--disable-userns` needs bwrap ≥ 0.8
 //!    ([`version::BWRAP_MIN`]); it works because `--unshare-user` is
 //!    present (the kernel rejects disable-userns without a private userns).
 //!    HANDOFF NOTE: `--die-with-parent` fires on the parent THREAD's death
@@ -125,6 +130,7 @@ mod argv;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::os::fd::RawFd;
 use std::path::Path;
 
 use crate::policy::Policy;
@@ -177,6 +183,10 @@ pub struct Build<'a> {
     /// membership — a buggy resolver can never inject a name the policy
     /// did not allow.
     pub passed_env: &'a BTreeMap<String, OsString>,
+    /// `sbx run`'s bwrap info pipe write end (issue #10, Q13). `Some(n)` emits
+    /// `--info-fd n` (bwrap writes `{"child-pid": …}` there after clone); the fd
+    /// must survive into bwrap — `sbx __init --keep-fd n`. Must be > 2 (row 15).
+    pub info_fd: Option<RawFd>,
 }
 
 /// A complete, validated bwrap invocation.
@@ -395,6 +405,15 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             )));
         }
     }
+    // Row 15 (issue #10, Q13): the bwrap info fd, when given, must be above
+    // the standard streams — 0–2 are the caller's stdio and bwrap's own.
+    if let Some(fd) = input.info_fd {
+        if fd <= 2 {
+            return Err(BwrapError(format!(
+                "info fd must be greater than 2 (got {fd})"
+            )));
+        }
+    }
     // The argv layout itself has no failure modes (module docs point 1) —
     // but the assembly output gets one final sweep before it is trusted.
     let argv = argv::assemble(input);
@@ -514,6 +533,7 @@ mod tests {
             command,
             cwd: None,
             passed_env,
+            info_fd: None,
         }
     }
 
@@ -720,6 +740,15 @@ mod tests {
             ));
         let input = base_input(&sweep, &command, &no_env);
         assert_eq!(err(&input), "assembled bwrap argv contains a NUL byte");
+
+        // Row 15 (issue #10, Q13): the info fd must be above the std streams.
+        let mut info = base_input(&policy, &command, &no_env);
+        info.info_fd = Some(2);
+        assert_eq!(err(&info), "info fd must be greater than 2 (got 2)");
+        info.info_fd = Some(0);
+        assert_eq!(err(&info), "info fd must be greater than 2 (got 0)");
+        info.info_fd = Some(3);
+        assert!(build(&info).is_ok());
     }
 
     #[test]

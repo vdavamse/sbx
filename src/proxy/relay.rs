@@ -152,6 +152,12 @@
 //!    (`exactly_one_decision_per_connection` stays true — the teardown
 //!    hook is not `record`). The two pinned detail strings below are the
 //!    test-visible identity of the two teardown classes.
+//!
+//! Byte counting (issue #10, T9): [`Counted`] wraps the upstream side and
+//! counts the bytes it accepts (`up`, replay buffer included) and the bytes it
+//! reads (`down`) for the close audit row. A scanner-withheld chunk is never
+//! written upstream, so it is never counted.
+//!
 //! 6. **Pre-feed** — pipelined bytes already inside the replay buffer are
 //!    future client→upstream bytes, so [`relay`] scans
 //!    `replay[hello_end..]` BEFORE writing anything upstream: a teardown
@@ -697,6 +703,89 @@ where
     Ok(RelayEnd::Finished)
 }
 
+/// Upstream byte counter for the close audit row (issue #10, T9). `up` counts
+/// bytes the upstream ACCEPTED (replay buffer included); `down` counts bytes
+/// read from the upstream. A scanner-withheld chunk is never written upstream,
+/// so it is never counted.
+pub(crate) struct Counted<U> {
+    inner: U,
+    up: u64,
+    down: u64,
+}
+
+impl<U> Counted<U> {
+    pub(crate) fn new(inner: U) -> Self {
+        Self {
+            inner,
+            up: 0,
+            down: 0,
+        }
+    }
+
+    pub(crate) fn up(&self) -> u64 {
+        self.up
+    }
+
+    pub(crate) fn down(&self) -> u64 {
+        self.down
+    }
+}
+
+impl<U: AsyncRead + Unpin> AsyncRead for Counted<U> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        let read = buf.filled().len().saturating_sub(before) as u64;
+        this.down = this.down.saturating_add(read);
+        res
+    }
+}
+
+impl<U: AsyncWrite + Unpin> AsyncWrite for Counted<U> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            this.up = this.up.saturating_add(*n as u64);
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &res {
+            this.up = this.up.saturating_add(*n as u64);
+        }
+        res
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +794,63 @@ mod tests {
 
     /// Hand-rolled current-thread block_on (the tokio `macros` feature is
     /// deliberately NOT enabled — proxy module docs point 8).
+    #[test]
+    fn counted_counts_reads_and_writes() {
+        block_on(async {
+            let (mut far, near) = tokio::io::duplex(4096);
+            let mut counted = Counted::new(near);
+            far.write_all(b"hello world").await.expect("far write");
+            let mut buf = [0u8; 5];
+            counted.read_exact(&mut buf).await.expect("read");
+            assert_eq!(&buf, b"hello");
+            // Only the 5 bytes actually delivered by read_exact count; the
+            // duplex may have buffered the rest, which is not "down" traffic.
+            assert_eq!(counted.down(), 5);
+            counted.write_all(b"abc").await.expect("write");
+            assert_eq!(counted.up(), 3);
+            let mut echoed = [0u8; 3];
+            far.read_exact(&mut echoed).await.expect("far read");
+            assert_eq!(&echoed, b"abc");
+        });
+    }
+
+    #[test]
+    fn counted_counts_vectored_writes() {
+        block_on(async {
+            let (mut far, near) = tokio::io::duplex(4096);
+            let mut counted = Counted::new(near);
+            let bufs = [std::io::IoSlice::new(b"ab"), std::io::IoSlice::new(b"cde")];
+            let n = counted.write_vectored(&bufs).await.expect("vectored");
+            counted.flush().await.expect("flush");
+            assert_eq!(counted.up(), n as u64);
+            assert!(counted.up() >= 2);
+            let mut got = vec![0u8; n];
+            far.read_exact(&mut got).await.expect("far read");
+        });
+    }
+
+    #[test]
+    fn relay_counts_replay_as_up() {
+        block_on(async {
+            // Replay bytes are written upstream first; a counted relay must
+            // report them as `up` (issue #10, T9).
+            let (mut far, near) = tokio::io::duplex(4096);
+            let (client, _client_far) = tokio::io::duplex(4096);
+            let mut counted = Counted::new(near);
+            let replay = b"GET / HTTP/1.1\r\n\r\n";
+            let far_task = tokio::spawn(async move {
+                let mut got = vec![0u8; b"GET / HTTP/1.1\r\n\r\n".len()];
+                far.read_exact(&mut got).await.expect("far read");
+                assert_eq!(&got[..], &b"GET / HTTP/1.1\r\n\r\n"[..]);
+                far.shutdown().await.expect("far shutdown");
+            });
+            let r = relay_until_upstream_eof(client, replay, &mut counted).await;
+            far_task.await.expect("far task");
+            assert!(r.is_ok());
+            assert_eq!(counted.up(), replay.len() as u64);
+        });
+    }
+
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

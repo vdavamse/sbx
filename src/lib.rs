@@ -57,8 +57,9 @@
 //! whose `teardown` hook surfaces relay-phase teardowns so a blocked
 //! attack is not audit-invisible; everything fails closed. [`policy`]
 //! deserialization now validates on EVERY path — the old point-5 asymmetry
-//! is resolved (TODO(#6)(a), landed with issue #6). `run` and `gc` remain
-//! stubs that exit 1. Tracking issue #20 describes the architecture; the
+//! is resolved (TODO(#6)(a), landed with issue #6). `run` is real since
+//! issue #10 (see [`run`]: the sandbox lifecycle, exit codes, audit log);
+//! `gc` remains a stub that exits 1. Tracking issue #20 describes the architecture; the
 //! issue #1 spike (`spikes/nft-load`) proved the unprivileged
 //! nftables-loading approach `sbx __init` ships.
 
@@ -69,3 +70,4 @@ pub mod egress;
 pub mod init;
 pub mod policy;
 pub mod proxy;
+pub mod run;

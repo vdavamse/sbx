@@ -86,7 +86,8 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 20 (was 10): the issue #10 end-to-end smoke builds the musl release binary.
+    timeout-minutes: 20
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
@@ -124,6 +125,70 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked
+
+      # Issue #10: the real `sbx run` against the static musl release binary,
+      # with bubblewrap from the prep step. Gating.
+      - name: "Smoke: sbx run end-to-end (release musl)"
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          T=$(mktemp -d)
+          cat > "$T/bench.json" <<'JSON'
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}
+          JSON
+          set +e
+          FAIL=0
+          OUT=$("$BIN" run --policy "$T/bench.json" --session-dir "$T/s" -- /usr/bin/bash -c 'echo sbx-ok; exit 7')
+          RC=$?
+          [ "$RC" -eq 7 ] || { echo "FAIL: exit $RC (expected 7)"; FAIL=1; }
+          [ "$OUT" = "sbx-ok" ] || { echo "FAIL: stdout was: $OUT"; FAIL=1; }
+          "$BIN" run --policy "$T/bench.json" --session-dir "$T/s" --timeout 1s -- /usr/bin/sleep 30
+          RC=$?
+          [ "$RC" -eq 124 ] || { echo "FAIL: timeout exit $RC (expected 124)"; FAIL=1; }
+          "$BIN" run --policy "$T/bench.json" --session-dir "$T/s" --audit "$T/a.jsonl" -- /usr/bin/true
+          RC=$?
+          [ "$RC" -eq 0 ] || { echo "FAIL: audited run exit $RC"; FAIL=1; }
+          tail -n 1 "$T/a.jsonl" | grep -q '"event":"exit"' || { echo "FAIL: last audit row is not exit"; FAIL=1; }
+          exit "$FAIL"
+
+      # Issue #10 AC3: startup overhead of `sbx run` over `bash -c true`. Report
+      # only: the step never fails the job, and it warns at >= 25 ms overhead.
+      - name: "Startup overhead (report-only, issue #10 AC3)"
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y hyperfine
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          T=$(mktemp -d)
+          cat > "$T/bench.json" <<'JSON'
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}
+          JSON
+          hyperfine -N --warmup 10 --runs 100 --export-json "$T/startup.json" \
+            "/usr/bin/bash -c true" \
+            "$BIN run --policy $T/bench.json --session-dir $T/s -- /usr/bin/bash -c true"
+          python3 - "$T/startup.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, statistics, sys
+          results = json.load(open(sys.argv[1]))["results"]
+          labels = ["/usr/bin/bash -c true", "sbx run --policy bench.json -- /usr/bin/bash -c true"]
+          rows = []
+          for label, r in zip(labels, results):
+              t = sorted(m["time_wall_clock"]["value"] * 1e3 for m in r["measurements"])
+              p90 = t[min(len(t) - 1, round(0.9 * (len(t) - 1)))]
+              rows.append((label, statistics.median(t), p90))
+          bash_median = rows[0][1]
+          sbx_median, sbx_p90 = rows[1][1], rows[1][2]
+          overhead = sbx_median - bash_median
+          print("### sbx run startup overhead (issue #10 AC3, report-only)")
+          print("")
+          print("| command | median (ms) | p90 (ms) |")
+          print("|---|---|---|")
+          for label, median, p90 in rows:
+              print(f"| `{label}` | {median:.2f} | {p90:.2f} |")
+          print("")
+          print(f"Overhead (median sbx - median bash): {overhead:.2f} ms; target < 25 ms.")
+          if overhead >= 25:
+              print(f"::warning::sbx run startup overhead is {overhead:.1f} ms (>= 25 ms target)")
+          PY
 
   build:
     name: build (${{ matrix.target }})
@@ -225,15 +290,18 @@ jobs:
             echo "ok: help hides __init"
           fi
 
-          # `run` and `gc` are still stubs: each parses its documented
-          # interface, then exits 1 with "not implemented" on stderr. The
-          # policy/session files need not exist — the stubs never read them.
+          # `run` is real since #10: a missing policy is an sbx-detected
+          # failure (rc 125, "sbx run: " prefix on stderr). `gc` is still a stub.
           "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
-          check_rc 1 $? "sbx run (stub)"
-          grep -q "not implemented" run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
+          check_rc 125 $? "sbx run (missing policy)"
+          grep -q "sbx run: " run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
+          grep -q "cannot read" run.err || { echo "FAIL: run stderr lacks 'cannot read':"; cat run.err; FAIL=1; }
 
           "$BIN" run --policy p.json --session-dir /tmp/s -- /bin/echo --help > /dev/null 2>&1
-          check_rc 1 $? "sbx run with hyphenated trailing args (stub)"
+          check_rc 125 $? "sbx run with hyphenated trailing args (missing policy)"
+
+          "$BIN" run --policy p.json --session-dir /tmp/s --timeout 0s -- true > /dev/null 2>&1
+          check_rc 2 $? "sbx run with a zero --timeout (usage error)"
 
           # check is real since issue #3: it validates a policy file (rc 0
           # valid / rc 1 invalid-or-unreadable, "sbx check: <reason>" on
