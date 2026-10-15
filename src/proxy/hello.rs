@@ -62,7 +62,7 @@ use std::io::Cursor;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{Limits, Rejected, canonicalize_host};
+use super::{Limits, NameSource, Rejected, canonicalize_host};
 use crate::policy::Domain;
 
 /// The TLS record content type of a handshake message — the first byte of
@@ -292,6 +292,18 @@ pub(crate) async fn inspect_tls<S: AsyncRead + Unpin>(
     expected: &Domain,
     limits: &Limits,
 ) -> Result<Vec<u8>, Rejected> {
+    inspect_tls_from(client, expected, NameSource::DnsMap, limits).await
+}
+
+/// [`inspect_tls`] with the name's [`NameSource`] (issue #8, Q4): the
+/// explicit CONNECT path passes `ConnectTarget` so the SNI mismatch wording
+/// names the CONNECT target.
+pub(crate) async fn inspect_tls_from<S: AsyncRead + Unpin>(
+    client: &mut S,
+    expected: &Domain,
+    source: NameSource,
+    limits: &Limits,
+) -> Result<Vec<u8>, Rejected> {
     let mut acceptor = rustls::server::Acceptor::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; READ_CHUNK];
@@ -353,6 +365,7 @@ pub(crate) async fn inspect_tls<S: AsyncRead + Unpin>(
                     return Err(Rejected::SniMismatch {
                         sni,
                         name: expected.clone(),
+                        source,
                     });
                 }
                 // Pipelined/coalesced second handshake flights deny (module
@@ -824,6 +837,7 @@ mod tests {
             Rejected::SniMismatch {
                 sni: dom("evil.test"),
                 name: dom("allowed.test"),
+                source: NameSource::DnsMap,
             }
         );
     }

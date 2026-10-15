@@ -169,7 +169,25 @@
 //!     confusion after an SNI-checked handshake (ALPN rides through
 //!     uninspected — inherent to any non-terminating proxy; #14's threat
 //!     model).
+//! 13. **Explicit proxy (issue #8)** — the same pipeline reached by an
+//!     explicit request, served by [`serve_explicit`] on the explicit
+//!     listener (see the `explicit` module for the full design). Name comes from the
+//!     request target, never the DNS map; `CONNECT :443` keeps the
+//!     inspect-before-connect lock (Q7: the `200` is written, the ClientHello
+//!     is inspected, and only then is the upstream dialed) and reuses
+//!     `scan_from = first_record_end` for the second-hello defense; `CONNECT
+//!     :80` inspects the tunnelled HTTP head; absolute-form is `http://`
+//!     port 80 only and is rebuilt as origin-form with `Connection: close`.
+//!     [`Via`] records the arrival path, [`NameSource`] selects the reason
+//!     wording (DnsMap rows stay byte-identical to #7), and every
+//!     client-derived string in a non-DnsMap reason is
+//!     redacted to authority-only (Q10). Residuals, documented: a CONNECT dial
+//!     failure after the `200` is a silent close; body framing beyond the
+//!     strict table is deferred (F3); transparent :80 keeps #7 framing (F2);
+//!     pipelined second requests on one connection are not inspected (the
+//!     vhost-confusion class, #14; see the `explicit` module docs point 10).
 
+pub(crate) mod explicit;
 pub mod hello;
 pub(crate) mod http;
 pub(crate) mod relay;
@@ -314,7 +332,11 @@ pub enum Rejected {
     /// the SNI failed canonicalization.
     SniMissing,
     /// The canonicalized SNI differs from the DNS-map name.
-    SniMismatch { sni: Domain, name: Domain },
+    SniMismatch {
+        sni: Domain,
+        name: Domain,
+        source: NameSource,
+    },
     /// The buffered HTTP head outgrew [`Limits::max_head_bytes`].
     HeadTooLarge { cap: usize },
     /// httparse rejected the request (detail = its error text;
@@ -334,18 +356,50 @@ pub enum Rejected {
     /// The `Host` value is not valid UTF-8 — NEVER `from_utf8_lossy`
     /// (egress.rs point 5: a lossy conversion could *create* a match).
     HostNotUtf8,
-    /// The `Host` port suffix exists but differs from the original
-    /// destination port (Q5).
-    HostPortMismatch { got: u16, want: u16 },
+    /// The `Host` port suffix exists but differs from the name's port (Q5).
+    HostPortMismatch {
+        got: u16,
+        want: u16,
+        source: NameSource,
+    },
     /// The (port-stripped) `Host` value is not a bare hostname
     /// ([`Domain::parse`] rejected it: scheme, userinfo, brackets, IP
     /// literal, junk).
     HostInvalid { value: String },
-    /// The canonicalized `Host` differs from the DNS-map name.
-    HostMismatch { host: Domain, name: Domain },
-    /// The absolute-form request-target's authority differs from the
-    /// DNS-map name (or carries a foreign port/scheme shape).
-    TargetMismatch { target: String, name: Domain },
+    /// The canonicalized `Host` differs from the name.
+    HostMismatch {
+        host: Domain,
+        name: Domain,
+        source: NameSource,
+    },
+    /// The absolute-form request-target's authority differs from the name
+    /// (or carries a foreign port/scheme shape). `target` is verbatim for
+    /// `DnsMap`, [`redact_for_audit`]ed otherwise.
+    TargetMismatch {
+        target: String,
+        name: Domain,
+        source: NameSource,
+    },
+    /// CONNECT target (authority-form `host:port`) failed the explicit
+    /// parser. `target` is redacted; `detail` is a pinned fragment.
+    ConnectTargetInvalid {
+        target: String,
+        detail: &'static str,
+    },
+    /// Absolute-form request-target (http:// only) failed the explicit
+    /// parser. `target` is redacted; `detail` is a pinned fragment.
+    RequestTargetInvalid {
+        target: String,
+        detail: &'static str,
+    },
+    /// Absolute-form target with a scheme other than `http` (redacted).
+    TargetSchemeUnsupported { scheme: String },
+    /// The explicit request is neither CONNECT nor absolute-form.
+    NotProxyRequest,
+    /// CONNECT declared a body (Content-Length > 0 or Transfer-Encoding).
+    ConnectHasBody,
+    /// Request framing is ambiguous (smuggling shape); `detail` pinned.
+    AmbiguousFraming { detail: &'static str },
     /// [`crate::egress::guard`] denied a resolved address or the connected
     /// peer: composition per egress.rs — `denied dial to {addr}: {denied}`
     /// (Q3: `{addr}` is the SocketAddr).
@@ -395,9 +449,10 @@ impl Rejected {
                 "TLS ClientHello offers encrypted_client_hello (ECH); denied in v1".to_owned()
             }
             Rejected::SniMissing => "missing or invalid SNI in the TLS ClientHello".to_owned(),
-            Rejected::SniMismatch { sni, name } => format!(
-                "SNI {} does not match the DNS-map name {}",
+            Rejected::SniMismatch { sni, name, source } => format!(
+                "SNI {} does not match {} {}",
                 sni.as_str(),
+                source.name_phrase(),
                 name.as_str()
             ),
             Rejected::HeadTooLarge { cap } => {
@@ -413,21 +468,48 @@ impl Rejected {
             Rejected::HostMissing => "HTTP request has no Host header".to_owned(),
             Rejected::HostMultiple => "HTTP request has multiple Host headers".to_owned(),
             Rejected::HostNotUtf8 => "Host header is not valid UTF-8".to_owned(),
-            Rejected::HostPortMismatch { got, want } => format!(
-                "Host port suffix :{got} does not match the original destination port {want}"
+            Rejected::HostPortMismatch { got, want, source } => format!(
+                "Host port suffix :{got} does not match {} {want}",
+                source.port_phrase()
             ),
             Rejected::HostInvalid { value } => {
                 format!("Host header {value:?} is not a bare hostname")
             }
-            Rejected::HostMismatch { host, name } => format!(
-                "HTTP Host {} does not match the DNS-map name {}",
+            Rejected::HostMismatch { host, name, source } => format!(
+                "HTTP Host {} does not match {} {}",
                 host.as_str(),
+                source.name_phrase(),
                 name.as_str()
             ),
-            Rejected::TargetMismatch { target, name } => format!(
-                "absolute-form request target {target:?} does not match the DNS-map name {}",
+            Rejected::TargetMismatch {
+                target,
+                name,
+                source,
+            } => format!(
+                "absolute-form request target {target:?} does not match {} {}",
+                source.name_phrase(),
                 name.as_str()
             ),
+            Rejected::NotProxyRequest => {
+                "not a proxy request: expected CONNECT host:port or an absolute-form http:// target"
+                    .to_owned()
+            }
+            Rejected::ConnectTargetInvalid { target, detail } => {
+                format!("CONNECT target {target:?} is invalid: {detail}")
+            }
+            Rejected::RequestTargetInvalid { target, detail } => {
+                format!("absolute-form request target {target:?} is invalid: {detail}")
+            }
+            Rejected::TargetSchemeUnsupported { scheme } => format!(
+                "absolute-form request target scheme {scheme:?} is not supported (http:// only; use CONNECT for TLS)"
+            ),
+            Rejected::ConnectHasBody => {
+                "CONNECT request declares a body (Content-Length > 0 or Transfer-Encoding)"
+                    .to_owned()
+            }
+            Rejected::AmbiguousFraming { detail } => {
+                format!("ambiguous HTTP request framing: {detail}")
+            }
             Rejected::DialDenied { addr, denied } => format!("denied dial to {addr}: {denied}"),
             Rejected::Eof => "connection closed before a complete protocol preamble".to_owned(),
             Rejected::DecisionTimeout { secs } => {
@@ -475,20 +557,147 @@ impl Failed {
     }
 }
 
+/// Where a name in a [`Rejected`] reason came from (issue #8, Q4). The
+/// `DnsMap` rows are the #7 wording byte-for-byte; the other two sources
+/// phrase the same check against the explicit proxy's own inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameSource {
+    /// The transparent path's fake-IP → policy-name map (#7 wording).
+    DnsMap,
+    /// The name is the CONNECT request-target's host.
+    ConnectTarget,
+    /// The name is the absolute-form request-target's host.
+    RequestTarget,
+}
+
+impl NameSource {
+    /// The reason phrase for the policy name ("the … name").
+    fn name_phrase(self) -> &'static str {
+        match self {
+            NameSource::DnsMap => "the DNS-map name",
+            NameSource::ConnectTarget => "the CONNECT target name",
+            NameSource::RequestTarget => "the request-target name",
+        }
+    }
+
+    /// The reason phrase for the destination port ("the … port").
+    fn port_phrase(self) -> &'static str {
+        match self {
+            NameSource::DnsMap => "the original destination port",
+            NameSource::ConnectTarget => "the CONNECT target port",
+            NameSource::RequestTarget => "the request-target port",
+        }
+    }
+}
+
+/// The explicit request shape, recorded as far as parsing got (issue #8).
+/// `Unknown` = the head was never classified (malformed, or not a proxy
+/// request at all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplicitKind {
+    /// `CONNECT host:port` — TLS (443) or an inspected tunnel (80).
+    Connect,
+    /// Absolute-form `http://` request (port 80 only).
+    Forward,
+    /// The head was never classified.
+    Unknown,
+}
+
+/// How a connection reached the proxy (issue #8, Q3): the transparent
+/// listener (with its recovered `SO_ORIGINAL_DST`, `None` iff the lookup
+/// failed) or the explicit listener (with the parsed kind and port).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Via {
+    /// The transparent redirect path (#7).
+    Transparent { orig_dst: Option<SocketAddrV4> },
+    /// The explicit HTTP proxy path (#8). `port` is the parsed target port.
+    Explicit {
+        kind: ExplicitKind,
+        port: Option<u16>,
+    },
+}
+
+impl Via {
+    /// The audit-log label — #10's JSONL `via` field (pinned).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Via::Transparent { .. } => "transparent",
+            Via::Explicit {
+                kind: ExplicitKind::Connect,
+                ..
+            } => "explicit-connect",
+            Via::Explicit {
+                kind: ExplicitKind::Forward,
+                ..
+            } => "explicit-forward",
+            Via::Explicit {
+                kind: ExplicitKind::Unknown,
+                ..
+            } => "explicit",
+        }
+    }
+}
+
+/// Cap on any client-derived text in an audit reason (issue #8, Q10).
+pub(crate) const AUDIT_TEXT_CAP: usize = 256;
+/// Replaces the userinfo (everything up to the LAST `@` of the authority).
+const REDACTED_USERINFO: &str = "<redacted>@";
+/// Appended when the capped text was cut.
+const TRUNCATION_MARK: &str = "...";
+
+/// Reduce client-supplied text to its authority for an audit reason (issue
+/// #8, Q10 / D4): any scheme and path/query/fragment are dropped, userinfo
+/// is replaced by `<redacted>@`, and the result is capped at
+/// [`AUDIT_TEXT_CAP`] bytes on a char boundary (with `...`).
+pub(crate) fn redact_for_audit(raw: &str) -> String {
+    let after_scheme = match raw.find("://") {
+        Some(at) => &raw[at + 3..],
+        None => raw,
+    };
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let mut out = match authority.rfind('@') {
+        Some(at) => format!("{REDACTED_USERINFO}{}", &authority[at + 1..]),
+        None => authority.to_owned(),
+    };
+    if out.len() > AUDIT_TEXT_CAP {
+        let mut cut = AUDIT_TEXT_CAP - TRUNCATION_MARK.len();
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str(TRUNCATION_MARK);
+    }
+    out
+}
+
 /// One connection's terminal audit record — #10's JSONL row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// The accepted sandbox-side peer.
     pub client: SocketAddr,
-    /// The `SO_ORIGINAL_DST` result; `None` iff the lookup itself failed.
-    pub orig_dst: Option<SocketAddrV4>,
-    /// The DNS-map result; `None` for pre-map denials.
+    /// How the connection arrived (issue #8, Q3): the transparent
+    /// `SO_ORIGINAL_DST` result, or the explicit proxy's parsed target.
+    pub via: Via,
+    /// The DNS-map result (transparent) or the parsed target host
+    /// (explicit); `None` for pre-name denials.
     pub name: Option<Domain>,
     /// The terminal outcome.
     pub verdict: Verdict,
 }
 
 impl Decision {
+    /// The transparent `SO_ORIGINAL_DST` result — `Some` only for
+    /// `Via::Transparent` whose lookup succeeded.
+    pub fn orig_dst(&self) -> Option<SocketAddrV4> {
+        match &self.via {
+            Via::Transparent { orig_dst } => *orig_dst,
+            Via::Explicit { .. } => None,
+        }
+    }
+
     /// THE audit-text composition site — #10 logs this verbatim.
     pub fn reason(&self) -> String {
         match &self.verdict {
@@ -800,6 +1009,22 @@ impl Proxy {
 /// transient errors (module docs point 10) and never panics. Must run on a
 /// runtime with the IO + time drivers enabled.
 pub async fn serve(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> io::Result<Infallible> {
+    accept_loop(listener, proxy, handle_connection).await
+}
+
+/// The shared accept loop (issue #8 seam): flips the listener non-blocking
+/// itself, then spawns `handler` per accepted connection. [`serve`] passes
+/// the transparent handler; `explicit::serve_explicit` (#8) passes the
+/// explicit one. Every fatal/backoff rule lives here, once.
+pub(crate) async fn accept_loop<H, Fut>(
+    listener: std::net::TcpListener,
+    proxy: Arc<Proxy>,
+    handler: H,
+) -> io::Result<Infallible>
+where
+    H: Fn(TcpStream, SocketAddr, Arc<Proxy>) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     listener.set_nonblocking(true)?;
     let listener = TcpListener::from_std(listener)?;
     let mut backoff = ACCEPT_BACKOFF_START;
@@ -807,7 +1032,7 @@ pub async fn serve(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> io::Re
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 backoff = ACCEPT_BACKOFF_START;
-                tokio::spawn(handle_connection(stream, client_addr, Arc::clone(&proxy)));
+                tokio::spawn(handler(stream, client_addr, Arc::clone(&proxy)));
             }
             Err(err) if accept_error_is_fatal(&err) => return Err(err),
             Err(_err) => {
@@ -877,7 +1102,7 @@ pub(crate) async fn handle_connection(
         Err(err) => (
             Decision {
                 client: client_addr,
-                orig_dst: None,
+                via: Via::Transparent { orig_dst: None },
                 name: None,
                 verdict: Verdict::Denied(Rejected::OriginalDst {
                     detail: err.to_string(),
@@ -896,30 +1121,66 @@ pub(crate) async fn handle_connection(
         scan_from,
     }) = relay
     {
-        // Replay the FULL buffer (preamble + pipelined bytes) to the
-        // UPSTREAM: the inspection consumed those bytes FROM THE CLIENT,
-        // so forwarding them upstream is what makes the upstream see the
-        // client's byte stream — verbatim on 443, and on 80 with the ONE
-        // documented deviation: the validated head carries the inserted
-        // `Connection: close` (http.rs module docs point 6; module docs
-        // point 9). Writing them back to the client instead would echo
-        // the client's own preamble at it and send the upstream nothing
-        // (the design sketch's `client.write_all` was a typo — deviation
-        // recorded in the issue notes; the suite's echo-equality
-        // assertions pin the direction). Then relay — on 443 through the
-        // second-hello scanner (module docs point 12). A scanner teardown
-        // is reported to the sink's teardown hook (round-2 review fix —
-        // a blocked attack must not be audit-invisible behind its
-        // `allowed …` line); the single Decision above stays the only
-        // `record`. Transport errors and clean EOFs are normal lifecycle
-        // — swallowed; no idle timeout in v1 (module docs point 6). Drop
-        // closes both sockets.
-        match relay::relay(client, &replay, scan_from, &mut connected.stream).await {
-            Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(&decision, detail),
-            // Clean end or transport error (EOF/RST/broken pipe): normal
-            // relay lifecycle — swallowed.
-            Ok(relay::RelayEnd::Finished) | Err(_) => {}
-        }
+        let mode = match scan_from {
+            Some(scan_from) => RelayMode::Scanned { scan_from },
+            None => RelayMode::Plain,
+        };
+        relay_tail(
+            &proxy,
+            &decision,
+            client,
+            &replay,
+            mode,
+            &mut connected.stream,
+        )
+        .await;
+    }
+}
+
+/// How the relay phase runs (issue #8 seam): the 443 second-hello scanner
+/// starting at `scan_from`, or the plain bidirectional copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayMode {
+    /// 443 — client→upstream runs through the scanner from this offset.
+    Scanned { scan_from: usize },
+    /// 80 (transparent) — plain `copy_bidirectional`.
+    Plain,
+    /// Explicit CONNECT-80 tunnel and absolute-form forward (issue #8): the
+    /// request carries `Connection: close`, so upstream EOF ends the
+    /// exchange (`relay::relay_until_upstream_eof`).
+    CloseOnUpstreamEof,
+}
+
+/// The shared relay tail (issue #8 seam): replay the FULL buffer upstream
+/// (module docs point 9 — inspection consumed those bytes FROM the client),
+/// relay, and report a scanner teardown to the sink (a blocked attack must
+/// not be audit-invisible behind its `allowed …` line). Errors are normal
+/// lifecycle — swallowed; the caller's drop closes both sockets.
+pub(crate) async fn relay_tail<C>(
+    proxy: &Proxy,
+    decision: &Decision,
+    client: C,
+    replay: &[u8],
+    mode: RelayMode,
+    upstream: &mut Upstream,
+) where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
+    let scan_from = match mode {
+        RelayMode::Scanned { scan_from } => Some(scan_from),
+        RelayMode::Plain | RelayMode::CloseOnUpstreamEof => None,
+    };
+    if let RelayMode::CloseOnUpstreamEof = mode {
+        // Explicit-only; the transparent relay never sees this mode.
+        // Clean end or transport error: normal relay lifecycle — swallowed.
+        let _ = relay::relay_until_upstream_eof(client, replay, upstream).await;
+        return;
+    }
+    match relay::relay(client, replay, scan_from, upstream).await {
+        Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
+        // Clean end or transport error (EOF/RST/broken pipe): normal relay
+        // lifecycle — swallowed.
+        Ok(relay::RelayEnd::Finished) | Err(_) => {}
     }
 }
 
@@ -1066,34 +1327,9 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     };
     // 5. Connect (GuardedConnector owns the connect timeout internally —
     //    the scopes never nest).
-    let connected = match proxy.connector.connect(&name, port).await {
+    let connected = match connect_upstream(proxy, &name, port).await {
         Ok(connected) => connected,
-        // THE single exhaustive ConnectError→verdict mapping site (Q6):
-        // DialDenied is a policy denial; the rest are infrastructure
-        // failures against an already-allowed name.
-        Err(err) => {
-            let verdict = match err {
-                ConnectError::DialDenied { addr, denied } => {
-                    Verdict::Denied(Rejected::DialDenied { addr, denied })
-                }
-                ConnectError::Resolve { detail } => Verdict::Error(Failed::Resolve {
-                    name: name.clone(),
-                    detail,
-                }),
-                ConnectError::EmptyResolve => {
-                    Verdict::Error(Failed::EmptyResolve { name: name.clone() })
-                }
-                ConnectError::Connect { detail } => Verdict::Error(Failed::Connect {
-                    name: name.clone(),
-                    detail,
-                }),
-                ConnectError::Timeout => Verdict::Error(Failed::ConnectTimeout {
-                    name: name.clone(),
-                    secs: proxy.limits.connect_timeout.as_secs(),
-                }),
-            };
-            return (decision(&ctx, Some(name), verdict), None);
-        }
+        Err(verdict) => return (decision(&ctx, Some(name), verdict), None),
     };
     // 6. Allowed — the decision carries the guarded peer actually
     //    connected; the relay state carries the FULL replay buffer and,
@@ -1136,11 +1372,50 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     )
 }
 
+/// Step 5 of the pipeline, shared by the transparent and explicit paths:
+/// dial `name:port` through the [`Connector`] and map its failure to a
+/// [`Verdict`] at exactly ONE site (Q6: only `DialDenied` is a policy
+/// denial; the rest are infrastructure failures against an allowed name).
+/// Scope B of the explicit pipeline (#8, Q7): called only after the
+/// inspection scope has closed — the two timeout scopes never nest.
+pub(crate) async fn connect_upstream(
+    proxy: &Proxy,
+    name: &Domain,
+    port: u16,
+) -> Result<Connected, Verdict> {
+    match proxy.connector.connect(name, port).await {
+        Ok(connected) => Ok(connected),
+        // THE single exhaustive ConnectError→verdict mapping site (Q6).
+        Err(err) => Err(match err {
+            ConnectError::DialDenied { addr, denied } => {
+                Verdict::Denied(Rejected::DialDenied { addr, denied })
+            }
+            ConnectError::Resolve { detail } => Verdict::Error(Failed::Resolve {
+                name: name.clone(),
+                detail,
+            }),
+            ConnectError::EmptyResolve => {
+                Verdict::Error(Failed::EmptyResolve { name: name.clone() })
+            }
+            ConnectError::Connect { detail } => Verdict::Error(Failed::Connect {
+                name: name.clone(),
+                detail,
+            }),
+            ConnectError::Timeout => Verdict::Error(Failed::ConnectTimeout {
+                name: name.clone(),
+                secs: proxy.limits.connect_timeout.as_secs(),
+            }),
+        }),
+    }
+}
+
 /// The [`Decision`] field bundle shared by every pipeline exit.
 fn decision(ctx: &ConnCtx, name: Option<Domain>, verdict: Verdict) -> Decision {
     Decision {
         client: ctx.client_addr,
-        orig_dst: Some(ctx.orig_dst),
+        via: Via::Transparent {
+            orig_dst: Some(ctx.orig_dst),
+        },
         name,
         verdict,
     }
@@ -1153,6 +1428,17 @@ fn decision(ctx: &ConnCtx, name: Option<Domain>, verdict: Verdict) -> Decision {
 /// module docs point 3).
 pub(crate) fn canonicalize_host(raw: &str) -> Option<Domain> {
     Domain::parse(raw.strip_suffix('.').unwrap_or(raw)).ok()
+}
+
+/// Seam (c), explicit listener (issue #8, Q9): the HTTP forward-proxy entry
+/// point #10 spawns BEFORE the go byte, in both modes. It shares the
+/// accept loop, the decision timeout and the sink with [`serve`], but
+/// never consults the DNS map. Same startup/return contract as [`serve`].
+pub async fn serve_explicit(
+    listener: std::net::TcpListener,
+    proxy: Arc<Proxy>,
+) -> io::Result<Infallible> {
+    accept_loop(listener, proxy, explicit::handle_explicit_connection).await
 }
 
 /// The fatal-accept-error classifier (module docs point 10): only a
@@ -1262,7 +1548,9 @@ mod tests {
         }
         let decision = Decision {
             client: sock("203.0.113.1:1000"),
-            orig_dst: Some(v4("203.0.113.7:443")),
+            via: Via::Transparent {
+                orig_dst: Some(v4("203.0.113.7:443")),
+            },
             name: Some(dom("allowed.test")),
             verdict: Verdict::Allowed {
                 name: dom("allowed.test"),
@@ -1532,6 +1820,7 @@ mod tests {
                 Rejected::SniMismatch {
                     sni: dom("evil.test"),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
                 "SNI evil.test does not match the DNS-map name allowed.test",
             ),
@@ -1563,6 +1852,7 @@ mod tests {
                 Rejected::HostPortMismatch {
                     got: 8080,
                     want: 80,
+                    source: NameSource::DnsMap,
                 },
                 "Host port suffix :8080 does not match the original destination port 80",
             ),
@@ -1576,6 +1866,7 @@ mod tests {
                 Rejected::HostMismatch {
                     host: dom("evil.test"),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
                 "HTTP Host evil.test does not match the DNS-map name allowed.test",
             ),
@@ -1583,6 +1874,7 @@ mod tests {
                 Rejected::TargetMismatch {
                     target: "http://evil.test/".to_owned(),
                     name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
                 },
                 "absolute-form request target \"http://evil.test/\" does not match the DNS-map name allowed.test",
             ),
@@ -1650,7 +1942,9 @@ mod tests {
         // the three labels (#10's JSONL field).
         let decision = Decision {
             client: sock(SANDBOX_CLIENT),
-            orig_dst: Some(v4("203.0.113.7:443")),
+            via: Via::Transparent {
+                orig_dst: Some(v4("203.0.113.7:443")),
+            },
             name: Some(dom("allowed.test")),
             verdict: Verdict::Allowed {
                 name: dom("allowed.test"),
@@ -1671,7 +1965,7 @@ mod tests {
         // Denied/Error decisions delegate to the pinned sub-vocabularies.
         let d = Decision {
             client: sock(SANDBOX_CLIENT),
-            orig_dst: None,
+            via: Via::Transparent { orig_dst: None },
             name: None,
             verdict: denied,
         };
@@ -1768,7 +2062,7 @@ mod tests {
             "unknown fake IP 203.0.113.7 (no DNS-map entry)"
         );
         assert_eq!(decision.name, None);
-        assert_eq!(decision.orig_dst, Some(v4("203.0.113.7:443")));
+        assert_eq!(decision.orig_dst(), Some(v4("203.0.113.7:443")));
         assert_eq!(decision.client, sock(SANDBOX_CLIENT));
         assert_eq!(calls.load(Ordering::SeqCst), 0, "never connects");
     }
@@ -1873,7 +2167,7 @@ mod tests {
             }
         );
         assert_eq!(decision.name, Some(dom("allowed.test")));
-        assert_eq!(decision.orig_dst, Some(v4("203.0.113.7:443")));
+        assert_eq!(decision.orig_dst(), Some(v4("203.0.113.7:443")));
         assert_eq!(
             decision.reason(),
             "allowed allowed.test via 93.184.216.34:443"
@@ -2357,12 +2651,12 @@ mod tests {
             Verdict::Denied(Rejected::PortNotAllowed { port }) if f8 => {
                 assert_eq!(*port, listen_addr.port());
                 assert_eq!(
-                    decisions[0].orig_dst.map(|o| o.port()),
+                    decisions[0].orig_dst().map(|o| o.port()),
                     Some(listen_addr.port())
                 );
             }
             Verdict::Denied(Rejected::OriginalDst { .. }) if !f8 => {
-                assert_eq!(decisions[0].orig_dst, None);
+                assert_eq!(decisions[0].orig_dst(), None);
             }
             other => panic!("unexpected verdict: {other:?} (f8={f8})"),
         }
@@ -2545,6 +2839,81 @@ mod tests {
         assert_eq!(sink.recorded().len(), 1, "exactly one decision");
         assert!(result.is_err(), "shutdown must end serve with an error");
         drop(client);
+    }
+
+    /// [`spawn_serve`] over the explicit entry point (issue #8, Q9).
+    fn spawn_serve_explicit(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> ServeHandle {
+        let stopper = listener.try_clone().expect("try_clone for teardown");
+        let (tx, rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let result = runtime
+                .block_on(serve_explicit(listener, proxy))
+                .map(|never| match never {});
+            let _ = tx.send(result);
+        });
+        ServeHandle {
+            thread,
+            rx,
+            stopper,
+        }
+    }
+
+    #[test]
+    fn serve_explicit_flips_nonblocking_itself() {
+        // Same fdpass contract as serve: the listener arrives BLOCKING and
+        // serve_explicit flips it. One connection that closes before a
+        // complete head ⇒ exactly one recorded decision (Eof, pre-name).
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (connector, _calls) = never_connector();
+        let (proxy, sink) = proxy_with(
+            &["allowed.test"],
+            &[TLS_PORT],
+            StaticMap::default(),
+            connector,
+            Limits::default(),
+        );
+        let handle = spawn_serve_explicit(listener, proxy);
+        let client = std::net::TcpStream::connect(addr).expect("connect");
+        drop(client);
+        let deadline = Instant::now() + BOUND;
+        while Instant::now() < deadline && sink.recorded().is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = handle.stop();
+        assert_eq!(sink.recorded().len(), 1, "exactly one decision");
+        assert_eq!(
+            sink.recorded()[0].verdict,
+            Verdict::Denied(Rejected::Eof),
+            "the explicit accept path decided (not blocked in accept)"
+        );
+        assert!(
+            result.is_err(),
+            "shutdown must end serve_explicit with an error"
+        );
+    }
+
+    #[test]
+    fn serve_explicit_exits_on_listener_shutdown() {
+        // The shared accept loop's teardown: shutdown(Both) ⇒ EINVAL ⇒ Err,
+        // bounded — identical to the transparent serve.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let (connector, _calls) = never_connector();
+        let (proxy, _sink) =
+            proxy_with(&[], &[], StaticMap::default(), connector, Limits::default());
+        let handle = spawn_serve_explicit(listener, proxy);
+        let err = handle
+            .stop()
+            .expect_err("shutdown must end serve_explicit with an error");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EINVAL),
+            "the pinned EINVAL teardown path: {err}"
+        );
     }
 
     #[test]
