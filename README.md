@@ -23,7 +23,7 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#6). The CLI parses the full documented
+**In progress** (issues #2–#7). The CLI parses the full documented
 interface, and `check` is real: it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
@@ -45,7 +45,24 @@ full unmodified-bwrap invocation (allow-list mounts, a
 cleared-and-whitelisted environment, pid/ipc/uts/user isolation,
 `--disable-userns`, synthetic `/etc`), materializes the session's
 synthetic files, and discovers/validates the host bwrap (≥ 0.8); `run`
-(#10) wires it behind `__init`. `run` and `gc` are stubs
+(#10) wires it behind `__init`. The transparent egress proxy is real
+(issue #7): the parent serves the handed-off transparent listener fd,
+recovers the sandbox's dialed destination via `SO_ORIGINAL_DST`, maps
+fake IPs back to names through a DNS-map seam (#9 plugs in), and
+inspects — never terminates — the protocol preamble: TLS `ClientHello`
+SNI on 443 (rustls parser, no crypto provider, ECH denied) and the HTTP
+request line + `Host` on 80. Allowed names are resolved and dialed by
+name under the resolved-address guard — every resolved address, plus a
+connected-peer re-check as the DNS-rebinding backstop — then the
+buffered bytes are replayed and the connection is relayed, with the
+validated name binding enforced for the whole connection lifetime: HTTP
+heads are replayed with an inserted `Connection: close` (no keep-alive
+reuse past the validated request), and on 443 a relay-phase scanner
+tears the connection down on any second `ClientHello` (the post-HRR
+retry shape) — the library module docs record the accepted residuals;
+every connection produces exactly one audit decision with the pinned deny
+vocabulary through the sink seam #10 plugs into (whose `teardown` hook
+surfaces blocked relay-phase attacks). `run` and `gc` are stubs
 that exit `1` with `not implemented yet`. Exit codes: `0`
 success, `1` runtime failure (including an invalid or unreadable
 policy file), `2` usage error (clap's convention). The architecture
