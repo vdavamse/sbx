@@ -8,7 +8,7 @@ use super::RunError;
 use crate::host::EffectiveMode;
 use crate::host::classify;
 use crate::host::facts::RunFacts;
-use crate::init::fdpass::StagedFailure;
+use crate::init::fdpass::{AchievedMode, StagedFailure};
 use crate::policy::{self, NetworkMode};
 
 /// The refusal for a policy whose mode `__init` could not provide (staged
@@ -30,6 +30,28 @@ pub(crate) fn refusal(required: NetworkMode, f: &StagedFailure, facts: &RunFacts
     }
     reason.push_str("; run `sbx check` for a full host report");
     RunError::new(reason)
+}
+
+/// Parent-side guard (review #2): `__init` is told the policy's weakest
+/// acceptable mode with `--min-mode`, but the parent does not rely on that
+/// alone. An achieved `explicit` for a policy that requires `transparent` is
+/// refused with the same text a staged refusal gets (pinned by the test).
+pub(crate) fn achieved_refusal(required: NetworkMode, achieved: &AchievedMode) -> Option<RunError> {
+    match achieved {
+        AchievedMode::Explicit { errno, reason } if !EffectiveMode::Explicit.provides(required) => {
+            let stripped = reason.strip_prefix("nft-load: ").unwrap_or(reason);
+            Some(refusal(
+                required,
+                &StagedFailure {
+                    stage: crate::init::Stage::NftLoad,
+                    errno: *errno,
+                    reason: stripped.to_owned(),
+                },
+                &RunFacts::default(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn required_word(mode: NetworkMode) -> &'static str {
@@ -181,5 +203,33 @@ mod tests {
             let net = effective_network(&policy);
             assert_eq!(net, policy.network, "{mode}");
         }
+    }
+
+    #[test]
+    fn achieved_refusal_mapping() {
+        use crate::init::fdpass::AchievedMode;
+        let explicit = AchievedMode::Explicit {
+            errno: Some(2),
+            reason: "nft-load: batch failed (attempt 1/5, genid 1): No such file or directory (os error 2)".to_owned(),
+        };
+        // Transparent policy + explicit result: refused, same text as a staged refusal.
+        let err = achieved_refusal(NetworkMode::Transparent, &explicit).expect("refused");
+        assert!(err.reason().starts_with(
+            "policy requires network mode transparent but this host provides only explicit: nftables NAT redirect is unavailable"
+        ), "{}", err.reason());
+        assert!(
+            err.reason().contains("; fix: load the nftables modules"),
+            "{}",
+            err.reason()
+        );
+        assert!(
+            err.reason()
+                .ends_with("run `sbx check` for a full host report")
+        );
+        // Explicit and none policies accept the explicit result.
+        assert!(achieved_refusal(NetworkMode::Explicit, &explicit).is_none());
+        assert!(achieved_refusal(NetworkMode::None, &explicit).is_none());
+        // A transparent result never refuses.
+        assert!(achieved_refusal(NetworkMode::Transparent, &AchievedMode::Transparent).is_none());
     }
 }

@@ -29,6 +29,7 @@ const LANDLOCK_CREATE_RULESET_VERSION: libc::c_long = 1;
 const SYSCTL_APPARMOR_USERNS: &str = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns";
 const SYSCTL_USERNS_CLONE: &str = "/proc/sys/kernel/unprivileged_userns_clone";
 const SYSCTL_MAX_USERNS: &str = "/proc/sys/user/max_user_namespaces";
+const SYSCTL_MAX_NETNS: &str = "/proc/sys/user/max_net_namespaces";
 
 /// The three sysctls the classifier reads. `None` = absent, unreadable or
 /// unparseable.
@@ -37,16 +38,20 @@ pub struct Sysctls {
     pub apparmor_restrict_userns: Option<i64>,
     pub unprivileged_userns_clone: Option<i64>,
     pub max_user_namespaces: Option<i64>,
+    /// `user.max_net_namespaces`: a zero here makes unshare(CLONE_NEWNET) fail
+    /// with ENOSPC even when user namespaces are allowed (review #1).
+    pub max_net_namespaces: Option<i64>,
 }
 
 impl Sysctls {
-    /// Read the three sysctls.
+    /// Read the sysctls the classifier uses.
     pub fn read() -> Self {
         let get = |path: &str| fs::read_to_string(path).ok().and_then(|t| parse_sysctl(&t));
         Self {
             apparmor_restrict_userns: get(SYSCTL_APPARMOR_USERNS),
             unprivileged_userns_clone: get(SYSCTL_USERNS_CLONE),
             max_user_namespaces: get(SYSCTL_MAX_USERNS),
+            max_net_namespaces: get(SYSCTL_MAX_NETNS),
         }
     }
 }

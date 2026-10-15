@@ -48,6 +48,10 @@ const U_MAX_ZERO: (&str, &str) = (
     "user namespaces are disabled (user.max_user_namespaces = 0)",
     "sudo sysctl -w user.max_user_namespaces=15000",
 );
+const U_MAX_NET_ZERO: (&str, &str) = (
+    "no network namespace can be created here: user.max_net_namespaces = 0 (ENOSPC; user namespaces are allowed)",
+    "sudo sysctl -w user.max_net_namespaces=15000",
+);
 const U_ENOSPC: (&str, &str) = (
     "no user namespace can be created here: the limit is exhausted or nesting is forbidden (ENOSPC; for example inside bwrap --disable-userns)",
     "run sbx outside sandboxes that forbid nested user namespaces, or raise user.max_user_namespaces",
@@ -193,6 +197,9 @@ pub fn staged(f: &StagedFailure, facts: &RunFacts) -> Capability {
                 U_EPERM
             } else if e == Some(libc::ENOSPC) && facts.sysctl.max_user_namespaces == Some(0) {
                 U_MAX_ZERO
+            } else if e == Some(libc::ENOSPC) && facts.sysctl.max_net_namespaces == Some(0) {
+                // Review #1: the netns limit, not the userns one, is exhausted.
+                U_MAX_NET_ZERO
             } else if e == Some(libc::ENOSPC) {
                 U_ENOSPC
             } else if e == Some(libc::EUSERS) {
@@ -705,6 +712,7 @@ fn list_item<S: AsRef<str>>(
 mod tests {
     use super::super::test_support::*;
     use super::*;
+    use crate::host::facts::Sysctls;
     use crate::init::fdpass::StagedFailure;
 
     fn f(stage: Stage, errno: Option<i32>, reason: &str) -> StagedFailure {
@@ -723,6 +731,14 @@ mod tests {
         let clone0 = sysctls(Some(0), Some(0), None);
         let max0 = sysctls(Some(0), None, Some(0));
         let max_big = sysctls(Some(0), None, Some(2147483647));
+        let netns0 = RunFacts {
+            sysctl: Sysctls {
+                max_user_namespaces: Some(15000),
+                max_net_namespaces: Some(0),
+                ..Default::default()
+            },
+            seccomp: None,
+        };
         let seccomp2 = RunFacts {
             seccomp: Some(2),
             ..RunFacts::default()
@@ -787,6 +803,12 @@ mod tests {
                 max_big,
                 CapId::Userns,
                 U_ENOSPC,
+            ),
+            (
+                f(Stage::Unshare, Some(libc::ENOSPC), "x"),
+                netns0,
+                CapId::Userns,
+                U_MAX_NET_ZERO,
             ),
             (
                 f(Stage::Unshare, Some(libc::EUSERS), "x"),

@@ -98,7 +98,7 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
 sbx check [--json]
-sbx check --policy policy.json [--host] [--json]
+sbx check --policy policy.json --host [--json]
 sbx check --policy policy.json
 sbx check --print-schema
 sbx gc --older-than 7d ROOT
@@ -197,6 +197,7 @@ platform, the Kubernetes and Docker forms are given:
 | `userns` | `unshare` is not permitted (EPERM) | allow unprivileged user namespaces for this user (AppArmor/SELinux policy, seccomp, `kernel.unprivileged_userns_clone`) |
 | `userns` | `user.max_user_namespaces = 0` | `sudo sysctl -w user.max_user_namespaces=15000` |
 | `userns` | ENOSPC: the limit is exhausted or nesting is forbidden (for example inside `bwrap --disable-userns`) | run sbx outside sandboxes that forbid nested user namespaces, or raise `user.max_user_namespaces` |
+| `userns` | ENOSPC with `user.max_net_namespaces = 0` while user namespaces are allowed | `sudo sysctl -w user.max_net_namespaces=15000` |
 | `userns` | EUSERS: nested too deeply | run sbx at a shallower nesting level |
 | `userns` | EINVAL: no user or network namespace support | use a kernel built with `CONFIG_USER_NS=y` and `CONFIG_NET_NS=y` |
 | `userns` | the id maps cannot be written (`/proc/self/{setgroups,uid_map,gid_map}`) | allow writes to those files in a fresh user namespace (a read-only or masked `/proc` blocks them) |
@@ -302,7 +303,7 @@ same keys in the same order:
 `rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
 `duration_ms`, `output_truncated`, `dns_poisoned` and `net_mode` (`transparent`
 or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
-(setup never completed)ed; `net_mode` is the last key).
+(setup never completed); `net_mode` is the last key).
 
 ```json
 {"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}

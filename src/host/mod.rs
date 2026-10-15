@@ -363,6 +363,7 @@ pub(crate) mod test_support {
                 apparmor_restrict_userns: apparmor,
                 unprivileged_userns_clone: clone,
                 max_user_namespaces: max,
+                max_net_namespaces: None,
             },
             seccomp: None,
         }

@@ -621,6 +621,11 @@ fn execute(
             t0 + SETUP_TIMEOUT,
         ) {
             SetupEnd::Ready { fds, mode } => {
+                // Review #2: the parent refuses an explicit result the policy
+                // cannot accept, whatever `--min-mode` said.
+                if let Some(err) = mode::achieved_refusal(policy.network.mode, &mode) {
+                    return Err(Cause::Setup(err));
+                }
                 net_mode = Some(mode.label());
                 if let AchievedMode::Explicit { reason, .. } = &mode {
                     write_diagnostics(false, &[fallback_notice(reason, policy.network.mode)]);
