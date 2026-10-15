@@ -9,9 +9,12 @@
 //!    (a provably dead fd) and is stopped by ABORT (point 7). #10 spawns it
 //!    before the go byte, next to the transparent proxy.
 //! 2. **Never forwards.** There is no upstream resolver, no resolver code and
-//!    no TCP DNS. TCP/53 is not served here: it reaches the transparent
-//!    proxy, which denies it (`PortNotAllowed`) unless a policy lists port 53,
-//!    in which case it gets `NoInspector`.
+//!    no TCP DNS. TCP to `127.0.0.1:53` (the `resolv.conf` target, i.e. the
+//!    usual stub fallback) is local, so the nft REDIRECT skips it and the
+//!    connect is refused with no audit record. TCP/53 to any other address
+//!    reaches the transparent proxy: `PortNotAllowed` unless a policy lists
+//!    port 53; then `UnknownFakeIp` for a non-fake address (the map lookup
+//!    runs first) and `NoInspector` for an allocated fake IP.
 //! 3. **Pipeline (per datagram, [`DnsServer::handle_datagram`]).** The raw-byte
 //!    header gate runs before the protocol library, so an attacker-chosen
 //!    section count never reaches the decoder. Then: decode, EDNS version,
@@ -22,8 +25,8 @@
 //! 4. **Answers.** Allowed names: A gets one fake IP at TTL [`FAKE_TTL`];
 //!    every other qtype gets NODATA (NOERROR, empty), Q2. Any other name, any
 //!    class other than IN (REFUSED), any opcode other than QUERY (NOTIMP) and
-//!    any malformed query get the error rcodes in the table on
-//!    [`DnsVerdict::rcode`]. TC is never set (replies stay far under 512
+//!    any malformed query get the error rcodes returned by
+//!    [`DnsVerdict::rcode`] (pinned in the tests). TC is never set (replies stay far under 512
 //!    bytes). A PTR for a fake IP is NXDOMAIN (Q14, D6). CD is cleared and AD
 //!    is never set: the resolver is not DNSSEC-aware (RFC 1035 Z rule). Negative
 //!    answers carry no SOA, unlike RFC 2308 suggests; that is intentional, the
