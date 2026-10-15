@@ -238,8 +238,6 @@ pub(crate) fn open_audit(path: &Path) -> Result<File, RunError> {
 
 struct AuditState {
     file: File,
-    /// Bytes this run has appended so far (the truncate-back target on a failed write).
-    size: u64,
     /// The first write failure, verbatim (M1: fail closed, reported by the caller).
     failure: Option<String>,
     finished: bool,
@@ -256,10 +254,8 @@ impl AuditLog {
     pub(crate) fn new(file: Option<File>, latch: Arc<FaultLatch>) -> Arc<Self> {
         Arc::new(Self {
             inner: file.map(|file| {
-                let size = file.metadata().map(|m| m.len()).unwrap_or(0);
                 Mutex::new(AuditState {
                     file,
-                    size,
                     failure: None,
                     finished: false,
                 })
@@ -274,24 +270,36 @@ impl AuditLog {
             .map(|m| m.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Appends one row with ONE write(2). A short write or an error truncates
-    /// the file back to the size before the write, so a failed row never leaves a
-    /// torn line behind, and the failure is returned verbatim.
-    fn append(state: &mut AuditState, bytes: &[u8]) -> Result<(), String> {
-        let result = match state.file.write(bytes) {
-            Ok(n) if n == bytes.len() => {
-                state.size += n as u64;
-                return Ok(());
-            }
-            Ok(n) => format!("short write: {n} of {} bytes", bytes.len()),
-            Err(err) => err.to_string(),
-        };
-        // SAFETY: ftruncate on the fd this log owns; a failure here is ignored
-        // (the run fails closed either way).
-        unsafe {
-            libc::ftruncate(state.file.as_raw_fd(), state.size as libc::off_t);
+    /// Appends one row with ONE write(2) under an advisory `flock(LOCK_EX)` on the
+    /// shared file. The pre-write offset is the REAL end of file (fstat under the
+    /// lock), never a snapshot: several runs may share one `--audit` file, and a
+    /// failed write must only remove this write's own bytes (review 2). A short write
+    /// or an error truncates the file back to that offset, so no torn row is left.
+    fn append(file: &File, bytes: &[u8]) -> Result<(), String> {
+        let fd = file.as_raw_fd();
+        // SAFETY: flock on the fd this log owns; LOCK_EX waits for other writers.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error().to_string());
         }
-        Err(result)
+        let result = (|| {
+            let pre = file.metadata().map_err(|err| err.to_string())?.len();
+            // O_APPEND: this write lands at the real EOF, which the lock keeps stable.
+            let failure = match (&*file).write(bytes) {
+                Ok(n) if n == bytes.len() => return Ok(()),
+                Ok(n) => format!("short write: {n} of {} bytes", bytes.len()),
+                Err(err) => err.to_string(),
+            };
+            // SAFETY: ftruncate on the fd this log owns, back to the pre-write EOF.
+            unsafe {
+                libc::ftruncate(fd, pre as libc::off_t);
+            }
+            Err(failure)
+        })();
+        // SAFETY: releasing the lock taken above on the same fd.
+        unsafe {
+            libc::flock(fd, libc::LOCK_UN);
+        }
+        result
     }
 
     /// Fail closed (Q7): the first write error latches a fault; later rows are
@@ -301,7 +309,7 @@ impl AuditLog {
         if state.failure.is_some() || state.finished {
             return;
         }
-        if let Err(text) = Self::append(&mut state, &line(row)) {
+        if let Err(text) = Self::append(&state.file, &line(row)) {
             self.latch.trip(Fault::Audit(text.clone()));
             state.failure = Some(text);
         }
@@ -312,7 +320,7 @@ impl AuditLog {
     pub(crate) fn finish(&self, row: &Row) {
         let Some(mut state) = self.lock() else { return };
         if state.failure.is_none() {
-            if let Err(text) = Self::append(&mut state, &line(row)) {
+            if let Err(text) = Self::append(&state.file, &line(row)) {
                 self.latch.trip(Fault::Audit(text.clone()));
                 state.failure = Some(text);
             }

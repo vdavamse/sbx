@@ -58,7 +58,7 @@ use std::convert::Infallible;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -209,6 +209,8 @@ struct Conclusion {
     poisoned: bool,
     stragglers: bool,
     cap: u64,
+    /// The forwarded stderr ends mid-line: start sbx's lines on a fresh line.
+    stderr_partial: bool,
 }
 
 /// The final step of every run that got past S5: M1 (an audit write failure
@@ -226,19 +228,39 @@ fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: 
         ));
         mark_audit_failure(&mut outcome, audit);
     }
+    let mut lines = Vec::new();
     if let Some(line) = sbx_diagnostic(&outcome) {
-        eprintln!("{line}");
+        lines.push(line);
     }
     if facts.truncated {
-        eprintln!(
+        lines.push(format!(
             "sbx run: output truncated at {} bytes (limits.output_bytes)",
             facts.cap
-        );
+        ));
     }
     if facts.stragglers {
-        eprintln!("sbx run: sandbox did not exit within 5s of SIGKILL");
+        lines.push("sbx run: sandbox did not exit within 5s of SIGKILL".to_owned());
     }
+    write_diagnostics(facts.stderr_partial, &lines);
     std::process::exit(exit_code(&outcome))
+}
+
+/// Writes sbx's own stderr lines, best effort (review 4): a closed or broken stderr
+/// must never panic or change the exit code, so errors are ignored and nothing here
+/// uses `eprintln!`. A partial line of forwarded payload stderr is terminated first
+/// (review 3), so sbx's text is never glued onto the payload's last bytes.
+fn write_diagnostics(partial: bool, lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut out = io::stderr().lock();
+    if partial {
+        let _ = out.write_all(b"\n");
+    }
+    for line in lines {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = out.flush();
 }
 
 /// M1: a recorded audit write failure turns any non-failed outcome into the
@@ -286,7 +308,7 @@ fn report_failure(reason: &str, t0: Instant, audit: Option<&AuditLog>) -> ExitCo
             false,
         ));
     }
-    eprintln!("sbx run: {reason}");
+    write_diagnostics(false, &[format!("sbx run: {reason}")]);
     ExitCode::from(EXIT_FAILURE as u8)
 }
 
@@ -422,13 +444,23 @@ fn execute(
     t0: Instant,
     audit_slot: &mut Option<Arc<AuditLog>>,
 ) -> Result<Infallible, Early> {
+    // S3 first: the policy is read BEFORE any signal is blocked (review 5). The open
+    // is non-blocking and a non-regular file is refused, so a FIFO or device cannot
+    // hang the run with the signals masked.
+    let policy = load_policy(&args.policy)?;
+
     // S1–S2: signal state before any thread and before any spawn.
     sys::reset_sigchld();
     let signals = sys::Signals::install()
         .map_err(|err| RunError::new(format!("cannot block signals: {err}")))?;
 
-    // S3: policy, mode, timeout, paths.
-    let policy = Policy::from_file(&args.policy).map_err(|err| RunError::new(err.to_string()))?;
+    // S3: mode, timeout, paths.
+    let rw_roots: Vec<PathBuf> = policy
+        .filesystem
+        .rw
+        .iter()
+        .map(|p| p.as_path().to_path_buf())
+        .collect();
     check_mode(policy.network.mode, PROVIDED_MODE)?;
     let timeout = effective_timeout(args.timeout, policy.limits.timeout);
     let deadline = deadline_from(t0, timeout);
@@ -439,10 +471,14 @@ fn execute(
     };
     if let Some(path) = &audit_path {
         if audit_inside_session(path, &session) {
-            return Err(RunError::new(format!(
-                "--audit must not be inside the session directory ({path:?})"
-            ))
-            .into());
+            return Err(refused(Writable::Session, path).into());
+        }
+        // Review 1: a policy rw path is writable by the payload exactly like the
+        // session directory, so the audit log must not live under one either.
+        for root in &rw_roots {
+            if audit_inside_session(path, root) {
+                return Err(refused(Writable::PolicyRw, path).into());
+            }
         }
     }
 
@@ -454,9 +490,10 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot create the fault latch: {err}")))?;
     let audit_file = match &audit_path {
         Some(path) => {
-            check_real_audit_location(path, &session)?;
+            let roots = writable_roots(&session, &rw_roots)?;
+            check_real_audit_location(path, &roots)?;
             let file = open_audit(path)?;
-            check_opened_audit_location(&file, &session)?;
+            check_opened_audit_location(&file, &roots)?;
             Some(file)
         }
         None => None,
@@ -607,14 +644,15 @@ fn execute(
         Ok(()) => main_loop(&mut sb, &signals, &latch, deadline, timeout),
         Err(cause) => cause,
     };
-    let (outcome, truncated, stragglers) = teardown(sb, cause, pumps);
+    let (outcome, end, stragglers) = teardown(sb, cause, pumps);
     let _ = lock.touch();
     conclude(
         outcome,
         Some(&audit),
         t0,
         Conclusion {
-            truncated,
+            truncated: end.truncated,
+            stderr_partial: end.stderr_partial,
             poisoned: map.poisoned(),
             stragglers,
             cap: policy.limits.output_bytes,
@@ -622,49 +660,106 @@ fn execute(
     )
 }
 
-/// M2: the audit path's REAL location (symlinked parents resolved) must not be
-/// inside the session directory. Checked before the open, so a refused path
-/// never creates a file. The session directory exists by now (S4).
-fn check_real_audit_location(path: &Path, session: &Path) -> Result<(), RunError> {
-    let refused = || {
-        RunError::new(format!(
+/// Which writable location an audit path collides with (for the pinned messages).
+#[derive(Clone, Copy)]
+enum Writable {
+    Session,
+    PolicyRw,
+}
+
+fn refused(kind: Writable, path: &Path) -> RunError {
+    match kind {
+        Writable::Session => RunError::new(format!(
             "--audit must not be inside the session directory ({path:?})"
+        )),
+        Writable::PolicyRw => RunError::new(format!(
+            "--audit must not be inside a writable policy path ({path:?})"
+        )),
+    }
+}
+
+/// The canonical writable roots: the session directory and every policy `rw` path
+/// that exists (a missing rw path cannot contain the log).
+fn writable_roots(session: &Path, rw: &[PathBuf]) -> Result<Vec<(Writable, PathBuf)>, RunError> {
+    let real_session = std::fs::canonicalize(session).map_err(|err| {
+        RunError::new(format!(
+            "cannot resolve session directory {session:?}: {err}"
         ))
-    };
+    })?;
+    let mut roots = vec![(Writable::Session, real_session)];
+    for path in rw {
+        if let Ok(real) = std::fs::canonicalize(path) {
+            roots.push((Writable::PolicyRw, real));
+        }
+    }
+    Ok(roots)
+}
+
+/// M2 (and review 1): the audit path's REAL parent must not be inside any writable
+/// root. Checked before the open, so a refused path never creates a file.
+fn check_real_audit_location(path: &Path, roots: &[(Writable, PathBuf)]) -> Result<(), RunError> {
     let parent = path.parent().unwrap_or(Path::new("/"));
     let real_parent = std::fs::canonicalize(parent).map_err(|err| {
         RunError::new(format!(
             "cannot resolve audit log directory {parent:?}: {err}"
         ))
     })?;
-    let real_session = std::fs::canonicalize(session).map_err(|err| {
-        RunError::new(format!(
-            "cannot resolve session directory {session:?}: {err}"
-        ))
-    })?;
-    if real_parent.starts_with(&real_session) {
-        return Err(refused());
+    for (kind, root) in roots {
+        if real_parent.starts_with(root) {
+            return Err(refused(*kind, path));
+        }
     }
     Ok(())
 }
 
 /// M2, after the open: the descriptor's real path (`/proc/self/fd/N`) must not be
-/// inside the session directory either (defence in depth against a raced symlink).
-fn check_opened_audit_location(file: &File, session: &Path) -> Result<(), RunError> {
+/// inside any writable root either (defence in depth against a raced symlink).
+fn check_opened_audit_location(file: &File, roots: &[(Writable, PathBuf)]) -> Result<(), RunError> {
     use std::os::fd::AsRawFd;
-    let real_session = std::fs::canonicalize(session).map_err(|err| {
-        RunError::new(format!(
-            "cannot resolve session directory {session:?}: {err}"
-        ))
-    })?;
     let real = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|err| RunError::new(format!("cannot resolve the audit log path: {err}")))?;
-    if real.starts_with(&real_session) {
-        return Err(RunError::new(format!(
-            "--audit must not be inside the session directory ({real:?})"
-        )));
+    for (kind, root) in roots {
+        if real.starts_with(root) {
+            return Err(refused(*kind, &real));
+        }
     }
     Ok(())
+}
+
+/// Reads the policy through a non-blocking open (review 5): a FIFO, device or other
+/// non-regular file is refused instead of blocking the run. Errors keep the
+/// `Policy::from_file` wording.
+fn load_policy(path: &Path) -> Result<Policy, RunError> {
+    use std::io::Read;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|err| RunError::new(format!("cannot read {}: {err}", path.display())))?;
+    let meta = file
+        .metadata()
+        .map_err(|err| RunError::new(format!("cannot read {}: {err}", path.display())))?;
+    if !meta.file_type().is_file() {
+        let kind = if meta.file_type().is_fifo() {
+            "a FIFO"
+        } else {
+            "not a regular file"
+        };
+        return Err(RunError::new(format!(
+            "policy {} is {kind}; expected a regular file",
+            path.display()
+        )));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|err| {
+        if err.kind() == io::ErrorKind::InvalidData {
+            RunError::new(format!("{} is not valid UTF-8", path.display()))
+        } else {
+            RunError::new(format!("cannot read {}: {err}", path.display()))
+        }
+    })?;
+    Policy::from_json_str(&text).map_err(|err| RunError::new(err.to_string()))
 }
 
 #[cfg(test)]

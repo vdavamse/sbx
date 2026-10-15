@@ -128,13 +128,24 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 |---|---|---|---|
 | the command exits N | N | `exited` | none |
 | the command is killed by a signal (bwrap reports it as 128+N) | 128+N | `exited` | none |
+| the sandbox itself is killed by a signal sbx did not send (for example the OOM killer; 137 for SIGKILL) | 128+N | `signaled` | `sbx run: sandbox killed by signal N (NAME)` |
 | `--timeout` / policy `limits.timeout` elapsed | 124 | `timeout` | `sbx run: timed out after 90s` |
 | sbx received SIGTERM / SIGINT / SIGHUP / SIGQUIT | 143 / 130 / 129 / 131 | `terminated` | `sbx run: terminated by SIGTERM` |
 | an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
 | a usage error | 2 | — | clap's message |
 
-A payload that exits 124, 125 or 128+N is indistinguishable from sbx's own
-codes by exit status alone; the audit `outcome` says which it was. A failure
+The audit row's `outcome` is one of: `exited` (the command ended by itself, or
+was killed by a signal bwrap relayed as 128+N), `signaled` (the sandbox, not
+the command, was killed by a signal sbx did not send), `timeout`, `terminated`
+(sbx received TERM/INT/HUP/QUIT) and `failed` (an sbx failure, including an
+audit write failure). A payload that exits 124, 125 or 128+N is
+indistinguishable from sbx's own codes by exit status alone; the audit
+`outcome` says which it was.
+
+If the sandbox does not report its exit within 5 seconds of the SIGKILL that
+sbx sent at teardown, sbx prints `sbx run: sandbox did not exit within 5s of
+SIGKILL` and keeps the rc it computed. The diagnostic reports that teardown
+took longer than its 5-second budget; it does not change the exit status. A failure
 after the payload started (for example `execvp` of a missing binary, rc 1) keeps
 the status of the failing stage and is printed by that stage.
 

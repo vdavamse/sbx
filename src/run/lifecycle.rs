@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use super::serve::{Fault, FaultLatch};
 use super::spawn::{open_pid1, parse_info, pid1_from_children};
-use super::stdio::Pumps;
+use super::stdio::{PumpEnd, Pumps};
 use super::sys::{self, Signals, pollfd, ready};
 use super::{INFO_MAX_BYTES, Outcome, PUMP_DRAIN_TIMEOUT, RunError, TEARDOWN_TIMEOUT};
 
@@ -213,7 +213,7 @@ pub(crate) fn teardown(
     mut sb: Sandbox,
     cause: Cause,
     pumps: Option<Pumps>,
-) -> (Outcome, bool, bool) {
+) -> (Outcome, PumpEnd, bool) {
     let mut stragglers = false;
     if sb.go_sent {
         // T2: pid 1 may still be unknown; give bwrap a short grace to report.
@@ -264,8 +264,10 @@ pub(crate) fn teardown(
     let status = sb.child.wait().ok();
     // T6: pumps see EOF once every write end died with the namespace.
     let outcome = outcome_of(cause, status);
-    let truncated = pumps.is_some_and(|p| p.finish(Instant::now() + PUMP_DRAIN_TIMEOUT));
-    (outcome, truncated, stragglers)
+    let end = pumps
+        .map(|p| p.finish(Instant::now() + PUMP_DRAIN_TIMEOUT))
+        .unwrap_or_default();
+    (outcome, end, stragglers)
 }
 
 #[cfg(test)]

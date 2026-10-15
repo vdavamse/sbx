@@ -567,6 +567,36 @@ fn scenarios() -> Vec<Scenario> {
             run: output_cap,
         },
         Scenario {
+            name: "audit-under-policy-rw-125",
+            gate: Always,
+            run: audit_under_policy_rw_125,
+        },
+        Scenario {
+            name: "policy-fifo-125",
+            gate: Always,
+            run: policy_fifo_125,
+        },
+        Scenario {
+            name: "closed-stderr-rc-125",
+            gate: Always,
+            run: closed_stderr_rc_125,
+        },
+        Scenario {
+            name: "closed-stderr-rc-124",
+            gate: Bwrap,
+            run: closed_stderr_rc_124,
+        },
+        Scenario {
+            name: "shared-audit-two-writers",
+            gate: Bwrap,
+            run: shared_audit_two_writers,
+        },
+        Scenario {
+            name: "partial-stderr-framing",
+            gate: Bwrap,
+            run: partial_stderr_framing,
+        },
+        Scenario {
             name: "output-epipe",
             gate: Bwrap,
             run: output_epipe,
@@ -667,6 +697,7 @@ struct Pol {
     ports: Vec<u16>,
     timeout: &'static str,
     output_bytes: u64,
+    rw: Vec<String>,
     role: Option<String>,
     env_set: Vec<(String, String)>,
     env_pass: Vec<String>,
@@ -680,6 +711,7 @@ impl Pol {
             ports: Vec::new(),
             timeout: "30s",
             output_bytes: 1 << 20,
+            rw: Vec::new(),
             role: Some(role.to_owned()),
             env_set: Vec::new(),
             env_pass: Vec::new(),
@@ -716,8 +748,14 @@ impl Pol {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}],"rw":[],"deny":[]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
+            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}],"rw":[{rw}],"deny":[]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
             mode = self.mode,
+            rw = self
+                .rw
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
             timeout = self.timeout,
             out = self.output_bytes,
         )
@@ -1472,41 +1510,83 @@ fn tty_never_inherited() -> Result<(), String> {
     Ok(())
 }
 
+/// The flood payload writes only `x` bytes (no newlines), so every `x` on stdout or
+/// stderr is a payload byte, and sbx's own lines (framing newline, notice) are not.
+fn payload_x_bytes(done: &Done) -> usize {
+    // sbx's own `sbx run: …` line contains an `x` ("sbx"): strip it first.
+    let stderr = match done.stderr.find("sbx run: ") {
+        Some(at) if at == 0 || done.stderr.as_bytes()[at - 1] == b'\n' => &done.stderr[..at],
+        _ => done.stderr.as_str(),
+    };
+    done.stdout
+        .bytes()
+        .chain(stderr.bytes())
+        .filter(|b| *b == b'x')
+        .count()
+}
+
 fn output_cap() -> Result<(), String> {
     let dir = scratch("cap");
     let mut pol = Pol::new("flood");
     pol.output_bytes = 1000;
     let policy = pol.write(&dir);
+    let audit = dir.join("a.jsonl");
     let args = sbx_args(
         &policy,
         &dir.join("s"),
-        &["--audit", dir.join("a.jsonl").to_str().expect("utf8")],
+        &["--audit", audit.to_str().expect("utf8")],
         &payload(&["10000"]),
     );
     let done = run_sbx(&args)?;
-    expect_rc(&done, 0)?;
-    let rows = read_audit(&dir.join("a.jsonl"))?;
+    let rows = read_audit(&audit)?;
     let _ = fs::remove_dir_all(&dir);
-    // sbx's own `sbx run:` diagnostics are never counted against the cap.
-    let payload_bytes: usize = done.stdout.len()
-        + done
-            .stderr
-            .lines()
-            .filter(|l| !l.starts_with("sbx run: "))
-            .map(|l| l.len() + 1)
-            .sum::<usize>();
-    if payload_bytes != 1000 {
-        return Err(format!(
-            "forwarded {payload_bytes} payload bytes, want 1000"
-        ));
+    expect_rc(&done, 0)?;
+    let x = payload_x_bytes(&done);
+    if x != 1000 {
+        return Err(format!("forwarded {x} payload bytes, want 1000"));
     }
-    let last = done.stderr.lines().last().unwrap_or("");
-    if last != "sbx run: output truncated at 1000 bytes (limits.output_bytes)" {
-        return Err(format!("truncation notice missing: {last:?}"));
+    // The notice is sbx's own final line, on its own line (review 3).
+    let notice = "sbx run: output truncated at 1000 bytes (limits.output_bytes)\n";
+    if !done.stderr.ends_with(notice) {
+        return Err(format!("truncation notice missing: {:?}", done.stderr));
+    }
+    let head = &done.stderr[..done.stderr.len() - notice.len()];
+    if !head.is_empty() && !head.ends_with('\n') {
+        return Err(format!("notice glued to a payload line: {:?}", done.stderr));
     }
     let exit = rows.last().ok_or("no audit rows")?;
     if exit["output_truncated"] != true {
         return Err(format!("exit row output_truncated: {exit}"));
+    }
+    Ok(())
+}
+
+/// Review 3 (the CI failure): a payload that stops mid-line on stderr must not have
+/// sbx's diagnostic glued onto that line. sbx starts its own line.
+fn partial_stderr_framing() -> Result<(), String> {
+    let dir = scratch("framing2");
+    let policy = Pol::new("exit").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--timeout", "1s"],
+        &[
+            OsString::from("/usr/bin/bash"),
+            OsString::from("-c"),
+            OsString::from("printf partial >&2; sleep 30"),
+        ],
+    );
+    let done = run_sbx(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 124)?;
+    if !done
+        .stderr
+        .starts_with("partial\nsbx run: timed out after 1s\n")
+    {
+        return Err(format!(
+            "diagnostic glued to the partial line: {:?}",
+            done.stderr
+        ));
     }
     Ok(())
 }
@@ -2063,6 +2143,162 @@ fn init_sigmask_reset() -> Result<(), String> {
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         ));
+    }
+    Ok(())
+}
+
+/// Review 1: `--audit` under a policy `rw` path is refused (the payload can write
+/// there), before anything is spawned.
+fn audit_under_policy_rw_125() -> Result<(), String> {
+    let dir = scratch("rwaudit");
+    let rw = dir.join("rw");
+    fs::create_dir_all(&rw).expect("mkdir");
+    let mut pol = Pol::new("exit");
+    pol.rw = vec![rw.to_str().expect("utf8").to_owned()];
+    let policy = pol.write(&dir);
+    let audit = rw.join("a.jsonl");
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--audit", audit.to_str().expect("utf8")],
+        &payload(&["0"]),
+    );
+    let r = expect_refusal(&args, "--audit must not be inside a writable policy path");
+    let created = audit.exists();
+    let _ = fs::remove_dir_all(&dir);
+    r?;
+    if created {
+        return Err("the audit file was created under the rw path".into());
+    }
+    Ok(())
+}
+
+/// Review 5: a FIFO policy is refused promptly (no blocking open with signals masked).
+fn policy_fifo_125() -> Result<(), String> {
+    let dir = scratch("fifo");
+    let fifo = dir.join("policy.json");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("cstr");
+    // SAFETY: mkfifo on a path in our scratch directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let args = sbx_args(&fifo, &dir.join("s"), &[], &payload(&["0"]));
+    let proc_ = Proc::spawn(&args, |_| {})?;
+    let done = proc_.finish(Duration::from_secs(10))?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 125)?;
+    expect_stderr(&done, "is a FIFO; expected a regular file")
+}
+
+/// Runs sbx with its stderr pipe's read end already closed (what `2>&1 | true` does).
+fn run_with_closed_stderr(args: &[OsString]) -> Result<ExitStatus, String> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe2 writes two fds into the array; the read end is closed at once.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err("pipe2 failed".into());
+    }
+    // SAFETY: fresh fds from pipe2; the read end is closed immediately (EPIPE on write).
+    unsafe { libc::close(fds[0]) };
+    // SAFETY: the write end is ours; OwnedFd closes it when the Stdio is consumed.
+    let stderr = Stdio::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) });
+    Command::new(SBX)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .status()
+        .map_err(|e| format!("spawn sbx: {e}"))
+}
+
+/// Review 4: a closed stderr must not panic the run (101) — the 125 is kept.
+fn closed_stderr_rc_125() -> Result<(), String> {
+    let dir = scratch("cs125");
+    let policy = dir.join("missing.json");
+    let args = sbx_args(&policy, &dir.join("s"), &[], &payload(&["0"]));
+    let status = run_with_closed_stderr(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    if status.code() == Some(125) {
+        Ok(())
+    } else {
+        Err(format!("rc {:?}, want 125", status.code()))
+    }
+}
+
+/// Review 4: a closed stderr must not panic the run — the timeout's 124 is kept.
+fn closed_stderr_rc_124() -> Result<(), String> {
+    let dir = scratch("cs124");
+    let policy = Pol::new("ready-sleep").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--timeout", "1s"],
+        &payload(&["30"]),
+    );
+    let status = run_with_closed_stderr(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    if status.code() == Some(124) {
+        Ok(())
+    } else {
+        Err(format!("rc {:?}, want 124", status.code()))
+    }
+}
+
+/// Review 2: two runs share one `--audit` file. Run A is started first (its pre-write
+/// size snapshot is taken at open), run B appends its rows, then A's exit-row write
+/// fails under RLIMIT_FSIZE. A's truncate-back must only remove A's own bytes: B's
+/// rows must survive, and the file must not be shorter than it was before A's write.
+fn shared_audit_two_writers() -> Result<(), String> {
+    let dir = scratch("shared");
+    let audit = dir.join("shared.jsonl");
+    let prefill = vec![b'\n'; 900];
+    fs::write(&audit, &prefill).expect("prefill");
+    let audit_str = audit.to_str().expect("utf8").to_owned();
+    // Run A: waits, and its exit row cannot be written (the file is past the limit).
+    fs::create_dir_all(dir.join("a")).expect("mkdir");
+    let a_policy = Pol::new("ready-sleep").write(&dir.join("a"));
+    let a_args = sbx_args(
+        &a_policy,
+        &dir.join("a").join("s"),
+        &["--audit", &audit_str],
+        &payload(&["30"]),
+    );
+    let a = Proc::spawn(&a_args, |cmd| {
+        // SAFETY: setrlimit and signal(3) only, between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                let lim = libc::rlimit {
+                    rlim_cur: 1024,
+                    rlim_max: 1024,
+                };
+                libc::setrlimit(libc::RLIMIT_FSIZE, &lim);
+                libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+    })?;
+    a.wait_stdout("READY")?;
+    // Run B: unlimited, completes, appends its exit row to the same file.
+    fs::create_dir_all(dir.join("b")).expect("mkdir");
+    let b_policy = Pol::new("exit").write(&dir.join("b"));
+    let b_args = sbx_args(
+        &b_policy,
+        &dir.join("b").join("s"),
+        &["--audit", &audit_str],
+        &payload(&["0"]),
+    );
+    let b = run_sbx(&b_args)?;
+    expect_rc(&b, 0)?;
+    // Now A ends: its exit row write fails, and must not erase B's row.
+    // SAFETY: signalling our own child process by pid.
+    unsafe { libc::kill(a.child.id() as libc::pid_t, libc::SIGTERM) };
+    let a_done = a.finish(Duration::from_secs(30))?;
+    let content = fs::read_to_string(&audit).unwrap_or_default();
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&a_done, 125)?;
+    let b_rows = content
+        .lines()
+        .filter(|l| l.contains("\"event\":\"exit\"") && l.contains("\"code\":0"))
+        .count();
+    if b_rows != 1 {
+        return Err(format!("run B's exit row was erased or torn: {content:?}"));
     }
     Ok(())
 }

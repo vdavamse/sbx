@@ -21,6 +21,8 @@ pub(crate) struct OutputBudget {
     truncated: AtomicBool,
     /// Set when `Pumps::finish` returns: no pump may forward anything after that (m8).
     closed: AtomicBool,
+    /// The forwarded stderr ends mid-line: sbx must start its own line with a newline.
+    stderr_partial: AtomicBool,
 }
 
 impl OutputBudget {
@@ -29,6 +31,7 @@ impl OutputBudget {
             remaining: AtomicU64::new(cap),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            stderr_partial: AtomicBool::new(false),
         })
     }
 
@@ -56,6 +59,15 @@ impl OutputBudget {
 
     pub(crate) fn truncated(&self) -> bool {
         self.truncated.load(Ordering::SeqCst)
+    }
+
+    /// Records the last byte forwarded to stderr (review 3: framing of sbx's lines).
+    pub(crate) fn note_stderr_tail(&self, last: u8) {
+        self.stderr_partial.store(last != b'\n', Ordering::SeqCst);
+    }
+
+    pub(crate) fn stderr_partial(&self) -> bool {
+        self.stderr_partial.load(Ordering::SeqCst)
     }
 
     pub(crate) fn close(&self) {
@@ -117,9 +129,14 @@ pub(crate) fn pump(src: OwnedFd, dst: RawFd, budget: Arc<OutputBudget>, done: mp
             break; // the run is concluding: forward nothing more (m8)
         }
         let grant = budget.take(n as u64) as usize;
-        if grant > 0 && write_all_fd(dst, &buf[..grant]).is_err() {
-            // Caller side gone: stop and drop the read end, so the payload sees EPIPE.
-            break;
+        if grant > 0 {
+            if write_all_fd(dst, &buf[..grant]).is_err() {
+                // Caller side gone: stop and drop the read end, so the payload sees EPIPE.
+                break;
+            }
+            if dst == 2 {
+                budget.note_stderr_tail(buf[grant - 1]);
+            }
         }
     }
     drop(src);
@@ -139,6 +156,15 @@ fn pump_stdin(dst: OwnedFd) {
             }
         }
     }
+}
+
+/// What the pumps forwarded, as the end of the run needs it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PumpEnd {
+    /// The output cap was hit.
+    pub truncated: bool,
+    /// The forwarded stderr ends mid-line.
+    pub stderr_partial: bool,
 }
 
 /// The running pumps. The stdin pump is never joined (it may sit in read(0)).
@@ -192,8 +218,7 @@ impl Pumps {
     }
 
     /// Waits for both OUTPUT pumps to reach EOF or exit, until `deadline`.
-    /// Returns whether the output cap was hit.
-    pub(crate) fn finish(self, deadline: Instant) -> bool {
+    pub(crate) fn finish(self, deadline: Instant) -> PumpEnd {
         for _ in 0..self.outputs {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if self.done.recv_timeout(remaining).is_err() {
@@ -203,7 +228,10 @@ impl Pumps {
         // Close the gate before the diagnostics are written (m8): a pump that is
         // still reading drains without forwarding from here on.
         self.budget.close();
-        self.budget.truncated()
+        PumpEnd {
+            truncated: self.budget.truncated(),
+            stderr_partial: self.budget.stderr_partial(),
+        }
     }
 }
 
