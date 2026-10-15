@@ -25,6 +25,15 @@
 //!   TEST-NET-3 (`203.0.113.7`, unmapped twin `203.0.113.9`) under the
 //!   real redirect. Teardown is the pinned `shutdown(SHUT_RDWR)` →
 //!   accept-EINVAL path with bounded joins.
+//! * `dns-*-netns` (issue #9) — the `Gate::Userns` tier with the parent's
+//!   fake-IP resolver serving the handed-off `:53` fd before the go byte
+//!   (`MapSpec::Fake`): child roles are a hand-rolled DNS client, the parent
+//!   checks every decision and the shared `FakeIpMap`; AC3 is the DNS answer
+//!   followed by a relayed connect, AC4 the pool-exhaustion REFUSED.
+//! * `Gate::Bwrap` — `getent-hosts-*-bwrap` (issue #9 AC1/AC2): the production
+//!   bwrap argv (env-clear spawn, process group) runs `/usr/bin/getent hosts`
+//!   inside the sandbox; SKIPs unless bwrap and getent are both present. CI
+//!   installs bubblewrap on the ubuntu runner.
 //!
 //! Payload lines are `SBX-PT-MARKER`-prefixed on stdout; denial roles
 //! share an `expect_close` helper accepting a clean EOF OR `ECONNRESET`
@@ -53,6 +62,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use sbx::dns::{
+    DnsDecision, DnsLimits, DnsRejected, DnsServer, DnsSink, DnsVerdict, FAKE_TTL, FakeIpMap,
+    serve_dns,
+};
 use sbx::init::fdpass;
 use sbx::policy::{self, Domain};
 use sbx::proxy::hello::build_client_hello;
@@ -90,8 +103,11 @@ fn main() -> ExitCode {
         return child_main(&role);
     }
 
-    let userns_ok = preflight_userns();
-    let origdst_ok = preflight_origdst();
+    let pre = Preflight {
+        userns: preflight_userns(),
+        origdst: preflight_origdst(),
+        bwrap: preflight_bwrap(),
+    };
     let (mut passed, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     // The F8 canary runs first and is the ONE scenario that reports its
     // own SKIP: where the conntrack lookup is unavailable it prints the
@@ -108,8 +124,8 @@ fn main() -> ExitCode {
         }
     }
     for sc in scenarios() {
-        if !sc.gate.satisfied(userns_ok, origdst_ok) {
-            println!("SKIP {}: {}", sc.name, sc.gate.skip_reason());
+        if !sc.gate.satisfied(&pre) {
+            println!("SKIP {}: {}", sc.name, sc.gate.skip_reason(&pre));
             skipped += 1;
             continue;
         }
@@ -150,20 +166,32 @@ enum Gate {
     OrigDst,
     /// Unprivileged user+net namespaces must work (the full-chain tier).
     Userns,
+    /// Userns plus a working bwrap and `/usr/bin/getent` (the issue #9
+    /// `getent` acceptance tier; CI installs bubblewrap).
+    Bwrap,
+}
+
+/// What the preflights found on this host (computed once, before any
+/// scenario runs).
+struct Preflight {
+    userns: bool,
+    origdst: bool,
+    bwrap: bool,
 }
 
 impl Gate {
-    fn satisfied(self, userns_ok: bool, origdst_ok: bool) -> bool {
+    fn satisfied(self, pre: &Preflight) -> bool {
         match self {
             Gate::Always => true,
             Gate::Network => std::env::var("SBX_PT_NETWORK").as_deref() == Ok("1"),
             Gate::Tools(list) => missing_tools(list).is_empty(),
-            Gate::OrigDst => origdst_ok,
-            Gate::Userns => userns_ok,
+            Gate::OrigDst => pre.origdst,
+            Gate::Userns => pre.userns,
+            Gate::Bwrap => pre.userns && pre.bwrap,
         }
     }
 
-    fn skip_reason(self) -> String {
+    fn skip_reason(self, pre: &Preflight) -> String {
         match self {
             Gate::Always => "always runs".to_owned(),
             Gate::Network => "set SBX_PT_NETWORK=1 to run the real-network tier".to_owned(),
@@ -172,6 +200,13 @@ impl Gate {
             }
             Gate::OrigDst => ORIGDST_SKIP.to_owned(),
             Gate::Userns => USERNS_SKIP.to_owned(),
+            Gate::Bwrap => {
+                if pre.userns {
+                    BWRAP_SKIP.to_owned()
+                } else {
+                    USERNS_SKIP.to_owned()
+                }
+            }
         }
     }
 }
@@ -179,6 +214,7 @@ impl Gate {
 /// VERBATIM the sandbox_init.rs pin (same cause, same words).
 const USERNS_SKIP: &str = "unprivileged userns unavailable (AppArmor? CI: sysctl kernel.apparmor_restrict_unprivileged_userns=0)";
 const ORIGDST_SKIP: &str = "SO_ORIGINAL_DST unavailable on this host (nf_conntrack?)";
+const BWRAP_SKIP: &str = "bwrap or /usr/bin/getent unavailable (CI: apt-get install bubblewrap)";
 
 struct Scenario {
     name: &'static str,
@@ -186,9 +222,8 @@ struct Scenario {
     run: fn() -> Result<(), String>,
 }
 
-/// The 16 gated scenarios (the design's table minus the origdst-probe
-/// canary, which the runner handles inline): the six host-netns F8-tier
-/// ones and the ten full-chain userns ones.
+/// Every gated scenario, in run order. The origdst-probe canary runs inline
+/// in `main` and is not listed here.
 fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -411,6 +446,41 @@ fn scenarios() -> Vec<Scenario> {
             gate: Gate::Userns,
             run: scenario_port_not_in_policy_netns,
         },
+        Scenario {
+            name: "dns-a-allowed-netns",
+            gate: Gate::Userns,
+            run: scenario_dns_a_allowed_netns,
+        },
+        Scenario {
+            name: "dns-negative-netns",
+            gate: Gate::Userns,
+            run: scenario_dns_negative_netns,
+        },
+        Scenario {
+            name: "dns-then-connect-netns",
+            gate: Gate::Userns,
+            run: scenario_dns_then_connect_netns,
+        },
+        Scenario {
+            name: "dns-exhaustion-netns",
+            gate: Gate::Userns,
+            run: scenario_dns_exhaustion_netns,
+        },
+        Scenario {
+            name: "dns-tcp-53-netns",
+            gate: Gate::Userns,
+            run: scenario_dns_tcp_53_netns,
+        },
+        Scenario {
+            name: "getent-hosts-allowed-bwrap",
+            gate: Gate::Bwrap,
+            run: scenario_getent_hosts_allowed_bwrap,
+        },
+        Scenario {
+            name: "getent-hosts-denied-bwrap",
+            gate: Gate::Bwrap,
+            run: scenario_getent_hosts_denied_bwrap,
+        },
     ]
 }
 
@@ -429,7 +499,7 @@ fn preflight_userns() -> bool {
     else {
         return false;
     };
-    match wait_bounded(&mut child, "probe-userns preflight") {
+    match wait_bounded(&mut child, "probe-userns preflight", false) {
         Ok(status) => status.code() == Some(0),
         Err(_) => false,
     }
@@ -498,8 +568,26 @@ fn orig_dst_of(stream: &TcpStream) -> Result<SocketAddrV4, String> {
 struct Spawned {
     child: Child,
     parent_end: Option<OwnedFd>,
+    /// `true` when the child leads its own process group (`process_group(0)`,
+    /// the bwrap tier): the kill signals the whole group, so payload
+    /// grandchildren cannot outlive the scenario holding the pipes open.
+    own_group: bool,
     stdout: JoinHandle<String>,
     stderr: JoinHandle<String>,
+}
+
+/// Kill the child, and its process group first when this harness made it a
+/// group leader. ESRCH is fine: the group may already be gone, and the
+/// child-only kill below still runs.
+fn kill_tree(child: &mut Child, own_group: bool) {
+    if own_group {
+        // SAFETY: kill(2) with the negative pid of the group this harness
+        // spawned the child to lead (process_group(0) => pgid == child.id()).
+        unsafe {
+            libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 /// A reaped scenario child: rc + fully drained stdio.
@@ -531,6 +619,41 @@ fn spawn_init(role: &str, payload: &[OsString]) -> Result<Spawned, String> {
     Ok(Spawned {
         child,
         parent_end: Some(parent_end),
+        own_group: false,
+        stdout,
+        stderr,
+    })
+}
+
+/// The production env-clear spawn (sandbox_init.rs `spawn_init_env_clear`,
+/// ported verbatim): `__init` gets an EMPTY environment and leads its own
+/// process group. The payload is a bwrap argv built by the production
+/// pipeline, so there is no role env.
+fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
+    use std::os::unix::process::CommandExt;
+
+    let (parent_end, child_end) =
+        fdpass::control_socketpair().map_err(|e| format!("control_socketpair: {e}"))?;
+    let child_fd = fdpass::prepare_child_end(child_end.as_fd())
+        .map_err(|e| format!("prepare_child_end: {e}"))?;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
+    cmd.arg("__init").arg("--fd").arg(child_fd.to_string());
+    cmd.arg("--");
+    cmd.args(payload_argv);
+    cmd.env_clear();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.process_group(0);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn sbx __init (env_clear): {e}"))?;
+    let stdout = reader_thread(child.stdout.take().expect("stdout is piped"));
+    let stderr = reader_thread(child.stderr.take().expect("stderr is piped"));
+    // R6: drop the parent's copy of the child end IMMEDIATELY after spawn.
+    drop(child_end);
+    Ok(Spawned {
+        child,
+        parent_end: Some(parent_end),
+        own_group: true,
         stdout,
         stderr,
     })
@@ -554,7 +677,7 @@ fn reader_thread<R: Read + Send + 'static>(mut src: R) -> JoinHandle<String> {
 }
 
 /// `try_wait` polled at 10 ms; on deadline expiry kill + reap + Err (FAIL).
-fn wait_bounded(child: &mut Child, what: &str) -> Result<ExitStatus, String> {
+fn wait_bounded(child: &mut Child, what: &str, own_group: bool) -> Result<ExitStatus, String> {
     let deadline = Instant::now() + BOUND;
     loop {
         match child
@@ -564,7 +687,7 @@ fn wait_bounded(child: &mut Child, what: &str) -> Result<ExitStatus, String> {
             Some(status) => return Ok(status),
             None => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_tree(child, own_group);
                     let _ = child.wait();
                     return Err(format!("{what} timed out after 5s (killed)"));
                 }
@@ -578,7 +701,7 @@ fn wait_bounded(child: &mut Child, what: &str) -> Result<ExitStatus, String> {
 /// failed (the kill closed the pipes, so the joins are bounded). No thread
 /// survives into the next scenario's spawn window (R6 harness discipline).
 fn finish(mut sp: Spawned, what: &str) -> Result<PayloadOutcome, String> {
-    let wait = wait_bounded(&mut sp.child, what);
+    let wait = wait_bounded(&mut sp.child, what, sp.own_group);
     let stdout = sp
         .stdout
         .join()
@@ -625,7 +748,7 @@ impl Drop for SpawnedGuard {
         if let Some(mut sp) = self.0.take() {
             // Kill FIRST: the reader threads' pipes hit EOF only once the
             // child (and any exec'd payload) dies, which bounds the joins.
-            let _ = sp.child.kill();
+            kill_tree(&mut sp.child, sp.own_group);
             let _ = sp.child.wait();
             let _ = sp.stdout.join();
             let _ = sp.stderr.join();
@@ -1079,11 +1202,35 @@ struct NetnsRun {
     dial_ran: bool,
     echo_addr: Option<SocketAddr>,
     echo: Option<EchoOutcome>,
+    /// The resolver's audit records (empty for a static-map run).
+    dns_decisions: Vec<DnsDecision>,
+    /// The run's live fake-IP map (`Some` only for [`MapSpec::Fake`]).
+    fake_map: Option<Arc<FakeIpMap>>,
+}
+
+/// Where the transparent proxy's names come from in one run: the static
+/// fixture every pre-#9 scenario uses, or a live [`FakeIpMap`] that the
+/// parent's DNS resolver allocates into (issue #9: one `Arc`, both sides).
+#[derive(Clone, Copy)]
+enum MapSpec<'a> {
+    Static(&'a [(Ipv4Addr, &'a str)]),
+    Fake(DnsLimits),
 }
 
 fn run_netns(
     role: &str,
     map: &[(Ipv4Addr, &str)],
+    allow: &[&str],
+    ports: &[u16],
+    connector: ConnectorSpec,
+    echo: EchoSpec,
+) -> Result<NetnsRun, String> {
+    run_netns_full(role, MapSpec::Static(map), allow, ports, connector, echo)
+}
+
+fn run_netns_full(
+    role: &str,
+    map: MapSpec<'_>,
     allow: &[&str],
     ports: &[u16],
     connector: ConnectorSpec,
@@ -1112,6 +1259,7 @@ fn run_netns(
     let explicit_role = role.starts_with("explicit-");
 
     let sink = Arc::new(RecordingSink::default());
+    let dns_sink = Arc::new(RecordingDnsSink::default());
     let log = connector_log();
     let dial_ran = Arc::new(AtomicBool::new(false));
     let connector_arc: Arc<dyn Connector> = match connector {
@@ -1155,9 +1303,16 @@ fn run_netns(
         }
     };
     let network = policy_network(allow, ports);
+    let (dns_map, fake_map): (Arc<dyn DnsMap>, Option<Arc<FakeIpMap>>) = match map {
+        MapSpec::Static(pairs) => (Arc::new(StaticMap::new(pairs)), None),
+        MapSpec::Fake(limits) => {
+            let fake = Arc::new(FakeIpMap::new(&limits));
+            (Arc::clone(&fake) as Arc<dyn DnsMap>, Some(fake))
+        }
+    };
     let proxy = Proxy::new(
         &network,
-        Arc::new(StaticMap::new(map)),
+        dns_map,
         sink.clone(),
         connector_arc,
         Limits::default(),
@@ -1171,6 +1326,19 @@ fn run_netns(
         None
     };
     let serve = spawn_serve(transparent, proxy)?;
+    // Issue #9: a fake-map run serves the handed-off :53 fd from the parent
+    // (also before the go byte). A static run holds it until after the reap.
+    let mut held_dns: Option<std::net::UdpSocket> = None;
+    let dns_serve = match fake_map.as_ref() {
+        Some(fake) => {
+            let server = DnsServer::new(&network, Arc::clone(fake), dns_sink.clone());
+            Some(spawn_serve_dns(dns, server)?)
+        }
+        None => {
+            held_dns = Some(dns);
+            None
+        }
+    };
     let go = send_go(sp_guard.borrow());
     // finish() disarms the guard on the normal path; a go-byte failure
     // leaves it armed, so the drop below kills the still-waiting child.
@@ -1180,12 +1348,13 @@ fn run_netns(
     // thread into the next scenario's spawn window — R6).
     let serve_stop = serve.stop();
     let explicit_stop = explicit_serve.map(ServeHandle::stop).transpose();
+    let dns_stop = dns_serve.map(DnsServeHandle::stop).transpose();
     let echo_outcome = echo_server
         .map(|srv| srv.into_outcome(matches!(echo, EchoSpec::ExpectMiss)))
         .transpose();
-    // The explicit + dns fds are held until the payload is reaped, then
-    // dropped here (no listener-gone races while the payload runs).
-    drop(dns);
+    // The explicit + static-dns fds are held until the payload is reaped,
+    // then dropped here (no listener-gone races while the payload runs).
+    drop(held_dns);
 
     let payload = payload?;
     match explicit_stop? {
@@ -1199,6 +1368,17 @@ fn run_netns(
         Err(_) => {}
         Ok(()) => return Err("serve returned Ok — impossible (Infallible)".to_owned()),
     }
+    // The resolver is aborted, never ended on its own (D4): Cancelled is the
+    // only acceptable exit, and it proves the task was alive all run long.
+    match dns_stop? {
+        None | Some(DnsServeExit::Cancelled) => {}
+        Some(other) => {
+            return Err(format!(
+                "the DNS resolver must serve until aborted, but {}",
+                other.detail()
+            ));
+        }
+    }
     Ok(NetnsRun {
         payload,
         decisions: sink.recorded(),
@@ -1207,7 +1387,157 @@ fn run_netns(
         dial_ran: dial_ran.load(Ordering::SeqCst),
         echo_addr,
         echo: echo_outcome?,
+        dns_decisions: dns_sink.recorded(),
+        fake_map,
     })
+}
+
+// ---------------------------------------------------------------------------
+// issue #9: the resolver's audit sink and the serve thread
+// ---------------------------------------------------------------------------
+
+/// Records every resolver decision in arrival order.
+#[derive(Default)]
+struct RecordingDnsSink(Mutex<Vec<DnsDecision>>);
+
+impl RecordingDnsSink {
+    fn recorded(&self) -> Vec<DnsDecision> {
+        self.0.lock().expect("dns sink lock").clone()
+    }
+}
+
+impl DnsSink for RecordingDnsSink {
+    fn record(&self, decision: &DnsDecision) {
+        self.0.lock().expect("dns sink lock").push(decision.clone());
+    }
+}
+
+/// How the resolver task ended when the parent stopped it.
+#[derive(Debug)]
+enum DnsServeExit {
+    /// Still serving when aborted: the only acceptable outcome (D4).
+    Cancelled,
+    /// `serve_dns` returned a fatal socket error before the stop.
+    Exited(io::Error),
+    /// The task panicked (the datagram path catches panics, so this is a bug).
+    Panicked,
+}
+
+impl DnsServeExit {
+    /// The reason text for a failed "must serve until aborted" check.
+    fn detail(&self) -> String {
+        match self {
+            DnsServeExit::Cancelled => "cancelled".to_owned(),
+            DnsServeExit::Exited(err) => format!("exited with {err}"),
+            DnsServeExit::Panicked => "panicked".to_owned(),
+        }
+    }
+}
+
+/// A `serve_dns` task on its own thread and current-thread runtime, stopped
+/// by one byte on a loopback socket pair and then ABORTED (the production
+/// stop mechanism, D4). Drop stops it too, so an error path never leaks it.
+struct DnsServeHandle {
+    thread: Option<JoinHandle<()>>,
+    stop: std::net::UdpSocket,
+    rx: Receiver<DnsServeExit>,
+}
+
+fn spawn_serve_dns(
+    socket: std::net::UdpSocket,
+    server: Arc<DnsServer>,
+) -> Result<DnsServeHandle, String> {
+    let stop_rx =
+        std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind stop socket: {e}"))?;
+    let stop_tx =
+        std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind stop socket: {e}"))?;
+    let stop_addr = stop_rx
+        .local_addr()
+        .map_err(|e| format!("stop socket addr: {e}"))?;
+    stop_tx
+        .connect(stop_addr)
+        .map_err(|e| format!("connect stop socket: {e}"))?;
+    let (tx, rx) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        let outcome = run_serve_dns_thread(socket, server, stop_rx);
+        let _ = tx.send(outcome);
+    });
+    Ok(DnsServeHandle {
+        thread: Some(thread),
+        stop: stop_tx,
+        rx,
+    })
+}
+
+fn run_serve_dns_thread(
+    socket: std::net::UdpSocket,
+    server: Arc<DnsServer>,
+    stop_rx: std::net::UdpSocket,
+) -> DnsServeExit {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => return DnsServeExit::Exited(err),
+    };
+    rt.block_on(async {
+        if let Err(err) = stop_rx.set_nonblocking(true) {
+            return DnsServeExit::Exited(err);
+        }
+        let stop = match tokio::net::UdpSocket::from_std(stop_rx) {
+            Ok(stop) => stop,
+            Err(err) => return DnsServeExit::Exited(err),
+        };
+        let task = tokio::spawn(serve_dns(socket, server));
+        let mut byte = [0u8; 1];
+        let _ = stop.recv(&mut byte).await;
+        task.abort();
+        match task.await {
+            Err(err) if err.is_cancelled() => DnsServeExit::Cancelled,
+            Err(_) => DnsServeExit::Panicked,
+            Ok(Err(err)) => DnsServeExit::Exited(err),
+            Ok(Ok(never)) => match never {},
+        }
+    })
+}
+
+impl DnsServeHandle {
+    /// Stop the task and join the thread. The exit says how it ended.
+    fn stop(mut self) -> Result<DnsServeExit, String> {
+        // A failed send means the task already ended; the channel says how.
+        let _ = self.stop.send(&[1]);
+        let exit = self
+            .rx
+            .recv_timeout(BOUND)
+            .map_err(|e| format!("DNS resolver did not stop: {e}"))?;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        Ok(exit)
+    }
+}
+
+impl Drop for DnsServeHandle {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.stop.send(&[1]);
+        }
+    }
+}
+
+/// Whether bwrap runs and `/usr/bin/getent` exists (the bwrap tier's
+/// userns-independent half; the gate also requires userns).
+fn preflight_bwrap() -> bool {
+    let Some(bwrap) = sbx::bwrap::version::find_bwrap() else {
+        return false;
+    };
+    let runs = Command::new(&bwrap)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .is_ok_and(|out| out.status.success());
+    runs && std::path::Path::new("/usr/bin/getent").is_file()
 }
 
 /// The single-decision assertion with the exact reason (every denial
@@ -2078,6 +2408,11 @@ fn child_main(role: &str) -> ExitCode {
             role_expect_close(TEST3, 443, Some(&hello))
         }
         "pt-denied-port" => role_expect_close(TEST3, 443, None),
+        "pt-dns-a-allowed" => role_dns_a_allowed(),
+        "pt-dns-negative" => role_dns_negative(),
+        "pt-dns-then-connect" => role_dns_then_connect(),
+        "pt-dns-exhaustion" => role_dns_exhaustion(),
+        "pt-dns-tcp-53" => role_expect_close(TEST3, 53, None),
         "explicit-connect-relay" => role_explicit_exact(
             &[
                 connect_head("allowed.test:443"),
@@ -3603,5 +3938,618 @@ fn role_explicit_exact(request: &[u8], expected: &[u8]) -> Result<(), String> {
         ));
     }
     marker("relay ok explicit");
+    Ok(())
+}
+
+// ============================================================================
+// Issue #9 — fake-IP DNS: scenarios (userns tier + bwrap getent tier)
+// ============================================================================
+
+/// The parent-side view of "this decision is `A <ip>` for `name`".
+fn is_answered(d: &DnsDecision, name: &str, ip: Ipv4Addr) -> bool {
+    matches!(&d.verdict, DnsVerdict::Answered { name: n, ip: got } if n.as_str() == name && *got == ip)
+}
+
+/// The fake IP of the Nth pool address.
+fn pool_ip(offset: u32) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(Ipv4Addr::new(198, 18, 0, 1)) + offset)
+}
+
+fn scenario_dns_a_allowed_netns() -> Result<(), String> {
+    let run = run_netns_full(
+        "pt-dns-a-allowed",
+        MapSpec::Fake(DnsLimits::default()),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Never,
+        EchoSpec::None,
+    )?;
+    assert_payload_success(&run.payload, &["dns a 198.18.0.1 198.18.0.1"])?;
+    let fake = pool_ip(0);
+    let [first, second] = run.dns_decisions.as_slice() else {
+        return Err(format!(
+            "expected exactly two resolver decisions, got {:?}",
+            run.dns_decisions
+        ));
+    };
+    for d in [first, second] {
+        if !is_answered(d, ALLOWED, fake) {
+            return Err(format!("want Answered {ALLOWED} A {fake}, got {d:?}"));
+        }
+        let reason = format!("answered {ALLOWED} A {fake}");
+        if d.reason() != reason {
+            return Err(format!("reason {:?}, want {reason:?}", d.reason()));
+        }
+    }
+    let allowed = Domain::parse(ALLOWED).expect("fixture");
+    if run.fake_map.as_ref().and_then(|m| m.name_for(fake)) != Some(allowed) {
+        return Err("name_for(198.18.0.1) must be allowed.test".to_owned());
+    }
+    if run.fake_map.as_ref().map(|m| m.len()) != Some(1) {
+        return Err("both queries are one name: the map holds exactly one entry".to_owned());
+    }
+    Ok(())
+}
+
+fn scenario_dns_negative_netns() -> Result<(), String> {
+    let run = run_netns_full(
+        "pt-dns-negative",
+        MapSpec::Fake(DnsLimits::default()),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Never,
+        EchoSpec::None,
+    )?;
+    assert_payload_success(&run.payload, &["dns negative ok"])?;
+    let allowed = Domain::parse(ALLOWED).expect("fixture");
+    let expected: [(&str, &str); 4] = [
+        ("NODATA", "NODATA for allowed.test type 28 (A only)"),
+        ("NODATA", "NODATA for allowed.test type 16 (A only)"),
+        (
+            "NotAllowed",
+            "notallowed.test is not in the policy allow list",
+        ),
+        (
+            "InvalidName",
+            "query name a\\032b.test is not a valid hostname",
+        ),
+    ];
+    if run.dns_decisions.len() != expected.len() {
+        return Err(format!(
+            "expected {} resolver decisions, got {:?}",
+            expected.len(),
+            run.dns_decisions
+        ));
+    }
+    for (decision, (kind, reason)) in run.dns_decisions.iter().zip(expected) {
+        let kind_ok = match (&decision.verdict, kind) {
+            (DnsVerdict::NoData { name, .. }, "NODATA") => *name == allowed,
+            (DnsVerdict::Denied(DnsRejected::NotAllowed { .. }), "NotAllowed") => true,
+            (DnsVerdict::Denied(DnsRejected::InvalidName { .. }), "InvalidName") => true,
+            _ => false,
+        };
+        if !kind_ok || decision.reason() != reason {
+            return Err(format!("want {kind} {reason:?}, got {decision:?}"));
+        }
+    }
+    if run.fake_map.as_ref().is_some_and(|m| !m.is_empty()) {
+        return Err("NODATA and NXDOMAIN must allocate nothing".to_owned());
+    }
+    Ok(())
+}
+
+/// AC3: a DNS answer followed by a connect to the fake IP reaches the echo
+/// upstream by name; a fake IP nobody was given is denied.
+fn scenario_dns_then_connect_netns() -> Result<(), String> {
+    let run = run_netns_full(
+        "pt-dns-then-connect",
+        MapSpec::Fake(DnsLimits::default()),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHit,
+    )?;
+    assert_payload_success(
+        &run.payload,
+        &[
+            "dns relay ok 198.18.0.1",
+            "closed without application bytes",
+        ],
+    )?;
+    let fake = pool_ip(0);
+    match run.dns_decisions.as_slice() {
+        [only] if is_answered(only, ALLOWED, fake) => {}
+        other => {
+            return Err(format!(
+                "want one Answered {ALLOWED} A {fake}, got {other:?}"
+            ));
+        }
+    }
+    let upstream = run.echo_addr.ok_or("echo server was not spawned")?;
+    let Some(decision_allowed) = run.decisions.first() else {
+        return Err("the proxy recorded nothing".to_owned());
+    };
+    if decision_allowed.verdict
+        != (Verdict::Allowed {
+            name: Domain::parse(ALLOWED).expect("fixture"),
+            upstream,
+        })
+    {
+        return Err(format!(
+            "first proxy decision must be Allowed via the echo: {decision_allowed:?}"
+        ));
+    }
+    if decision_allowed.orig_dst() != Some(SocketAddrV4::new(fake, 443)) {
+        return Err(format!(
+            "orig_dst must be the fake IP: {:?}",
+            decision_allowed.orig_dst()
+        ));
+    }
+    let unmapped = Ipv4Addr::new(198, 18, 0, 2);
+    match run.decisions.get(1) {
+        Some(d)
+            if d.verdict == Verdict::Denied(Rejected::UnknownFakeIp { ip: unmapped })
+                && d.reason() == "unknown fake IP 198.18.0.2 (no DNS-map entry)" => {}
+        other => return Err(format!("want the unmapped denial, got {other:?}")),
+    }
+    if run.decisions.len() != 2 {
+        return Err(format!("expected two proxy decisions: {:?}", run.decisions));
+    }
+    match run.echo {
+        Some(EchoOutcome::Hit(ref bytes)) if *bytes == tls_relay_payload() => {}
+        ref other => {
+            return Err(format!(
+                "the echo server must receive the EXACT payload: {other:?}"
+            ));
+        }
+    }
+    if run.connector_log != [format!("{ALLOWED}:443")] {
+        return Err(format!(
+            "the connector must see exactly one by-name request: {:?}",
+            run.connector_log
+        ));
+    }
+    Ok(())
+}
+
+/// AC4: the pool is full at two names. A NEW name is REFUSED with the pinned
+/// reason, the existing names keep answering, and nothing wraps.
+fn scenario_dns_exhaustion_netns() -> Result<(), String> {
+    let run = run_netns_full(
+        "pt-dns-exhaustion",
+        MapSpec::Fake(DnsLimits { max_names: 2 }),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Never,
+        EchoSpec::None,
+    )?;
+    assert_payload_success(&run.payload, &["dns exhaustion ok"])?;
+    let [a, b, refused, again] = run.dns_decisions.as_slice() else {
+        return Err(format!(
+            "expected four resolver decisions, got {:?}",
+            run.dns_decisions
+        ));
+    };
+    if !is_answered(a, "a.allowed.test", pool_ip(0)) {
+        return Err(format!("first name: {a:?}"));
+    }
+    if !is_answered(b, "b.allowed.test", pool_ip(1)) {
+        return Err(format!("second name: {b:?}"));
+    }
+    if refused.verdict != DnsVerdict::Error(sbx::dns::DnsFailed::PoolExhausted)
+        || refused.reason() != "fake-IP pool 198.18.0.0/15 exhausted"
+    {
+        return Err(format!("third name must be refused: {refused:?}"));
+    }
+    if !is_answered(again, "a.allowed.test", pool_ip(0)) {
+        return Err(format!(
+            "the existing mapping must keep answering: {again:?}"
+        ));
+    }
+    let map = run.fake_map.ok_or("fake map missing")?;
+    if map.len() != 2 {
+        return Err(format!(
+            "the map must hold exactly 2 names, has {}",
+            map.len()
+        ));
+    }
+    if map.name_for(Ipv4Addr::new(198, 18, 0, 3)).is_some() {
+        return Err("198.18.0.3 must never be allocated".to_owned());
+    }
+    Ok(())
+}
+
+/// TCP/53 is not served by the resolver: it reaches the transparent proxy,
+/// whose port policy denies it. The resolver sees nothing.
+fn scenario_dns_tcp_53_netns() -> Result<(), String> {
+    let run = run_netns_full(
+        "pt-dns-tcp-53",
+        MapSpec::Fake(DnsLimits::default()),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Never,
+        EchoSpec::None,
+    )?;
+    assert_payload_success(&run.payload, &["closed without application bytes"])?;
+    assert_single_decision(
+        &run.decisions,
+        &Verdict::Denied(Rejected::PortNotAllowed { port: 53 }),
+        "port 53 is not in the policy port list",
+    )?;
+    if !run.dns_decisions.is_empty() {
+        return Err(format!(
+            "TCP/53 must not reach the resolver: {:?}",
+            run.dns_decisions
+        ));
+    }
+    Ok(())
+}
+
+/// The bwrap-tier runner: the production pipeline (`find_bwrap` →
+/// `session_layout().materialize()` → `Build` → `build()` → the argv as
+/// `__init`'s payload, via the env-clear spawn) with a live resolver and no
+/// transparent serve (`getent` never connects). The session directory is
+/// removed on every path.
+struct BwrapDnsRun {
+    out: PayloadOutcome,
+    decisions: Vec<DnsDecision>,
+    map: Arc<FakeIpMap>,
+}
+
+fn run_dns_bwrap(tag: &str, allow: &[&str], argv: &[&str]) -> Result<BwrapDnsRun, String> {
+    let session =
+        std::env::temp_dir().join(format!("sbx-proxy-dns-bwrap-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&session);
+    let result = run_dns_bwrap_in(&session, allow, argv);
+    let _ = std::fs::remove_dir_all(&session);
+    result
+}
+
+fn run_dns_bwrap_in(
+    session: &std::path::Path,
+    allow: &[&str],
+    argv: &[&str],
+) -> Result<BwrapDnsRun, String> {
+    let bwrap = sbx::bwrap::version::find_bwrap()
+        .ok_or("find_bwrap found nothing despite the Gate::Bwrap preflight")?;
+    let policy_json = serde_json::json!({
+        "version": 1,
+        "filesystem": { "ro": ["/usr"], "rw": [], "deny": [] },
+        "network": { "mode": "transparent", "allow": allow, "ports": [443] },
+        "env": { "pass": [], "set": {} },
+        "limits": { "timeout": "120s", "output_bytes": 10485760 }
+    })
+    .to_string();
+    let pol = policy::Policy::from_json_str(&policy_json)
+        .map_err(|e| format!("bwrap-tier policy must parse: {e}"))?;
+    sbx::bwrap::etc::session_layout(session)
+        .materialize()
+        .map_err(|e| format!("materialize {}: {e}", session.display()))?;
+    let command: Vec<OsString> = argv.iter().map(OsString::from).collect();
+    let passed_env = std::collections::BTreeMap::new();
+    let input = sbx::bwrap::Build {
+        policy: &pol,
+        session_dir: session,
+        bwrap_path: &bwrap,
+        command: &command,
+        cwd: None,
+        passed_env: &passed_env,
+    };
+    let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
+
+    let mut guard = SpawnedGuard::new(spawn_init_env_clear(launch.argv())?);
+    let fdpass::ListenerFds {
+        transparent,
+        explicit,
+        dns,
+    } = recv_fds(guard.borrow())?;
+    drop(transparent);
+    drop(explicit);
+    let map = Arc::new(FakeIpMap::new(&DnsLimits::default()));
+    let sink = Arc::new(RecordingDnsSink::default());
+    let network = policy_network(allow, &[443]);
+    let server = DnsServer::new(&network, Arc::clone(&map), sink.clone());
+    let dns_serve = spawn_serve_dns(dns, server)?;
+    let go = send_go(guard.borrow());
+    let out = go.and_then(|()| finish(guard.take(), "dns-bwrap payload"));
+    let dns_exit = dns_serve.stop();
+    let out = out?;
+    match dns_exit? {
+        DnsServeExit::Cancelled => {}
+        other => {
+            return Err(format!(
+                "the DNS resolver must serve until aborted, but {}",
+                other.detail()
+            ));
+        }
+    }
+    Ok(BwrapDnsRun {
+        out,
+        decisions: sink.recorded(),
+        map,
+    })
+}
+
+/// AC1: `getent hosts` inside bwrap resolves an allow-listed name to its
+/// fake IP through the sandbox's resolv.conf (nameserver 127.0.0.1).
+fn scenario_getent_hosts_allowed_bwrap() -> Result<(), String> {
+    let run = run_dns_bwrap(
+        "allowed",
+        &["pypi.org"],
+        &["/usr/bin/getent", "hosts", "pypi.org"],
+    )?;
+    if run.out.rc != 0 {
+        return Err(format!(
+            "getent rc {} (want 0)\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            run.out.rc, run.out.stdout, run.out.stderr
+        ));
+    }
+    let fields: Vec<&str> = run.out.stdout.split_whitespace().collect();
+    if fields != ["198.18.0.1", "pypi.org"] {
+        return Err(format!(
+            "getent stdout {:?} (want the fake IP and the name)",
+            run.out.stdout
+        ));
+    }
+    if !run.out.stderr.trim().is_empty() {
+        return Err(format!("getent stderr must be empty: {:?}", run.out.stderr));
+    }
+    let fake = Ipv4Addr::new(198, 18, 0, 1);
+    let pypi = Domain::parse("pypi.org").expect("fixture");
+    let mut answered = 0usize;
+    for d in &run.decisions {
+        match &d.verdict {
+            DnsVerdict::NoData { name, qtype: 28 } if *name == pypi => {}
+            DnsVerdict::Answered { name, ip } if *name == pypi && *ip == fake => answered += 1,
+            other => return Err(format!("unexpected resolver decision: {other:?}")),
+        }
+    }
+    if answered == 0 {
+        return Err("glibc must ask for A and get the fake IP".to_owned());
+    }
+    if run.map.name_for(fake) != Some(pypi) {
+        return Err("name_for(198.18.0.1) must be pypi.org".to_owned());
+    }
+    Ok(())
+}
+
+/// AC2: a name outside the allow-list is NXDOMAIN for every qtype glibc asks
+/// (rc 2 = NOTFOUND), and nothing is ever allocated.
+fn scenario_getent_hosts_denied_bwrap() -> Result<(), String> {
+    let run = run_dns_bwrap(
+        "denied",
+        &["pypi.org"],
+        &["/usr/bin/getent", "hosts", "example.com"],
+    )?;
+    if run.out.rc != 2 {
+        return Err(format!(
+            "getent rc {} (want 2, NOTFOUND)\n--- stderr ---\n{}",
+            run.out.rc, run.out.stderr
+        ));
+    }
+    if !run.out.stdout.trim().is_empty() {
+        return Err(format!("getent stdout must be empty: {:?}", run.out.stdout));
+    }
+    if run.decisions.is_empty() {
+        return Err("the resolver must have seen the query".to_owned());
+    }
+    let mut saw_a = false;
+    for d in &run.decisions {
+        match &d.verdict {
+            DnsVerdict::Denied(DnsRejected::NotAllowed { name })
+                if name.as_str() == "example.com" => {}
+            other => return Err(format!("every decision must be NotAllowed: {other:?}")),
+        }
+        if d.reason() != "example.com is not in the policy allow list" {
+            return Err(format!("reason {:?}", d.reason()));
+        }
+        if d.question.as_ref().is_some_and(|q| q.qtype == 1) {
+            saw_a = true;
+        }
+    }
+    if !saw_a {
+        return Err("glibc must ask for an A record".to_owned());
+    }
+    if !run.map.is_empty() {
+        return Err("a denied name must allocate nothing".to_owned());
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// child side (issue #9): a hand-rolled DNS client, an oracle independent of
+// hickory, and the resolver roles.
+// ----------------------------------------------------------------------------
+
+/// One A answer: (address, TTL).
+type DnsAnswer = (Ipv4Addr, u32);
+
+#[derive(Debug)]
+struct DnsReply {
+    rcode: u8,
+    answers: Vec<DnsAnswer>,
+}
+
+/// A recursion-desired query for `name` (raw dotted bytes) of `qtype`.
+fn dns_query(id: u16, name: &[u8], qtype: u16) -> Vec<u8> {
+    let mut q = id.to_be_bytes().to_vec();
+    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.split(|&b| b == b'.').filter(|l| !l.is_empty()) {
+        q.push(u8::try_from(label.len()).expect("label fits"));
+        q.extend_from_slice(label);
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes());
+    q
+}
+
+/// One UDP exchange with `server`, bounded by [`BOUND`].
+fn dns_exchange(server: SocketAddrV4, query: &[u8]) -> Result<Vec<u8>, String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
+    sock.connect(server)
+        .map_err(|e| format!("connect {server}: {e}"))?;
+    sock.set_read_timeout(Some(BOUND))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    sock.send(query)
+        .map_err(|e| format!("send to {server}: {e}"))?;
+    let mut buf = [0u8; 512];
+    let n = sock
+        .recv(&mut buf)
+        .map_err(|e| format!("recv from {server}: {e}"))?;
+    Ok(buf[..n].to_vec())
+}
+
+/// Parse a reply: id and QR checked, the question skipped, each answer must
+/// be the `c0 0c 00 01 00 01 ttl 00 04 a.b.c.d` shape this resolver emits.
+fn parse_reply(reply: &[u8], id: u16) -> Result<DnsReply, String> {
+    if reply.len() < 12 {
+        return Err(format!(
+            "reply of {} bytes is shorter than a header",
+            reply.len()
+        ));
+    }
+    if u16::from_be_bytes([reply[0], reply[1]]) != id {
+        return Err("reply id does not match the query".to_owned());
+    }
+    if reply[2] & 0x80 == 0 {
+        return Err("reply has QR clear".to_owned());
+    }
+    let rcode = reply[3] & 0x0f;
+    let qd = u16::from_be_bytes([reply[4], reply[5]]);
+    let an = u16::from_be_bytes([reply[6], reply[7]]);
+    if qd != 1 {
+        return Err(format!("reply carries {qd} questions, want 1"));
+    }
+    let mut at = 12usize;
+    loop {
+        let len = *reply.get(at).ok_or("question name runs off the reply")? as usize;
+        at += 1;
+        if len == 0 {
+            break;
+        }
+        at += len;
+    }
+    at += 4;
+    let mut answers = Vec::new();
+    for _ in 0..an {
+        let rr = reply
+            .get(at..at + 16)
+            .ok_or("answer record runs off the reply")?;
+        if rr[..6] != [0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01] || rr[10..12] != [0x00, 0x04] {
+            return Err(format!("unexpected answer shape: {rr:02x?}"));
+        }
+        let ttl = u32::from_be_bytes([rr[6], rr[7], rr[8], rr[9]]);
+        answers.push((Ipv4Addr::new(rr[12], rr[13], rr[14], rr[15]), ttl));
+        at += 16;
+    }
+    Ok(DnsReply { rcode, answers })
+}
+
+fn dns_lookup(server: SocketAddrV4, id: u16, name: &[u8], qtype: u16) -> Result<DnsReply, String> {
+    let reply = dns_exchange(server, &dns_query(id, name, qtype))?;
+    parse_reply(&reply, id)
+}
+
+/// Exactly one A answer with TTL [`FAKE_TTL`] and rcode 0; returns the IP.
+fn single_a(reply: &DnsReply, what: &str) -> Result<Ipv4Addr, String> {
+    if reply.rcode != 0 {
+        return Err(format!("{what}: rcode {} (want 0)", reply.rcode));
+    }
+    match reply.answers.as_slice() {
+        [(ip, ttl)] if *ttl == FAKE_TTL => Ok(*ip),
+        other => Err(format!(
+            "{what}: want one A answer with TTL {FAKE_TTL}, got {other:?}"
+        )),
+    }
+}
+
+/// Rcode `rcode` and no answers.
+fn expect_empty(reply: &DnsReply, rcode: u8, what: &str) -> Result<(), String> {
+    if reply.rcode != rcode || !reply.answers.is_empty() {
+        return Err(format!(
+            "{what}: want rcode {rcode} and no answers, got rcode {} with {:?}",
+            reply.rcode, reply.answers
+        ));
+    }
+    Ok(())
+}
+
+fn role_dns_a_allowed() -> Result<(), String> {
+    let via_test3 = dns_lookup(SocketAddrV4::new(TEST3, 53), 0x0101, b"allowed.test", 1)?;
+    let via_loopback = dns_lookup(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53),
+        0x0102,
+        b"ALLOWED.test",
+        1,
+    )?;
+    let a = single_a(&via_test3, "allowed.test via TEST3:53")?;
+    let b = single_a(&via_loopback, "ALLOWED.test via 127.0.0.1:53")?;
+    marker(&format!("dns a {a} {b}"));
+    Ok(())
+}
+
+fn role_dns_negative() -> Result<(), String> {
+    let server = SocketAddrV4::new(TEST3, 53);
+    expect_empty(
+        &dns_lookup(server, 0x0201, b"allowed.test", 28)?,
+        0,
+        "AAAA allowed.test",
+    )?;
+    expect_empty(
+        &dns_lookup(server, 0x0202, b"allowed.test", 16)?,
+        0,
+        "TXT allowed.test",
+    )?;
+    expect_empty(
+        &dns_lookup(server, 0x0203, b"notallowed.test", 1)?,
+        3,
+        "A notallowed.test",
+    )?;
+    expect_empty(
+        &dns_lookup(server, 0x0204, b"a b.test", 1)?,
+        3,
+        "A 'a b.test'",
+    )?;
+    marker("dns negative ok");
+    Ok(())
+}
+
+/// AC3, child half: resolve, connect to the fake IP (the TLS relay), then
+/// connect to a fake IP nobody was given (the denial).
+fn role_dns_then_connect() -> Result<(), String> {
+    let reply = dns_lookup(
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53),
+        0x0301,
+        ALLOWED.as_bytes(),
+        1,
+    )?;
+    let ip = single_a(&reply, "allowed.test")?;
+    role_relay(&tls_relay_payload(), &tls_relay_payload(), ip, 443)?;
+    marker(&format!("dns relay ok {ip}"));
+    role_expect_close(Ipv4Addr::new(198, 18, 0, 2), 443, None)
+}
+
+/// AC4, child half: fill the two-name pool, refuse a third, re-ask the first.
+fn role_dns_exhaustion() -> Result<(), String> {
+    let server = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53);
+    single_a(
+        &dns_lookup(server, 0x0401, b"a.allowed.test", 1)?,
+        "a.allowed.test",
+    )?;
+    single_a(
+        &dns_lookup(server, 0x0402, b"b.allowed.test", 1)?,
+        "b.allowed.test",
+    )?;
+    expect_empty(
+        &dns_lookup(server, 0x0403, b"c.allowed.test", 1)?,
+        5,
+        "c.allowed.test (pool full)",
+    )?;
+    single_a(
+        &dns_lookup(server, 0x0404, b"a.allowed.test", 1)?,
+        "a.allowed.test again",
+    )?;
+    marker("dns exhaustion ok");
     Ok(())
 }

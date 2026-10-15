@@ -25,7 +25,13 @@
 //! environment, user/pid/ipc/uts/cgroup isolation, `--disable-userns`
 //! hardening, synthetic `/etc`, session work/home/tmp), plus bwrap
 //! discovery/version parsing; #10 spawns it via `Launch::command()` (which
-//! encodes the `env_clear` contract). [`proxy`] is the real transparent
+//! encodes the `env_clear` contract).
+//! [`dns`] is the fake-IP resolver (issue #9): it serves `__init`'s handed-off
+//! UDP :53 fd, answers A for allow-listed names from `198.18.0.0/15` (a stable
+//! per-run [`dns::FakeIpMap`], also the proxy's [`proxy::DnsMap`]), NODATA for
+//! other types, NXDOMAIN for every other name, and never forwards; one
+//! [`dns::DnsDecision`] per datagram goes to the [`dns::DnsSink`] seam (#10).
+//! [`proxy`] is the real transparent
 //! egress proxy (issue #7) and its explicit counterpart (issue #8, served
 //! by [`proxy::serve_explicit`]; `CONNECT` and absolute-form requests on
 //! the explicit listener, same policy and inspectors): it serves #5's
@@ -58,6 +64,7 @@
 
 pub mod bwrap;
 pub mod cli;
+pub mod dns;
 pub mod egress;
 pub mod init;
 pub mod policy;

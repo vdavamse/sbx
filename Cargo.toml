@@ -23,6 +23,15 @@ httparse = "=1.10.1"
 humantime = "2.4"
 idna = "1.1"
 libc = { version = "0.2", default-features = false }
+# DNS wire codec for the fake-IP resolver (issue #9): protocol only — no
+# resolver, no runtime, NO features (default-features off drops "std" +
+# "tokio"; the DNSSEC/TLS/HTTPS/QUIC code stays uncompiled, which the
+# RUSTSEC-2026-0118 ignore in deny.toml depends on). Exact pin: 0.26.x
+# declares rust-version 1.88 > MSRV 1.85; 0.25.2 (rust-version 1.71.1) is
+# probe-verified on rustc 1.85.0 and pure Rust (static-musl OK). Every
+# datagram passes the hand-rolled header-count gate BEFORE the decoder
+# runs (src/dns/wire.rs). Re-evaluate when MSRV >= 1.88.
+hickory-proto = { version = "=0.25.2", default-features = false }
 # Namespace/netlink plumbing for `sbx __init` (issue #5) — spike-verified
 # exact pins (spikes/nft-load/FINDINGS.md): neither crate declares
 # rust-version, so `=0.3.5` + `--locked` is the MSRV-1.85 guarantee.
