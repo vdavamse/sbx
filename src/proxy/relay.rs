@@ -39,12 +39,14 @@
 //!      while a message is still open tears down (hello-shaped state ⇒
 //!      second-hello detail, anything else ⇒ framing detail). No
 //!      legitimate post-CCS client flight contains a FRAGMENTED handshake
-//!      message: the client's Finished fits one record in every stack
-//!      (TLS 1.2 ~36 B, TLS 1.3 ~52 B — records hold 16 KiB), TLS 1.3
-//!      defines no fragmenting post-handshake CLIENT message (KeyUpdate is
-//!      a fresh single-record message), and TLS 1.2 renegotiation is
-//!      practically extinct (its ClientHello is single-record too — and a
-//!      plaintext post-CCS hello tears down regardless). A continuation
+//!      message: the TLS 1.2 client's encrypted Finished fits one record
+//!      (~36 B — records hold 16 KiB), a TLS 1.3 client's protected
+//!      handshake messages (Finished, KeyUpdate) all ride OUTER 0x17
+//!      records the scanner never message-parses (RFC 8446 §5.2 — the real
+//!      type is sealed inside `TLSInnerPlaintext`), and TLS 1.2
+//!      renegotiation is practically extinct (its ClientHello is
+//!      single-record too — and a plaintext post-CCS hello tears down
+//!      regardless). A continuation
 //!      therefore can only be (i) an attacker tiling a MASKED split hello
 //!      toward completion — withholding the continuation chunk means the
 //!      server's deframer never completes it, at ANY server reassembly
@@ -84,43 +86,47 @@
 //!    treats it as fatal too (CCS_RECEIVED_EARLY). The trade-off remains
 //!    deliberate: deny-on-artifact would break EVERY TLS 1.2 connection at
 //!    its encrypted Finished, and a tear-down-at-mask would false-kill
-//!    ~1/256 of ALL TLS connections (both versions — a TLS 1.3 client's
-//!    encrypted Finished rides an OUTER 0x16 record, RFC 8446 §5.1) whose
-//!    first ciphertext byte is 0x01, at their first application-data
-//!    record. Under these rules that phantom RETAINS across its app-data
-//!    interrupts and the connection lives (`ccs_then_ciphertext_shapes_pass`
-//!    pins it); pass-through costs at most an invisible ENCRYPTED
-//!    renegotiation hello — which no non-terminating proxy can see
-//!    (documented residual, proxy module docs point 12). Recorded
+//!    ~1/256 of TLS 1.2 connections (TLS 1.2 only — its encrypted
+//!    Finished keeps the real content type outside; a TLS 1.3 client's
+//!    protected records ALL ride outer 0x17 with the real type sealed
+//!    inside `TLSInnerPlaintext` — RFC 8446 §5.2, rustls
+//!    `Tls13MessageEncrypter::encrypt` — so no ciphertext phantom ever
+//!    arms in TLS 1.3) whose first ciphertext byte is 0x01, at their
+//!    first application-data record. Under these rules that phantom
+//!    RETAINS across its app-data interrupts and the connection lives
+//!    (`ccs_then_ciphertext_shapes_pass` pins it); pass-through costs at
+//!    most an invisible ENCRYPTED renegotiation hello — which no
+//!    non-terminating proxy can see (documented residual, proxy module
+//!    docs point 12). Recorded
 //!    residuals of the deferred policy (Q4 family): (a) an encrypted TLS
 //!    1.2 renegotiation whose CCS arrives while a phantom
 //!    ciphertext-parsed message is open tears the connection down
 //!    (renegotiation with zero intervening application-data records —
-//!    practically extinct); (b) the symmetric false-teardown family of a
-//!    0x01-leading encrypted Finished (~1/256 of connections): it arms a
-//!    deferred hello that fires if its random 24-bit length drains exactly
-//!    across consecutive client 0x16 records (~2^-19 — a random 24-bit
-//!    length landing under a ~40-byte record remainder), and ANY later
-//!    client 0x16 while the phantom is open trips the continuation deny —
-//!    TLS 1.2 renegotiation (extinct, and plaintext post-CCS hellos tear
-//!    down anyway) or a TLS 1.3 client KeyUpdate (~1/256 of the rare
-//!    rekeying connections); and (c) a TLS 1.3 client OMITTING the
-//!    middlebox-compat CCS (RFC 8446 App-D.4 makes it a MAY; mainstream
-//!    stacks — OpenSSL, BoringSSL, Go, rustls, s2n, NSS, mbedTLS, JSSE —
-//!    send it by default, apps can disable compat mode) has its encrypted
-//!    Finished parsed as a plaintext phantom in the strict pre-CCS phase:
-//!    teardown at its first application-data record (~100% of such
-//!    data-carrying connections), or at the Finished itself when its first
-//!    ciphertext byte is 0x01 (~1/256 of them) — pinned by
-//!    `no_ccs_tls13_client_tears_down`, fail-closed and self-inflicted
-//!    only.
+//!    practically extinct); and (b) the symmetric false-teardown family of
+//!    a 0x01-leading TLS 1.2 encrypted Finished (~1/256 of TLS 1.2
+//!    connections): it arms a deferred hello that fires if its random
+//!    24-bit length drains exactly across consecutive client 0x16 records
+//!    (~2^-19 — a random 24-bit length landing under a ~40-byte record
+//!    remainder), and ANY later client 0x16 while the phantom is open
+//!    trips the continuation deny — only TLS 1.2 renegotiation (extinct,
+//!    and plaintext post-CCS hellos tear down anyway). TLS 1.3 clients
+//!    are fully supported with OR without the middlebox-compat CCS (RFC
+//!    8446 App-D.4 makes it a MAY): every post-CH1 record is outer
+//!    0x14/0x15/0x17 and passes inertly (`tls13_no_ccs_client_passes`,
+//!    `tls13_compat_ccs_client_passes`), while a plaintext CH2 (outer
+//!    0x16) still tears down in both phases
+//!    (`tls13_plaintext_second_hello_after_protected_flight_tears_down`).
+//!    The only wire that parses a ciphertext-shaped 0x16 in the strict
+//!    pre-CCS phase is a protocol-violating TLS 1.2 client skipping its
+//!    mandatory CCS (fatal server-side anyway) — denied fail-closed,
+//!    pinned by `protocol_violating_no_ccs_ciphertext_tears_down`.
 //! 4. **Record framing is the trust anchor** — the record layer (5-byte
 //!    header, big-endian length) is plaintext in EVERY TLS version, and
 //!    both endpoints parse it identically: bytes this scanner passes inside
 //!    a record body can never be re-interpreted as a record header by the
 //!    server. The divergences policed explicitly (round-2/3 review fixes):
 //!    servers IGNORE several record classes mid-reassembly and KEEP an
-//!    open handshake message across them — CCS, warning `user_canceled`
+//!    open handshake message across them — warning `user_canceled`
 //!    alerts, rejected-0-RTT early data (point 3) — so the scanner NEVER
 //!    wipes hello-shaped message state (masks pass with the state
 //!    RETAINED) and NEVER lets a post-CCS open message receive
@@ -301,20 +307,19 @@ impl RelayScanner {
                     if self.msg_open() && ty != RECORD_HANDSHAKE {
                         // A record boundary inside an open handshake
                         // message is only legal as another handshake
-                        // continuation. Servers IGNORE several record
-                        // classes mid-reassembly and KEEP the fragment
-                        // across them — CCS (RFC 8446 §5 middlebox
-                        // compat; rustls allows 2 and its deframer spans
-                        // survive; OpenSSL's s3.tmp.buf likewise),
-                        // warning `user_canceled` alerts, and
-                        // rejected-0-RTT early data (rustls-verified;
-                        // module docs points 3–4) — so WIPING message
-                        // state at such a record is how a split CH2
-                        // smuggles through (round-2 review fix). The
-                        // shapes, post-CCS: a mid-message CCS tears down
-                        // unconditionally in BOTH phases (review fix C1 —
-                        // no legitimate client emits one, and OpenSSL
-                        // treats it as fatal too); any OTHER
+                        // continuation. Servers IGNORE warning
+                        // `user_canceled` alerts and rejected-0-RTT early
+                        // data mid-reassembly and KEEP the fragment
+                        // across them (rustls-verified; module docs
+                        // points 3–4) — so WIPING message state at such
+                        // a record is how a split CH2 smuggles through
+                        // (round-2 review fix). The shapes, post-CCS: a
+                        // mid-message CCS tears down unconditionally in
+                        // BOTH phases (review fix C1 — the one mask class
+                        // no legitimate client emits mid-fragment, and
+                        // OpenSSL fatals on it: BAD_CHANGE_CIPHER_SPEC /
+                        // CCS_RECEIVED_EARLY — hence teardown, not
+                        // retention); any OTHER
                         // non-handshake record PASSES (inert) with a
                         // HELLO-SHAPED open message RETAINED — never
                         // wiped, at any claimed length (round-3 review
@@ -774,10 +779,10 @@ mod tests {
 
     #[test]
     fn ccs_then_ciphertext_shapes_pass() {
-        // The TLS 1.2/1.3 survival case — and the round-3 AVAILABILITY
-        // pin: after the client CCS, the encrypted Finished (0x16 with a
-        // ciphertext body — a TLS 1.3 Finished rides an outer 0x16 record
-        // too, RFC 8446 §5.1) and everything after it must pass. The
+        // The TLS 1.2 survival case — and the round-3 AVAILABILITY pin:
+        // after the client CCS, the encrypted Finished (0x16 with a
+        // ciphertext body — TLS 1.2 only; TLS 1.3 protected records ride
+        // outer 0x17, RFC 8446 §5.2) and everything after it must pass. The
         // "ciphertext" bytes are deliberately shaped to misparse (a
         // leading 0x01 = the ~1/256 random type-byte hit, a bogus 24-bit
         // length overshooting the record): the phantom arms a deferred
@@ -785,7 +790,7 @@ mod tests {
         // rule RETAINS the state and passes the record. A
         // deny-on-artifact scanner would break every TLS 1.2 connection
         // here; a tear-down-at-mask scanner (the round-3 rejected option)
-        // would false-kill ~1/256 of ALL TLS connections here.
+        // would false-kill ~1/256 of TLS 1.2 connections here.
         let mut wire = Vec::new();
         wire.extend_from_slice(&ccs_rec());
         wire.extend_from_slice(&rec(
@@ -986,16 +991,17 @@ mod tests {
         torn_down(&err, TORN_DOWN_SECOND_HELLO);
     }
 
-    /// Round-3 F1/F2 pin (replaces the old length-gate residual test): a
-    /// masked split hello with ANY claimed length dies at its FIRST
-    /// continuation record. The retention gate has no length threshold —
-    /// OpenSSL reassembles handshake messages up to INT_MAX−4 (~2 GiB,
-    /// statem_lib.c `tls_get_message_header`), so no finite plausibility
-    /// bound is fail-closed (a padded CH2 claiming 81920 bytes bypassed
-    /// the round-2 64 KiB gate; PoC executed) — and the continuation deny
-    /// closes the attack at ANY server reassembly bound: the server's
+    /// Round-3 F1/F2 pin: a masked split hello with ANY claimed length
+    /// dies at its FIRST continuation record. The retention gate has no
+    /// length threshold — OpenSSL reassembles handshake messages up to
+    /// INT_MAX−4 (~2 GiB, statem_lib.c `tls_get_message_header`), so no
+    /// finite plausibility bound is fail-closed. No length gate was ever
+    /// landed: a 64 KiB plausibility threshold proposed during the round-2
+    /// fix cycle was proven bypassable by padding (a padded CH2 claiming
+    /// 81920 bytes; PoC executed) before it shipped — and the continuation
+    /// deny closes the attack at ANY server reassembly bound: the server's
     /// deframer only ever completes the split hello through a 0x16
-    /// continuation, and that chunk is withheld. Lengths span the old
+    /// continuation, and that chunk is withheld. Lengths span the PROPOSED
     /// gate's boundary on both sides (65536/65537), the PoC's 81920, and
     /// the single-record scale (6).
     #[test]
@@ -1089,26 +1095,25 @@ mod tests {
     }
 
     #[test]
-    fn no_ccs_tls13_client_tears_down() {
-        // Residual (c) pin (round-2 review): a TLS 1.3 client OMITTING the
-        // middlebox-compat CCS (RFC 8446 App-D.4 MAY) never flips the
-        // scanner into the deferred phase — its encrypted Finished parses
-        // as a plaintext phantom in the STRICT pre-CCS phase. The wire:
-        // a ciphertext-shaped 0x16 record (random first byte ≠ 0x01, a
-        // 24-bit length overshooting the record) followed by the first
-        // application-data record ⇒ TORN_DOWN_FRAMING at the 0x17
-        // (~100% of such data-carrying connections); when the first
-        // ciphertext byte IS 0x01 (~1/256) the plaintext type-byte deny
-        // fires at the Finished itself ⇒ TORN_DOWN_SECOND_HELLO.
-        // Fail-closed and self-inflicted only — documented, not mitigated
-        // (mainstream stacks all send the compat CCS by default).
+    fn protocol_violating_no_ccs_ciphertext_tears_down() {
+        // Fail-closed deny pin for a wire NO real TLS 1.3 client emits
+        // (module docs point 3; TLS 1.3 protected records ride outer 0x17
+        // — see the tls13_* pins below): a ciphertext-shaped 0x16 record
+        // with no preceding CCS — a protocol-violating TLS 1.2 client
+        // skipping its mandatory CCS, fatal server-side anyway. It parses
+        // as a plaintext phantom in the STRICT pre-CCS phase: random first
+        // byte ≠ 0x01 with a 24-bit length overshooting the record, then
+        // an application-data record ⇒ TORN_DOWN_FRAMING at the 0x17; a
+        // 0x01 first byte ⇒ the plaintext type-byte deny fires at the
+        // record itself ⇒ TORN_DOWN_SECOND_HELLO.
         let mut wire = Vec::new();
         wire.extend_from_slice(&rec(
             RECORD_HANDSHAKE,
             &[0xC1, 0x4F, 0x00, 0x10, 0x9A, 0x3E],
         ));
         wire.extend_from_slice(&rec(0x17, b"app data"));
-        let err = scan_all(&wire).expect_err("a no-CCS client must tear down at its first 0x17");
+        let err =
+            scan_all(&wire).expect_err("a no-CCS 0x16 phantom must tear down at its first 0x17");
         torn_down(&err, TORN_DOWN_FRAMING);
         let mut wire = Vec::new();
         wire.extend_from_slice(&rec(
@@ -1116,8 +1121,54 @@ mod tests {
             &[0x01, 0x4F, 0x00, 0x10, 0x9A, 0x3E],
         ));
         wire.extend_from_slice(&rec(0x17, b"app data"));
-        let err = scan_all(&wire).expect_err("the 0x01-leading variant tears down at the Finished");
+        let err = scan_all(&wire).expect_err("the 0x01-leading variant tears down at the record");
         torn_down(&err, TORN_DOWN_SECOND_HELLO);
+    }
+
+    /// The real TLS 1.3 client wires (module docs point 3): every
+    /// protected record — encrypted flight incl. Finished, application
+    /// data, KeyUpdate — rides OUTER 0x17 (RFC 8446 §5.2), so the scanner
+    /// never message-parses it. Bodies are shaped to misparse were they
+    /// ever parsed (a leading 0x01, a bogus overshooting 24-bit length).
+    fn tls13_protected(body: &[u8]) -> Vec<u8> {
+        rec(0x17, body)
+    }
+
+    #[test]
+    fn tls13_no_ccs_client_passes() {
+        // Compat mode OFF (RFC 8446 App-D.4 MAY): no CCS ever arrives —
+        // the scanner stays in the strict phase and must still pass.
+        let mut wire = tls13_protected(&[0x01, 0xFF, 0xFF, 0x00, 0x77, 0x88]);
+        wire.extend_from_slice(&tls13_protected(b"app data"));
+        wire.extend_from_slice(&tls13_protected(b"more app data"));
+        scan_all(&wire).expect("a no-CCS TLS 1.3 client must pass");
+    }
+
+    #[test]
+    fn tls13_compat_ccs_client_passes() {
+        // Compat mode ON: the middlebox CCS, then the protected flight,
+        // app data, and a KeyUpdate-shaped protected record.
+        let mut wire = ccs_rec();
+        wire.extend_from_slice(&tls13_protected(&[0x01, 0xFF, 0xFF, 0x00, 0x77, 0x88]));
+        wire.extend_from_slice(&tls13_protected(b"app data"));
+        wire.extend_from_slice(&tls13_protected(&[
+            0x18, 0x00, 0x00, 0x01, 0x00, 0x17, 0, 0,
+        ]));
+        scan_all(&wire).expect("a compat-CCS TLS 1.3 client must pass");
+    }
+
+    #[test]
+    fn tls13_plaintext_second_hello_after_protected_flight_tears_down() {
+        // The protected flight being inert must not open a hole: a
+        // plaintext CH2 (outer 0x16) after it tears down in BOTH phases.
+        for lead in [Vec::new(), ccs_rec()] {
+            let mut wire = lead;
+            wire.extend_from_slice(&tls13_protected(&[0x01, 0xFF, 0xFF, 0x00, 0x77, 0x88]));
+            wire.extend_from_slice(&tls13_protected(b"app data"));
+            wire.extend_from_slice(&hs_rec(&[&hello_msg()]));
+            let err = scan_all(&wire).expect_err("a plaintext CH2 must tear down");
+            torn_down(&err, TORN_DOWN_SECOND_HELLO);
+        }
     }
 
     /// The round-2 alert-mask attack PIPELINED into the replay tail
@@ -1290,7 +1341,7 @@ mod tests {
             w.extend_from_slice(&hs_rec(&[&hello_msg()]));
             w
         };
-        // The no-CCS client wire (residual (c)).
+        // The protocol-violating no-CCS ciphertext-0x16 wire.
         let no_ccs = {
             let mut w = rec(RECORD_HANDSHAKE, &[0xC1, 0x4F, 0x00, 0x10, 0x9A, 0x3E]);
             w.extend_from_slice(&rec(0x17, b"app data"));

@@ -63,11 +63,17 @@
 //!    server to close after responding and to NOT process further requests
 //!    on the connection. Deliberate costs: no keep-alive for sandbox HTTP
 //!    clients (every request is re-inspected and re-audited on its own
-//!    connection — fail-closed by construction), and the ONE documented
-//!    deviation from "the upstream sees the client's byte stream verbatim"
-//!    (mod.rs point 9). Recorded residuals (mod.rs point 12): a
-//!    NON-conforming server ignoring `Connection: close`, and the 443 twin
-//!    no rewrite can reach — h2 `:authority` vhost confusion after an
+//!    connection — fail-closed by construction), no protocol upgrades on
+//!    port 80 (the inserted `close` rides the combined `Connection` list —
+//!    RFC 9110 §7.6.1 — and §9.6's close-after-response obligation is
+//!    irreconcilable with a 101 switch, RFC 9110 §7.8, so conforming
+//!    servers will not honor `ws://` WebSocket — RFC 6455 §4.1 — or `h2c`
+//!    upgrade handshakes), and the ONE documented deviation from "the
+//!    upstream sees the client's byte stream verbatim" (mod.rs point 9).
+//!    Recorded residuals (mod.rs point 12): a NON-conforming server
+//!    ignoring `Connection: close` (one that also honors an upgrade opens
+//!    an uninspectable tunnel, not merely follow-up requests), and the
+//!    443 twin no rewrite can reach — h2 `:authority` vhost confusion after an
 //!    SNI-checked handshake (ALPN rides through uninspected; inherent to
 //!    any non-terminating proxy; #14's threat model). A full per-request
 //!    relay scanner (this module's [`crate::proxy::relay::RelayScanner`]

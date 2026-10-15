@@ -154,17 +154,17 @@
 //!     relay.rs module docs point 3): an ENCRYPTED TLS 1.2 renegotiation
 //!     hello is invisible to any non-terminating proxy; a legitimate HRR
 //!     retry (e.g. a 0-RTT rejection) is torn down — sandbox clients are
-//!     CLI tools that negotiate first-try; a TLS 1.3 client OMITTING the
-//!     middlebox-compat CCS (RFC 8446 App-D.4 MAY; mainstream stacks send
-//!     it) is torn down at its first post-Finished record; a client 0x16
-//!     sent while a 0x01-leading encrypted-Finished phantom is open
-//!     (~1/256 of connections; TLS 1.2 renegotiation — extinct — or a
-//!     TLS 1.3 client KeyUpdate) trips the continuation deny; and the
-//!     deferred policy's rare false-teardown directions (~2^-19) are
-//!     pinned there. The port-80 analogue of the name-binding lifetime
-//!     problem is closed by enforcement, not scanning: the validated head
-//!     is replayed with an inserted `Connection: close` (http.rs module
-//!     docs point 6) — residuals: a NON-conforming server ignoring it,
+//!     CLI tools that negotiate first-try; a client 0x16 sent while a
+//!     0x01-leading TLS 1.2 encrypted-Finished phantom is open (~1/256 of
+//!     TLS 1.2 connections; TLS 1.2 renegotiation — extinct) trips the
+//!     continuation deny; and the deferred policy's rare false-teardown
+//!     directions (~2^-19) are pinned there. TLS 1.3 clients, with or
+//!     without the middlebox-compat CCS, pass untouched: their protected
+//!     records all ride outer 0x17 (RFC 8446 §5.2). The port-80 analogue
+//!     of the name-binding lifetime problem is closed by enforcement,
+//!     not scanning: the validated head is replayed with an inserted
+//!     `Connection: close` (http.rs module docs point 6) — residuals: a
+//!     NON-conforming server ignoring it,
 //!     and the 443 twin no rewrite can reach: h2 `:authority` vhost
 //!     confusion after an SNI-checked handshake (ALPN rides through
 //!     uninspected — inherent to any non-terminating proxy; #14's threat
