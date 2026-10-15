@@ -78,6 +78,13 @@ harness = false
 name = "sandbox_proxy"
 harness = false
 
+# Issue #11 integration suite: the real `sbx check` (probe, nested bwrap tiers
+# with --disable-userns and a read-only /proc/sys) — hand-rolled SKIP-with-message
+# runner, like the other harness = false suites.
+[[test]]
+name = "sandbox_check"
+harness = false
+
 # Issue #10 integration suite: spawns the real `sbx run` (and the test binary
 # itself as the payload role) — hand-rolled SKIP-with-message runner, like the
 # other harness = false suites.

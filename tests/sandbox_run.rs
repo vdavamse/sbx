@@ -262,23 +262,40 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
             println!("DIAL {}", dial(SocketAddr::from((ip, port)), sni));
             0
         }
+        "noroute-checks" => {
+            // Issue #11: the explicit fallback removed the default route, so a
+            // direct connect fails fast with ENETUNREACH; the explicit proxy
+            // still answers (the CONNECT below is denied by policy: 403).
+            let t0 = Instant::now();
+            match TcpStream::connect_timeout(
+                &SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 443)),
+                BOUND,
+            ) {
+                Ok(_) => println!("DIRECT tcp connected"),
+                Err(e) => println!(
+                    "DIRECT tcp errno={:?} ms={}",
+                    e.raw_os_error(),
+                    t0.elapsed().as_millis()
+                ),
+            }
+            // IPv6 is disabled in the sandbox netns: the direct connect fails with
+            // EADDRNOTAVAIL (review suggestion; measured).
+            let t6 = TcpStream::connect_timeout(
+                &SocketAddr::from((
+                    std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7),
+                    443,
+                )),
+                BOUND,
+            );
+            match t6 {
+                Ok(_) => println!("DIRECT tcp6 connected"),
+                Err(e) => println!("DIRECT tcp6 errno={:?}", e.raw_os_error()),
+            }
+            explicit_connect_print();
+            0
+        }
         "explicit-connect" => {
-            let proxy = std::env::var("HTTPS_PROXY").unwrap_or_default();
-            let addr = proxy.trim_start_matches("http://").to_owned();
-            let mut s = match TcpStream::connect(&addr) {
-                Ok(s) => s,
-                Err(e) => {
-                    println!("EXPLICIT connect-error {e}");
-                    return 0;
-                }
-            };
-            let _ =
-                s.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n");
-            let _ = s.set_read_timeout(Some(BOUND));
-            let mut buf = [0u8; 256];
-            let n = s.read(&mut buf).unwrap_or(0);
-            let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-            println!("EXPLICIT {}", text.lines().next().unwrap_or(""));
+            explicit_connect_print();
             0
         }
         "concurrent" => {
@@ -400,6 +417,26 @@ fn dns_ask(name: &str) -> (u8, Option<Ipv4Addr>) {
 }
 
 /// Dials and sends a ClientHello (with SNI if given); reports what came back.
+/// Sends a CONNECT for a denied name through the explicit proxy and prints the
+/// status line (`EXPLICIT …`).
+fn explicit_connect_print() {
+    let proxy = std::env::var("HTTPS_PROXY").unwrap_or_default();
+    let addr = proxy.trim_start_matches("http://").to_owned();
+    let mut s = match TcpStream::connect(&addr) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("EXPLICIT connect-error {e}");
+            return;
+        }
+    };
+    let _ = s.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n");
+    let _ = s.set_read_timeout(Some(BOUND));
+    let mut buf = [0u8; 256];
+    let n = s.read(&mut buf).unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
+    println!("EXPLICIT {}", text.lines().next().unwrap_or(""));
+}
+
 fn dial(addr: SocketAddr, sni: Option<&str>) -> String {
     let mut s = match TcpStream::connect_timeout(&addr, BOUND) {
         Ok(s) => s,
@@ -685,6 +722,31 @@ fn scenarios() -> Vec<Scenario> {
             name: "startup-overhead-report",
             gate: Bwrap,
             run: startup_overhead_report,
+        },
+        Scenario {
+            name: "explicit-fallback-break-rules",
+            gate: Bwrap,
+            run: explicit_fallback_break_rules,
+        },
+        Scenario {
+            name: "none-fallback-break-rules",
+            gate: Bwrap,
+            run: none_fallback_break_rules,
+        },
+        Scenario {
+            name: "transparent-refused-break-rules-125",
+            gate: Bwrap,
+            run: transparent_refused_break_rules_125,
+        },
+        Scenario {
+            name: "refused-no-userns-125",
+            gate: Bwrap,
+            run: refused_no_userns_125,
+        },
+        Scenario {
+            name: "refused-ro-proc-sys-125",
+            gate: Bwrap,
+            run: refused_ro_proc_sys_125,
         },
     ]
 }
@@ -1719,6 +1781,18 @@ fn audit_rows_check() -> Result<(), String> {
     let (rows, done, dir) = audit_rows_scenario("arows", "net-checks", &[], &["allowed.test"])?;
     let _ = fs::remove_dir_all(&dir);
     expect_rc(&done, 0)?;
+    // Issue #11 (Q5): a transparent host records the achieved mode and never
+    // prints the explicit-fallback notice.
+    let exit = rows.last().ok_or("no rows")?;
+    if exit["net_mode"] != "transparent" {
+        return Err(format!("exit row net_mode: {exit}"));
+    }
+    if done.stderr.contains("notice:") {
+        return Err(format!(
+            "unexpected notice on a transparent run: {:?}",
+            done.stderr
+        ));
+    }
     let has = |pred: &dyn Fn(&serde_json::Value) -> bool| rows.iter().any(pred);
     if !has(&|r| r["event"] == "dns" && r["host"] == "allowed.test" && r["verdict"] == "answered") {
         return Err("no answered DNS row for allowed.test".into());
@@ -2497,4 +2571,210 @@ fn output_cap_merged() -> Result<(), String> {
         return Err("notice glued to a payload line on the merged stream".into());
     }
     Ok(())
+}
+
+// ---- issue #11: the explicit fallback and the refusal ------------------------
+
+const FALLBACK_NOTICE: &str = "sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (nft-load: batch failed";
+
+/// AC (issue #11, Q1): an explicit policy with a refused nft batch still runs
+/// (`--test-break-rules` is the hidden fail-only driver). Direct connects fail
+/// with ENETUNREACH in well under a second, the explicit proxy still answers,
+/// the notice is printed, and the exit row records `net_mode: explicit`.
+fn explicit_fallback_break_rules() -> Result<(), String> {
+    let dir = scratch("fbexp");
+    let mut pol = Pol::new("noroute-checks");
+    pol.mode = "explicit";
+    let policy = pol.write(&dir);
+    let audit = dir.join("a.jsonl");
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &[
+            "--audit",
+            audit.to_str().expect("utf8"),
+            "--test-break-rules",
+        ],
+        &payload(&[]),
+    );
+    let done = run_sbx(&args)?;
+    let rows = read_audit(&audit);
+    let _ = fs::remove_dir_all(&dir);
+    let rows = rows?;
+    expect_rc(&done, 0)?;
+    if !done.stdout.contains("DIRECT tcp errno=Some(101)") {
+        return Err(format!(
+            "direct connect was not ENETUNREACH: {:?}",
+            done.stdout
+        ));
+    }
+    let ms = done
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("DIRECT tcp errno=Some(101) ms="))
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or("no timing on the direct connect line")?;
+    if ms >= 1000 {
+        return Err(format!("ENETUNREACH took {ms} ms (expected < 1000)"));
+    }
+    if !done.stdout.contains("DIRECT tcp6 errno=Some(99)") {
+        return Err(format!(
+            "direct IPv6 connect was not EADDRNOTAVAIL: {:?}",
+            done.stdout
+        ));
+    }
+    if !done.stdout.contains("EXPLICIT HTTP/1.1 403") {
+        return Err(format!("explicit proxy did not answer: {:?}", done.stdout));
+    }
+    expect_stderr(&done, FALLBACK_NOTICE)?;
+    let exit = rows.last().ok_or("no rows")?;
+    if exit["event"] != "exit" || exit["net_mode"] != "explicit" {
+        return Err(format!("exit row: {exit}"));
+    }
+    Ok(())
+}
+
+/// AC (issue #11): `none` policies run on the explicit variant too.
+fn none_fallback_break_rules() -> Result<(), String> {
+    let dir = scratch("fbnone");
+    let mut pol = Pol::new("exit");
+    pol.mode = "none";
+    let policy = pol.write(&dir);
+    let audit = dir.join("a.jsonl");
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &[
+            "--audit",
+            audit.to_str().expect("utf8"),
+            "--test-break-rules",
+        ],
+        &payload(&["0"]),
+    );
+    let done = run_sbx(&args)?;
+    let rows = read_audit(&audit);
+    let _ = fs::remove_dir_all(&dir);
+    let rows = rows?;
+    expect_rc(&done, 0)?;
+    expect_stderr(
+        &done,
+        "sbx run: notice: running in network mode explicit (policy mode none) because the nftables NAT redirect is unavailable (nft-load: batch failed",
+    )?;
+    let exit = rows.last().ok_or("no rows")?;
+    if exit["net_mode"] != "explicit" {
+        return Err(format!("exit row: {exit}"));
+    }
+    Ok(())
+}
+
+/// AC (issue #11, Q1): a transparent policy is refused (rc 125) when the host
+/// cannot provide it. The refusal names the stage, the reason and the fix,
+/// points at `sbx check`, and the exit row records a failed run with a null
+/// `net_mode`. `__init`'s own staged line comes first.
+fn transparent_refused_break_rules_125() -> Result<(), String> {
+    let dir = scratch("refuse");
+    let policy = Pol::new("exit").write(&dir);
+    let audit = dir.join("a.jsonl");
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &[
+            "--audit",
+            audit.to_str().expect("utf8"),
+            "--test-break-rules",
+        ],
+        &payload(&["0"]),
+    );
+    let done = run_sbx(&args)?;
+    let rows = read_audit(&audit);
+    let _ = fs::remove_dir_all(&dir);
+    let rows = rows?;
+    expect_rc(&done, 125)?;
+    let staged = done
+        .stderr
+        .find("sbx __init: nft-load:")
+        .ok_or("no staged line")?;
+    let refusal = done
+        .stderr
+        .find("sbx run: policy requires network mode transparent but this host provides only explicit: nftables NAT redirect is unavailable")
+        .ok_or_else(|| format!("no refusal line: {:?}", done.stderr))?;
+    if refusal < staged {
+        return Err("the refusal must follow __init's staged line".into());
+    }
+    if !done
+        .stderr
+        .contains("run `sbx check` for a full host report")
+    {
+        return Err(format!("no sbx check hint: {:?}", done.stderr));
+    }
+    let exit = rows.last().ok_or("no rows")?;
+    if exit["outcome"] != "failed" || !exit["net_mode"].is_null() {
+        return Err(format!("exit row: {exit}"));
+    }
+    Ok(())
+}
+
+/// Runs `sbx run` inside a bwrap tier and returns the `Done` record.
+fn run_inside_bwrap(bwrap_args: &[&str], sbx_run: &[OsString]) -> Result<Done, String> {
+    let bwrap = sbx::bwrap::version::find_bwrap().ok_or("bwrap disappeared")?;
+    let mut cmd = Command::new(&bwrap);
+    cmd.args(bwrap_args);
+    cmd.arg("--");
+    cmd.arg(SBX);
+    cmd.args(sbx_run);
+    cmd.env("SBX_BWRAP", &bwrap);
+    let out = cmd.output().map_err(|e| format!("spawn bwrap tier: {e}"))?;
+    Ok(Done {
+        rc: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
+}
+
+/// AC (issue #11, Q4/T6): a host where user namespaces cannot be nested (the
+/// `bwrap --disable-userns` tier, E3) refuses `run` with rc 125 and the
+/// ENOSPC explanation.
+fn refused_no_userns_125() -> Result<(), String> {
+    let dir = scratch("nonest");
+    let policy = Pol::new("exit").write(&dir);
+    let sbx_run = sbx_args(&policy, &dir.join("s"), &[], &payload(&["0"]));
+    let done = run_inside_bwrap(
+        &["--unshare-user", "--disable-userns", "--dev-bind", "/", "/"],
+        &sbx_run,
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 125)?;
+    expect_stderr(
+        &done,
+        "this host cannot run sandboxes: no user namespace can be created here",
+    )
+}
+
+/// AC (issue #11, E4): a read-only `/proc/sys` (Docker-style) refuses `run`
+/// with the IPv6 EROFS explanation, rc 125.
+fn refused_ro_proc_sys_125() -> Result<(), String> {
+    let dir = scratch("roproc");
+    let policy = Pol::new("exit").write(&dir);
+    let sbx_run = sbx_args(&policy, &dir.join("s"), &[], &payload(&["0"]));
+    let done = run_inside_bwrap(
+        &[
+            "--unshare-user",
+            "--unshare-pid",
+            "--dev-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--ro-bind",
+            "/proc/sys",
+            "/proc/sys",
+        ],
+        &sbx_run,
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 125)?;
+    expect_stderr(
+        &done,
+        "cannot disable IPv6 in the sandbox network namespace: /proc/sys is read-only (EROFS",
+    )
 }

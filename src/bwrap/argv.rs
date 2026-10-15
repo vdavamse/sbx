@@ -95,11 +95,35 @@ pub(super) const INFRA_ETC: [&str; 7] = [
 /// still-dangling shim aborts the launch at bwrap's mountpoint creation
 /// (ENOENT — the dest byte-order sort processes /lib/x86_64-linux-gnu
 /// before the /usr bind that would resolve the link).
-const USR_MERGE_SHIMS: [(&str, &str); 4] = [
+pub(super) const USR_MERGE_SHIMS: [(&str, &str); 4] = [
     ("/bin", "usr/bin"),
     ("/sbin", "usr/sbin"),
     ("/lib", "usr/lib"),
     ("/lib64", "usr/lib64"),
+];
+
+/// The namespace block (module docs point 2), shared by `build` and the
+/// host probe's `probe_argv` (issue #11) so the probe runs the very same
+/// namespace flags. NEVER `--unshare-net` (the netns belongs to `__init`).
+pub(super) const NAMESPACE_FLAGS: [&str; 5] = [
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--unshare-cgroup-try",
+];
+
+/// The hardening block (module docs point 3), shared by `build` and
+/// `probe_argv`: `--disable-userns` is the flag the nested-userns probe
+/// exercises.
+pub(super) const HARDENING_FLAGS: [&str; 7] = [
+    "--disable-userns",
+    "--cap-drop",
+    "ALL",
+    "--die-with-parent",
+    "--new-session",
+    "--hostname",
+    "sandbox",
 ];
 
 // Mount priority classes (module docs point 4): ascending, and bwrap's
@@ -146,13 +170,7 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     // 2. The unshare block — NEVER --unshare-net (module docs point 6):
     //    the netns belongs to sbx __init (#5); bwrap joins the inherited
     //    one, where the nftables rules and listeners already live.
-    for flag in [
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--unshare-cgroup-try",
-    ] {
+    for flag in NAMESPACE_FLAGS {
         argv.push(OsString::from(flag));
     }
 
@@ -160,15 +178,7 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     //    requires --unshare-user (present above) and bwrap >= 0.8
     //    (version::BWRAP_MIN); --hostname requires --unshare-uts
     //    (present).
-    for flag in [
-        "--disable-userns",
-        "--cap-drop",
-        "ALL",
-        "--die-with-parent",
-        "--new-session",
-        "--hostname",
-        "sandbox",
-    ] {
+    for flag in HARDENING_FLAGS {
         argv.push(OsString::from(flag));
     }
     // 3a. `--info-fd N` (issue #10, Q13): bwrap reports its pid-1 pid here.

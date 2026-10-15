@@ -18,13 +18,19 @@ use super::RunError;
 use super::sys::Signals;
 use super::sys::{self, pollfd, ready};
 use crate::bwrap::Launch;
-use crate::init::fdpass::ListenerFds;
+use crate::init::fdpass::{AchievedMode, ListenerFds, SetupMsg, StagedFailure, recv_setup};
+use crate::policy::NetworkMode;
 
-/// The re-exec argv after the program: `__init --fd C --keep-fd I -- <argv…>`.
+/// The re-exec argv after the program:
+/// `__init --fd C --keep-fd I --parent-pid P --min-mode M [--test-break-rules] -- <argv…>`
+/// (issue #11: `M` is the policy's mode — the weakest mode `__init` may fall
+/// back to).
 pub(crate) fn init_argv(
     control_fd: RawFd,
     info_fd: RawFd,
     parent_pid: u32,
+    min_mode: NetworkMode,
+    test_break_rules: bool,
     launch: &Launch,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
@@ -35,10 +41,24 @@ pub(crate) fn init_argv(
         info_fd.to_string().into(),
         "--parent-pid".into(),
         parent_pid.to_string().into(),
-        "--".into(),
+        "--min-mode".into(),
+        mode_word(min_mode).into(),
     ];
+    if test_break_rules {
+        argv.push("--test-break-rules".into());
+    }
+    argv.push("--".into());
     argv.extend(launch.argv().iter().cloned());
     argv
+}
+
+/// The `--min-mode` spelling of a policy mode (the `parse_network_mode` set).
+fn mode_word(mode: NetworkMode) -> &'static str {
+    match mode {
+        NetworkMode::Transparent => "transparent",
+        NetworkMode::Explicit => "explicit",
+        NetworkMode::None => "none",
+    }
 }
 
 /// `/proc/self/exe` (the same-binary invariant even if the file is replaced
@@ -47,17 +67,26 @@ pub(crate) fn init_argv(
 pub(crate) fn init_command(
     control_fd: RawFd,
     info_fd: RawFd,
+    min_mode: NetworkMode,
+    test_break_rules: bool,
     launch: &Launch,
     stdin: Stdio,
 ) -> Command {
     let mut cmd = Command::new("/proc/self/exe");
     // m6: __init arms PDEATHSIG and verifies this pid as its parent.
-    cmd.args(init_argv(control_fd, info_fd, std::process::id(), launch))
-        .env_clear()
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+    cmd.args(init_argv(
+        control_fd,
+        info_fd,
+        std::process::id(),
+        min_mode,
+        test_break_rules,
+        launch,
+    ))
+    .env_clear()
+    .stdin(stdin)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .process_group(0);
     cmd
 }
 
@@ -119,7 +148,13 @@ pub(crate) fn pid1_from_children(bwrap_pid: libc::pid_t) -> Option<OwnedFd> {
 
 /// How the setup wait ended.
 pub(crate) enum SetupEnd {
-    Fds(ListenerFds),
+    /// `__init` reached `send-fds`: the listener fds and the mode it achieved.
+    Ready {
+        fds: ListenerFds,
+        mode: AchievedMode,
+    },
+    /// `__init` reported a staged failure (`'E'`) and is exiting.
+    Refused(StagedFailure),
     Signal(i32),
     /// The run deadline (`--timeout`) passed first.
     TimedOut,
@@ -167,8 +202,9 @@ pub(crate) fn wait_for_fds(
             }
         }
         if ready(fds[1].revents) {
-            return match crate::init::fdpass::recv_listener_fds(ctrl.as_raw_fd()) {
-                Ok(listeners) => SetupEnd::Fds(listeners),
+            return match recv_setup(ctrl.as_raw_fd()) {
+                Ok(SetupMsg::Ready { fds, mode }) => SetupEnd::Ready { fds, mode },
+                Ok(SetupMsg::Failed(failure)) => SetupEnd::Refused(failure),
                 Err(err) => {
                     // m1: a dying __init hangs up ctrl AND readies its pidfd; the ctrl
                     // error can win the race. Give the pidfd a moment: if __init is gone,
@@ -190,6 +226,44 @@ pub(crate) fn wait_for_fds(
 mod tests {
     use super::*;
     use std::os::fd::AsFd;
+
+    #[test]
+    fn wait_for_fds_reports_refusal() {
+        // Issue #11: a staged failure ('E') is a successful receive: the wait
+        // returns Refused with the stage, errno and reason, while __init is
+        // still alive (the run then waits for its stderr line).
+        use crate::init::InitError;
+        use crate::init::Stage;
+        use crate::init::fdpass::{control_socketpair, send_failure};
+        let (parent_end, child_end) = control_socketpair().expect("socketpair");
+        let err = InitError::new(Stage::NftLoad, "batch failed").with_errno(Some(2));
+        use std::os::fd::AsRawFd;
+        send_failure(child_end.as_raw_fd(), &err);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn");
+        let pidfd = sys::pidfd_open(child.id() as libc::pid_t).expect("pidfd");
+        let signals = sys::Signals::install().expect("signals");
+        let now = Instant::now();
+        let end = wait_for_fds(
+            parent_end.as_fd(),
+            pidfd.as_fd(),
+            &signals,
+            now + Duration::from_secs(10),
+            now + Duration::from_secs(10),
+        );
+        match end {
+            SetupEnd::Refused(failure) => {
+                assert_eq!(failure.stage, Stage::NftLoad);
+                assert_eq!(failure.errno, Some(2));
+                assert_eq!(failure.reason, "batch failed");
+            }
+            _ => panic!("expected Refused"),
+        }
+        let _ = child.kill();
+        child.wait().expect("reap");
+    }
 
     #[test]
     fn dead_init_with_hung_up_ctrl_reports_its_exit() {
@@ -275,9 +349,9 @@ mod tests {
             info_fd: Some(9),
         })
         .expect("builds");
-        let argv = init_argv(7, 9, 4242, &launch);
+        let argv = init_argv(7, 9, 4242, NetworkMode::Explicit, false, &launch);
         assert_eq!(
-            &argv[..8],
+            &argv[..10],
             [
                 "__init",
                 "--fd",
@@ -286,10 +360,17 @@ mod tests {
                 "9",
                 "--parent-pid",
                 "4242",
-                "--"
+                "--min-mode",
+                "explicit",
+                "--",
             ]
             .map(OsString::from)
         );
-        assert_eq!(&argv[8..], launch.argv());
+        assert_eq!(&argv[10..], launch.argv());
+        let with_break = init_argv(7, 9, 4242, NetworkMode::Transparent, true, &launch);
+        assert_eq!(
+            with_break[8..11],
+            ["transparent", "--test-break-rules", "--"].map(OsString::from)
+        );
     }
 }

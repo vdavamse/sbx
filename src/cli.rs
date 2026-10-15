@@ -7,7 +7,8 @@
 //! without CLI churn:
 //!
 //! - `run`    — sandbox lifecycle, egress proxy, audit log (real since #10)
-//! - `check`  — policy validation + JSON Schema (real since #3)
+//! - `check`  — host capability report (issue #11), policy validation and
+//!   JSON Schema (real since #3)
 //! - `gc`     — session-directory garbage collection (#12)
 //! - `__init` — re-exec'd namespace helper (real since #5; hidden — #10's
 //!   `run` is its only production caller)
@@ -27,6 +28,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
+
+use crate::policy::NetworkMode;
 
 /// Parse a positive human-readable duration (`120s`, `7d`, `500ms`, ...) for clap.
 ///
@@ -121,17 +124,36 @@ pub enum Cmd {
             required = true
         )]
         cmd: Vec<OsString>,
+
+        /// (hidden) Test-only, fail-only: load a deliberately broken nftables
+        /// batch in the sandbox setup (forwarded to `__init`; issue #11, Q6).
+        #[arg(long, hide = true)]
+        test_break_rules: bool,
     },
 
-    /// Validate a policy file, or print the policy JSON Schema.
+    /// Report what this host can run, or validate a policy file.
     Check {
-        /// Sandbox policy file (JSON) to validate.
-        #[arg(long, value_name = "PATH", required_unless_present = "print_schema")]
+        /// Sandbox policy file (JSON): validated, or — with --host — compared
+        /// against this host.
+        #[arg(long, value_name = "PATH", conflicts_with = "print_schema")]
         policy: Option<PathBuf>,
 
         /// Print the policy JSON Schema (draft 2020-12) to stdout and exit.
-        #[arg(long, conflicts_with = "policy")]
+        #[arg(long, conflicts_with_all = ["policy", "host", "json", "test_break_rules"])]
         print_schema: bool,
+
+        /// With --policy: also check that this host can run the policy.
+        #[arg(long, requires = "policy")]
+        host: bool,
+
+        /// Print the host report as JSON (report version 1).
+        #[arg(long)]
+        json: bool,
+
+        /// (hidden) Test-only, fail-only: make the probe's nftables load fail
+        /// (issue #11, Q6 precedent).
+        #[arg(long, hide = true)]
+        test_break_rules: bool,
     },
 
     /// Delete session directories older than a cutoff.
@@ -155,8 +177,8 @@ pub enum Cmd {
         // discipline). Validated in the pipeline's `control` stage BEFORE
         // any namespace work, so a bad fd fails fast and deterministically.
         // `//` rationale, not `///`: clap renders doc comments as help text.
-        #[arg(long, value_name = "FD", value_parser = parse_control_fd)]
-        fd: RawFd,
+        #[arg(long, value_name = "FD", value_parser = parse_control_fd, required_unless_present = "probe")]
+        fd: Option<RawFd>,
 
         /// (hidden) The bwrap `--info-fd` pipe write end `run` hands through.
         //
@@ -183,6 +205,25 @@ pub enum Cmd {
         #[arg(long, hide = true)]
         test_break_rules: bool,
 
+        /// (hidden) The weakest network mode the caller accepts — `run` passes
+        /// its policy's mode. Defaults to transparent (no explicit fallback).
+        //
+        // Issue #11 (Q1): with explicit or none, a refused nft batch falls
+        // back to the explicit mode (default route removed and verified).
+        #[arg(long, value_name = "MODE", hide = true, value_parser = parse_network_mode)]
+        min_mode: Option<NetworkMode>,
+
+        /// (hidden) Host capability probe for `sbx check`: run the setup stages
+        /// and the nested bwrap launches, print one JSON line, exit 0.
+        //
+        // Issue #11 (T3/T4). Conflicts with every pipeline argument.
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "parent_pid", "min_mode", "cmd"])]
+        probe: bool,
+
+        /// (hidden, with --probe) The bwrap binary the probe launches.
+        #[arg(long, value_name = "PATH", hide = true, requires = "probe")]
+        bwrap: Option<PathBuf>,
+
         /// Command to exec, verbatim — everything after `--`.
         //
         // Same contract as `run`'s trailing command (OsString-clean,
@@ -194,15 +235,54 @@ pub enum Cmd {
             trailing_var_arg = true,
             allow_hyphen_values = true,
             num_args = 1..,
-            required = true
+            required_unless_present = "probe"
         )]
         cmd: Vec<OsString>,
     },
 }
 
+/// Parse `--min-mode` / the policy's network mode spelling for clap: exactly
+/// `transparent`, `explicit` or `none` (issue #11).
+pub fn parse_network_mode(s: &str) -> Result<NetworkMode, String> {
+    match s {
+        "transparent" => Ok(NetworkMode::Transparent),
+        "explicit" => Ok(NetworkMode::Explicit),
+        "none" => Ok(NetworkMode::None),
+        other => Err(format!(
+            "`{other}` is not a network mode (transparent, explicit, none)"
+        )),
+    }
+}
+
+/// Cross-argument rules clap cannot express alone (issue #11). Returns the
+/// usage error to report (rc 2). `check --policy P` without `--host` is the
+/// validate-only form, which must stay probe-free, so `--json` and
+/// `--test-break-rules` need a host report.
+pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
+    if let Cmd::Check {
+        policy: Some(_),
+        host: false,
+        json,
+        test_break_rules,
+        ..
+    } = &cli.command
+    {
+        if *json || *test_break_rules {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--json and --test-break-rules need a host report: add --host or drop --policy",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Binary entry point: parse `argv` and dispatch to the subcommand.
 ///
-/// `check` contract (issue #3): `--policy PATH` validates the file —
+/// `check` contract (issues #3 and #11): bare or `--json` prints the host
+/// capability report (exit 0 when the host can run at least the explicit
+/// mode, 1 otherwise); `--policy P --host` adds the policy comparison;
+/// `--policy PATH` alone validates the file, probe-free —
 /// silent rc 0 on success, rc 1 with `sbx check: <reason>` on stderr for
 /// an invalid *or* unreadable policy — and `--print-schema` prints the
 /// policy JSON Schema to stdout with rc 0. The two flags are mutually
@@ -227,6 +307,9 @@ pub fn run() -> ExitCode {
     Cli::command().debug_assert();
 
     let cli = Cli::parse();
+    if let Err(err) = validate(&cli) {
+        err.exit();
+    }
     match cli.command {
         Cmd::Run {
             policy,
@@ -235,6 +318,7 @@ pub fn run() -> ExitCode {
             timeout,
             audit,
             cmd,
+            test_break_rules,
         } => crate::run::run(crate::run::RunArgs {
             policy,
             session_dir,
@@ -242,19 +326,54 @@ pub fn run() -> ExitCode {
             timeout,
             audit,
             cmd,
+            test_break_rules,
         }),
         Cmd::Check {
+            print_schema: true, ..
+        } => check_print_schema(),
+        Cmd::Check {
+            policy: Some(path),
+            host: false,
+            ..
+        } => check(path),
+        Cmd::Check {
             policy,
-            print_schema,
-        } => check(policy, print_schema),
+            host,
+            json,
+            test_break_rules,
+            ..
+        } => crate::host::check(crate::host::CheckArgs {
+            policy,
+            host,
+            json,
+            test_break_rules,
+        }),
         Cmd::Gc { .. } => not_implemented("gc"),
         Cmd::Init {
             fd,
             keep_fd,
             parent_pid,
+            min_mode,
             test_break_rules,
+            probe,
+            bwrap,
             cmd,
-        } => crate::init::run_init(fd, keep_fd, parent_pid, test_break_rules, cmd),
+        } => {
+            if probe {
+                return crate::init::probe::run_probe(bwrap, test_break_rules);
+            }
+            let Some(fd) = fd else {
+                unreachable!("clap enforces --fd unless --probe")
+            };
+            crate::init::run_init(crate::init::InitArgs {
+                fd,
+                keep_fd,
+                parent_pid,
+                min_mode: min_mode.unwrap_or(NetworkMode::Transparent),
+                test_break_rules,
+                cmd,
+            })
+        }
     }
 }
 
@@ -266,22 +385,21 @@ pub fn run() -> ExitCode {
 /// stdout (broken pipe, e.g. `check --print-schema | true`) is not an sbx
 /// failure either: Unix convention, silent rc 0 — `println!` would panic
 /// (rc 101) because Rust ignores SIGPIPE.
-fn check(policy: Option<PathBuf>, print_schema: bool) -> ExitCode {
-    if print_schema {
-        use std::io::Write;
-        let mut out = std::io::stdout();
-        return match writeln!(out, "{}", crate::policy::schema_json()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-            Err(err) => {
-                eprintln!("sbx check: cannot write schema to stdout: {err}");
-                ExitCode::FAILURE
-            }
-        };
+fn check_print_schema() -> ExitCode {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    match writeln!(out, "{}", crate::policy::schema_json()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("sbx check: cannot write schema to stdout: {err}");
+            ExitCode::FAILURE
+        }
     }
-    let Some(path) = policy else {
-        unreachable!("clap enforces --policy unless --print-schema")
-    };
+}
+
+/// `check --policy P` (validate-only, probe-free): silent rc 0 on success.
+fn check(path: PathBuf) -> ExitCode {
     match crate::policy::Policy::from_file(&path) {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
@@ -334,7 +452,9 @@ mod tests {
                 timeout,
                 audit,
                 cmd,
+                test_break_rules,
             } => {
+                assert!(!test_break_rules);
                 assert_eq!(policy, Path::new("p.json"));
                 assert_eq!(session_dir, Path::new("/tmp/s"));
                 assert_eq!(cwd.as_deref(), Some(Path::new("/w")));
@@ -440,6 +560,7 @@ mod tests {
             Cmd::Check {
                 policy,
                 print_schema,
+                ..
             } => {
                 assert_eq!(policy.as_deref(), Some(Path::new("p.json")));
                 assert!(!print_schema);
@@ -456,6 +577,7 @@ mod tests {
             Cmd::Check {
                 policy,
                 print_schema,
+                ..
             } => {
                 assert_eq!(policy, None);
                 assert!(print_schema);
@@ -562,11 +684,166 @@ mod tests {
     }
 
     #[test]
-    fn check_requires_policy_or_print_schema() {
-        // `required_unless_present`: a bare `check` has nothing to do — the
-        // binary reports clap's usage error and exits 2.
-        let err = Cli::try_parse_from(["sbx", "check"]).expect_err("bare check must fail");
+    fn check_bare_parses() {
+        // Issue #11: a bare `check` is the host report (no longer a usage error).
+        let cli = Cli::try_parse_from(["sbx", "check"]).expect("bare check must parse");
+        validate(&cli).expect("bare check is valid");
+        match cli.command {
+            Cmd::Check {
+                policy,
+                print_schema,
+                host,
+                json,
+                test_break_rules,
+            } => {
+                assert_eq!(
+                    (policy, print_schema, host, json, test_break_rules),
+                    (None, false, false, false, false)
+                );
+            }
+            other => panic!("expected Cmd::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_json_and_host_forms_parse() {
+        for argv in [
+            &["sbx", "check", "--json"][..],
+            &["sbx", "check", "--policy", "p.json", "--host"][..],
+            &["sbx", "check", "--policy", "p.json", "--host", "--json"][..],
+        ] {
+            let cli = Cli::try_parse_from(argv).expect("must parse");
+            validate(&cli).expect("valid");
+        }
+    }
+
+    #[test]
+    fn check_host_requires_policy() {
+        let err = Cli::try_parse_from(["sbx", "check", "--host"]).expect_err("--host alone");
         assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn check_validate_only_rejects_json_and_break_rules() {
+        let cli = Cli::try_parse_from(["sbx", "check", "--policy", "p.json", "--json"])
+            .expect("parses; validate rejects");
+        let err = validate(&cli).expect_err("--json needs --host");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let cli = Cli::try_parse_from(["sbx", "check", "--policy", "p.json", "--test-break-rules"])
+            .expect("parses");
+        assert!(validate(&cli).is_err());
+    }
+
+    #[test]
+    fn check_print_schema_conflicts_with_host_and_json() {
+        for argv in [
+            &["sbx", "check", "--print-schema", "--json"][..],
+            &["sbx", "check", "--print-schema", "--host"][..],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("must conflict");
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn check_hidden_flags_absent_from_help() {
+        let mut check = Cli::command();
+        let help = check
+            .find_subcommand_mut("check")
+            .expect("check exists")
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("test-break-rules"), "{help}");
+        assert!(help.contains("--json"), "{help}");
+        let run = Cli::command()
+            .find_subcommand_mut("run")
+            .expect("run exists")
+            .render_long_help()
+            .to_string();
+        assert!(!run.contains("test-break-rules"), "{run}");
+    }
+
+    #[test]
+    fn init_probe_parses_without_fd() {
+        let cli = Cli::try_parse_from(["sbx", "__init", "--probe", "--bwrap", "/usr/bin/bwrap"])
+            .expect("probe must parse");
+        match cli.command {
+            Cmd::Init {
+                probe,
+                bwrap,
+                fd,
+                cmd,
+                ..
+            } => {
+                assert!(probe);
+                assert_eq!(bwrap.as_deref(), Some(Path::new("/usr/bin/bwrap")));
+                assert_eq!(fd, None);
+                assert!(cmd.is_empty());
+            }
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_probe_conflicts_with_pipeline_args() {
+        let err = Cli::try_parse_from(["sbx", "__init", "--probe", "--fd", "3"])
+            .expect_err("--probe with --fd");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let err = Cli::try_parse_from(["sbx", "__init", "--probe", "--", "/bin/true"])
+            .expect_err("--probe with a command");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn init_requires_fd_without_probe() {
+        let err = Cli::try_parse_from(["sbx", "__init", "--", "/bin/true"])
+            .expect_err("no --fd and no --probe");
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn init_min_mode_parses_and_rejects_bogus() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "3",
+            "--min-mode",
+            "explicit",
+            "--",
+            "/bin/true",
+        ])
+        .expect("min-mode parses");
+        match cli.command {
+            Cmd::Init { min_mode, .. } => assert_eq!(min_mode, Some(NetworkMode::Explicit)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+        let err = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "3",
+            "--min-mode",
+            "bogus",
+            "--",
+            "/bin/true",
+        ])
+        .expect_err("bogus mode");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn parse_network_mode_table() {
+        assert_eq!(
+            parse_network_mode("transparent"),
+            Ok(NetworkMode::Transparent)
+        );
+        assert_eq!(parse_network_mode("explicit"), Ok(NetworkMode::Explicit));
+        assert_eq!(parse_network_mode("none"), Ok(NetworkMode::None));
+        assert_eq!(
+            parse_network_mode("Explicit"),
+            Err("`Explicit` is not a network mode (transparent, explicit, none)".to_owned())
+        );
     }
 
     #[test]
@@ -610,7 +887,7 @@ mod tests {
                 test_break_rules,
                 cmd,
                 ..
-            } => (fd, test_break_rules, cmd),
+            } => (fd.expect("--fd given"), test_break_rules, cmd),
             other => panic!("expected Cmd::Init, got {other:?}"),
         }
     }

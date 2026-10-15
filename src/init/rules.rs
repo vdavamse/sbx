@@ -477,7 +477,8 @@ pub fn load(sock: &mut NetlinkSocket, break_rules: bool) -> Result<LoadStats, In
                 if !is_erestart(errno) {
                     return Err(load_fail(format!(
                         "batch failed (attempt {attempt}/{MAX_BATCH_ATTEMPTS}, genid {genid}): {msg}"
-                    )));
+                    ))
+                    .with_errno(errno));
                 }
                 // ERESTART: silent retry — success stays silent (D6), and a
                 // retry that eventually commits is success.
@@ -490,7 +491,8 @@ pub fn load(sock: &mut NetlinkSocket, break_rules: bool) -> Result<LoadStats, In
     Err(load_fail(format!(
         "batch still rejected with ERESTART after {MAX_BATCH_ATTEMPTS} attempts \
          (ruleset keeps changing underneath us; last genid {last_genid}): {last_msg}"
-    )))
+    ))
+    .with_errno(Some(ERESTART)))
 }
 
 // ---------------------------------------------------------------------------

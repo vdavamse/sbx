@@ -77,9 +77,9 @@ impl From<serde_json::Error> for PolicyError {
 
 /// The network isolation level a policy demands.
 ///
-/// The policy states the *minimum* it accepts; sbx refuses to run a policy
-/// under a weaker mode than the host can provide (capability comparison is
-/// issue #11). Spellings are exactly `transparent`, `explicit`, `none`.
+/// The policy states the *minimum* it accepts; `sbx run` refuses a policy
+/// whose mode the host cannot provide, and `sbx check` shows what a host
+/// provides. Spellings are exactly `transparent`, `explicit`, `none`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
@@ -87,8 +87,12 @@ pub enum NetworkMode {
     /// normally and sbx's proxy filters allowed destinations in the network
     /// namespace, without the command's cooperation.
     Transparent,
-    /// The sandboxed command must connect through an explicitly configured
-    /// proxy; sbx does not redirect traffic transparently.
+    /// The sandboxed command connects through sbx's explicit proxy (sbx sets
+    /// the proxy environment variables). Direct connections never leave the
+    /// sandbox: they are redirected transparently when the host supports it,
+    /// and fail (IPv4 with ENETUNREACH, IPv6 with EADDRNOTAVAIL; IPv6 is
+    /// disabled in the sandbox). The DNS and transparent-proxy listeners stay
+    /// reachable on loopback, and the transparent listener denies what it gets.
     Explicit,
     /// No network access at all.
     None,

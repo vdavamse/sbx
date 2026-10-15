@@ -102,6 +102,12 @@ pub fn unshare_namespaces() -> Result<OuterIds, InitError> {
 /// Pure errno → staged-error mapper for [`unshare_namespaces`] (design D12:
 /// the syscall itself is never unit-tested; its error vocabulary is).
 fn unshare_error(err: io::Error) -> InitError {
+    let errno = err.raw_os_error();
+    unshare_error_text(err).with_errno(errno)
+}
+
+/// The text half of [`unshare_error`] (the errno is attached by the caller).
+fn unshare_error_text(err: io::Error) -> InitError {
     if err.raw_os_error() == Some(libc::EPERM) {
         InitError::new(
             Stage::Unshare,
@@ -135,8 +141,10 @@ fn map_line(outer: u32) -> String {
 }
 
 fn write_proc(path: &str, value: &str) -> Result<(), InitError> {
-    fs::write(path, value)
-        .map_err(|e| InitError::new(Stage::Idmap, format!("write {path} = {value:?}: {e}")))
+    fs::write(path, value).map_err(|e| {
+        InitError::new(Stage::Idmap, format!("write {path} = {value:?}: {e}"))
+            .with_errno(e.raw_os_error())
+    })
 }
 
 /// Configure the fresh netns: `lo` UP → `10.255.255.1/32` → default route
@@ -176,9 +184,9 @@ fn link_up(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
         ..Default::default()
     });
     sock.request(&req)
-        .map_err(|e| netns_fail(format!("lo up request: {e}")))?
+        .map_err(|e| netns_fail(format!("lo up request: {e}")).with_errno(e.raw_os_error()))?
         .recv_ack()
-        .map_err(|e| netns_fail(format!("lo up: {e}")))
+        .map_err(|e| netns_fail(format!("lo up: {e}")).with_errno(e.as_io_error().raw_os_error()))
 }
 
 /// `ip addr add 10.255.255.1/32 dev lo` equivalent (F7): scope universe,
@@ -199,9 +207,12 @@ fn add_sandbox_addr(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> 
         .push_address(SANDBOX_ADDR.into())
         .push_local(SANDBOX_ADDR.into());
     sock.request(&req)
-        .map_err(|e| netns_fail(format!("addr request: {e}")))?
+        .map_err(|e| netns_fail(format!("addr request: {e}")).with_errno(e.raw_os_error()))?
         .recv_ack()
-        .map_err(|e| netns_fail(format!("addr add {SANDBOX_ADDR}/32: {e}")))
+        .map_err(|e| {
+            netns_fail(format!("addr add {SANDBOX_ADDR}/32: {e}"))
+                .with_errno(e.as_io_error().raw_os_error())
+        })
 }
 
 /// `ip route add default dev lo src 10.255.255.1` equivalent (F7): table
@@ -211,22 +222,133 @@ fn add_default_route(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError>
     let mut req = rt_route::Request::new()
         .set_create()
         .set_excl()
-        .op_newroute_do(&rt_route::Rtmsg {
-            rtm_family: libc::AF_INET as u8,
-            rtm_dst_len: 0,
-            rtm_src_len: 0,
-            rtm_tos: 0,
-            rtm_table: RT_TABLE_MAIN,
-            rtm_protocol: RTPROT_BOOT,
-            rtm_scope: RT_SCOPE_LINK,
-            rtm_type: RTN_UNICAST,
-            rtm_flags: 0,
-        });
+        .op_newroute_do(&default_route_msg());
     req.encode().push_oif(lo).push_prefsrc(SANDBOX_ADDR.into());
     sock.request(&req)
-        .map_err(|e| netns_fail(format!("route request: {e}")))?
+        .map_err(|e| netns_fail(format!("route request: {e}")).with_errno(e.raw_os_error()))?
         .recv_ack()
-        .map_err(|e| netns_fail(format!("route add default: {e}")))
+        .map_err(|e| {
+            netns_fail(format!("route add default: {e}")).with_errno(e.as_io_error().raw_os_error())
+        })
+}
+
+/// The kernel's `local` routing table (255): the sandbox address, the
+/// loopback routes and the broadcast entries live here, never in `main`.
+pub(crate) const RT_TABLE_LOCAL: u32 = 255;
+
+/// Explicit-fallback route removal (issue #11, Q1; module docs): delete the
+/// default route via `lo` that [`add_default_route`] installed, then read the
+/// whole IPv4 routing table back (all tables) and require that no egress
+/// route is left. Every failure is a staged [`Stage::Fallback`] error and
+/// the caller never starts the payload (fail closed).
+///
+/// Measured (E1/E2): without this route a direct `connect(2)` hangs on the
+/// nat-less ruleset; with it removed the same connect returns ENETUNREACH in
+/// milliseconds, so the explicit proxy is the only way out.
+pub fn remove_default_route() -> Result<(), InitError> {
+    let lo = lo_ifindex_fallback()?;
+    let mut sock = NetlinkSocket::new();
+    let mut req = rt_route::Request::new().op_delroute_do(&default_route_msg());
+    req.encode().push_oif(lo);
+    sock.request(&req)
+        .map_err(|e| fallback_fail(format!("route del default: {e}")).with_errno(e.raw_os_error()))?
+        .recv_ack()
+        .map_err(|e| {
+            fallback_fail(format!("route del default: {e}"))
+                .with_errno(e.as_io_error().raw_os_error())
+        })?;
+    let rows = dump_ipv4_routes(&mut sock)?;
+    no_egress_route_verdict(&rows)
+}
+
+fn fallback_fail(reason: impl Into<String>) -> InitError {
+    InitError::new(Stage::Fallback, reason)
+}
+
+fn lo_ifindex_fallback() -> Result<u32, InitError> {
+    lo_ifindex().map_err(|err| fallback_fail(format!("lo index: {}", err.reason())))
+}
+
+/// The exact `Rtmsg` [`add_default_route`] installs — the delete must match
+/// it field for field.
+fn default_route_msg() -> rt_route::Rtmsg {
+    rt_route::Rtmsg {
+        rtm_family: libc::AF_INET as u8,
+        rtm_dst_len: 0,
+        rtm_src_len: 0,
+        rtm_tos: 0,
+        rtm_table: RT_TABLE_MAIN,
+        rtm_protocol: RTPROT_BOOT,
+        rtm_scope: RT_SCOPE_LINK,
+        rtm_type: RTN_UNICAST,
+        rtm_flags: 0,
+    }
+}
+
+/// One IPv4 route as the read-back sees it (module-private, pure input of
+/// [`no_egress_route_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteRow {
+    /// `RTA_TABLE` when present, else the header's `rtm_table`.
+    pub table: u32,
+    /// `RTA_DST`, `None` when the attribute is absent.
+    pub dst: Option<Ipv4Addr>,
+    pub dst_len: u8,
+}
+
+/// Dump every IPv4 route in every table (`rtm_table = 0`).
+fn dump_ipv4_routes(sock: &mut NetlinkSocket) -> Result<Vec<RouteRow>, InitError> {
+    let req = rt_route::Request::new().op_getroute_dump(&rt_route::Rtmsg {
+        rtm_family: libc::AF_INET as u8,
+        rtm_table: 0,
+        ..Default::default()
+    });
+    let mut iter = sock
+        .request(&req)
+        .map_err(|e| fallback_fail(format!("getroute dump: {e}")).with_errno(e.raw_os_error()))?;
+    let mut rows = Vec::new();
+    while let Some(res) = iter.recv() {
+        let (hdr, attrs) = res.map_err(|e| {
+            fallback_fail(format!("getroute dump: {e}")).with_errno(e.as_io_error().raw_os_error())
+        })?;
+        let table = attrs.get_table().unwrap_or(u32::from(hdr.rtm_table));
+        let dst = match attrs.get_dst() {
+            Ok(IpAddr::V4(ip)) => Some(ip),
+            _ => None,
+        };
+        rows.push(RouteRow {
+            table,
+            dst,
+            dst_len: hdr.rtm_dst_len,
+        });
+    }
+    Ok(rows)
+}
+
+/// Pure verdict over the post-delete routing table (fail closed): no route
+/// with prefix length 0 may remain in any table, and every remaining route
+/// must live in the `local` table (E2: after the delete only
+/// 10.255.255.1, 127.0.0.0/8 and the broadcast entries are left, all in
+/// table 255). Pinned reasons, first match wins.
+pub(crate) fn no_egress_route_verdict(rows: &[RouteRow]) -> Result<(), InitError> {
+    for row in rows {
+        if row.dst_len == 0 {
+            return Err(fallback_fail(format!(
+                "read-back: a default route is still present (table {})",
+                row.table
+            )));
+        }
+    }
+    for row in rows {
+        if row.table != RT_TABLE_LOCAL {
+            let dst = row.dst.map_or_else(|| "-".to_owned(), |ip| ip.to_string());
+            return Err(fallback_fail(format!(
+                "read-back: unexpected route left in table {} ({dst}/{})",
+                row.table, row.dst_len
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Dump-based read-back verification (module docs point 4): lo UP, both
@@ -238,10 +360,12 @@ fn verify_readback(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
     let req = rt_link::Request::new().op_getlink_dump(&rt_link::Ifinfomsg::default());
     let mut iter = sock
         .request(&req)
-        .map_err(|e| netns_fail(format!("getlink dump: {e}")))?;
+        .map_err(|e| netns_fail(format!("getlink dump: {e}")).with_errno(e.raw_os_error()))?;
     let mut lo_up: Option<bool> = None;
     while let Some(res) = iter.recv() {
-        let (hdr, attrs) = res.map_err(|e| netns_fail(format!("getlink dump: {e}")))?;
+        let (hdr, attrs) = res.map_err(|e| {
+            netns_fail(format!("getlink dump: {e}")).with_errno(e.as_io_error().raw_os_error())
+        })?;
         if attrs.get_ifname().is_ok_and(|n| n == c"lo") {
             lo_up = Some(hdr.ifi_flags & IFF_UP != 0);
         }
@@ -260,10 +384,12 @@ fn verify_readback(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
     });
     let mut iter = sock
         .request(&req)
-        .map_err(|e| netns_fail(format!("getaddr dump: {e}")))?;
+        .map_err(|e| netns_fail(format!("getaddr dump: {e}")).with_errno(e.raw_os_error()))?;
     let (mut have_sandbox, mut have_loopback4) = (false, false);
     while let Some(res) = iter.recv() {
-        let (hdr, attrs) = res.map_err(|e| netns_fail(format!("getaddr dump: {e}")))?;
+        let (hdr, attrs) = res.map_err(|e| {
+            netns_fail(format!("getaddr dump: {e}")).with_errno(e.as_io_error().raw_os_error())
+        })?;
         let ip = attrs
             .get_local()
             .or_else(|_| attrs.get_address())
@@ -291,10 +417,12 @@ fn verify_readback(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
     });
     let mut iter = sock
         .request(&req)
-        .map_err(|e| netns_fail(format!("getroute dump: {e}")))?;
+        .map_err(|e| netns_fail(format!("getroute dump: {e}")).with_errno(e.raw_os_error()))?;
     let mut have_default = false;
     while let Some(res) = iter.recv() {
-        let (hdr, attrs) = res.map_err(|e| netns_fail(format!("getroute dump: {e}")))?;
+        let (hdr, attrs) = res.map_err(|e| {
+            netns_fail(format!("getroute dump: {e}")).with_errno(e.as_io_error().raw_os_error())
+        })?;
         if hdr.rtm_dst_len != 0 {
             continue;
         }
@@ -336,10 +464,10 @@ fn classify_disable_write(err: &io::Error) -> Result<(), InitError> {
     if err.kind() == io::ErrorKind::NotFound {
         return Ok(());
     }
-    Err(InitError::new(
-        Stage::Ipv6,
-        format!("write disable_ipv6 failed: {err}"),
-    ))
+    Err(
+        InitError::new(Stage::Ipv6, format!("write disable_ipv6 failed: {err}"))
+            .with_errno(err.raw_os_error()),
+    )
 }
 
 /// Pure decision fn for the post-disable verification read: a missing
@@ -355,15 +483,77 @@ fn interpret_if_inet6(contents: io::Result<String>) -> Result<(), InitError> {
             format!("IPv6 addresses still present after disable: {text:?}"),
         )),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(InitError::new(
-            Stage::Ipv6,
-            format!("read {IF_INET6_PATH}: {err}"),
-        )),
+        Err(err) => Err(
+            InitError::new(Stage::Ipv6, format!("read {IF_INET6_PATH}: {err}"))
+                .with_errno(err.raw_os_error()),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    fn row(table: u32, dst: Option<Ipv4Addr>, dst_len: u8) -> RouteRow {
+        RouteRow {
+            table,
+            dst,
+            dst_len,
+        }
+    }
+
+    #[test]
+    fn no_egress_route_verdict_table() {
+        // Issue #11 (E2): after the delete only the local table remains.
+        let local = [
+            row(RT_TABLE_LOCAL, Some(SANDBOX_ADDR), 32),
+            row(RT_TABLE_LOCAL, Some(Ipv4Addr::LOCALHOST), 32),
+            row(RT_TABLE_LOCAL, Some(Ipv4Addr::new(127, 0, 0, 0)), 8),
+            row(RT_TABLE_LOCAL, Some(Ipv4Addr::new(127, 255, 255, 255)), 32),
+        ];
+        assert!(no_egress_route_verdict(&[]).is_ok());
+        assert!(no_egress_route_verdict(&local).is_ok());
+        // A default route in any table is pinned as a read-back failure.
+        let in_main = [row(RT_TABLE_MAIN as u32, None, 0)];
+        let err = no_egress_route_verdict(&in_main).expect_err("default in main");
+        assert_eq!(err.stage(), Stage::Fallback);
+        assert_eq!(
+            err.reason(),
+            "read-back: a default route is still present (table 254)"
+        );
+        let in_local = [row(RT_TABLE_LOCAL, None, 0)];
+        let err = no_egress_route_verdict(&in_local).expect_err("default in local");
+        assert_eq!(
+            err.reason(),
+            "read-back: a default route is still present (table 255)"
+        );
+        // A non-default route in main is an unexpected leftover (dash for an
+        // absent RTA_DST).
+        let stray = [row(
+            RT_TABLE_MAIN as u32,
+            Some(Ipv4Addr::new(10, 0, 0, 0)),
+            8,
+        )];
+        let err = no_egress_route_verdict(&stray).expect_err("stray main route");
+        assert_eq!(
+            err.reason(),
+            "read-back: unexpected route left in table 254 (10.0.0.0/8)"
+        );
+        let no_dst = [row(RT_TABLE_MAIN as u32, None, 16)];
+        let err = no_egress_route_verdict(&no_dst).expect_err("no RTA_DST");
+        assert_eq!(
+            err.reason(),
+            "read-back: unexpected route left in table 254 (-/16)"
+        );
+    }
+
+    #[test]
+    fn default_route_msg_matches_the_add() {
+        // The delete must name exactly the route the add installed.
+        let m = default_route_msg();
+        assert_eq!(m.rtm_table, RT_TABLE_MAIN);
+        assert_eq!(m.rtm_dst_len, 0);
+        assert_eq!(m.rtm_protocol, RTPROT_BOOT);
+    }
+
     use super::*;
 
     // NO test in this module (or anywhere in the unit suite) calls
