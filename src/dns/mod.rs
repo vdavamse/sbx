@@ -15,10 +15,10 @@
 //!    reaches the transparent proxy: `PortNotAllowed` unless a policy lists
 //!    port 53; then `UnknownFakeIp` for a non-fake address (the map lookup
 //!    runs first) and `NoInspector` for an allocated fake IP.
-//! 3. **Pipeline (per datagram, [`DnsServer::handle_datagram`]).** The raw-byte
+//! 3. **Pipeline (per datagram, `DnsServer::handle_datagram`).** The raw-byte
 //!    header gate runs before the protocol library, so an attacker-chosen
 //!    section count never reaches the decoder. Then: decode, EDNS version,
-//!    class, name (raw labels, then [`crate::proxy::canonicalize_host`]),
+//!    class, name (raw labels, then `crate::proxy::canonicalize_host`),
 //!    allow-list ([`crate::egress::allowed`]), qtype, allocation. The map
 //!    insert happens BEFORE the reply is built, so a client that gets an
 //!    address can always be mapped back.
@@ -60,7 +60,7 @@
 //! 10. **Why hickory.** The wire codec is `hickory-proto` 0.25.2 with no
 //!     features (`wire.rs` docs and `Cargo.toml`). The header gate and the
 //!     deny.toml entries record the advisory reasoning. Re-evaluate at MSRV 1.88.
-//! 11. **Test tiers.** Unit tests here drive [`DnsServer::handle_datagram`] with
+//! 11. **Test tiers.** Unit tests here drive `DnsServer::handle_datagram` with
 //!     no sockets. The socket tier runs `serve_dns` on a current-thread runtime
 //!     against a real UDP client. `tests/sandbox_proxy.rs` covers the namespace
 //!     and `getent` path.
@@ -111,7 +111,7 @@ impl Default for DnsLimits {
 }
 
 /// The audit form of a question. The name is as received (case kept), escaped
-/// and capped by [`dns_name_for_audit`].
+/// and capped by `dns_name_for_audit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsQuestion {
     pub name: String,
