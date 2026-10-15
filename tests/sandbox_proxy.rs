@@ -2273,11 +2273,13 @@ const TOOL_BOUND: Duration = Duration::from_secs(30);
 /// Missing tools from `list` (empty = all present). A tool is present when
 /// `<tool> --version` (openssl: `openssl version`) runs and exits 0.
 fn missing_tools(list: &'static [&'static str]) -> Vec<&'static str> {
+    // Probe inside the isolated env the scenarios run in, so a tool that
+    // cannot start under that env reports SKIP, not a proxy FAIL.
+    let home = Scratch::new("probe").expect("probe home");
     list.iter()
         .copied()
         .filter(|tool| {
-            // Probe the way the suite runs each tool: openssl has no
-            // `--version`; pip runs as `python3 -m pip`.
+            // openssl has no `--version`; pip runs as `python3 -m pip`.
             let mut probe = match *tool {
                 "pip" => {
                     let mut cmd = Command::new("python3");
@@ -2295,6 +2297,7 @@ fn missing_tools(list: &'static [&'static str]) -> Vec<&'static str> {
                     cmd
                 }
             };
+            isolated(&mut probe, &home.0);
             probe
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -2392,20 +2395,12 @@ fn run_bounded(mut cmd: Command, what: &str, limit: Duration) -> Result<ToolOut,
 /// The tool env isolation (design §5): nothing from the user's config.
 /// Everything is cleared, then re-added: PATH, a fresh HOME/XDG cache, git
 /// with no system or global config, pip with no config file, and no proxy
-/// variables except the ones a scenario sets. PYENV_ROOT is passed through
-/// deliberately: the `python3` on PATH is a pyenv shim that resolves its
-/// interpreter from the REAL pyenv root (`$HOME/.pyenv`), which the
-/// isolated HOME would otherwise hide.
+/// variables except the ones a scenario sets.
 fn isolated(cmd: &mut Command, home: &std::path::Path) {
-    let real_home = std::env::var_os("HOME").unwrap_or_default();
     cmd.env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("XDG_CACHE_HOME", home)
-        .env(
-            "PYENV_ROOT",
-            std::path::Path::new(&real_home).join(".pyenv"),
-        )
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "sbx")
@@ -2415,6 +2410,12 @@ fn isolated(cmd: &mut Command, home: &std::path::Path) {
         .env("PIP_CONFIG_FILE", "/dev/null")
         .env("NO_PROXY", "")
         .env("no_proxy", "");
+    // Passed through ONLY when the runner set it: a pyenv `python3` shim on
+    // PATH resolves its interpreter from this root, which the isolated HOME
+    // would otherwise hide. Never a guessed location.
+    if let Some(root) = std::env::var_os("PYENV_ROOT") {
+        cmd.env("PYENV_ROOT", root);
+    }
 }
 
 /// The python upstream fixture plus its docroot (cert, repo, index files).
@@ -2553,9 +2554,15 @@ fn make_docroot(dir: &std::path::Path) -> Result<(), String> {
     std::fs::write(src.join("README"), "sbx-git-ok\n").map_err(|e| e.to_string())?;
     run(&["git", "init", "-q"], &src)?;
     run(&["git", "add", "README"], &src)?;
+    // The fixture commit carries its own identity: the isolated tool env (and
+    // a CI runner) has no global git config, so no author is auto-detected.
     run(
         &[
             "git",
+            "-c",
+            "user.name=sbx-test",
+            "-c",
+            "user.email=sbx-test@invalid",
             "-c",
             "commit.gpgsign=false",
             "commit",

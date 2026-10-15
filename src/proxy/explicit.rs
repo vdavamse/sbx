@@ -56,9 +56,8 @@
 //! 11. **Audit (Q10)** — one [`Decision`] per connection, recorded before
 //!     any relay byte or deny response. Client-derived text in reasons is
 //!     [`crate::proxy::redact_for_audit`]ed: authority only, no path, query,
-//!     or headers, capped at 256 bytes. Residual (documented): a CONNECT
-//!     whose upstream dial fails after the `200` is a silent close, since
-//!     the client already saw the tunnel open.
+//!     or headers, capped at 256 bytes. (The post-`200` dial-failure
+//!     residual is listed once, in point 10.)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -369,12 +368,7 @@ pub(crate) fn check_proxy_head(
     max_headers: usize,
 ) -> Result<(), Rejected> {
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
-    let mut request = httparse::Request::new(&mut headers);
-    if request.parse(head).is_err() {
-        return Err(Rejected::HttpMalformed {
-            detail: "request head re-parse failed".to_owned(),
-        });
-    }
+    let request = reparse_head(head, &mut headers)?;
     let (source, require) = match req.kind {
         ExplicitKind::Connect => (
             NameSource::ConnectTarget,
@@ -413,14 +407,9 @@ pub(crate) fn rewrite_forward_head(
     max_headers: usize,
 ) -> Result<Vec<u8>, Rejected> {
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
-    let mut request = httparse::Request::new(&mut headers);
     // Fail closed: the head was validated already, so a re-parse failure
     // is a bug, but it must never be rebuilt with an invented method.
-    if request.parse(head).is_err() {
-        return Err(Rejected::HttpMalformed {
-            detail: "request head re-parse failed".to_owned(),
-        });
-    }
+    let request = reparse_head(head, &mut headers)?;
     let origin = req.origin_form.as_deref().unwrap_or("/");
     let mut out = format!("{} {origin} HTTP/1.{}\r\n", req.method, req.minor_version).into_bytes();
     for header in request.headers.iter() {
@@ -437,6 +426,24 @@ pub(crate) fn rewrite_forward_head(
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
     Ok(out)
+}
+
+/// Re-parse a head that must be exactly one complete request: httparse
+/// `Complete(n)` with `n == head.len()`. Anything else (`Partial`, trailing
+/// bytes, an error) fails closed as HttpMalformed. httparse leaves the
+/// header slice untouched on `Partial`, so reading it would silently skip
+/// the Host and framing checks.
+fn reparse_head<'h, 'b>(
+    head: &'b [u8],
+    headers: &'h mut [httparse::Header<'b>],
+) -> Result<httparse::Request<'h, 'b>, Rejected> {
+    let mut request = httparse::Request::new(headers);
+    match request.parse(head) {
+        Ok(httparse::Status::Complete(n)) if n == head.len() => Ok(request),
+        _ => Err(Rejected::HttpMalformed {
+            detail: "request head re-parse failed".to_owned(),
+        }),
+    }
 }
 
 /// What [`decide_explicit`] hands back to the connection handler.
@@ -711,8 +718,7 @@ mod tests {
     use crate::proxy::AUDIT_TEXT_CAP;
     use crate::proxy::hello::{build_client_hello, first_record_end};
     use crate::proxy::{
-        ConnectError, Connected, Connector, DecisionSink, DialFn, DnsMap, GuardedConnector,
-        ResolveFn, Upstream,
+        Connector, DecisionSink, DialFn, DnsMap, GuardedConnector, ResolveFn, Upstream,
     };
 
     const CLIENT: &str = "127.0.0.1:40000";
@@ -1498,19 +1504,53 @@ mod tests {
     }
 
     #[test]
-    fn connect_error_never_reaches_explicit_surface_without_dial() {
-        // Connect errors are mapped by connect_upstream (single site), not
-        // here; this pins that a dial failure after the 200 is silent.
-        let verdict = Verdict::Error(Failed::Connect {
-            name: dom("allowed.test"),
-            detail: String::new(),
+    fn decide_explicit_connect_dial_failure_after_200_is_silent() {
+        // A refused dial after the tunnel opened: the 200 already went out,
+        // so the verdict is an Error and the handler closes silently.
+        block_on(async {
+            let dial: DialFn = Arc::new(|_name: &str, _port: u16| {
+                Box::pin(async { Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused")) })
+            });
+            let connector: Arc<dyn Connector> = Arc::new(GuardedConnector::new(
+                public_resolve(),
+                dial,
+                Duration::from_secs(5),
+            ));
+            let proxy = proxy_with_connector(connector, Duration::from_secs(5));
+            let mut bytes = connect("allowed.test:443");
+            bytes.extend_from_slice(&hello("allowed.test"));
+            let (decided, out) = drive(&proxy, &bytes).await;
+            assert_eq!(out, RESPONSE_CONNECT_ESTABLISHED.to_vec());
+            assert!(decided.tunnel_open);
+            assert!(matches!(
+                decided.decision.verdict,
+                Verdict::Error(Failed::Connect { .. })
+            ));
+            assert_eq!(
+                explicit_response(&decided.decision.verdict, decided.tunnel_open),
+                None
+            );
         });
-        assert_eq!(explicit_response(&verdict, true), None);
-        let _ = ConnectError::Timeout;
-        let _ = Connected {
-            stream: Box::new(duplex(8).0),
-            peer: sock(PUBLIC),
-        };
+    }
+
+    #[test]
+    fn reparse_requires_exactly_one_complete_head() {
+        // Partial, trailing bytes, and a clean head: only the last parses.
+        let mut headers = vec![httparse::EMPTY_HEADER; 8];
+        assert!(reparse_head(b"GET / HTTP/1.1\r\nHost: a", &mut headers).is_err());
+        let with_tail = b"GET / HTTP/1.1\r\nHost: a\r\n\r\nPIPELINED";
+        assert!(reparse_head(with_tail, &mut headers).is_err());
+        let exact = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        assert!(reparse_head(exact, &mut headers).is_ok());
+        // The explicit callers inherit it: a partial head is never checked.
+        let connect = b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n";
+        let parsed = parse_proxy_request(connect, connect.len(), 8).expect("parses");
+        assert_eq!(
+            check_proxy_head(b"CONNECT allowed.test:443 HTTP/1.1\r\nHost: al", &parsed, 8),
+            Err(Rejected::HttpMalformed {
+                detail: "request head re-parse failed".to_owned()
+            })
+        );
     }
 
     #[test]

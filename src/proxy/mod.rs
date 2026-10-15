@@ -331,7 +331,9 @@ pub enum Rejected {
     /// rustls saw no SNI (absent OR an IP literal — indistinguishable), or
     /// the SNI failed canonicalization.
     SniMissing,
-    /// The canonicalized SNI differs from the DNS-map name.
+    /// The canonicalized SNI differs from the expected name: the DNS-map
+    /// name (transparent) or the CONNECT target host (explicit). `source`
+    /// selects the reason wording.
     SniMismatch {
         sni: Domain,
         name: Domain,
@@ -1014,8 +1016,9 @@ pub async fn serve(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> io::Re
 
 /// The shared accept loop (issue #8 seam): flips the listener non-blocking
 /// itself, then spawns `handler` per accepted connection. [`serve`] passes
-/// the transparent handler; `explicit::serve_explicit` (#8) passes the
-/// explicit one. Every fatal/backoff rule lives here, once.
+/// the transparent handler; [`serve_explicit`] passes
+/// `explicit::handle_explicit_connection`. Every fatal/backoff rule lives
+/// here, once.
 pub(crate) async fn accept_loop<H, Fut>(
     listener: std::net::TcpListener,
     proxy: Arc<Proxy>,

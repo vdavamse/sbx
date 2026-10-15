@@ -28,9 +28,10 @@
 //! encodes the `env_clear` contract). [`proxy`] is the real transparent
 //! egress proxy (issue #7) and its explicit counterpart (issue #8, served
 //! by [`proxy::serve_explicit`]; `CONNECT` and absolute-form requests on
-//! the explicit listener, same policy and inspectors): it serves #5's handed-off transparent listener
-//! fd, recovers the dialed destination via `SO_ORIGINAL_DST`, maps fake IPs
-//! back to names through the [`proxy::DnsMap`] seam (#9), enforces the
+//! the explicit listener, same policy and inspectors): it serves #5's
+//! handed-off transparent listener fd, recovers the dialed destination via
+//! `SO_ORIGINAL_DST`, maps fake IPs back to names through the
+//! [`proxy::DnsMap`] seam (#9), enforces the
 //! policy's port + domain allow-lists, and inspects WITHOUT terminating the
 //! protocol preamble — TLS `ClientHello` SNI on 443 (rustls's `Acceptor`
 //! with NO crypto provider; ECH denied) and the HTTP request line + `Host`
