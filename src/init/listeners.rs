@@ -16,7 +16,7 @@
 //!    these sockets die at exec even if [`super`] 's fd hygiene ever missed
 //!    one — the parent's SCM_RIGHTS-dup'd copies live on. Blocking mode is
 //!    deliberate: #7 flips `transparent` non-blocking itself before handing
-//!    it to tokio.
+//!    it to tokio, and `dns::serve_dns` flips `dns` the same way.
 //! 5. Partial binds clean up via RAII: if bind N fails, binds 0..N-1 drop
 //!    (close) as the error propagates — the staged [`Stage::Listeners`]
 //!    failure leaves nothing behind, and the fresh netns dies with the

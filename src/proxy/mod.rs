@@ -26,8 +26,8 @@
 //!    `map_lookup_precedes_guard_ordering`; the host-netns test tier is a
 //!    second canary (its orig-dst is 127.0.0.1, Loopback-denied if the
 //!    order ever flips).
-//! 3. **Three seams** — [`DnsMap`] (#9 plugs in the run's live fake-IP
-//!    allocation map), [`DecisionSink`] (#10 plugs in the JSONL audit log),
+//! 3. **Three seams** — [`DnsMap`] (#9: [`crate::dns::FakeIpMap`], the same
+//!    `Arc` the resolver allocates into), [`DecisionSink`] (#10 plugs in the JSONL audit log),
 //!    and [`serve`] itself (#10 spawns it as a task BEFORE the go byte —
 //!    the fdpass go guarantee — and tears down via task abort or listener
 //!    shutdown). Both trait seams run on the single runtime thread: they
@@ -712,12 +712,12 @@ impl Decision {
     }
 }
 
-/// Seam (a): fake IP → canonical policy name. #9 plugs in the run's live
-/// allocation map.
+/// Seam (a): fake IP → canonical policy name. #9: [`crate::dns::FakeIpMap`]
+/// is the run's live allocation map.
 pub trait DnsMap: Send + Sync + 'static {
     /// Fake IP → canonical policy name. SYNC + CHEAP + NON-BLOCKING (called
-    /// on the runtime thread); `None` = unknown fake IP ⇒ deny. #9: back
-    /// with the run's live allocation map; production keys are always
+    /// on the runtime thread); `None` = unknown fake IP ⇒ deny. #9: the
+    /// implementation is [`crate::dns::FakeIpMap`]; production keys are always
     /// 198.18.0.0/15 (unspoofable-by-design interplay with
     /// [`egress::Denied::Benchmarking`], egress.rs point 7).
     fn name_for(&self, ip: Ipv4Addr) -> Option<Domain>;
@@ -958,7 +958,7 @@ pub struct Proxy {
     pub allow: Vec<Domain>,
     /// Cloned from `policy.network.ports`.
     pub ports: Vec<u16>,
-    /// Seam (a) — #9 plugs in.
+    /// Seam (a) — #9: [`crate::dns::FakeIpMap`].
     pub dns_map: Arc<dyn DnsMap>,
     /// Seam (b) — #10 plugs in.
     pub sink: Arc<dyn DecisionSink>,
@@ -1704,10 +1704,10 @@ mod tests {
         Arc::new(GuardedConnector::new(resolve, dial, connect_timeout))
     }
 
-    fn proxy_with(
+    fn proxy_with<M: DnsMap>(
         allow: &[&str],
         ports: &[u16],
-        map: StaticMap,
+        map: M,
         connector: Arc<dyn Connector>,
         limits: Limits,
     ) -> (Arc<Proxy>, Arc<RecordingSink>) {
@@ -2067,6 +2067,60 @@ mod tests {
         assert_eq!(decision.name, None);
         assert_eq!(decision.orig_dst(), Some(v4("203.0.113.7:443")));
         assert_eq!(decision.client, sock(SANDBOX_CLIENT));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "never connects");
+    }
+
+    #[test]
+    fn fake_ip_map_backs_decide() {
+        // #9: the real FakeIpMap is the DnsMap the proxy consults. The name it
+        // allocated is the one the proxy resolves; an unallocated fake IP in the
+        // same pool is UnknownFakeIp (deny) before any read.
+        let map = crate::dns::FakeIpMap::new(&crate::dns::DnsLimits::default());
+        let fake = map
+            .allocate(&dom("allowed.test"))
+            .expect("the first name allocates");
+        assert_eq!(fake, Ipv4Addr::new(198, 18, 0, 1));
+        let log = call_log();
+        let connector = guarded(
+            resolve_addrs(vec![sock(PUBLIC)]),
+            dial_duplex(sock(PUBLIC), Arc::clone(&log)),
+            Duration::from_secs(10),
+        );
+        let (proxy, _sink) = proxy_with(
+            &["allowed.test"],
+            &[TLS_PORT],
+            map,
+            connector,
+            Limits::default(),
+        );
+        let hello = tls_hello("allowed.test");
+        let (decision, relay) = run_decide(&proxy, "198.18.0.1:443", &hello);
+        assert_eq!(
+            decision.verdict,
+            Verdict::Allowed {
+                name: dom("allowed.test"),
+                upstream: sock(PUBLIC),
+            }
+        );
+        assert!(relay.is_some(), "the allowed path returns the relay state");
+        assert_eq!(log_of(&log), [("allowed.test".to_owned(), TLS_PORT)]);
+
+        // A fake IP the run never allocated: deny before any read, with the
+        // pinned reason.
+        let (connector, calls) = never_connector();
+        let (proxy, _sink) = proxy_with(
+            &["allowed.test"],
+            &[TLS_PORT],
+            crate::dns::FakeIpMap::new(&crate::dns::DnsLimits::default()),
+            connector,
+            Limits::default(),
+        );
+        let (decision, relay) = run_decide(&proxy, "198.18.0.2:443", &[]);
+        assert!(relay.is_none());
+        assert_eq!(
+            decision.reason(),
+            "unknown fake IP 198.18.0.2 (no DNS-map entry)"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "never connects");
     }
 

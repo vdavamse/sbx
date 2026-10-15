@@ -68,9 +68,9 @@ pub const SO_ORIGINAL_DST: i32 = 80;
 
 /// `IP_RECVORIGDSTADDR` (== `IP_ORIGDSTADDR`) from `<uapi/linux/in.h>` —
 /// NOT in the libc crate. Enables the ancillary message carrying the
-/// original destination `sockaddr_in` on UDP `recvmsg`. #9's consumer —
-/// with the spike's F4 caveat: it reports the POST-DNAT `127.0.0.1:53`, so
-/// it is informational only (replies go via `recv_from`'s peer address).
+/// original destination `sockaddr_in` on UDP `recvmsg`. #9 deliberately does
+/// not enable it (F4: it reports the POST-DNAT `127.0.0.1:53`, so it is
+/// informational only; replies go via `recv_from`'s peer address).
 pub const IP_RECVORIGDSTADDR: i32 = 20;
 
 /// `ERESTART` from `<asm-generic/errno.h>` — kernel-internal errno returned

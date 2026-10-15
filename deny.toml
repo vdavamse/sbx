@@ -18,7 +18,18 @@ yanked = "deny"
 # Grow this list only by explicit, justified decisions; prefer the table
 # form with a reason, e.g.
 #   { id = "RUSTSEC-0000-0000", reason = "not reachable in sbx" },
-ignore = []
+ignore = [
+    # hickory-proto 0.25.2 (issue #9). Both lift when MSRV >= 1.88 allows 0.26.1+.
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto DNSSEC code (pub mod dnssec) is compiled only behind its dnssec-ring or dnssec-aws-lc-rs features; sbx enables neither, enforced by the [[bans.features]] entry for hickory-proto below" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto encoder O(n^2) name compression: sbx encodes at most 3 names per response (question, one answer owner, the OPT root) from a header-gated question of <= 255 bytes; fixed only in 0.26.1, which needs rustc 1.88 > MSRV 1.85" },
+]
+
+# Precondition for the RUSTSEC-2026-0118 ignore above: no DNSSEC feature may
+# ever be enabled on hickory-proto (dnssec-ring / dnssec-aws-lc-rs gate
+# `pub mod dnssec`; __dnssec is what they pull in). Enforced, not just noted.
+[[bans.features]]
+crate = "hickory-proto"
+deny = ["dnssec-ring", "dnssec-aws-lc-rs", "__dnssec"]
 
 [licenses]
 # Everything not listed here is denied. The list is deliberately

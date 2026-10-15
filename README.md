@@ -23,15 +23,19 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Status
 
-**In progress** (issues #2–#8). The CLI parses the full documented
+**In progress** (issues #2–#9). The CLI parses the full documented
 interface, and `check` is real: it validates a policy file against the
 versioned policy schema (`--policy`) and prints that JSON Schema
 (`--print-schema`); example policies live in [`examples/`](examples/).
 The library also carries the egress decision core (issue #4): the
 domain allow-list matcher and the resolved-address guard that the proxy
-and fake-IP resolver (#7–#9) will call. The explicit HTTP proxy (#8)
+and fake-IP resolver (#7–#9) call. The explicit HTTP proxy (#8)
 serves `CONNECT` and absolute-form requests on the explicit listener with
 the same policy and inspectors; #10 wires both listeners into `sbx run`.
+The fake-IP DNS resolver is real (issue #9): A queries for allow-listed names
+get a per-run address from `198.18.0.0/15` that the transparent proxy maps back
+to the name; AAAA gets an empty answer, every other name NXDOMAIN, and nothing
+is ever forwarded upstream (TCP DNS is not served).
 The internal `__init` helper is
 real (issue #5): `sbx run` (#10) will re-exec it with one end of a
 control socketpair, and it unshares user + network namespaces, brings
@@ -51,7 +55,7 @@ synthetic files, and discovers/validates the host bwrap (≥ 0.8); `run`
 (#10) wires it behind `__init`. The transparent egress proxy is real
 (issue #7): the parent serves the handed-off transparent listener fd,
 recovers the sandbox's dialed destination via `SO_ORIGINAL_DST`, maps
-fake IPs back to names through a DNS-map seam (#9 plugs in), and
+fake IPs back to names through the fake-IP map (#9), and
 inspects — never terminates — the protocol preamble: TLS `ClientHello`
 SNI on 443 (rustls parser, no crypto provider, ECH denied) and the HTTP
 request line + `Host` on 80. Allowed names are resolved and dialed by
