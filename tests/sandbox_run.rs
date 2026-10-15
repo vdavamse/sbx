@@ -2974,11 +2974,15 @@ fn gc_hostile_payload_tree() -> Result<(), String> {
     Ok(())
 }
 
-/// `run` and `gc` race on one old session, 20 times. Invariants: a refused run
-/// is 125 with a lock or binding message; a run that succeeded left its
-/// marker; gc is 0, or 1 only with the Q13 line; and a final gc leaves no
-/// tombstone behind. The outcome counts are printed, so a run shows that both
-/// sides actually raced.
+/// `run` and `gc` race on one old session, 20 times, in both orders: even
+/// iterations start gc first (it removes the old session before `run` gets
+/// there), odd ones start `run` first (gc sees a young, locked session, or
+/// runs after the run ended). The start gap sweeps 0 to ~5 ms. Invariants:
+/// a refused run is 125 with a lock or binding message; a run that succeeded
+/// left its marker; gc is 0, or 1 only with the Q13 line; and a final gc
+/// leaves no tombstone behind. The outcome counts are printed and must show
+/// that gc removed a session while a run was starting, and that runs
+/// succeeded.
 fn run_vs_gc_race() -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("race");
@@ -2986,8 +2990,9 @@ fn run_vs_gc_race() -> Result<(), String> {
     fs::create_dir_all(&root).expect("mkdir root");
     let session = root.join("s");
     let policy = Pol::new("mark").write(&dir);
-    let (mut run_ok, mut run_refused, mut gc_ok, mut gc_recreated) = (0u32, 0u32, 0u32, 0u32);
-    for iter in 0..20 {
+    let (mut run_ok, mut run_refused, mut gc_removed, mut gc_skipped, mut gc_recreated) =
+        (0u32, 0u32, 0u32, 0u32, 0u32);
+    for iter in 0..20u32 {
         let _ = fs::remove_dir_all(&session);
         fs::create_dir(&session).map_err(|e| e.to_string())?;
         fs::set_permissions(&session, fs::Permissions::from_mode(0o700))
@@ -2995,11 +3000,17 @@ fn run_vs_gc_race() -> Result<(), String> {
         fs::write(session.join("sbx.lock"), b"").map_err(|e| e.to_string())?;
         backdate_dir(&session, Duration::from_secs(86_400))?;
 
-        let run = Proc::spawn(&sbx_args(&policy, &session, &[], &payload(&[])), |_| {})?;
-        // Sweep the gc start across the run's startup (0 to ~5 ms) so the two
-        // overlap at different points: before the lock, during it, after it.
-        std::thread::sleep(Duration::from_micros(250 * iter as u64));
-        let gc = gc_proc(&root, None)?;
+        let gap = Duration::from_micros(250 * u64::from(iter));
+        let run_args = sbx_args(&policy, &session, &[], &payload(&[]));
+        let (run, gc) = if iter % 2 == 0 {
+            let gc = gc_proc(&root, None)?;
+            std::thread::sleep(gap);
+            (Proc::spawn(&run_args, |_| {})?, gc)
+        } else {
+            let run = Proc::spawn(&run_args, |_| {})?;
+            std::thread::sleep(gap);
+            (run, gc_proc(&root, None)?)
+        };
         let run = run.finish(Duration::from_secs(60))?;
         let gc = gc.finish(Duration::from_secs(60))?;
 
@@ -3026,7 +3037,8 @@ fn run_vs_gc_race() -> Result<(), String> {
             other => return Err(format!("iter {iter}: run rc {other}: {:?}", run.stderr)),
         }
         match gc.rc {
-            0 => gc_ok += 1,
+            0 if gc.stdout.contains("removed ") => gc_removed += 1,
+            0 => gc_skipped += 1,
             1 if gc
                 .stderr
                 .contains("a concurrent sbx run recreated entries during removal") =>
@@ -3037,8 +3049,14 @@ fn run_vs_gc_race() -> Result<(), String> {
         }
     }
     println!(
-        "  run-vs-gc-race outcomes: run ok {run_ok}, run refused {run_refused}, gc ok {gc_ok}, gc recreated {gc_recreated}"
+        "  run-vs-gc-race outcomes: run ok {run_ok}, run refused {run_refused}, gc removed {gc_removed}, gc skipped {gc_skipped}, gc recreated {gc_recreated}"
     );
+    if gc_removed == 0 {
+        return Err("gc never removed a session while a run was starting".into());
+    }
+    if run_ok == 0 {
+        return Err("no run ever succeeded".into());
+    }
     let done = gc_proc(&root, None)?.finish(Duration::from_secs(60))?;
     expect_rc(&done, 0)?;
     let left: Vec<String> = fs::read_dir(&root)

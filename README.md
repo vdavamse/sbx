@@ -390,7 +390,7 @@ deletes sessions, so it is conservative by design.
   the same mount-point message, although it is not a directory.
 - **ROOT rules.** ROOT must exist and be a directory. Its final component must
   not be a symlink. Symlinks in ancestor directories are followed, as with any
-  path you type. A ROOT with a `..` component is refused (the reason is "must not contain .."). ROOT
+  path you type. A ROOT with a `..` component is refused (the reason is ``must not contain `..` ``). ROOT
   must be owned by you or by root, and if it is group- or world-writable it must
   have the sticky bit. `/` is always refused.
 - **Output and exit codes.** One line per collected entry on stdout, in name
@@ -418,9 +418,12 @@ deletes sessions, so it is conservative by design.
     not handled.
   - A btrfs subvolume has a different `st_dev` and is refused as a mount point.
   - On kernels older than 5.8 the mount id comes from `name_to_handle_at`
-    instead of `statx`; filesystems that do not support file handles (for
-    example procfs) make gc fail on those entries (fail closed), and the
-    `MOUNT_ROOT` attribute is not available.
+    instead of `statx`. If ROOT's filesystem does not support file handles
+    (procfs, and overlayfs on some older kernels when it is not exported),
+    the whole ROOT is refused with `cannot stat` and nothing is removed (fail
+    closed). A session on such a filesystem inside a handle-capable ROOT is
+    reported as `cannot stat` and left in place. The `MOUNT_ROOT` attribute is
+    also unavailable there, so the mount-id comparison is the only check.
   - A process running as your user that writes into a session while gc empties
     it can make gc fail (`could not empty the directory after N passes`); the
     tombstone is left for the next gc.

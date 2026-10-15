@@ -237,29 +237,11 @@ jobs:
           hyperfine -N --warmup 10 --runs 100 --export-json "$T/startup.json" \
             "/usr/bin/bash -c true" \
             "$BIN run --policy $T/bench.json --session-dir $T/s -- /usr/bin/bash -c true"
-          python3 - "$T/startup.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, statistics, sys
-          results = json.load(open(sys.argv[1]))["results"]
-          labels = ["/usr/bin/bash -c true", "sbx run --policy bench.json -- /usr/bin/bash -c true"]
-          rows = []
-          for label, r in zip(labels, results):
-              t = sorted(m["time_wall_clock"]["value"] * 1e3 for m in r["measurements"])
-              p90 = t[min(len(t) - 1, round(0.9 * (len(t) - 1)))]
-              rows.append((label, statistics.median(t), p90))
-          bash_median = rows[0][1]
-          sbx_median, sbx_p90 = rows[1][1], rows[1][2]
-          overhead = sbx_median - bash_median
-          print("### sbx run startup overhead (issue #10 AC3, report-only)")
-          print("")
-          print("| command | median (ms) | p90 (ms) |")
-          print("|---|---|---|")
-          for label, median, p90 in rows:
-              print(f"| `{label}` | {median:.2f} | {p90:.2f} |")
-          print("")
-          print(f"Overhead (median sbx - median bash): {overhead:.2f} ms; target < 25 ms.")
-          if overhead >= 25:
-              print(f"::warning::sbx run startup overhead is {overhead:.1f} ms (>= 25 ms target)")
-          PY
+          # Summary from the hyperfine JSON (1.x `times` or 2.x `measurements`);
+          # the script never crashes on an unknown shape, it prints n/a instead.
+          python3 .github/scripts/test_startup_summary.py > /dev/null \
+            || echo "::warning::startup summary self-test failed"
+          python3 .github/scripts/startup_summary.py "$T/startup.json" >> "$GITHUB_STEP_SUMMARY"
 
       # Issue #11 Docker tier (report-only): the default Docker seccomp profile
       # is expected to refuse nested unshare (EPERM, U_SECCOMP). Recorded in the

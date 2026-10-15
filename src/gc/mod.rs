@@ -29,8 +29,10 @@
 //! non-directories and symlinks (Q8, design deviation 2).
 //!
 //! Known residuals (#14): NFS `.nfsXXXX` files, flock on NFS/9p, btrfs
-//! subvolumes (a different st_dev, refused as a mount), and on kernels < 5.8 a
-//! same-filesystem bind mount inside a session is not detected.
+//! subvolumes (a different st_dev, refused as a mount). Mount identity is the
+//! kernel mount id (`STATX_MNT_ID`, or `name_to_handle_at` on kernels < 5.8),
+//! so a same-filesystem bind mount is detected on every kernel that supports
+//! file handles; a filesystem without them makes gc fail closed.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt::{self, Display};
@@ -43,6 +45,14 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) mod sys;
 pub(crate) mod walk;
+
+/// Test support for the integration suite: runs gc's mount checks on the
+/// calling thread as on a kernel without `STATX_MNT_ID` and `MOUNT_ROOT` (< 5.8),
+/// through the `name_to_handle_at` fallback. Not a configuration option.
+#[doc(hidden)]
+pub fn force_mount_id_fallback(on: bool) {
+    sys::set_force_handle_mount_id(on);
+}
 
 use sys::{DirStream, MountId};
 

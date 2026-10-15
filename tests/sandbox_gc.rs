@@ -33,7 +33,7 @@ fn main() -> ExitCode {
     // Role dispatch FIRST: the mount roles unshare, which needs one thread.
     if let Ok(role) = std::env::var(ROLE_ENV) {
         let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-        return ExitCode::from(run_role(&role, &args));
+        return run_role(&role, &args);
     }
     let filter: Option<String> = std::env::args().nth(1);
     let userns_ok = userns_available();
@@ -135,6 +135,11 @@ fn scenarios() -> Vec<Scenario> {
             run: mount_point_inside_session,
         },
         Scenario {
+            name: "mount-point-fallback-mount-id",
+            gate: Userns,
+            run: mount_point_fallback_mount_id,
+        },
+        Scenario {
             name: "session-dir-is-mount-point",
             gate: Userns,
             run: session_dir_is_mount_point,
@@ -144,17 +149,17 @@ fn scenarios() -> Vec<Scenario> {
 
 // ---- roles (re-exec'd children) ----------------------------------------------
 
-fn run_role(role: &str, args: &[OsString]) -> u8 {
+fn run_role(role: &str, args: &[OsString]) -> ExitCode {
     match role {
         "probe-userns" => {
             // SAFETY: unshare takes flags by value; no pointers.
             let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
-            u8::from(rc != 0)
+            ExitCode::from(u8::from(rc != 0))
         }
         "mountns" => mountns_role(args),
         other => {
             eprintln!("sandbox_gc: unknown role {other:?}");
-            2
+            ExitCode::from(2)
         }
     }
 }
@@ -169,8 +174,14 @@ fn arg_str(args: &[OsString], i: usize) -> String {
 /// make `/` private, build the mount layout for `mode`, then run `sbx gc` on
 /// `root` inside it. The role exits with gc's rc, and its stdio is the
 /// caller's.
-fn mountns_role(args: &[OsString]) -> u8 {
+fn mountns_role(args: &[OsString]) -> ExitCode {
     let mode = arg_str(args, 0);
+    // `inproc-<layout>`: the same layout, but gc runs in this process with the
+    // name_to_handle_at fallback forced on (kernels < 5.8 behaviour).
+    let (mode, inproc) = match mode.strip_prefix("inproc-") {
+        Some(rest) => (rest.to_owned(), true),
+        None => (mode, false),
+    };
     let root = args.get(1).map(PathBuf::from).unwrap_or_default();
     let outside = args.get(2).map(PathBuf::from).unwrap_or_default();
     // SAFETY: getuid/getgid have no preconditions and cannot fail.
@@ -178,18 +189,18 @@ fn mountns_role(args: &[OsString]) -> u8 {
     // SAFETY: unshare takes flags by value; no pointers.
     if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
         eprintln!("unshare: {}", io::Error::last_os_error());
-        return 3;
+        return ExitCode::from(3);
     }
     let maps = fs::write("/proc/self/setgroups", "deny")
         .and_then(|()| fs::write("/proc/self/uid_map", format!("0 {uid} 1")))
         .and_then(|()| fs::write("/proc/self/gid_map", format!("0 {gid} 1")));
     if let Err(err) = maps {
         eprintln!("id maps: {err}");
-        return 3;
+        return ExitCode::from(3);
     }
     if let Err(err) = mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE) {
         eprintln!("make / private: {err}");
-        return 3;
+        return ExitCode::from(3);
     }
     let layout = match mode.as_str() {
         "cross" => build_cross(&root, &outside),
@@ -198,17 +209,25 @@ fn mountns_role(args: &[OsString]) -> u8 {
     };
     if let Err(err) = layout {
         eprintln!("{err}");
-        return 3;
+        return ExitCode::from(3);
+    }
+    if inproc {
+        sbx::gc::force_mount_id_fallback(true);
+        return sbx::gc::gc(sbx::gc::GcArgs {
+            root,
+            older_than: DAY,
+            dry_run: false,
+        });
     }
     match Command::new(SBX)
         .args(["gc", "--older-than", "1d"])
         .arg(&root)
         .status()
     {
-        Ok(status) => u8::try_from(status.code().unwrap_or(3)).unwrap_or(3),
+        Ok(status) => ExitCode::from(u8::try_from(status.code().unwrap_or(3)).unwrap_or(3)),
         Err(err) => {
             eprintln!("spawn sbx gc: {err}");
-            3
+            ExitCode::from(3)
         }
     }
 }
@@ -842,6 +861,16 @@ fn run_child(mut cmd: Command) -> Result<Done, String> {
 /// both tombstones, and the canary survives. After the namespace is gone,
 /// a plain gc collects both tombstones.
 fn mount_point_inside_session() -> Result<(), String> {
+    mount_point_case("cross")
+}
+
+/// The same layout, gc run in-process with the name_to_handle_at fallback
+/// forced (kernels < 5.8): the bind mount is still detected, by mount id.
+fn mount_point_fallback_mount_id() -> Result<(), String> {
+    mount_point_case("inproc-cross")
+}
+
+fn mount_point_case(mode: &str) -> Result<(), String> {
     let s = Scratch::new("mountx");
     let root = s.root();
     let outside = s.0.join("outside");
@@ -853,7 +882,7 @@ fn mount_point_inside_session() -> Result<(), String> {
         mkdirs(&sess.join("work").join(if name == "s1" { "b" } else { "t" }));
         backdate(&sess, DAY * 2).map_err(|e| e.to_string())?;
     }
-    let inside = mountns("cross", &root, &outside)?;
+    let inside = mountns(mode, &root, &outside)?;
     expect_rc(&inside, 1)?;
     if !inside.stdout.is_empty() {
         return Err(format!("unexpected stdout: {:?}", inside.stdout));

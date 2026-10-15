@@ -64,14 +64,15 @@ impl Statx {
     }
 }
 
-/// The mount a directory sits on: its `mnt_id` when the kernel reports it
-/// (Linux >= 5.8), otherwise its `st_dev` (Q6). A same-filesystem bind mount
-/// has the same `st_dev`, so the fallback cannot see it; see the README
-/// residual for kernels < 5.8.
+/// The mount a directory sits on, as the kernel's mount id. Every value comes
+/// from [`statx_fd`], which always supplies one: `STATX_MNT_ID` when the
+/// kernel reports it (Linux >= 5.8), otherwise `name_to_handle_at`, which
+/// reports the same id space as `/proc/self/mountinfo` on Linux 2.6.39+. A
+/// same-filesystem bind mount therefore has a different id and is detected on
+/// every supported kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MountId {
-    mnt_id: Option<u64>,
-    dev: u64,
+    mnt_id: u64,
 }
 
 impl MountId {
@@ -79,11 +80,10 @@ impl MountId {
         Ok(Self::from_statx(&statx_fd(fd)?))
     }
 
+    /// `x` must come from [`statx_fd`] (so `mnt_id` is valid).
     pub(crate) fn from_statx(x: &Statx) -> Self {
-        Self {
-            mnt_id: (x.mask & STATX_MNT_ID != 0).then_some(x.mnt_id),
-            dev: x.dev(),
-        }
+        debug_assert!(x.mask & STATX_MNT_ID != 0, "statx_fd supplies the mount id");
+        Self { mnt_id: x.mnt_id }
     }
 
     /// True iff `x` (a child's statx, or a session's) sits on this mount and
@@ -95,11 +95,20 @@ impl MountId {
         {
             return false;
         }
-        match (self.mnt_id, x.mask & STATX_MNT_ID != 0) {
-            (Some(id), true) => x.mnt_id == id,
-            _ => x.dev() == self.dev,
-        }
+        x.mnt_id == self.mnt_id
     }
+}
+
+thread_local! {
+    /// Test support: when set on this thread, [`statx_fd`] behaves as on a
+    /// kernel without `STATX_MNT_ID` and `STATX_ATTR_MOUNT_ROOT` (< 5.8).
+    static FORCE_HANDLE_MOUNT_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes this thread's mount checks use the `name_to_handle_at` fallback, as
+/// on kernels older than 5.8. Test support only.
+pub(crate) fn set_force_handle_mount_id(on: bool) {
+    FORCE_HANDLE_MOUNT_ID.with(|f| f.set(on));
 }
 
 fn statx_raw(dirfd: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<Statx> {
@@ -126,42 +135,54 @@ fn statx_raw(dirfd: RawFd, path: &CStr, flags: libc::c_int) -> io::Result<Statx>
 }
 
 /// `statx(fd, "", AT_EMPTY_PATH|AT_NO_AUTOMOUNT|AT_SYMLINK_NOFOLLOW)`. Works
-/// on O_PATH fds. On kernels without `STATX_MNT_ID` (< 5.8) the mount id is
-/// filled in from `name_to_handle_at`, which reports the same id space as
-/// `/proc/self/mountinfo` (Linux 2.6.39+), so the mount checks still see a
-/// same-filesystem bind mount.
+/// on O_PATH fds. The result always carries a valid mount id (see
+/// [`MountId`]): when the kernel omits `STATX_MNT_ID` it is filled in from
+/// [`mount_id_via_handle`]. A filesystem without file-handle support (for
+/// example procfs, or an overlay without `nfs_export` on an old kernel) makes
+/// this fail, which is the fail-closed outcome.
 pub(crate) fn statx_fd(fd: BorrowedFd<'_>) -> io::Result<Statx> {
     let mut x = statx_raw(
         fd.as_raw_fd(),
         c"",
         libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT | libc::AT_SYMLINK_NOFOLLOW,
     )?;
+    if FORCE_HANDLE_MOUNT_ID.with(std::cell::Cell::get) {
+        x.mask &= !STATX_MNT_ID;
+        x.attributes_mask &= !STATX_ATTR_MOUNT_ROOT;
+    }
     if x.mask & STATX_MNT_ID == 0 {
-        x.mnt_id = mount_id_via_handle(fd)?;
+        x.mnt_id = mount_id_via_handle(fd, HANDLE_BYTES)?;
         x.mask |= STATX_MNT_ID;
     }
     Ok(x)
 }
 
+/// `MAX_HANDLE_SZ`: room for the largest handle the kernel returns.
+const HANDLE_BYTES: u32 = 128;
+
 /// The mount id of an open fd, via `name_to_handle_at(fd, "", AT_EMPTY_PATH)`.
-fn mount_id_via_handle(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    /// A `struct file_handle` with room for the largest handle the kernel
-    /// returns (`MAX_HANDLE_SZ` = 128).
+/// `EOVERFLOW` is success for the mount id: when the handle does not fit (or
+/// the filesystem cannot encode this inode), the kernel has already copied the
+/// mount id out and only the handle is missing. `EOPNOTSUPP` returns before
+/// that copy and is an error (no file-handle support). Passing `handle_bytes`
+/// 0 is the usual probe for the id alone.
+fn mount_id_via_handle(fd: BorrowedFd<'_>, handle_bytes: u32) -> io::Result<u64> {
+    /// A `struct file_handle` with `handle_bytes` bytes of storage.
     #[repr(C)]
     struct HandleBuf {
         handle_bytes: u32,
         handle_type: i32,
-        data: [u8; 128],
+        data: [u8; HANDLE_BYTES as usize],
     }
     let mut buf = HandleBuf {
-        handle_bytes: 128,
+        handle_bytes,
         handle_type: 0,
-        data: [0; 128],
+        data: [0; HANDLE_BYTES as usize],
     };
     let mut mount_id: libc::c_int = 0;
-    // SAFETY: `buf` is a file_handle-shaped struct whose handle_bytes says 128
-    // bytes of storage, and `mount_id` is a live c_int; both outlive the call.
-    // AT_EMPTY_PATH with "" names the fd itself.
+    // SAFETY: `buf` is a file_handle-shaped struct whose handle_bytes says at
+    // most HANDLE_BYTES of storage, and `mount_id` is a live c_int; both
+    // outlive the call. AT_EMPTY_PATH with "" names the fd itself.
     let rc = unsafe {
         libc::name_to_handle_at(
             fd.as_raw_fd(),
@@ -172,7 +193,10 @@ fn mount_id_via_handle(fd: BorrowedFd<'_>) -> io::Result<u64> {
         )
     };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EOVERFLOW) {
+            return Err(err);
+        }
     }
     u64::try_from(mount_id).map_err(|_| io::Error::other("negative mount id"))
 }
@@ -453,12 +477,52 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
 
+    fn tmp() -> std::fs::File {
+        std::fs::File::open(std::env::temp_dir()).expect("open tmp")
+    }
+
+    /// `handle_bytes` 0 never fits: the kernel answers EOVERFLOW after
+    /// copying the mount id out. That is the probe idiom, and it must yield the
+    /// id (the `EOVERFLOW` branch of `mount_id_via_handle`).
     #[test]
-    fn handle_mount_id_matches_statx_and_separates_mounts() {
-        let dir = std::fs::File::open(std::env::temp_dir()).expect("open tmp");
+    fn eoverflow_probe_still_yields_the_mount_id() {
+        let dir = tmp();
         let st = statx_raw(dir.as_raw_fd(), c"", libc::AT_EMPTY_PATH).expect("statx");
+        let id = mount_id_via_handle(dir.as_fd(), 0).expect("EOVERFLOW probe yields the id");
         if st.mask & STATX_MNT_ID != 0 {
-            assert_eq!(mount_id_via_handle(dir.as_fd()).expect("handle"), st.mnt_id);
+            assert_eq!(id, st.mnt_id);
         }
+    }
+
+    /// The fallback path, forced on this kernel, reports the same mount id
+    /// as the kernel's own `STATX_MNT_ID`, and drops `MOUNT_ROOT` the way an
+    /// older kernel would.
+    #[test]
+    fn forced_fallback_gives_the_kernel_mount_id() {
+        let dir = tmp();
+        let kernel = statx_fd(dir.as_fd()).expect("statx");
+        set_force_handle_mount_id(true);
+        let forced = statx_fd(dir.as_fd());
+        set_force_handle_mount_id(false);
+        let forced = forced.expect("fallback statx");
+        assert_eq!(forced.mnt_id, kernel.mnt_id);
+        assert_eq!(forced.attributes_mask & STATX_ATTR_MOUNT_ROOT, 0);
+        assert!(MountId::from_statx(&forced).contains(&forced));
+    }
+
+    /// procfs has no export operations, so name_to_handle_at is EOPNOTSUPP.
+    /// The fallback must fail the statx rather than guess a mount id.
+    #[test]
+    fn fallback_fails_closed_without_file_handles() {
+        let Ok(proc_dir) = std::fs::File::open("/proc") else {
+            return;
+        };
+        set_force_handle_mount_id(true);
+        let r = statx_fd(proc_dir.as_fd());
+        set_force_handle_mount_id(false);
+        assert!(
+            r.is_err(),
+            "a filesystem without file handles must fail closed"
+        );
     }
 }
