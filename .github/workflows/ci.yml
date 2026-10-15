@@ -150,6 +150,12 @@ jobs:
           RC=$?
           [ "$RC" -eq 0 ] || { echo "FAIL: audited run exit $RC"; FAIL=1; }
           tail -n 1 "$T/a.jsonl" | grep -q '"event":"exit"' || { echo "FAIL: last audit row is not exit"; FAIL=1; }
+          # Issue #12: gc collects a real session left by the runs above; the
+          # bench.json and a.jsonl files are skipped silently.
+          touch -d '2 days ago' "$T/s"
+          OUT=$("$BIN" gc --older-than 1d "$T")
+          RC=$?
+          [ "$RC" -eq 0 ] && [ "$OUT" = "removed \"$T/s\"" ] && [ ! -e "$T/s" ] || { echo "FAIL: gc of a real session rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
       # Issue #11: the real `sbx check` on the runner (gating). Every host item
@@ -231,29 +237,11 @@ jobs:
           hyperfine -N --warmup 10 --runs 100 --export-json "$T/startup.json" \
             "/usr/bin/bash -c true" \
             "$BIN run --policy $T/bench.json --session-dir $T/s -- /usr/bin/bash -c true"
-          python3 - "$T/startup.json" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, statistics, sys
-          results = json.load(open(sys.argv[1]))["results"]
-          labels = ["/usr/bin/bash -c true", "sbx run --policy bench.json -- /usr/bin/bash -c true"]
-          rows = []
-          for label, r in zip(labels, results):
-              t = sorted(m["time_wall_clock"]["value"] * 1e3 for m in r["measurements"])
-              p90 = t[min(len(t) - 1, round(0.9 * (len(t) - 1)))]
-              rows.append((label, statistics.median(t), p90))
-          bash_median = rows[0][1]
-          sbx_median, sbx_p90 = rows[1][1], rows[1][2]
-          overhead = sbx_median - bash_median
-          print("### sbx run startup overhead (issue #10 AC3, report-only)")
-          print("")
-          print("| command | median (ms) | p90 (ms) |")
-          print("|---|---|---|")
-          for label, median, p90 in rows:
-              print(f"| `{label}` | {median:.2f} | {p90:.2f} |")
-          print("")
-          print(f"Overhead (median sbx - median bash): {overhead:.2f} ms; target < 25 ms.")
-          if overhead >= 25:
-              print(f"::warning::sbx run startup overhead is {overhead:.1f} ms (>= 25 ms target)")
-          PY
+          # Summary from the hyperfine JSON (1.x `times` or 2.x `measurements`);
+          # the script never crashes on an unknown shape, it prints n/a instead.
+          python3 .github/scripts/test_startup_summary.py > /dev/null \
+            || echo "::warning::startup summary self-test failed"
+          python3 .github/scripts/startup_summary.py "$T/startup.json" >> "$GITHUB_STEP_SUMMARY"
 
       # Issue #11 Docker tier (report-only): the default Docker seccomp profile
       # is expected to refuse nested unshare (EPERM, U_SECCOMP). Recorded in the
@@ -411,7 +399,7 @@ jobs:
           fi
 
           # `run` is real since #10: a missing policy is an sbx-detected
-          # failure (rc 125, "sbx run: " prefix on stderr). `gc` is still a stub.
+          # failure (rc 125, "sbx run: " prefix on stderr). `gc` is real (#12).
           "$BIN" run --policy p.json --session-dir /tmp/s -- true > /dev/null 2> run.err
           check_rc 125 $? "sbx run (missing policy)"
           grep -q "sbx run: " run.err || { echo "FAIL: run stderr:"; cat run.err; FAIL=1; }
@@ -485,9 +473,23 @@ jobs:
           "$BIN" check --policy examples/default.json --print-schema > /dev/null 2>&1
           check_rc 2 $? "sbx check --policy with --print-schema (usage error)"
 
-          "$BIN" gc --older-than 7d /tmp/root > /dev/null 2> gc.err
-          check_rc 1 $? "sbx gc (stub)"
-          grep -q "not implemented" gc.err || { echo "FAIL: gc stderr:"; cat gc.err; FAIL=1; }
+          # Issue #12: real `sbx gc` on a scratch ROOT: dry run first (nothing
+          # removed), then the real run; the young session stays; a missing
+          # ROOT is refused (rc 1).
+          mkdir -p gc-root/old gc-root/young
+          : > gc-root/old/sbx.lock; : > gc-root/young/sbx.lock
+          touch -d '10 days ago' gc-root/old
+          "$BIN" gc --older-than 7d --dry-run gc-root > gc.out 2> gc.err
+          check_rc 0 $? "sbx gc --dry-run"
+          grep -qx 'would remove "gc-root/old"' gc.out || { echo "FAIL: gc dry-run stdout:"; cat gc.out; FAIL=1; }
+          [ -d gc-root/old ] || { echo "FAIL: dry-run removed gc-root/old"; FAIL=1; }
+          "$BIN" gc --older-than 7d gc-root > gc.out 2> gc.err
+          check_rc 0 $? "sbx gc"
+          grep -qx 'removed "gc-root/old"' gc.out || { echo "FAIL: gc stdout:"; cat gc.out; FAIL=1; }
+          [ ! -e gc-root/old ] && [ -f gc-root/young/sbx.lock ] || { echo "FAIL: gc kept/removed the wrong sessions"; FAIL=1; }
+          "$BIN" gc --older-than 7d gc-root/missing > /dev/null 2> gc.err
+          check_rc 1 $? "sbx gc on a missing ROOT"
+          grep -q "does not exist" gc.err || { echo "FAIL: gc stderr:"; cat gc.err; FAIL=1; }
 
           # __init is real since issue #5, but a full run needs a control
           # socketpair handed over by `run` (#10). The namespace-independent

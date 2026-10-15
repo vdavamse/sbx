@@ -85,6 +85,13 @@ harness = false
 name = "sandbox_check"
 harness = false
 
+# Issue #12 integration suite: the real `sbx gc` on real temp ROOTs, plus the
+# mount-crossing scenarios inside a user+mount namespace (a child role that
+# unshares) — hand-rolled SKIP-with-message runner, like the other suites.
+[[test]]
+name = "sandbox_gc"
+harness = false
+
 # Issue #10 integration suite: spawns the real `sbx run` (and the test binary
 # itself as the payload role) — hand-rolled SKIP-with-message runner, like the
 # other harness = false suites.

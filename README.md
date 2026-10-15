@@ -74,7 +74,8 @@ vocabulary through the sink seam #10 plugs into (whose `teardown` hook
 surfaces blocked relay-phase attacks). `sbx run` is the sandbox
 lifecycle (issue #10): timeouts, signals, stdio pumps, the output cap and the
 JSONL audit log; its exit codes are in [Running commands](#running-commands).
-`gc` is still a stub that exits `1` with `not implemented yet`. For `check`
+`sbx gc` removes expired session directories (see [Garbage collection](#garbage-collection));
+`0` success, `1` refused ROOT or any per-session failure, `2` usage. For `check`
 and `__init`: `0` success, `1` runtime failure (including an invalid or
 unreadable policy file), `2` usage error (clap's convention). The architecture
 and issue roadmap live in tracking issue #20. `spikes/` holds
@@ -101,7 +102,7 @@ sbx check [--json]
 sbx check --policy policy.json --host [--json]
 sbx check --policy policy.json
 sbx check --print-schema
-sbx gc --older-than 7d ROOT
+sbx gc --older-than 7d [--dry-run] ROOT
 ```
 
 Durations are human format (`500ms`, `90s`, `2h`, `7d`) and must be
@@ -287,7 +288,8 @@ sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
 owned by the current user. Only one run may use a session at a time: a lock on
 `sbx.lock` inside it is held for the whole run, and a second run fails with
 `session directory is in use`. The directory's mtime is updated at the start and
-the end of every run, which is the activity signal `gc` (#12) reads.
+the end of every run, which is the activity signal `gc` (#12) reads — see
+[Garbage collection](#garbage-collection).
 
 **Audit log.** `--audit F` appends one JSON object per line to `F`. The file is
 created with mode 0600, must be a regular file (never a symlink, FIFO or
@@ -347,6 +349,84 @@ about 14 ms to every exec of the binary (the same build measured there:
 binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
 build is not the cost. CI runs on ext4 and reports the number on every run
 (report-only, with a warning at ≥ 25 ms).
+
+## Garbage collection
+
+`sbx gc --older-than D [--dry-run] ROOT` removes the session directories under
+`ROOT` that have been idle for longer than `D`. It is the only command that
+deletes sessions, so it is conservative by design.
+
+- **What counts as a session.** An immediate child of `ROOT` that is a real
+  directory (never a symlink) owned by you, with no group or other write bit,
+  that contains an `sbx.lock` regular file with one link. A directory without
+  `sbx.lock` is not a session: it is skipped, and gc never creates the lock.
+  A session directory must be readable and searchable by its owner: a session
+  with mode `0000` or `0300` is reported (`cannot open`) and left in place.
+- **Reserved names.** A session may not be named like a tombstone
+  (`.sbx-gc.<pid>.<16 hex digits>`). `sbx run` refuses such a `--session-dir`
+  with exit 125 (`has a name reserved for sbx gc tombstones`).
+- **Age.** The directory mtime, read while gc holds the session's lock, with a
+  clock taken at that moment. `run` touches the mtime at start and end, so a
+  session that is running, or that ended recently, is young. A future mtime is
+  kept.
+- **What is never touched.** A locked (live) session; any symlink, at any
+  level (symlinks are removed as links, never followed); entries owned by
+  another user; anything across a mount point (see below).
+- **Delete protocol.** gc takes the session's lock, renames the directory to
+  `ROOT/.sbx-gc.<pid>.<nonce>` (a *tombstone*), empties it, unlinks the lock and
+  removes the tombstone. Concurrent gc processes exclude each other with a
+  `flock` on the directory itself, so a second gc skips an entry the first one
+  is removing and reports it at most once. An interrupted gc leaves a
+  tombstone; the next gc collects it regardless of its age. `run` checks, after
+  it takes the lock, that the session it locked was not tombstoned meanwhile,
+  and refuses (exit 125) if it was.
+- **Mount points.** A bind mount, or a filesystem mounted inside a session, is
+  not descended into. The session directory is moved to a tombstone and emptied
+  up to the mount point; the mounted part and the rest of the tombstone stay
+  where they are, and gc reports `mount point at "<path>"` and the tombstone
+  path (`remainder left at`). Once the mount is gone, the next gc finishes the
+  job. A session directory that is itself a mount point is left in place
+  (`session directory is a mount point`). A bind-mounted file is reported with
+  the same mount-point message, although it is not a directory.
+- **ROOT rules.** ROOT must exist and be a directory. Its final component must
+  not be a symlink. Symlinks in ancestor directories are followed, as with any
+  path you type. A ROOT with a `..` component is refused (the reason is ``must not contain `..` ``). ROOT
+  must be owned by you or by root, and if it is group- or world-writable it must
+  have the sticky bit. `/` is always refused.
+- **Output and exit codes.** One line per collected entry on stdout, in name
+  order: `removed "<path>"`, or `would remove "<path>"` with `--dry-run`.
+  Failures are on stderr as `sbx gc: "<path>": <reason>`. Exit `0`: every
+  eligible session was handled (including "nothing to do"). Exit `1`: ROOT was
+  refused, or a session failed (for example a group-writable session, which is
+  left in place); gc continues with the other sessions and reports the failure
+  at the end. Exit `2`: a usage error (for example `--older-than 0s`). A session
+  that is in use, still young, or being removed by another gc is not a failure
+  and prints nothing.
+- **Messages for hoisted subtrees.** To keep the number of open directories
+  bounded, the walker can move a deep subdirectory up to the top of the
+  session under a name `.sbx-gc-hoist.<N>`. A failure inside such a subtree is
+  reported with that name in its path.
+- **`--dry-run`.** It briefly takes each candidate's lock to check that the
+  session is free, then releases it. A `run` that starts in that instant fails
+  with `session directory is in use` (exit 125) and can be retried. It only
+  checks what is checkable before removing: it cannot predict a failure inside
+  the tree, such as a mount point, an entry owned by another user, or a
+  directory that cannot be read (EACCES) and cannot be repaired. Those show up
+  in a real run.
+- **Limitations (#14).**
+  - NFS `.nfsXXXX` silly-rename files and flock semantics on NFS and 9p are
+    not handled.
+  - A btrfs subvolume has a different `st_dev` and is refused as a mount point.
+  - On kernels older than 5.8 the mount id comes from `name_to_handle_at`
+    instead of `statx`. If ROOT's filesystem does not support file handles
+    (procfs, and overlayfs on some older kernels when it is not exported),
+    the whole ROOT is refused with `cannot stat` and nothing is removed (fail
+    closed). A session on such a filesystem inside a handle-capable ROOT is
+    reported as `cannot stat` and left in place. The `MOUNT_ROOT` attribute is
+    also unavailable there, so the mount-id comparison is the only check.
+  - A process running as your user that writes into a session while gc empties
+    it can make gc fail (`could not empty the directory after N passes`); the
+    tombstone is left for the next gc.
 
 ## Build
 
