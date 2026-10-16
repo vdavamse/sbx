@@ -102,6 +102,7 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
 sbx check [--json]
+sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
 sbx check --policy policy.json
 sbx check --print-schema
@@ -229,6 +230,64 @@ probe but fails later, the sandbox starts and then bwrap exits with its own rc
 check` reports the failure as `bwrap-proc` with the `procMount` hint. `sbx run` does
 no pre-check, so the payload's own rc (bwrap's rc 1) passes through. A per-run
 pre-check is tracked as a follow-up.
+
+## Conformance
+
+`sbx check --conformance` runs every security guarantee as an executable check:
+69 checks in eight groups, the same code that `cargo test --test conformance`
+runs in CI.
+
+- **A: allow list** (`allow-list`): allowed names resolve and reach the upstream;
+  everything else is refused on DNS, CONNECT and TLS.
+- **B: SNI/Host confusion** (`sni-host`): a mismatched SNI, Host or ECH hello is
+  refused, and a second ClientHello tears the connection down.
+- **C: no direct egress** (`no-direct-egress`): no route, no raw, packet, XDP,
+  vsock or ICMP sockets, no non-53 UDP, no IPv6, no netlink changes.
+- **D: isolation** (`isolation`): host loopback, abstract and pathname unix
+  sockets, other sessions' listeners, files and fake IPs, and host processes
+  are unreachable.
+- **E: tooling** (`tooling`, network tier): real `curl`, `git`, `pip` and `npm`
+  through the policy; opt-in with `--network`.
+- **F: fail-closed** (`fail-closed`): SIGKILL, SIGSTOP and a missing proxy leave
+  no path open; a broken nftables load or audit log ends the run with rc 125.
+- **G: cleanup** (`cleanup`): background processes die on exit, timeout and
+  signals; the sandbox network namespace is empty afterwards.
+- **H: secrets** (`secrets`): the caller's environment, `/proc` environments,
+  inherited descriptors, HOME and processes are not visible to the payload.
+
+The tiers: **host** (a `sbx run` per scenario, built-in policies), **init**
+(the production `sbx __init` with the listeners dropped), **lab** (an
+unprivileged nested user, network and mount namespace with a local fixture on
+9.9.9.9 and a lab DNS that never touches the real network), and **network**
+(opt-in, real hosts). The offline tiers need no root and never dial an upstream.
+Their files live under `$TMPDIR/sbx-conformance-*`, with two documented
+exceptions: the D04 control socket `/tmp/sbxc-<8 hex>.s` (kept short because
+`sun_path` is 108 bytes), and, when `$TMPDIR` lies under `$HOME`, the base
+directory under `/tmp` (so the sandbox's bind parents do not expose `$HOME`).
+Both are removed at the end of a run.
+
+```
+sbx check --conformance                    # every offline check
+sbx check --conformance --only A,D         # a group, or ids: --only A01,H06
+sbx check --conformance --list             # the catalog (add --json for each check's needs)
+sbx check --conformance --network --json   # add the network tier; JSON report
+```
+
+Exit codes: `0` when nothing failed and nothing needed by a selected check was
+missing (warn rows and opt-in skips are allowed); `1` when a check FAILs or a
+selected check is skipped for a missing capability or is not implemented in this
+build; `2` for a usage error. The JSON document has `kind: "conformance"` and
+`version: 1`; `summary.conformant` matches the exit code. A FAIL keeps the
+temporary artifacts and prints their path on stderr. A full offline run takes a
+few seconds (the budget is 120 s).
+
+A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
+hazard, not a defect. It goes away when issue #35 lands.
+
+**Status.** The host and init tiers are implemented. The lab tier (A02–A06, A12,
+B01–B09, C02, C07, F02, F04) lands in a follow-up PR; until then those 19 checks
+report `not implemented` and the command exits `1`. The network tier is also
+still to come. Operator policies are not supported by `--conformance` in v1.
 
 ## Running commands
 

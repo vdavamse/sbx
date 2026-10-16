@@ -65,12 +65,17 @@
 //! [`host`] classifies what the sandbox needs (user namespaces, the
 //! nftables redirect, bwrap, …) from a probe that runs the very same setup
 //! stages, and `run` shares that classifier for its refusals (rc 125).
+//! [`conformance`] (issue #13) is `sbx check --conformance`: every security
+//! guarantee as an executable check (69 checks, eight groups). Its host and
+//! init tiers are real in this build; the lab and network tiers land in a
+//! follow-up PR and report `not implemented` until then.
 //! Tracking issue #20 describes the architecture; the
 //! issue #1 spike (`spikes/nft-load`) proved the unprivileged
 //! nftables-loading approach `sbx __init` ships.
 
 pub mod bwrap;
 pub mod cli;
+pub mod conformance;
 pub mod dns;
 pub mod egress;
 pub mod gc;

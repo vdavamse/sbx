@@ -67,7 +67,7 @@ use crate::policy::{AbsolutePath, NetworkMode};
 /// The infra `PATH` (Q3): the standard sbin/bin search path so payload
 /// tooling resolves without policy involvement. Emitted in the infra
 /// block BEFORE pass/set, so policy can override it (last --setenv wins).
-const INFRA_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const INFRA_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// The mandatory infra `/etc` binds (Q1): toolchain prerequisites with no
 /// secrets — always bound as infrastructure regardless of policy (the

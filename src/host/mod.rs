@@ -89,7 +89,7 @@ impl Serialize for CapId {
 }
 
 /// An item's status. Human labels: `ok`, `FAIL`, `skip`, `warn`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Ok,

@@ -233,6 +233,39 @@ jobs:
           [ $? -eq 0 ] || { echo "FAIL: sbx check --policy examples/default.json --host"; FAIL=1; }
           exit "$FAIL"
 
+      # Issue #13 (gating): the conformance suite on the release musl binary. PR1
+      # state, asserted exactly: nothing FAILs; the 19 lab checks are
+      # not-implemented skips and the 6 network checks are opt-in, so the command
+      # exits 1 until the lab tier lands (the second PR flips this to rc 0).
+      - name: "Conformance (release musl, gating)"
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          set +e
+          FAIL=0
+          "$BIN" check --conformance --json > conf.json
+          RC=$?
+          python3 - conf.json "$RC" <<'PY' || FAIL=1
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          rc = int(sys.argv[2])
+          assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
+          fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
+          assert not fails, f"FAIL checks: {fails}"
+          lab = {"A02", "A03", "A04", "A05", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "C02", "C07", "F02", "F04"}
+          net = {"E01", "E02", "E03", "E04", "E05", "E06"}
+          non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
+          want = {i: ("skip", "not-implemented") for i in lab} | {i: ("skip", "opt-in") for i in net}
+          assert non_ok == want, f"unexpected non-ok set: {non_ok}"
+          assert rc == 1, f"rc {rc} (PR1 expects 1)"
+          PY
+          python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          s = json.load(open(sys.argv[1]))["summary"]
+          print("### sbx check --conformance (issue #13)")
+          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['capability_skips']} capability skip, {s['not_implemented']} not implemented, {s['opt_in_skips']} opt-in")
+          PY
+          exit "$FAIL"
+
       # Issue #11 negative tier (gating): nested inside bwrap --disable-userns,
       # user namespaces cannot be created (ENOSPC, E3), so `check` reports the
       # userns item and `run` refuses with rc 125. Inside a read-only /proc/sys
@@ -268,6 +301,20 @@ jobs:
           r = json.load(open(sys.argv[1]))
           v6 = next(c for c in r["capabilities"] if c["id"] == "netns-ipv6")
           assert v6["status"] == "fail" and v6["errno"] == 30, v6
+          PY
+          # Issue #13 nested negative tier: no sandbox can be built, so every host,
+          # lab and init check is a capability skip (rc 1); the opt-in network checks
+          # are still opt-in (rc 0 for them).
+          bwrap --unshare-user --disable-userns --dev-bind / / -- "$BIN" check --conformance --json > confnest.json
+          RC=$?
+          [ "$RC" -eq 1 ] || { echo "FAIL: nested conformance rc $RC (expected 1)"; FAIL=1; }
+          python3 - confnest.json <<'PY' || FAIL=1
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          assert r["network_mode"] == "unavailable", r["network_mode"]
+          for c in r["checks"]:
+              if c["tier"] in ("host", "lab", "init"):
+                  assert c["status"] == "skip" and c["skip_kind"] == "capability", (c["id"], c["status"], c.get("skip_kind"))
           PY
           exit "$FAIL"
 
@@ -445,6 +492,20 @@ jobs:
           else
             echo "ok: help hides __init"
           fi
+          # Issue #13 (no namespaces needed): the conformance catalog and usage errors.
+          if echo "$HELP" | grep -q "__conformance"; then
+            echo "FAIL: help leaks hidden '__conformance'"
+            FAIL=1
+          fi
+          LIST=$("$BIN" check --conformance --list 2>&1)
+          check_rc 0 $? "sbx check --conformance --list"
+          [ "$(echo "$LIST" | grep -c '^  [A-H][0-9][0-9]  ')" -eq 69 ] || { echo "FAIL: --list is not 69 rows"; FAIL=1; }
+          "$BIN" check --conformance --list --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["checks"]) == 69' || { echo "FAIL: --list --json is not 69 checks"; FAIL=1; }
+          "$BIN" check --conformance --only Z99 > /dev/null 2>&1
+          check_rc 2 $? "sbx check --conformance --only Z99"
+          echo '{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}' > conf-policy.json
+          "$BIN" check --conformance --policy conf-policy.json > /dev/null 2>&1
+          check_rc 2 $? "sbx check --conformance --policy"
 
           # `run` is real since #10: a missing policy is an sbx-detected
           # failure (rc 125, "sbx run: " prefix on stderr). `gc` is real (#12).
