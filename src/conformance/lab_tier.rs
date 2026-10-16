@@ -391,36 +391,75 @@ fn fail_closed(env: &Env, logs: &Arc<Logs>, mode: FailMode) -> Scn {
     scn.nums.insert("t_signal", t_sig);
     scn.nums.insert("accepts_before", before as u64);
     match mode {
-        FailMode::Sigkill => {
-            running.sigkill();
-            scn.nums.insert("t_kill", mono_ms());
-        }
+        FailMode::Sigkill => running.sigkill(),
         FailMode::Sigstop => {
             running.signal(libc::SIGSTOP);
             std::thread::sleep(Duration::from_millis(1000));
             running.sigkill();
-            let t_kill = mono_ms();
-            scn.nums.insert("t_kill", t_kill);
-            let inside = work_log_times(&session.join("work").join("f04.log"))
-                .iter()
-                .filter(|t| **t > t_sig && **t < t_kill)
-                .count();
-            scn.nums.insert("stop_attempts", inside as u64);
         }
     }
-    // Evidence first, cleanup second: `wait_bounded` SIGKILLs the whole process
-    // group (every surviving relay holder is in it), so reaping before the
-    // observation window would hide exactly the survivor F02 must see.
-    if mode == FailMode::Sigkill {
-        std::thread::sleep(Duration::from_secs(2));
-    } else {
-        std::thread::sleep(Duration::from_millis(500));
+    let t_kill = mono_ms();
+    scn.nums.insert("t_kill", t_kill);
+    if mode == FailMode::Sigstop {
+        let inside = work_log_times(&session.join("work").join("f04.log"))
+            .iter()
+            .filter(|t| **t > t_sig && **t < t_kill)
+            .count();
+        scn.nums.insert("stop_attempts", inside as u64);
     }
-    let _fin = running.wait_bounded(Instant::now() + Duration::from_secs(5));
+    // The observation window runs from the SIGKILL. F02 observes at +2 s and
+    // requires the held connection to close within 1.5 s: a close the window
+    // never sees (the cleanup below would cause it) cannot pass.
+    let window = match mode {
+        FailMode::Sigkill => Duration::from_secs(2),
+        FailMode::Sigstop => Duration::from_millis(500),
+    };
+    std::thread::sleep(window);
+    // OBSERVE before any cleanup: the fixture's state now, the chain's liveness
+    // now. The reap and the group kill come only after this.
+    observe_fail_closed(&mut scn, logs, mode, tag, t_sig, t_kill);
     let gone = poll_gone(&token, None, Duration::from_secs(5));
     scn.ctl
         .insert("gone", gone.map_err(|pids| format!("survivors {pids:?}")));
+    running.wait_exit(Instant::now() + Duration::from_secs(5));
+    let _fin = running.finish();
     scn
+}
+
+/// The fail-closed evidence, read from the fixture at observation time (before
+/// cleanup): late accepts after the kill and, for F02, the held connection's
+/// accept and close times (`u64::MAX` close = still open when observed).
+fn observe_fail_closed(
+    scn: &mut Scn,
+    logs: &Logs,
+    mode: FailMode,
+    tag: &str,
+    t_sig: u64,
+    t_kill: u64,
+) {
+    let snap = logs.tls_snapshot();
+    let sni = format!("{tag}.allowed.conformance.test");
+    let cutoff = match mode {
+        FailMode::Sigkill => t_kill + 50,
+        FailMode::Sigstop => t_sig + 50,
+    };
+    let late = snap
+        .iter()
+        .filter(|r| r.sni.as_deref() == Some(sni.as_str()) && r.accept_ms > cutoff)
+        .count();
+    scn.nums.insert("late_accepts", late as u64);
+    if mode == FailMode::Sigkill {
+        let held: Vec<&TlsRec> = snap
+            .iter()
+            .filter(|r| r.tokens.iter().any(|t| t == "HOLD-f02"))
+            .collect();
+        scn.nums.insert("held_count", held.len() as u64);
+        if let Some(h) = held.first() {
+            scn.nums.insert("held_accept", h.accept_ms);
+            scn.nums
+                .insert("held_close", h.close_ms.unwrap_or(u64::MAX));
+        }
+    }
 }
 
 /// Poll the fixture's TLS log until `n` connections with `sni` were accepted.
@@ -1159,44 +1198,30 @@ fn f02(ev: &Ev<'_>) -> R {
     let t_sig = num(s, "t_signal")?;
     let t_kill = num(s, "t_kill")?;
     clock_control(t_sig, t_kill)?;
-    let sni = "f02.allowed.conformance.test";
-    let late = ev
-        .tls
-        .iter()
-        .filter(|r| r.sni.as_deref() == Some(sni) && r.accept_ms > t_kill + 50)
-        .count();
+    // Everything below was read at observation time, before cleanup.
+    let held_count = num(s, "held_count")?;
+    ctl(
+        held_count == 1,
+        format!("expected one connection carrying HOLD-f02 at observation, found {held_count}"),
+    )?;
+    let held_accept = num(s, "held_accept")?;
+    let held_close = num(s, "held_close")?;
+    ctl(
+        held_accept <= t_sig,
+        format!("held connection accepted after the signal ({held_accept} > {t_sig})"),
+    )?;
+    ctl(
+        held_close == u64::MAX || held_close >= t_sig,
+        format!("held connection closed before the signal ({held_close} < {t_sig})"),
+    )?;
+    let late = num(s, "late_accepts")?;
     need(
         late == 0,
         format!("f02: {late} new upstream connections after the SIGKILL"),
     )?;
-    // The held connection is the one that carried the probe's HOLD-f02 marker:
-    // exactly that connection, not "the first f02 record" (a failed earlier
-    // attempt can be the first record).
-    let held: Vec<&TlsRec> = ev
-        .tls
-        .iter()
-        .filter(|r| r.tokens.iter().any(|t| t == "HOLD-f02"))
-        .collect();
-    ctl(
-        held.len() == 1,
-        format!(
-            "expected one connection carrying HOLD-f02, found {}",
-            held.len()
-        ),
-    )?;
-    let held = held[0];
-    ctl(
-        // Millisecond clock: a close in the signal's own millisecond is "at the
-        // signal", which is the SIGKILL's effect, not an early close.
-        held.accept_ms <= t_sig && held.close_ms.is_none_or(|c| c >= t_sig),
-        format!(
-            "the held connection was not open at the signal (accept {} close {:?} signal {t_sig})",
-            held.accept_ms, held.close_ms
-        ),
-    )?;
     need(
-        held.close_ms.is_some_and(|c| c <= t_kill + 2000),
-        "f02: the held upstream connection stayed open 2 s after the SIGKILL",
+        held_close != u64::MAX && held_close <= t_kill + 1500,
+        "f02: the held upstream connection was still open 1.5 s after the SIGKILL (observed at +2 s, before cleanup)",
     )?;
     s.ctl
         .get("gone")
@@ -1217,12 +1242,7 @@ fn f04(ev: &Ev<'_>) -> R {
         attempts >= 3,
         format!("only {attempts} probe attempts logged inside the stop window"),
     )?;
-    let sni = "f04.allowed.conformance.test";
-    let during = ev
-        .tls
-        .iter()
-        .filter(|r| r.sni.as_deref() == Some(sni) && r.accept_ms > t_stop + 50)
-        .count();
+    let during = num(s, "late_accepts")?;
     need(
         during == 0,
         format!("f04: {during} upstream connections while sbx run was stopped or after the kill"),

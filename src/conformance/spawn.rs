@@ -183,6 +183,7 @@ impl SbxRun {
             stdin,
             t0,
             finished: false,
+            exit: None,
         })
     }
 }
@@ -197,6 +198,8 @@ pub struct Running {
     stdin: Option<ChildStdin>,
     t0: Instant,
     finished: bool,
+    /// The reaped status once [`Running::wait_exit`] ran (`Some(None)`: wait failed).
+    exit: Option<Option<std::process::ExitStatus>>,
 }
 
 impl Running {
@@ -252,7 +255,20 @@ impl Running {
     }
 
     /// Poll for the exit until `deadline`; on expiry kill the group and reap.
+    /// Equivalent to [`Running::wait_exit`] followed by [`Running::finish`].
     pub fn wait_bounded(&mut self, deadline: Instant) -> Finished {
+        self.wait_exit(deadline);
+        self.finish()
+    }
+
+    /// Reap `sbx run` (no group kill on a normal exit). Only the deadline kills:
+    /// on expiry the group is SIGKILLed and the child reaped. Observations that
+    /// must see the state AFTER the run's own exit and BEFORE cleanup (the
+    /// lifecycle and fail-closed checks) happen between this and [`finish`].
+    pub fn wait_exit(&mut self, deadline: Instant) {
+        if self.exit.is_some() {
+            return;
+        }
         let status = loop {
             match self.child.try_wait() {
                 Ok(Some(st)) => break Some(st),
@@ -265,6 +281,15 @@ impl Running {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
+        self.exit = Some(status);
+    }
+
+    /// Cleanup and collection: kill the group (leftover setsid-less descendants,
+    /// e.g. a background process holding stdout), drain the output, and build
+    /// the result. Must run after every observation of the scenario.
+    pub fn finish(&mut self) -> Finished {
+        self.wait_exit(Instant::now());
+        let status = self.exit.flatten();
         self.finished = true;
         // Leftover descendants (for example a setsid'd background probe that
         // held stdout) are killed as a group; the pipes close, then we drain.

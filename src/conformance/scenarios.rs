@@ -229,6 +229,9 @@ pub(super) struct Opts {
     allow_no_done: bool,
     /// Ignore a `Finished` refusal (F05 expects it): do not classify.
     expect_refusal: bool,
+    /// Observe the token's survivors after the run's exit and before the
+    /// cleanup kill, recording the lifecycle assertion under this key.
+    observe_gone: Option<(&'static str, String)>,
 }
 
 /// One scenario from start to finish: policy, session, ops, and the bounded wait.
@@ -274,7 +277,11 @@ pub(super) fn plain(
         Ok(r) => r,
         Err(e) => return Scn::unavailable(name, format!("cannot spawn sbx run: {e}")),
     };
-    let fin = r.wait_bounded(started + bound);
+    r.wait_exit(started + bound);
+    if let Some((key, token)) = &opts.observe_gone {
+        gone_check(&mut scn, key, token, None);
+    }
+    let fin = r.finish();
     if opts.expect_refusal {
         let mut s = scn.clone();
         s.ms = fin.elapsed_ms;
@@ -851,6 +858,8 @@ fn s5(env: &Env) -> Scn {
         Opts {
             fsize: Some(16384),
             allow_no_done: true,
+            // Survivors: rc 125 kills the group; the bg must be gone within 5 s.
+            observe_gone: Some(("f06.gone", token.clone())),
             ..Default::default()
         },
     );
@@ -860,8 +869,6 @@ fn s5(env: &Env) -> Scn {
         .unwrap_or(0);
     s.nums.insert("audit_bytes", audit_len);
     s.notes.insert("token", token.clone());
-    // Survivors: rc 125 kills the group; the bg must be gone within 5 s.
-    gone_check(&mut s, "f06.gone", &token, None);
     s
 }
 
@@ -917,9 +924,10 @@ fn s6(env: &Env) -> Vec<Scn> {
     }
     s6.notes.insert("token", token.clone());
     r.close_stdin();
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s6, fin, &audit, false);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s6, "g01.gone", &token, netns.as_deref());
+    let fin = r.finish();
+    finish_scn(&mut s6, fin, &audit, false);
     out.push(s6);
     // S6b: the same session dir is reusable.
     let mut s6b = Scn::named("S6b");
@@ -985,9 +993,10 @@ fn s7(env: &Env) -> Scn {
             Err("token not alive before the timeout".to_owned())
         },
     );
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "g02.gone", &token, None);
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }
@@ -1045,9 +1054,10 @@ fn s8(env: &Env) -> Vec<Scn> {
             },
         );
         r.signal(sig);
-        let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-        finish_scn(&mut s, fin, &audit, true);
+        r.wait_exit(Instant::now() + Duration::from_secs(10));
         gone_check(&mut s, "g03.gone", &token, None);
+        let fin = r.finish();
+        finish_scn(&mut s, fin, &audit, true);
         s.nums.insert("signal", sig as u64);
         s.notes.insert("token", token);
         out.push(s);
@@ -1099,9 +1109,10 @@ fn s9(env: &Env) -> Scn {
             Err("token not alive when the background process was spawned".to_owned())
         },
     );
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "g04.gone", &token, None);
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }
@@ -1156,9 +1167,10 @@ fn s10(env: &Env) -> Scn {
             .insert("netns_members_before", pids_in_netns(n).len() as u64);
     }
     r.sigkill();
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "f01.gone", &token, netns.as_deref());
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }
