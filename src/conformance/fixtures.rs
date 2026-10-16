@@ -50,7 +50,14 @@ pub struct TlsRec {
     pub extra_handshake: u32,
     /// When the fixture saw EOF or a reset (`None`: still open).
     pub close_ms: Option<u64>,
+    /// The held-connection markers (see [`HOLD_TOKENS`]) this connection carried.
+    pub tokens: Vec<String>,
 }
+
+/// Markers a probe sends on the connection it holds open (`tcp_loop`'s
+/// `hold_token`). The fixture records which connection carried which marker, so
+/// a check can pin the exact connection the probe held.
+pub const HOLD_TOKENS: [&str; 2] = ["HOLD-f02", "HOLD-f04"];
 
 /// One HTTP fixture request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,6 +260,7 @@ fn serve_tls(logs: &Logs, mut s: TcpStream, conn: u64) {
         first_byte,
         extra_handshake: 0,
         close_ms: None,
+        tokens: Vec::new(),
     };
     lock(&logs.tls).push(rec);
     if first_byte != 0x16 {
@@ -280,13 +288,36 @@ fn serve_tls(logs: &Logs, mut s: TcpStream, conn: u64) {
         }
         match s.read(&mut chunk) {
             Ok(0) | Err(_) => break,
-            Ok(k) => buf.extend_from_slice(&chunk[..k]),
+            Ok(k) => {
+                buf.extend_from_slice(&chunk[..k]);
+                note_tokens(logs, conn, &buf);
+            }
         }
     }
     if let Some(r) = lock(&logs.tls).iter_mut().rev().find(|r| r.conn == conn) {
         r.extra_handshake = extra;
     }
     mark_closed(logs, conn);
+}
+
+/// Record every hold marker found in this connection's bytes so far (the
+/// record is updated while the connection is still open).
+fn note_tokens(logs: &Logs, conn: u64, buf: &[u8]) {
+    let found: Vec<&str> = HOLD_TOKENS
+        .iter()
+        .copied()
+        .filter(|t| buf.windows(t.len()).any(|w| w == t.as_bytes()))
+        .collect();
+    if found.is_empty() {
+        return;
+    }
+    if let Some(r) = lock(&logs.tls).iter_mut().rev().find(|r| r.conn == conn) {
+        for t in found {
+            if !r.tokens.iter().any(|x| x == t) {
+                r.tokens.push(t.to_owned());
+            }
+        }
+    }
 }
 
 fn mark_closed(logs: &Logs, conn: u64) {

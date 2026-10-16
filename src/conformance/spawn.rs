@@ -121,8 +121,20 @@ impl SbxRun {
         // fork and exec. Every child starts with default signal dispositions: an
         // inherited SIG_IGN (a background job in a non-interactive shell) would
         // make `sbx run` ignore the very signals G03 sends it.
+        // The run dies with the process that spawned it (PR_SET_PDEATHSIG on the
+        // spawning thread, which is always the main thread here): a SIGKILLed
+        // `sbx check` or lab child takes its `sbx run` (and, through the run's
+        // own die-with-parent, bwrap and the probe) down with it. A parent that
+        // already died before the prctl is detected by the getppid check.
+        let parent = std::process::id() as libc::pid_t;
         unsafe {
             cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
                 for sig in [libc::SIGINT, libc::SIGHUP, libc::SIGTERM, libc::SIGQUIT] {
                     libc::signal(sig, libc::SIG_DFL);
                 }

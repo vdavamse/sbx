@@ -358,6 +358,7 @@ fn fail_closed(env: &Env, logs: &Arc<Logs>, mode: FailMode) -> Scn {
         "attempt_timeout_ms": attempt_ms,
         "log": log,
         "hold_first": mode == FailMode::Sigkill,
+        "hold_token": if mode == FailMode::Sigkill { "HOLD-f02" } else { "" },
     }))];
     let mut cmd = vec![
         env.exe_text.clone(),
@@ -438,7 +439,7 @@ fn wait_accepts(logs: &Logs, sni: &str, n: usize, bound: Duration) -> usize {
     }
 }
 
-/// The probe's `tcp_loop` log: the unix-ms timestamp of each attempt line.
+/// The probe's `tcp_loop` log: the CLOCK_MONOTONIC (`mono_ms`) timestamp of each attempt line.
 fn work_log_times(path: &Path) -> Vec<u64> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -1168,12 +1169,31 @@ fn f02(ev: &Ev<'_>) -> R {
         late == 0,
         format!("f02: {late} new upstream connections after the SIGKILL"),
     )?;
-    let held = ev
+    // The held connection is the one that carried the probe's HOLD-f02 marker:
+    // exactly that connection, not "the first f02 record" (a failed earlier
+    // attempt can be the first record).
+    let held: Vec<&TlsRec> = ev
         .tls
         .iter()
-        .filter(|r| r.sni.as_deref() == Some(sni))
-        .min_by_key(|r| r.accept_ms)
-        .ok_or_else(|| fail("f02: no held connection recorded"))?;
+        .filter(|r| r.tokens.iter().any(|t| t == "HOLD-f02"))
+        .collect();
+    ctl(
+        held.len() == 1,
+        format!(
+            "expected one connection carrying HOLD-f02, found {}",
+            held.len()
+        ),
+    )?;
+    let held = held[0];
+    ctl(
+        // Millisecond clock: a close in the signal's own millisecond is "at the
+        // signal", which is the SIGKILL's effect, not an early close.
+        held.accept_ms <= t_sig && held.close_ms.is_none_or(|c| c >= t_sig),
+        format!(
+            "the held connection was not open at the signal (accept {} close {:?} signal {t_sig})",
+            held.accept_ms, held.close_ms
+        ),
+    )?;
     need(
         held.close_ms.is_some_and(|c| c <= t_kill + 2000),
         "f02: the held upstream connection stayed open 2 s after the SIGKILL",

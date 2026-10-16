@@ -302,8 +302,11 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         if is_e {
             // Without --network: opt-in. With it: ok, or an opt-in skip for a
             // tool missing on this host (E05 needs npm).
+            // With the network switch on, every E check must run and pass except
+            // E05, which may be an opt-in skip when npm is absent (as in CI).
             let ok = if network {
-                c["status"] == "ok" || (c["status"] == "skip" && kind == Some("opt-in"))
+                c["status"] == "ok"
+                    || (id == "E05" && c["status"] == "skip" && kind == Some("opt-in"))
             } else {
                 c["status"] == "skip" && kind == Some("opt-in")
             };
@@ -317,6 +320,17 @@ fn full_report_scenario() -> Result<Option<String>, String> {
             return Err(format!(
                 "{id}: expected ok, got {} ({})",
                 c["status"], c["detail"]
+            ));
+        }
+    }
+    if network {
+        let ran = checks
+            .iter()
+            .filter(|c| E_IDS.contains(&c["id"].as_str().unwrap_or("")) && c["status"] == "ok")
+            .count();
+        if ran < 5 {
+            return Err(format!(
+                "network switch on but only {ran} E checks ran ok (expected 5, E05 may skip)"
             ));
         }
     }

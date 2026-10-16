@@ -255,8 +255,11 @@ pub enum Op {
         server: String,
     },
     /// Repeated connect + ClientHello + one-line read (PR2, issue #13). Every
-    /// attempt appends `<unix_ms> ok:<line>` or `<unix_ms> err:<kind>` to `log`.
-    /// With `hold_first`, the first successful socket stays open for the loop.
+    /// attempt appends `<mono_ms> ok:<line>` or `<mono_ms> err:<kind>` to `log`
+    /// (`mono_ms` is CLOCK_MONOTONIC, see [`mono_ms`]).
+    /// With `hold_first`, the first successful socket stays open for the loop;
+    /// `hold_token` (when set) is sent on it as one TLS application-data record,
+    /// so the fixture can pin its record to exactly this connection.
     TcpLoop {
         id: String,
         target: Target,
@@ -269,6 +272,8 @@ pub enum Op {
         log: String,
         #[serde(default)]
         hold_first: bool,
+        #[serde(default)]
+        hold_token: String,
     },
 }
 
@@ -429,7 +434,6 @@ struct State {
     stdin_eof: bool,
 }
 
-/// Unix time in milliseconds.
 /// Monotonic milliseconds (`CLOCK_MONOTONIC`). Every timing comparison in the
 /// lab uses this clock: it is shared by every process on the host (bwrap runs
 /// no time namespace) and it never jumps backwards, unlike `CLOCK_REALTIME`.
@@ -443,11 +447,100 @@ pub fn mono_ms() -> u64 {
     (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
 }
 
+/// Unix time in milliseconds.
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// First source port of the per-run allocator. The range sits below Linux's
+/// default ephemeral range (32768-60999), so the kernel never picks one of
+/// these for an unbound socket.
+const SRC_PORT_BASE: u16 = 20_000;
+const SRC_PORT_LAST: u16 = 32_000;
+static NEXT_SRC_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(SRC_PORT_BASE);
+
+/// Connect with a source port unique to this probe process (issue #13 review).
+///
+/// Why: in transparent mode every leg of one `sbx run` reaches the proxy from
+/// the same sandbox address to the same listener. When two legs reuse an
+/// ephemeral port, conntrack rewrites the later leg's source port on the reply
+/// tuple collision, so the audit row carries a port the probe never had. A
+/// unique port per leg means no two reply tuples can collide.
+///
+/// IPv4 only (the audit rows the checks pin are IPv4); other families use a
+/// plain connect. A bind collision (`EADDRINUSE`) retries with the next port.
+pub(crate) fn dial(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let SocketAddr::V4(v4) = addr else {
+        return TcpStream::connect_timeout(&addr, timeout);
+    };
+    let mut last = io::Error::new(io::ErrorKind::AddrInUse, "no free source port");
+    for _ in 0..16 {
+        let port = NEXT_SRC_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if port > SRC_PORT_LAST {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the probe ran out of source ports",
+            ));
+        }
+        match dial_from(v4, port, timeout) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => last = e,
+            other => return other,
+        }
+    }
+    Err(last)
+}
+
+fn dial_from(dst: std::net::SocketAddrV4, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: plain socket(2)/bind(2)/setsockopt(2)/connect(2) on a fresh fd we
+    // own (wrapped in OwnedFd straight away); every sockaddr is a local,
+    // fully-initialised struct whose size is passed along.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = OwnedFd::from_raw_fd(fd);
+        let mut src: libc::sockaddr_in = std::mem::zeroed();
+        src.sin_family = libc::AF_INET as libc::sa_family_t;
+        src.sin_port = port.to_be();
+        if libc::bind(
+            fd,
+            &src as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let tv = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        let mut dst_sa: libc::sockaddr_in = std::mem::zeroed();
+        dst_sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        dst_sa.sin_port = dst.port().to_be();
+        dst_sa.sin_addr.s_addr = u32::from_ne_bytes(dst.ip().octets());
+        if libc::connect(
+            fd,
+            &dst_sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(TcpStream::from(owned))
+    }
 }
 
 fn errno_of(e: &io::Error) -> Option<i32> {
@@ -976,6 +1069,7 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
             attempt_timeout_ms,
             log,
             hold_first,
+            hold_token,
             ..
         } => run_tcp_loop(
             &id,
@@ -987,6 +1081,7 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
                 attempt_timeout_ms: *attempt_timeout_ms,
                 log,
                 hold_first: *hold_first,
+                hold_token: hold_token.clone(),
             },
             st,
         ),
@@ -1072,7 +1167,7 @@ fn dns_query_at(
         let addr: SocketAddr = server.parse().map_err(|e: std::net::AddrParseError| {
             io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
         })?;
-        let mut s = TcpStream::connect_timeout(&addr, timeout)?;
+        let mut s = dial(addr, timeout)?;
         let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
         s.set_read_timeout(Some(timeout))?;
         s.set_write_timeout(Some(timeout))?;
@@ -1117,6 +1212,7 @@ struct LoopSpec<'a> {
     attempt_timeout_ms: u64,
     log: &'a str,
     hold_first: bool,
+    hold_token: String,
 }
 
 /// `tcp_loop`: attempts until the duration ends (see [`Op::TcpLoop`]).
@@ -1157,7 +1253,7 @@ fn run_tcp_loop(id: &str, spec: &LoopSpec<'_>, st: &State) -> OpResult {
     while Instant::now() < end {
         attempts += 1;
         let keep = spec.hold_first && held.is_none();
-        let (status, kept) = loop_attempt(addr, &hello, timeout, keep);
+        let (status, kept) = loop_attempt(addr, &hello, timeout, keep, spec.hold_token.as_bytes());
         if status.starts_with("ok:") {
             oks += 1;
         }
@@ -1184,8 +1280,9 @@ fn loop_attempt(
     hello: &[u8],
     timeout: Duration,
     keep: bool,
+    hold_token: &[u8],
 ) -> (String, Option<TcpStream>) {
-    let mut s = match TcpStream::connect_timeout(&addr, timeout) {
+    let mut s = match dial(addr, timeout) {
         Ok(s) => s,
         Err(e) => return (format!("err:{:?}", e.kind()), None),
     };
@@ -1213,8 +1310,22 @@ fn loop_attempt(
         return ("err:eof".to_owned(), None);
     }
     let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+    if keep && !hold_token.is_empty() {
+        // The held connection's own marker: a valid TLS application-data record.
+        if s.write_all(&tls_app_record(hold_token)).is_err() {
+            return ("err:hold-token".to_owned(), None);
+        }
+    }
     let kept = keep.then_some(s);
     (format!("ok:{text}"), kept)
+}
+
+/// One TLS application-data record (version 3.3) carrying `payload`.
+fn tls_app_record(payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x17, 0x03, 0x03];
+    v.extend((payload.len() as u16).to_be_bytes());
+    v.extend_from_slice(payload);
+    v
 }
 
 /// The address a `tcp` or `tcp_loop` target names (a name is resolved through
@@ -1264,10 +1375,7 @@ fn run_tcp(
             );
         }
     };
-    let mut stream = match TcpStream::connect_timeout(
-        &addr,
-        Duration::from_millis(connect_timeout_ms),
-    ) {
+    let mut stream = match dial(addr, Duration::from_millis(connect_timeout_ms)) {
         Ok(s) => s,
         Err(e) => {
             let detail = format!("connect {addr}: {e}");

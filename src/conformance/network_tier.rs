@@ -1,7 +1,7 @@
 //! The network tier (issue #13, PR2, §11): E01–E06 run real tools through
-//! `sbx run` against the real internet. Opt-in: `--network` or
-//! `--network` (the CLI flag; `tests/conformance.rs` honours
-//! `SBX_CONFORMANCE_NETWORK=1` by passing it). Each check is one `sbx run`.
+//! `sbx run` against the real internet. Opt-in: the `--network` CLI flag
+//! (`tests/conformance.rs` passes it when `SBX_CONFORMANCE_NETWORK=1`). Each
+//! check is one `sbx run`.
 //!
 //! Gating, in order: no `--network` → opt-in skip; a needed tool missing →
 //! opt-in skip; the host cannot resolve the check's first name → capability
@@ -348,6 +348,10 @@ fn one(env: &Env, d: &Net, argv: &[String]) -> Result<CheckResult, String> {
             if fin.rc != Some(0) {
                 return Err(format!("E03: git clone rc {:?}", fin.rc));
             }
+            // The clone must have gone through the proxy, not around it.
+            if !connect_row(&audit, "github.com", "transparent") {
+                return Err("E03: no audit connect row for github.com via transparent".to_owned());
+            }
             let readme = session.join("work").join("hw").join("README");
             if !readme.is_file() {
                 return Err(format!("E03: {} is missing on the host", readme.display()));
@@ -357,6 +361,13 @@ fn one(env: &Env, d: &Net, argv: &[String]) -> Result<CheckResult, String> {
         "E04" => {
             if fin.rc != Some(0) {
                 return Err(format!("E04: pip download rc {:?}", fin.rc));
+            }
+            for host in ["pypi.org", "files.pythonhosted.org"] {
+                if !connect_row(&audit, host, "transparent") {
+                    return Err(format!(
+                        "E04: no audit connect row for {host} via transparent"
+                    ));
+                }
             }
             let dir = session.join("work").join("dl");
             let found = std::fs::read_dir(&dir)
@@ -375,6 +386,11 @@ fn one(env: &Env, d: &Net, argv: &[String]) -> Result<CheckResult, String> {
         "E05" => {
             if fin.rc != Some(0) {
                 return Err(format!("E05: npm view rc {:?}", fin.rc));
+            }
+            if !connect_row(&audit, "registry.npmjs.org", "transparent") {
+                return Err(
+                    "E05: no audit connect row for registry.npmjs.org via transparent".to_owned(),
+                );
             }
             let out = fin.stdout.join("\n");
             if !is_semver_line(&out) {
