@@ -352,32 +352,32 @@ pub fn pids_in_netns(netns: &str) -> Vec<u32> {
     pids
 }
 
-/// Poll until no process carries `token` (and none is in `netns`). On timeout
-/// every survivor is SIGKILLed and reported (pids are the evidence).
-pub fn wait_gone(token: &str, netns: Option<&str>, timeout: Duration) -> Result<(), String> {
+/// Poll until no process carries `token` and (when given) none is in `netns`.
+/// Does NOT kill: on timeout it returns the survivors, so the caller can record
+/// the evidence before any cleanup (review: a kill here hid netns members from G05).
+pub fn poll_gone(token: &str, netns: Option<&str>, timeout: Duration) -> Result<(), Vec<u32>> {
     let deadline = Instant::now() + timeout;
     loop {
-        let alive =
-            !proc_scan(token).is_empty() || netns.is_some_and(|n| !pids_in_netns(n).is_empty());
-        if !alive {
+        let mut pids = proc_scan(token);
+        if let Some(n) = netns {
+            pids.extend(pids_in_netns(n));
+        }
+        pids.sort();
+        pids.dedup();
+        if pids.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            let mut pids = proc_scan(token);
-            if let Some(n) = netns {
-                pids.extend(pids_in_netns(n));
-            }
-            pids.sort();
-            pids.dedup();
-            for p in &pids {
-                kill_pid(*p, libc::SIGKILL);
-            }
-            return Err(format!(
-                "survived the {}s bound: pids {pids:?} (SIGKILLed)",
-                timeout.as_secs()
-            ));
+            return Err(pids);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// SIGKILL the given pids (cleanup after evidence was recorded).
+pub fn kill_pids(pids: &[u32]) {
+    for p in pids {
+        kill_pid(*p, libc::SIGKILL);
     }
 }
 

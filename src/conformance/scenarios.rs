@@ -19,7 +19,9 @@ use super::policies::{self, Builtin};
 use super::probe::{
     HelloSpec, Op, Ops, ProbeOutput, ReadSpec, ReadToEndSpec, SendSpec, Step, Target,
 };
-use super::spawn::{Finished, Running, SbxRun, netns_of, pids_in_netns, proc_scan, wait_gone};
+use super::spawn::{
+    Finished, Running, SbxRun, kill_pids, netns_of, pids_in_netns, poll_gone, proc_scan,
+};
 
 /// Run-wide inputs shared by every scenario.
 pub struct Env {
@@ -70,11 +72,41 @@ impl Scn {
     }
 }
 
+/// Wait for the token and netns to empty, recording the evidence BEFORE any
+/// cleanup: `netns-after-exit` is the netns membership at the moment the poll
+/// ends (G05 reads it), and `key` is the lifecycle assertion. Survivors are
+/// then SIGKILLed; the kill is reported in the assertion's evidence.
+fn gone_check(scn: &mut Scn, key: &'static str, token: &str, netns: Option<&str>) {
+    let polled = poll_gone(token, netns, Duration::from_secs(5));
+    if let Some(n) = netns {
+        let left = pids_in_netns(n);
+        let verdict = if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "netns members after exit (before cleanup): pids {left:?}"
+            ))
+        };
+        scn.ctl.insert("netns-after-exit", verdict);
+    }
+    let outcome = match &polled {
+        Ok(()) => Ok(()),
+        Err(pids) => {
+            kill_pids(pids);
+            Err(format!(
+                "survivors after exit: pids {pids:?} (SIGKILLed after recording)"
+            ))
+        }
+    };
+    scn.ctl.insert(key, outcome);
+}
+
 /// Which scenario group produces these names.
 pub fn group_of(name: &str) -> &'static str {
     match name {
         "S12" => "S12",
         "S1" => "S1",
+        "S13" => "S13",
         "S2" | "S3" => "S2",
         "S4" => "S4",
         "S5" => "S5",
@@ -93,6 +125,7 @@ pub fn run_group(env: &Env, group: &str) -> Vec<Scn> {
     match group {
         "S12" => s12(env),
         "S1" => vec![s1(env)],
+        "S13" => vec![s13(env)],
         "S2" => s2(env),
         "S4" => vec![s4(env)],
         "S5" => vec![s5(env)],
@@ -143,7 +176,27 @@ fn finish_scn(scn: &mut Scn, fin: Finished, audit: &Path, allow_no_done: bool) {
         Err(e) => scn.probe_err = Some(e),
     }
     scn.skip = classify_skip(&fin);
+    if std::env::var_os("SBX_CONFORMANCE_TRACE").is_some() {
+        trace_ops(scn);
+    }
     scn.fin = Some(fin);
+}
+
+/// `SBX_CONFORMANCE_TRACE=1`: one stderr line per probe op with its wall time
+/// since the previous op (the per-op timing used to size scenario bounds).
+fn trace_ops(scn: &Scn) {
+    if let Some(b) = scn.nums.get("budget_ms") {
+        eprintln!("trace {} op budget {} ms (bound adds 10 s)", scn.name, b);
+    }
+    let Some(p) = &scn.probe else { return };
+    let mut rows: Vec<&super::probe::OpResult> = p.results.values().collect();
+    rows.sort_by_key(|r| r.t_ms);
+    let mut prev: Option<u64> = None;
+    for r in rows {
+        let dt = prev.map_or(0, |t| r.t_ms.saturating_sub(t));
+        eprintln!("trace {} {:<18} {:>6} ms (ok={})", scn.name, r.id, dt, r.ok);
+        prev = Some(r.t_ms);
+    }
 }
 
 fn parse_probe(lines: &[String], allow_no_done: bool) -> Result<ProbeOutput, String> {
@@ -179,8 +232,16 @@ struct Opts {
 }
 
 /// One scenario from start to finish: policy, session, ops, and the bounded wait.
+/// A scenario's wall-clock bound: its ops' worst-case budget plus 10 s of slack.
+pub fn budget_bound(ops: &[Op]) -> Duration {
+    Duration::from_millis(ops.iter().map(Op::budget_ms).sum::<u64>()) + Duration::from_secs(10)
+}
+
 fn plain(env: &Env, name: &'static str, which: Builtin, ops: Vec<Op>, opts: Opts) -> Scn {
+    let bound = budget_bound(&ops);
+    let budget = ops.iter().map(Op::budget_ms).sum::<u64>();
     let mut scn = Scn::named(name);
+    scn.nums.insert("budget_ms", budget);
     let text = policies::policy_json(which, &env.exe_text, None);
     let policy = match policies::write_policy(&env.base, &format!("p-{name}-{which:?}"), &text) {
         Ok(p) => p,
@@ -207,7 +268,7 @@ fn plain(env: &Env, name: &'static str, which: Builtin, ops: Vec<Op>, opts: Opts
         Ok(r) => r,
         Err(e) => return Scn::unavailable(name, format!("cannot spawn sbx run: {e}")),
     };
-    let fin = r.wait_bounded(started + Duration::from_secs(10));
+    let fin = r.wait_bounded(started + bound);
     if opts.expect_refusal {
         let mut s = scn.clone();
         s.ms = fin.elapsed_ms;
@@ -266,7 +327,7 @@ fn dns(id: &str, name: &str) -> Op {
         qtype: "A".to_owned(),
         server: "127.0.0.1:53".to_owned(),
         tcp: false,
-        timeout_ms: 2000,
+        timeout_ms: 1000,
     }
 }
 
@@ -277,7 +338,7 @@ fn dns_q(id: &str, name: &str, qtype: &str, server: &str, tcp: bool) -> Op {
         qtype: qtype.to_owned(),
         server: server.to_owned(),
         tcp,
-        timeout_ms: 2000,
+        timeout_ms: 1000,
     }
 }
 
@@ -288,7 +349,7 @@ fn tcp_addr(id: &str, addr: &str, steps: Vec<Step>) -> Op {
             addr: addr.to_owned(),
         },
         steps,
-        connect_timeout_ms: 2000,
+        connect_timeout_ms: 1000,
     }
 }
 
@@ -300,7 +361,7 @@ fn tcp_name(id: &str, name: &str, port: u16, steps: Vec<Step>) -> Op {
             port,
         },
         steps,
-        connect_timeout_ms: 2000,
+        connect_timeout_ms: 1000,
     }
 }
 
@@ -321,14 +382,14 @@ fn read_head() -> Step {
     Step::Read(ReadSpec {
         until: Some("\r\n\r\n".to_owned()),
         max: 65536,
-        timeout_ms: 3000,
+        timeout_ms: 1000,
     })
 }
 
 fn to_end() -> Step {
     Step::ReadToEnd(ReadToEndSpec {
         max: 65536,
-        timeout_ms: 3000,
+        timeout_ms: 1000,
     })
 }
 
@@ -423,13 +484,6 @@ fn s1(env: &Env) -> Scn {
         dns("a09.idn", "xn--pyp-lhd.org"),
         dns("d02.dns", "localhost"),
         dns_q(
-            "c06.dns_tcp",
-            "allowed.conformance.test",
-            "A",
-            "8.8.8.8:53",
-            true,
-        ),
-        dns_q(
             "c06.a8",
             "allowed.conformance.test",
             "A",
@@ -455,14 +509,14 @@ fn s1(env: &Env) -> Scn {
             addr: "8.8.8.8:123".into(),
             text: "Q".into(),
             attempts: 3,
-            recv_timeout_ms: 200,
+            recv_timeout_ms: 100,
         },
         Op::Udp {
             id: "c05.u443".into(),
             addr: "9.9.9.9:443".into(),
             text: "Q".into(),
             attempts: 3,
-            recv_timeout_ms: 200,
+            recv_timeout_ms: 100,
         },
         tcp_addr("c09.v6", "[2606:4700:4700::1111]:443", vec![]),
         tcp_addr("c09.v6lo", "[::1]:80", vec![]),
@@ -538,13 +592,6 @@ fn s1(env: &Env) -> Scn {
             path: Some(host_sock.to_string_lossy().into_owned()),
             abstract_name: None,
         },
-        Op::SocketsWalk {
-            id: "d05.walk".into(),
-            roots: vec!["/".into()],
-            skip: vec!["/proc".into(), "/dev".into(), "/sys".into()],
-            max_entries: 400000,
-            max_depth: 16,
-        },
         tcp_addr(
             "a10.hello",
             "1.1.1.1:443",
@@ -615,6 +662,7 @@ fn s1(env: &Env) -> Scn {
         ));
     }
     ops.push(tcp_addr("b10.abs", proxy, vec![text("GET http://allowed.conformance.test/ HTTP/1.1\r\nHost: other.conformance.test\r\nConnection: close\r\n\r\n"), read_head()]));
+    ops.push(tcp_addr("b10.rev", proxy, vec![text("GET http://other.conformance.test/ HTTP/1.1\r\nHost: allowed.conformance.test\r\nConnection: close\r\n\r\n"), read_head()]));
     ops.push(tcp_addr("b10.https", proxy, vec![text("GET https://allowed.conformance.test/ HTTP/1.1\r\nHost: allowed.conformance.test\r\nConnection: close\r\n\r\n"), read_head()]));
     ops.push(tcp_addr(
         "a10.abs",
@@ -695,6 +743,25 @@ fn s1(env: &Env) -> Scn {
     scn.ctl.insert("d04.own", d04_ctl);
     let _ = fs::remove_file(&host_sock);
     scn
+}
+
+/// S13: the D05 socket walk over the sandbox's whole view, under its own
+/// wall-clock budget. A walk cut short by the budget is a WARN, not a pass.
+fn s13(env: &Env) -> Scn {
+    let ops = vec![
+        hello("s13.hello"),
+        Op::SocketsWalk {
+            id: "d05.walk".into(),
+            roots: vec!["/".into()],
+            skip: vec!["/proc".into(), "/dev".into(), "/sys".into()],
+            max_entries: 400000,
+            max_depth: 16,
+            budget_ms: 8000,
+        },
+    ];
+    let mut s = plain(env, "S13", Builtin::Transparent, ops, Opts::default());
+    s.name = "S13";
+    s
 }
 
 fn s2(env: &Env) -> Vec<Scn> {
@@ -788,8 +855,7 @@ fn s5(env: &Env) -> Scn {
     s.nums.insert("audit_bytes", audit_len);
     s.notes.insert("token", token.clone());
     // Survivors: rc 125 kills the group; the bg must be gone within 5 s.
-    let gone = wait_gone(&token, None, Duration::from_secs(5));
-    s.ctl.insert("f06.gone", gone);
+    gone_check(&mut s, "f06.gone", &token, None);
     s
 }
 
@@ -847,8 +913,7 @@ fn s6(env: &Env) -> Vec<Scn> {
     r.close_stdin();
     let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
     finish_scn(&mut s6, fin, &audit, false);
-    let gone = wait_gone(&token, netns.as_deref(), Duration::from_secs(5));
-    s6.ctl.insert("g01.gone", gone);
+    gone_check(&mut s6, "g01.gone", &token, netns.as_deref());
     out.push(s6);
     // S6b: the same session dir is reusable.
     let mut s6b = Scn::named("S6b");
@@ -916,8 +981,7 @@ fn s7(env: &Env) -> Scn {
     );
     let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
     finish_scn(&mut s, fin, &audit, true);
-    let gone = wait_gone(&token, None, Duration::from_secs(5));
-    s.ctl.insert("g02.gone", gone);
+    gone_check(&mut s, "g02.gone", &token, None);
     s.notes.insert("token", token);
     s
 }
@@ -977,8 +1041,7 @@ fn s8(env: &Env) -> Vec<Scn> {
         r.signal(sig);
         let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
         finish_scn(&mut s, fin, &audit, true);
-        let gone = wait_gone(&token, None, Duration::from_secs(5));
-        s.ctl.insert("g03.gone", gone);
+        gone_check(&mut s, "g03.gone", &token, None);
         s.nums.insert("signal", sig as u64);
         s.notes.insert("token", token);
         out.push(s);
@@ -1032,8 +1095,7 @@ fn s9(env: &Env) -> Scn {
     );
     let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
     finish_scn(&mut s, fin, &audit, true);
-    let gone = wait_gone(&token, None, Duration::from_secs(5));
-    s.ctl.insert("g04.gone", gone);
+    gone_check(&mut s, "g04.gone", &token, None);
     s.notes.insert("token", token);
     s
 }
@@ -1090,8 +1152,7 @@ fn s10(env: &Env) -> Scn {
     r.sigkill();
     let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
     finish_scn(&mut s, fin, &audit, true);
-    let gone = wait_gone(&token, netns.as_deref(), Duration::from_secs(5));
-    s.ctl.insert("f01.gone", gone);
+    gone_check(&mut s, "f01.gone", &token, netns.as_deref());
     s.notes.insert("token", token);
     s
 }
@@ -1151,6 +1212,10 @@ fn s11(env: &Env) -> Vec<Scn> {
         ];
     };
     let a_session = env.base.join("s-S11a");
+    // The host path of A's secret, from the same layout code the sandbox uses.
+    let a_secret_host = crate::bwrap::etc::session_layout(&a_session)
+        .work
+        .join("a-secret");
     let a_audit = env.base.join("a-S11a.jsonl");
     let mut ra = match SbxRun::new(&env.exe, &pol, &a_session, payload(ops_a, &env.exe_text))
         .audit(&a_audit)
@@ -1205,10 +1270,7 @@ fn s11(env: &Env) -> Vec<Scn> {
             },
             Op::Stat {
                 id: "d.bstat1".into(),
-                path: a_session
-                    .join("work/a-secret")
-                    .to_string_lossy()
-                    .into_owned(),
+                path: a_secret_host.to_string_lossy().into_owned(),
             },
             Op::Stat {
                 id: "d.bstat2".into(),
@@ -1235,6 +1297,16 @@ fn s11(env: &Env) -> Vec<Scn> {
     ra.close_stdin();
     let a_fin = ra.wait_bounded(Instant::now() + Duration::from_secs(10));
     finish_scn(&mut a, a_fin, &a_audit, false);
+    // Control for D08: the file really is at the host path B stats (the layout).
+    let host_file = if a_secret_host.is_file() {
+        Ok(())
+    } else {
+        Err(format!(
+            "A's secret is not at {} on the host",
+            a_secret_host.display()
+        ))
+    };
+    a.ctl.insert("d.host-file", host_file);
     if let Some(fin) = b_fin {
         finish_scn(&mut b, fin, &b_audit, false);
     }
@@ -1300,6 +1372,9 @@ fn s12(env: &Env) -> Vec<Scn> {
         Op::Unshare {
             id: "d10.unshare".into(),
             flags: "user".into(),
+        },
+        Op::Caps {
+            id: "d10.caps".into(),
         },
         Op::Read {
             id: "d10.cmdline".into(),

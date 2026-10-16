@@ -69,8 +69,10 @@ pub type Scns = BTreeMap<&'static str, Scn>;
 pub fn scenarios_of(id: &str) -> &'static [&'static str] {
     match id {
         "A01" | "A07" | "A08" | "A09" | "A10" | "A11" | "B10" | "C01" | "C03" | "C05" | "C06"
-        | "C08" | "C09" | "C10" | "C11" | "C12" | "C13" | "C14" | "D01" | "D02" | "D03" | "D04"
-        | "D05" => &["S1"],
+        | "C08" | "C09" | "C10" | "C11" | "C12" | "C13" | "C14" | "D01" | "D02" | "D03" | "D04" => {
+            &["S1"]
+        }
+        "D05" => &["S13"],
         "C04" => &["S2", "S3"],
         "D06" | "D07" | "D08" | "D09" => &["S11a", "S11b"],
         "D10" | "H01" | "H02" | "H03" | "H04" | "H05" | "H06" => &["S12"],
@@ -487,6 +489,12 @@ fn b10(s: &Scns) -> R {
         "the forward-path control (A10 absolute-form) did not answer 400",
     )?;
     let abs = op(s1, "b10.abs")?;
+    leg_denied(
+        s1,
+        "b10.abs",
+        "explicit-forward",
+        "HTTP Host other.conformance.test does not match the request-target name allowed.conformance.test",
+    )?;
     need(
         status_code(abs) == "403",
         format!(
@@ -502,7 +510,21 @@ fn b10(s: &Scns) -> R {
             first_line(https)
         ),
     )?;
-    Ok("absolute-form Host mismatch 403; https:// target 400".to_owned())
+    let rev = op(s1, "b10.rev")?;
+    need(
+        status_code(rev) == "403",
+        format!(
+            "GET http://other + Host allowed: expected 403, got {:?}",
+            first_line(rev)
+        ),
+    )?;
+    leg_denied(
+        s1,
+        "b10.rev",
+        "explicit-forward",
+        "other.conformance.test is not in the policy allow list",
+    )?;
+    Ok("absolute-form Host mismatch 403 in both directions, with pinned reasons; https:// target 400".to_owned())
 }
 
 // ---------------------------------------------------------------- group C
@@ -807,8 +829,8 @@ fn d04(s: &Scns) -> R {
 
 /// D05: `Ok(pass)`, `Ok(Err(warn))` for visible or non-exhaustive, `Err` for a broken control.
 fn d05(s: &Scns) -> Result<R, F> {
-    let s1 = sc(s, "S1")?;
-    let w = op(s1, "d05.walk").map_err(as_ctl)?;
+    let s13 = sc(s, "S13")?;
+    let w = op(s13, "d05.walk").map_err(as_ctl)?;
     let visited = w.data["visited"].as_u64().unwrap_or(0);
     ctl(
         visited > 100,
@@ -900,6 +922,7 @@ fn d08(s: &Scns) -> R {
     let a = sc(s, "S11a")?;
     let b = sc(s, "S11b")?;
     ctl_ok(a, "d.write").map_err(|f| ctl_fail(f.msg))?;
+    ctl_key(a, "d.host-file")?;
     let read = op(a, "d.read").map_err(as_ctl)?;
     ctl(
         read.data["matched"]
@@ -1068,15 +1091,12 @@ fn g04(s: &Scns) -> R {
 fn g05(s: &Scns) -> R {
     let s6 = sc(s, "S6")?;
     let s6b = sc(s, "S6b")?;
-    let netns = s6
-        .notes
+    // The netns inode is a control: without it the membership check has no subject.
+    s6.notes
         .get("netns")
-        .cloned()
         .ok_or_else(|| ctl_fail("the sandbox netns inode was not recorded while alive"))?;
-    need(
-        super::spawn::pids_in_netns(&netns).is_empty(),
-        "processes remain in the sandbox netns after exit",
-    )?;
+    // Evidence recorded before cleanup (a kill before this check hid the members).
+    assert_key(s6, "netns-after-exit")?;
     rc_is(s6b, 0)?;
     Ok("the sandbox netns is empty after exit; the session is reusable".to_owned())
 }
@@ -1237,6 +1257,14 @@ fn d10(s: &Scns) -> R {
         comm == "bwrap",
         format!("pid 1 comm: expected bwrap, got {comm:?}"),
     )?;
+    let caps = op(s12, "d10.caps")?;
+    for (key, label) in [("eff", "Eff"), ("prm", "Prm"), ("bnd", "Bnd")] {
+        let v = caps.data[key].as_str().unwrap_or("?");
+        need(
+            v == "0000000000000000",
+            format!("payload Cap{label} is {v}: expected no capabilities (--cap-drop ALL)"),
+        )?;
+    }
     let un = op(s12, "d10.unshare")?;
     need(
         errno(un) == Some(libc::ENOSPC) || errno(un) == Some(libc::EPERM),
@@ -1256,10 +1284,11 @@ pub fn evaluate(id: &str, s: &Scns) -> CheckResult {
             .map(String::as_str)
             == Some("false")
     {
+        // Not a pass and not an opt-in: H06 could not be set up on this host.
         return CheckResult::skip(
             id,
-            SkipKind::OptIn,
-            "n/a: HOME is unset or lies under a directory the sandbox binds",
+            SkipKind::Capability,
+            "cannot test: HOME is unset or lies under /root, /work, /tmp, /usr, /etc, /proc or /dev; run with HOME outside those",
         );
     }
     let outcome: Result<R, F> = match id {

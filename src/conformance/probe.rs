@@ -88,6 +88,9 @@ fn skip_default() -> Vec<String> {
 fn n50000() -> usize {
     50000
 }
+fn walk_budget_default() -> u64 {
+    8000
+}
 fn n12() -> usize {
     12
 }
@@ -193,6 +196,13 @@ pub enum Op {
         max_entries: usize,
         #[serde(default = "n12")]
         max_depth: usize,
+        /// Wall-clock budget: the walk stops (truncated) when it runs out.
+        #[serde(default = "walk_budget_default")]
+        budget_ms: u64,
+    },
+    /// Capability sets of the probe process (`/proc/self/status`).
+    Caps {
+        id: String,
     },
     Procs {
         id: String,
@@ -264,6 +274,7 @@ impl Op {
             | Op::Fds { id }
             | Op::Stat { id, .. }
             | Op::SocketsWalk { id, .. }
+            | Op::Caps { id }
             | Op::Procs { id }
             | Op::Unshare { id, .. }
             | Op::SpawnBg { id, .. }
@@ -294,6 +305,7 @@ impl Op {
             Op::Fds { .. } => "fds",
             Op::Stat { .. } => "stat",
             Op::SocketsWalk { .. } => "sockets_walk",
+            Op::Caps { .. } => "caps",
             Op::Procs { .. } => "procs",
             Op::Unshare { .. } => "unshare",
             Op::SpawnBg { .. } => "spawn_bg",
@@ -436,6 +448,13 @@ pub fn run_probe(tag: Option<&str>, ops_json: &str) -> ExitCode {
             return ExitCode::from(3);
         }
     };
+    if doc.ops.iter().any(destructive) && !inside_sandbox() {
+        println!(
+            "{}",
+            json!({"error": "refused: network-changing or file-writing ops run only inside an sbx sandbox"})
+        );
+        return ExitCode::from(4);
+    }
     if doc.v != PROBE_VERSION {
         println!(
             "{}",
@@ -460,6 +479,25 @@ pub fn run_probe(tag: Option<&str>, ops_json: &str) -> ExitCode {
     }
     emit(json!({"done": true, "t_ms": now_ms()}));
     ExitCode::SUCCESS
+}
+
+/// Ops that change the network namespace or write files.
+fn destructive(op: &Op) -> bool {
+    match op {
+        Op::Netlink { action, .. } => action != "dump_links",
+        Op::Write { .. } => true,
+        _ => false,
+    }
+}
+
+/// True inside an sbx sandbox: the network namespace holds only `lo`, and the
+/// user namespace is not the initial one (its uid_map is not the identity map).
+/// A host, or any process outside a user namespace, is never inside.
+pub fn inside_sandbox() -> bool {
+    let map = fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
+    let fields: Vec<&str> = map.split_whitespace().collect();
+    let identity = fields == ["0", "0", "4294967295"];
+    !fields.is_empty() && !identity && link_names() == ["lo"]
 }
 
 fn execute(op: &Op, st: &mut State) -> OpResult {
@@ -719,9 +757,16 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
             skip,
             max_entries,
             max_depth,
+            budget_ms,
             ..
         } => {
-            let (found, visited, truncated) = sockets_walk(roots, skip, *max_entries, *max_depth);
+            let (found, visited, truncated) = sockets_walk(
+                roots,
+                skip,
+                *max_entries,
+                *max_depth,
+                Duration::from_millis(*budget_ms),
+            );
             let shown: Vec<String> = found.iter().take(20).cloned().collect();
             ok_result(
                 &id,
@@ -730,6 +775,24 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
                 None,
                 format!("{} socket files, {visited} entries visited", found.len()),
                 json!({"found": shown, "visited": visited, "truncated": truncated}),
+            )
+        }
+        Op::Caps { .. } => {
+            let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let cap = |key: &str| -> String {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_owned()))
+                    .unwrap_or_default()
+            };
+            let (eff, prm, bnd) = (cap("CapEff:"), cap("CapPrm:"), cap("CapBnd:"));
+            ok_result(
+                &id,
+                name,
+                !eff.is_empty(),
+                None,
+                format!("CapEff {eff} CapPrm {prm} CapBnd {bnd}"),
+                json!({"eff": eff, "prm": prm, "bnd": bnd}),
             )
         }
         Op::Procs { .. } => {
@@ -1479,7 +1542,9 @@ fn sockets_walk(
     skip: &[String],
     max_entries: usize,
     max_depth: usize,
+    budget: Duration,
 ) -> (Vec<String>, usize, bool) {
+    let started = std::time::Instant::now();
     let mut found: Vec<String> = Vec::new();
     let mut visited = 0usize;
     let mut truncated = false;
@@ -1488,7 +1553,7 @@ fn sockets_walk(
         .map(|r| (std::path::PathBuf::from(r), 0))
         .collect();
     while let Some((dir, depth)) = stack.pop() {
-        if visited >= max_entries {
+        if visited >= max_entries || started.elapsed() > budget {
             truncated = true;
             break;
         }
@@ -1564,7 +1629,19 @@ impl ProbeOutput {
             }
         }
         if !done && !allow_no_done {
-            return Err("probe output has no done line".to_owned());
+            // Name the last op that completed: a timeout is then diagnosable.
+            let last = results.values().max_by_key(|r| r.t_ms);
+            let at = match last {
+                Some(r) => format!(
+                    "; last completed op {} ({}) at +{} ms after the banner",
+                    r.id,
+                    r.op,
+                    r.t_ms
+                        .saturating_sub(banner["t_ms"].as_u64().unwrap_or(r.t_ms))
+                ),
+                None => "; no op completed".to_owned(),
+            };
+            return Err(format!("probe output has no done line{at}"));
         }
         Ok(ProbeOutput { pid, results, done })
     }
@@ -1572,6 +1649,50 @@ impl ProbeOutput {
     /// The result of op `id`.
     pub fn get(&self, id: &str) -> Option<&OpResult> {
         self.results.get(id)
+    }
+}
+
+impl Op {
+    /// The worst-case wall time this op can take (its timeouts summed). The
+    /// runner sizes a scenario's bound from the sum over its ops.
+    pub fn budget_ms(&self) -> u64 {
+        match self {
+            Op::Dns { timeout_ms, .. } => *timeout_ms,
+            Op::Tcp {
+                steps,
+                connect_timeout_ms,
+                ..
+            } => {
+                connect_timeout_ms
+                    + steps
+                        .iter()
+                        .map(|st| match st {
+                            Step::Send(_) => 0,
+                            Step::Read(r) => r.timeout_ms,
+                            Step::ReadHttp(r) => r.timeout_ms,
+                            Step::ReadToEnd(r) => r.timeout_ms,
+                            Step::SleepMs(ms) => *ms,
+                        })
+                        .sum::<u64>()
+            }
+            Op::Udp {
+                attempts,
+                recv_timeout_ms,
+                ..
+            } => u64::from(*attempts) * recv_timeout_ms,
+            Op::SocketsWalk { budget_ms, .. } => *budget_ms,
+            Op::Sleep { ms, .. } => *ms,
+            Op::WaitStdin { timeout_ms, .. } => *timeout_ms,
+            Op::DnsFlood { count, .. } => u64::from(*count) * 50,
+            _ => 0,
+        }
+    }
+}
+
+impl Ops {
+    /// The sum of the per-op budgets.
+    pub fn budget_ms(&self) -> u64 {
+        self.ops.iter().map(Op::budget_ms).sum()
     }
 }
 
@@ -1675,6 +1796,7 @@ mod tests {
                 skip: vec![],
                 max_entries: 1,
                 max_depth: 1,
+                budget_ms: 1,
             },
             Op::Procs { id: "pr".into() },
             Op::Unshare {

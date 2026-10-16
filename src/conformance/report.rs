@@ -16,10 +16,13 @@ use crate::host::{EffectiveMode, Status};
 pub enum SkipKind {
     /// The host cannot provide what the check needs (counts toward rc 1).
     Capability,
-    /// Opt-in: `--network` absent, a tool missing, or not selected (rc 0).
+    /// Opt-in: `--network` absent or a tool missing (rc 0).
     OptIn,
     /// The check is not implemented in this build (counts toward rc 1).
     NotImplemented,
+    /// Left out by `--only`: not run, counted only as `not_selected` (never as
+    /// a skip, opt-in or otherwise).
+    NotSelected,
 }
 
 impl SkipKind {
@@ -29,6 +32,7 @@ impl SkipKind {
             SkipKind::Capability => "capability: ",
             SkipKind::OptIn => "opt-in: ",
             SkipKind::NotImplemented => "not implemented: ",
+            SkipKind::NotSelected => "",
         }
     }
 }
@@ -168,6 +172,10 @@ impl Report {
             duration_ms: self.duration_ms,
         };
         for r in &self.results {
+            if r.skip_kind == Some(SkipKind::NotSelected) {
+                s.not_selected += 1;
+                continue;
+            }
             match r.status {
                 Status::Ok => s.ok += 1,
                 Status::Fail => s.fail += 1,
@@ -181,9 +189,6 @@ impl Report {
                     }
                 }
             }
-            if r.detail == NOT_SELECTED {
-                s.not_selected += 1;
-            }
         }
         s.conformant =
             s.fail == 0 && s.capability_skips == 0 && s.not_implemented == 0 && !self.nothing_ran();
@@ -194,11 +199,14 @@ impl Report {
     /// checks without `--network`): nothing was verified, which is not conformance.
     pub fn nothing_ran(&self) -> bool {
         self.only.is_some()
-            && self.results.iter().any(|r| r.detail != NOT_SELECTED)
             && self
                 .results
                 .iter()
-                .filter(|r| r.detail != NOT_SELECTED)
+                .any(|r| r.skip_kind != Some(SkipKind::NotSelected))
+            && self
+                .results
+                .iter()
+                .filter(|r| r.skip_kind != Some(SkipKind::NotSelected))
                 .all(|r| r.status == Status::Skip && r.skip_kind == Some(SkipKind::OptIn))
     }
 
@@ -216,17 +224,11 @@ impl Report {
                 s.capability_skips,
                 s.not_implemented
             )
-        } else if s.opt_in_skips > s.not_selected_count() {
+        } else if s.opt_in_skips > 0 {
             "result: conformant (opt-in skips only)".to_owned()
         } else {
             "result: conformant".to_owned()
         }
-    }
-}
-
-impl Summary {
-    fn not_selected_count(&self) -> usize {
-        self.not_selected
     }
 }
 
@@ -250,7 +252,7 @@ pub fn render_human(r: &Report) -> String {
         let defs: Vec<&CheckDef> = catalog::group_checks(group).collect();
         let shown: Vec<&CheckDef> = defs
             .into_iter()
-            .filter(|d| find(d.id).is_some_and(|x| x.detail != NOT_SELECTED))
+            .filter(|d| find(d.id).is_some_and(|x| x.skip_kind != Some(SkipKind::NotSelected)))
             .collect();
         if shown.is_empty() {
             continue;
@@ -368,7 +370,13 @@ pub fn stderr_lines(r: &Report) -> Vec<String> {
         let first = r
             .results
             .iter()
-            .find(|x| x.status == Status::Skip && x.skip_kind != Some(SkipKind::OptIn))
+            .find(|x| {
+                x.status == Status::Skip
+                    && matches!(
+                        x.skip_kind,
+                        Some(SkipKind::Capability | SkipKind::NotImplemented)
+                    )
+            })
             .map(|x| format!("{}: {}", x.id, x.detail))
             .unwrap_or_default();
         lines.push(format!(
@@ -448,7 +456,7 @@ mod tests {
     pub(crate) fn synthetic() -> Report {
         let mut results: Vec<CheckResult> = CATALOG
             .iter()
-            .map(|d| CheckResult::skip(d.id, SkipKind::OptIn, NOT_SELECTED))
+            .map(|d| CheckResult::skip(d.id, SkipKind::NotSelected, NOT_SELECTED))
             .collect();
         let set = |results: &mut Vec<CheckResult>, r: CheckResult| {
             let i = results.iter().position(|x| x.id == r.id).unwrap();
@@ -516,7 +524,7 @@ mod tests {
     fn human_layout_golden() {
         let mut r = synthetic();
         r.results
-            .retain(|x| x.detail != NOT_SELECTED || x.id == "A01");
+            .retain(|x| x.skip_kind != Some(SkipKind::NotSelected) || x.id == "A01");
         let expect = "\
 sbx 0.1.0 conformance (kernel 6.8.0-test, network mode transparent, lab ok)
 
@@ -568,7 +576,7 @@ result: NOT conformant (1 FAIL)
         let mut ok = synthetic();
         for x in ok.results.iter_mut() {
             if x.status != Status::Ok {
-                *x = CheckResult::skip(&x.id.clone(), SkipKind::OptIn, NOT_SELECTED);
+                *x = CheckResult::skip(&x.id.clone(), SkipKind::NotSelected, NOT_SELECTED);
             }
         }
         assert_eq!(ok.result_line(), "result: conformant");
@@ -583,7 +591,7 @@ result: NOT conformant (1 FAIL)
         let mut only_opt = synthetic();
         only_opt.results.iter_mut().for_each(|x| {
             if x.status != Status::Ok {
-                *x = CheckResult::skip(&x.id.clone(), SkipKind::OptIn, NOT_SELECTED);
+                *x = CheckResult::skip(&x.id.clone(), SkipKind::NotSelected, NOT_SELECTED);
             }
         });
         assert_eq!(exit_code(&only_opt), 0);
@@ -598,7 +606,7 @@ result: NOT conformant (1 FAIL)
                     *x = if x.id == "D05" {
                         x.clone()
                     } else {
-                        CheckResult::skip(&x.id.clone(), SkipKind::OptIn, NOT_SELECTED)
+                        CheckResult::skip(&x.id.clone(), SkipKind::NotSelected, NOT_SELECTED)
                     };
                 });
             w

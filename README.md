@@ -259,8 +259,12 @@ The tiers: **host** (a `sbx run` per scenario, built-in policies), **init**
 (the production `sbx __init` with the listeners dropped), **lab** (an
 unprivileged nested user, network and mount namespace with a local fixture on
 9.9.9.9 and a lab DNS that never touches the real network), and **network**
-(opt-in, real hosts). The offline tiers are hermetic: no root, nothing outside
-`$TMPDIR/sbx-conformance-*`, and the host tier never dials an upstream.
+(opt-in, real hosts). The offline tiers need no root and never dial an upstream.
+Their files live under `$TMPDIR/sbx-conformance-*`, with two documented
+exceptions: the D04 control socket `/tmp/sbxc-<8 hex>.s` (kept short because
+`sun_path` is 108 bytes), and, when `$TMPDIR` lies under `$HOME`, the base
+directory under `/tmp` (so the sandbox's bind parents do not expose `$HOME`).
+Both are removed at the end of a run.
 
 ```
 sbx check --conformance                    # every offline check

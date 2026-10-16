@@ -18,8 +18,10 @@
 //!    capability skip (rc 1); opt-in skips (no `--network`) are rc 0.
 //! 6. Budget: 120 s for the offline tiers; a scenario not started by then is a
 //!    capability skip.
-//! 7. Hermeticity: no root, nothing outside `$TMPDIR/sbx-conformance-*`, and
-//!    the host tier never dials an upstream. Artifacts are kept on FAIL.
+//! 7. Hermeticity: no root and no upstream dial. Files live under
+//!    `$TMPDIR/sbx-conformance-*`, except the D04 control socket
+//!    `/tmp/sbxc-<8 hex>.s` (sun_path length) and, when `$TMPDIR` is under
+//!    `$HOME`, the base under `/tmp`. Artifacts are kept on FAIL.
 //!
 //! Interruption: a normal exit removes the temp base. SIGINT, SIGTERM or
 //!    SIGKILL to the suite itself is not trapped: the base (with its copy of
@@ -134,7 +136,7 @@ pub fn check(args: ConformanceArgs) -> ExitCode {
         if !selected_here {
             results.push(CheckResult::skip(
                 d.id,
-                SkipKind::OptIn,
+                SkipKind::NotSelected,
                 report::NOT_SELECTED,
             ));
             continue;
@@ -224,10 +226,8 @@ fn make_base() -> std::io::Result<(PathBuf, String)> {
 /// The capability text for a check the host cannot run (§8.4 gating table).
 fn host_cannot(mode: EffectiveMode, d: &catalog::CheckDef) -> Option<String> {
     if mode == EffectiveMode::Unavailable && d.tier != Tier::Network {
-        return Some(format!(
-            "the host cannot run sandboxes: {} (run `sbx check`)",
-            d.id
-        ));
+        let _ = d.id;
+        return Some("the host cannot run sandboxes (run `sbx check`)".to_owned());
     }
     if d.needs.contains(&Need::Transparent) && mode == EffectiveMode::Explicit {
         return Some(

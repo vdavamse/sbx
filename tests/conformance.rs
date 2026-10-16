@@ -46,6 +46,10 @@ fn main() -> std::process::ExitCode {
     run("help-hides-hidden-subcommand", help_scenario());
     run("hidden-probe-on-host", probe_scenario());
     run("hidden-probe-malformed-rc3", probe_malformed_scenario());
+    run(
+        "hidden-probe-destructive-refused-outside-sandbox",
+        probe_destructive_scenario(),
+    );
     match full_report_scenario() {
         Ok(Some(msg)) => println!("SKIP conformance: {msg}"),
         Ok(None) => println!("PASS full-report"),
@@ -139,7 +143,7 @@ fn only_scenario() -> Result<(), String> {
         ));
     }
     for c in checks.iter().filter(|c| c["id"] != "A01") {
-        if c["detail"] != "not selected (--only)" {
+        if c["skip_kind"] != "not-selected" {
             return Err(format!("{} was not marked not selected", c["id"]));
         }
     }
@@ -203,6 +207,31 @@ fn probe_scenario() -> Result<(), String> {
     let banner: serde_json::Value = serde_json::from_str(&lines[0]).map_err(|e| e.to_string())?;
     if banner["probe"] != 1 {
         return Err("probe banner missing".to_owned());
+    }
+    Ok(())
+}
+
+/// The destructive ops (netlink changes, writes) are refused unless the probe runs
+/// inside an sbx sandbox. On the host (identity uid_map) they must be refused with rc 4.
+fn probe_destructive_scenario() -> Result<(), String> {
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
+    if uid_map.split_whitespace().collect::<Vec<_>>() != ["0", "0", "4294967295"] {
+        println!("SKIP probe-destructive: not running on the initial user namespace");
+        return Ok(());
+    }
+    let out = sbx(&[
+        "__conformance",
+        "probe",
+        r#"{"v":1,"ops":[{"op":"netlink","id":"x","action":"lo_down"}]}"#,
+    ])?;
+    if rc(&out) != 4 {
+        return Err(format!(
+            "destructive probe op outside a sandbox: rc {}, expected 4",
+            rc(&out)
+        ));
+    }
+    if !text(&out).contains("refused") {
+        return Err("refusal text missing".to_owned());
     }
     Ok(())
 }

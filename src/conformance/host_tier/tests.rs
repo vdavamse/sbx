@@ -160,6 +160,12 @@ fn s1() -> Scn {
             true,
             reply("HTTP/1.1 400 Bad Request\r\n\r\n"),
         ),
+        tcp(
+            "b10.rev",
+            &x(18),
+            true,
+            reply("HTTP/1.1 403 Forbidden\r\n\r\n"),
+        ),
         op(
             "c01.links",
             true,
@@ -264,12 +270,6 @@ fn s1() -> Scn {
         tcp("d02.hello", &t(53), true, none_read()),
         op("d03.abs", false, Some(libc::ECONNREFUSED), json!({})),
         op("d04.path", false, Some(libc::ENOENT), json!({})),
-        op(
-            "d05.walk",
-            true,
-            None,
-            json!({"found": [], "visited": 500, "truncated": false}),
-        ),
         op("d.listen", true, None, json!({"port": 40000})),
     ];
     let mut s = scn(
@@ -277,6 +277,16 @@ fn s1() -> Scn {
         ops,
         vec![
             answered("127.0.0.1:50001", "allowed.conformance.test"),
+            deny(
+                "127.0.0.1:50015",
+                "explicit-forward",
+                "HTTP Host other.conformance.test does not match the request-target name allowed.conformance.test",
+            ),
+            deny(
+                "127.0.0.1:50018",
+                "explicit-forward",
+                "other.conformance.test is not in the policy allow list",
+            ),
             denied_dns(
                 "127.0.0.1:50030",
                 "other.conformance.test is not in the policy allow list",
@@ -366,6 +376,21 @@ fn s1() -> Scn {
     s
 }
 
+fn s13() -> Scn {
+    let mut s = scn(
+        "S13",
+        vec![op(
+            "d05.walk",
+            true,
+            None,
+            json!({"found": [], "visited": 500, "truncated": false}),
+        )],
+        vec![],
+    );
+    s.name = "S13";
+    s
+}
+
 fn s2() -> Scn {
     let mut s = scn(
         "S2",
@@ -426,6 +451,7 @@ fn s6(name: &'static str) -> Scn {
     if name == "S6" {
         s.ctl.insert("g01.seen", Ok(()));
         s.ctl.insert("g01.gone", Ok(()));
+        s.ctl.insert("netns-after-exit", Ok(()));
         s.notes.insert("netns", "net:[4026532309]".to_owned());
     }
     s.fin = Some(fin(Some(0), "", vec![], 30));
@@ -491,6 +517,7 @@ fn s11a() -> Scn {
         )],
     );
     a.notes.insert("ip", "198.18.0.5".to_owned());
+    a.ctl.insert("d.host-file", Ok(()));
     a.notes.insert("port", "40000".to_owned());
     a
 }
@@ -571,6 +598,12 @@ fn s12() -> Scn {
                 json!({"pids": [1, 2, 3], "pid1_comm": "bwrap", "self_pid": 3}),
             ),
             op("d10.unshare", false, Some(libc::ENOSPC), json!({})),
+            op(
+                "d10.caps",
+                true,
+                None,
+                json!({"eff": "0000000000000000", "prm": "0000000000000000", "bnd": "0000000000000000"}),
+            ),
         ],
         vec![],
     );
@@ -601,6 +634,7 @@ pub fn good() -> Scns {
     m.insert("S11a", s11a());
     m.insert("S11b", s11b());
     m.insert("S12", s12());
+    m.insert("S13", s13());
     m
 }
 
@@ -741,16 +775,12 @@ fn bad(id: &str, control: bool) -> Option<Scns> {
                 .ctl
                 .insert("d04.own", Err("sun_path too long".into()));
         }
-        ("D05", false) => edit!(
-            s1_of(&mut m),
-            "d05.walk",
-            |r: &mut OpResult| r.data["found"] = json!(["/usr/lib/x/agent.sock"])
-        ),
-        ("D05", true) => edit!(
-            s1_of(&mut m),
-            "d05.walk",
-            |r: &mut OpResult| r.data["visited"] = json!(3)
-        ),
+        ("D05", false) => edit!(m.get_mut("S13").unwrap(), "d05.walk", |r: &mut OpResult| {
+            r.data["found"] = json!(["/usr/lib/x/agent.sock"])
+        }),
+        ("D05", true) => edit!(m.get_mut("S13").unwrap(), "d05.walk", |r: &mut OpResult| {
+            r.data["visited"] = json!(3)
+        }),
         ("D06", false) => edit!(m.get_mut("S11b").unwrap(), "d.btcp", |r: &mut OpResult| {
             r.errno = None;
             r.data["connected"] = json!(true)
@@ -1017,4 +1047,97 @@ fn unavailable_scenario_is_not_a_pass() {
     let mut m = good();
     m.insert("S1", Scn::unavailable("S1", "boom".into()));
     assert_eq!(status_of("A01", &m).0, Status::Fail);
+}
+
+#[test]
+fn g05_survivors_recorded_before_cleanup_are_a_fail() {
+    // Review (CRITICAL): the netns members must be judged from the evidence
+    // recorded before the cleanup kill, never from a re-check after it.
+    let mut m = good();
+    m.get_mut("S6").unwrap().ctl.insert(
+        "netns-after-exit",
+        Err("netns members after exit (before cleanup): pids [7]".into()),
+    );
+    let (st, detail, control) = status_of("G05", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+    assert!(!control, "{detail}");
+    assert!(detail.contains("netns-after-exit"), "{detail}");
+}
+
+#[test]
+fn d08_host_path_control_breaks_when_the_layout_moves() {
+    let mut m = good();
+    m.get_mut("S11a").unwrap().ctl.insert(
+        "d.host-file",
+        Err("A's secret is not at /x/wk/a-secret on the host".into()),
+    );
+    let (st, detail, control) = status_of("D08", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+    assert!(control, "{detail}");
+}
+
+#[test]
+fn d10_any_capability_fails() {
+    for key in ["eff", "prm", "bnd"] {
+        let mut m = good();
+        let r = m
+            .get_mut("S12")
+            .unwrap()
+            .probe
+            .as_mut()
+            .unwrap()
+            .results
+            .get_mut("d10.caps")
+            .unwrap();
+        r.data[key] = json!("000001ffffffffff");
+        let (st, detail, control) = status_of("D10", &m);
+        assert_eq!(st, Status::Fail, "{key}: {detail}");
+        assert!(!control, "{key}: {detail}");
+    }
+}
+
+#[test]
+fn b10_pins_the_forward_leg_and_both_reasons() {
+    // Only the reverse-direction row exists: the absolute-form Host mismatch leg
+    // must not pass on it.
+    let mut m = good();
+    m.get_mut("S1")
+        .unwrap()
+        .audit
+        .retain(|r| r["reason"] != "HTTP Host other.conformance.test does not match the request-target name allowed.conformance.test");
+    let (st, detail, _) = status_of("B10", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+    assert!(detail.contains("explicit-forward"), "{detail}");
+}
+
+#[test]
+fn h06_that_cannot_run_is_a_capability_skip_not_a_pass() {
+    let mut m = good();
+    m.get_mut("S12")
+        .unwrap()
+        .notes
+        .insert("home_applicable", "false".into());
+    let r = evaluate("H06", &m);
+    assert_eq!(r.status, Status::Skip);
+    assert_eq!(
+        r.skip_kind,
+        Some(crate::conformance::report::SkipKind::Capability)
+    );
+}
+
+#[test]
+fn s13_walk_truncated_by_its_budget_is_a_warn() {
+    let mut m = good();
+    let w = m
+        .get_mut("S13")
+        .unwrap()
+        .probe
+        .as_mut()
+        .unwrap()
+        .results
+        .get_mut("d05.walk")
+        .unwrap();
+    w.data["truncated"] = json!(true);
+    let r = evaluate("D05", &m);
+    assert_eq!(r.status, Status::Warn, "{r:?}");
 }
