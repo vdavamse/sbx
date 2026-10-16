@@ -170,6 +170,7 @@ mod tests {
   ok    bwrap       bubblewrap 0.9.0 at /usr/bin/bwrap
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
+  ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
   ok    landlock    Landlock ABI 4 (report-only)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
@@ -186,6 +187,7 @@ network mode: transparent (policies with network mode transparent, explicit or n
   ok    bwrap       bubblewrap 0.9.0 at /usr/bin/bwrap
   skip  bwrap-run   not probed: user namespaces are unavailable
   skip  bwrap-proc  not probed: user namespaces are unavailable
+  skip  seccomp     not probed: user namespaces are unavailable
   ok    landlock    Landlock ABI 4 (report-only)
 
 network mode: unavailable (no policy can run until the failed items are fixed)
@@ -275,6 +277,15 @@ network mode: unavailable (no policy can run until the failed items are fixed)
       "id": "bwrap-proc",
       "status": "ok",
       "detail": "bwrap mounts a fresh /proc",
+      "evidence": null,
+      "errno": null,
+      "impact": null,
+      "fix": null
+    },
+    {
+      "id": "seccomp",
+      "status": "ok",
+      "detail": "bwrap installs sbx's socket-family filter (installation only; denials not probed)",
       "evidence": null,
       "errno": null,
       "impact": null,

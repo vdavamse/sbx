@@ -92,11 +92,30 @@ const EXPECTED_PWD: &str = "PWD=/work";
 /// infra/generated `/etc` binds, the session leaves — and cannot drift
 /// from it again. Failure to run THIS (AppArmor-blocked userns, seccomp,
 /// missing `/usr` …) skips the suite with `USERNS_SKIP`.
+/// The sealed seccomp-program memfd (issue #34), made inheritable for the
+/// spawn that follows. The caller keeps the returned fd alive across the spawn.
+fn seccomp_memfd() -> Result<(std::os::fd::OwnedFd, std::os::fd::RawFd), String> {
+    use std::os::fd::AsRawFd;
+    let fd =
+        sbx::bwrap::seccomp::program_memfd().map_err(|e| format!("seccomp program memfd: {e}"))?;
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_SETFD on the memfd we own; the spawn that follows is the only
+    // child that should inherit it.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } != 0 {
+        return Err(format!(
+            "clear CLOEXEC on the seccomp memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((fd, raw))
+}
+
 fn smoke_launch(bwrap: &Path) -> Result<Outcome, String> {
     let session = TempSession::new("probe-smoke");
     let policy = Policy::from_json_str(BASE_POLICY).expect("BASE_POLICY must parse");
     let empty = no_env();
     let command = [OsString::from("/bin/true")];
+    let (_seccomp, seccomp_fd) = seccomp_memfd()?;
     let input = Build {
         policy: &policy,
         session_dir: &session.dir,
@@ -105,6 +124,7 @@ fn smoke_launch(bwrap: &Path) -> Result<Outcome, String> {
         cwd: None,
         passed_env: &empty,
         info_fd: None,
+        seccomp_fd,
     };
     // The run_payload pipeline with `/bin/true` instead of a `/bin/sh`
     // script (the smoke needs no shell — only the loader + coreutils-free
@@ -334,6 +354,7 @@ fn run_payload(
         .iter()
         .map(OsString::from)
         .collect();
+    let (_seccomp, seccomp_fd) = seccomp_memfd()?;
     let input = Build {
         policy: &policy,
         session_dir: &session.dir,
@@ -342,6 +363,7 @@ fn run_payload(
         cwd: None,
         passed_env,
         info_fd: None,
+        seccomp_fd,
     };
     let launch = build(&input).map_err(|e| format!("build: {e}"))?;
     run_bounded(launch.command(), "bwrap payload")
@@ -832,6 +854,33 @@ if unshare -U true 2>/dev/null; then echo "SBX-BW-MARKER userns-ALLOWED"; else e
         "a nested userns was created despite --disable-userns:\n{}",
         out.stdout
     );
+    house_print(&format!("PASS {NAME}"));
+}
+
+/// #34: bwrap installs the socket-family filter (`--seccomp N`) in pid 1 and in
+/// the payload: `Seccomp: 2` is SECCOMP_MODE_FILTER in both `/proc/self` and
+/// `/proc/1`, on the same build-to-spawn path every scenario uses.
+#[test]
+fn bwrap_seccomp_installed() {
+    const NAME: &str = "bwrap-seccomp-installed";
+    let Some(bwrap) = probe_ready(NAME) else {
+        return;
+    };
+    let session = TempSession::new(NAME);
+    let script = r#"
+echo "SBX-BW-MARKER payload $(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/self/status)"
+echo "SBX-BW-MARKER pid1 $(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/1/status)"
+"#;
+    let out = run_payload(bwrap, &session, BASE_POLICY, &no_env(), script)
+        .expect("bwrap-seccomp payload run");
+    assert_clean_success(&out);
+    for want in ["payload 2", "pid1 2"] {
+        assert!(
+            has_marker(&out, want),
+            "bwrap must install the filter ({want}):\n{}",
+            out.stdout
+        );
+    }
     house_print(&format!("PASS {NAME}"));
 }
 

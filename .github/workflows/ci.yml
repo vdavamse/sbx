@@ -156,6 +156,30 @@ jobs:
           OUT=$("$BIN" gc --older-than 1d "$T")
           RC=$?
           [ "$RC" -eq 0 ] && [ "$OUT" = "removed \"$T/s\"" ] && [ ! -e "$T/s" ] || { echo "FAIL: gc of a real session rc $RC: $OUT"; FAIL=1; }
+          # Issue #34: the socket-family filter. AF_VSOCK (a channel that bypasses
+          # the netns; live on VM-backed runners) and AF_PACKET fail with
+          # EAFNOSUPPORT (errno 97) inside the sandbox, through socket(2), the
+          # socketpair(2) variant, and a high-word family spelling (the kernel
+          # keeps only the low 32 bits); AF_UNIX keeps working.
+          PROG=$(cat <<'PY'
+          import ctypes, socket as s
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+          def raw(nr, *args):
+              r = libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(a) for a in args])
+              return "ok" if r >= 0 else "errno %d" % ctypes.get_errno()
+          pair = (ctypes.c_int * 2)()
+          print("vsock", raw(41, 40, 1, 0))
+          print("packet", raw(41, 17, 1, 0))
+          print("hiword", raw(41, (1 << 32) | 40, 1, 0))
+          print("socketpair-vsock", raw(53, 40, 1, 0, ctypes.addressof(pair)))
+          s.socket(s.AF_UNIX, s.SOCK_STREAM).close()
+          print("unix ok")
+          PY
+          )
+          OUT=$("$BIN" run --policy "$T/bench.json" --session-dir "$T/s" -- /usr/bin/python3 -c "$PROG")
+          RC=$?
+          printf '%s\n' "$OUT" | grep -qx 'vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'packet errno 97' && printf '%s\n' "$OUT" | grep -qx 'hiword errno 97' && printf '%s\n' "$OUT" | grep -qx 'socketpair-vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'unix ok' && [ "$RC" -eq 0 ] || { echo "FAIL: socket-family filter rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
       # Issue #11: the real `sbx check` on the runner (gating). Every host item

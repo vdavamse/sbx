@@ -192,6 +192,16 @@ pub enum Cmd {
         #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
         keep_fd: Option<RawFd>,
 
+        /// (hidden) The sealed memfd holding sbx's seccomp program, handed to bwrap
+        /// as `--seccomp` (issue #34).
+        //
+        // Validated in the control stage (init::validate_seccomp_fd): a sealed
+        // memfd whose bytes equal this binary's own program. Optional so direct
+        // `__init` callers (the integration suites) keep working; `run` always
+        // passes it.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
+        seccomp_fd: Option<RawFd>,
+
         /// (hidden) The pid of the `run` process that spawned us (m6): __init sets
         /// PR_SET_PDEATHSIG and refuses to continue if its parent is not this pid.
         //
@@ -221,7 +231,7 @@ pub enum Cmd {
         /// and the nested bwrap launches, print one JSON line, exit 0.
         //
         // Issue #11 (T3/T4). Conflicts with every pipeline argument.
-        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "parent_pid", "min_mode", "cmd"])]
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "parent_pid", "min_mode", "cmd"])]
         probe: bool,
 
         /// (hidden, with --probe) The bwrap binary the probe launches.
@@ -364,6 +374,7 @@ pub fn run() -> ExitCode {
         Cmd::Init {
             fd,
             keep_fd,
+            seccomp_fd,
             parent_pid,
             min_mode,
             test_break_rules,
@@ -380,6 +391,7 @@ pub fn run() -> ExitCode {
             crate::init::run_init(crate::init::InitArgs {
                 fd,
                 keep_fd,
+                seccomp_fd,
                 parent_pid,
                 min_mode: min_mode.unwrap_or(NetworkMode::Transparent),
                 test_break_rules,
@@ -944,6 +956,63 @@ mod tests {
             Cmd::Init { keep_fd, .. } => assert_eq!(keep_fd, Some(9)),
             other => panic!("expected Cmd::Init, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn init_parses_seccomp_fd() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--seccomp-fd",
+            "11",
+            "--",
+            "/bin/true",
+        ])
+        .expect("--seccomp-fd must parse");
+        match cli.command {
+            Cmd::Init { seccomp_fd, .. } => assert_eq!(seccomp_fd, Some(11)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_seccomp_fd_hidden_in_help() {
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand("__init")
+            .expect("__init subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--seccomp-fd"), "{help}");
+    }
+
+    #[test]
+    fn init_probe_conflicts_with_seccomp_fd() {
+        let err = Cli::try_parse_from(["sbx", "__init", "--probe", "--seccomp-fd", "11"])
+            .expect_err("--probe must conflict with --seccomp-fd");
+        assert!(
+            err.to_string().contains("--seccomp-fd") || err.to_string().contains("cannot be used"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn init_rejects_negative_seccomp_fd() {
+        assert!(
+            Cli::try_parse_from([
+                "sbx",
+                "__init",
+                "--fd",
+                "7",
+                "--seccomp-fd",
+                "-1",
+                "--",
+                "/bin/true"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

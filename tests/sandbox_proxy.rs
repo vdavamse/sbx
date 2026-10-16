@@ -629,7 +629,10 @@ fn spawn_init(role: &str, payload: &[OsString]) -> Result<Spawned, String> {
 /// ported verbatim): `__init` gets an EMPTY environment and leads its own
 /// process group. The payload is a bwrap argv built by the production
 /// pipeline, so there is no role env.
-fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
+fn spawn_init_env_clear(
+    payload_argv: &[OsString],
+    seccomp_fd: std::os::fd::RawFd,
+) -> Result<Spawned, String> {
     use std::os::unix::process::CommandExt;
 
     let (parent_end, child_end) =
@@ -638,6 +641,7 @@ fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
         .map_err(|e| format!("prepare_child_end: {e}"))?;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.arg("__init").arg("--fd").arg(child_fd.to_string());
+    cmd.arg("--seccomp-fd").arg(seccomp_fd.to_string());
     cmd.arg("--");
     cmd.args(payload_argv);
     cmd.env_clear();
@@ -657,6 +661,24 @@ fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
         stdout,
         stderr,
     })
+}
+
+/// The sealed seccomp-program memfd (issue #34), made inheritable for the
+/// spawn that follows. The caller keeps the returned fd alive across the spawn.
+fn seccomp_memfd() -> Result<(std::os::fd::OwnedFd, std::os::fd::RawFd), String> {
+    use std::os::fd::AsRawFd;
+    let fd =
+        sbx::bwrap::seccomp::program_memfd().map_err(|e| format!("seccomp program memfd: {e}"))?;
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_SETFD on the memfd we own; the spawn that follows is the only
+    // child that should inherit it.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } != 0 {
+        return Err(format!(
+            "clear CLOEXEC on the seccomp memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((fd, raw))
 }
 
 /// Spawn the role binary as the payload: `__init -- <current_exe>` with
@@ -4227,6 +4249,7 @@ fn run_dns_bwrap_in(
         .map_err(|e| format!("materialize {}: {e}", session.display()))?;
     let command: Vec<OsString> = argv.iter().map(OsString::from).collect();
     let passed_env = std::collections::BTreeMap::new();
+    let (_seccomp, seccomp_fd) = seccomp_memfd()?;
     let input = sbx::bwrap::Build {
         policy: &pol,
         session_dir: session,
@@ -4235,10 +4258,11 @@ fn run_dns_bwrap_in(
         cwd: None,
         passed_env: &passed_env,
         info_fd: None,
+        seccomp_fd,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 
-    let mut guard = SpawnedGuard::new(spawn_init_env_clear(launch.argv())?);
+    let mut guard = SpawnedGuard::new(spawn_init_env_clear(launch.argv(), seccomp_fd)?);
     let fdpass::ListenerFds {
         transparent,
         explicit,

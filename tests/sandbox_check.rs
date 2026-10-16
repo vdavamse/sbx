@@ -103,6 +103,11 @@ fn scenarios() -> Vec<Scenario> {
             run: json_shape,
         },
         Scenario {
+            name: "seccomp-item-ok",
+            gate: Gate::Bwrap,
+            run: seccomp_item_ok,
+        },
+        Scenario {
             name: "bwrap-missing",
             gate: Gate::Userns,
             run: bwrap_missing,
@@ -274,7 +279,7 @@ fn usage_contract() -> Result<(), String> {
     Ok(())
 }
 
-/// The JSON report's shape holds on every host: version 1, the nine ids in
+/// The JSON report's shape holds on every host: version 1, the ids in
 /// report order, rc 1 exactly when the network mode is unavailable, and every
 /// failing item carries a fix.
 fn json_shape() -> Result<(), String> {
@@ -304,6 +309,27 @@ fn json_shape() -> Result<(), String> {
     Ok(())
 }
 
+/// Issue #34: where bwrap runs, the `seccomp` item is ok — the nested launch
+/// with sbx's socket-family filter (`bwrap-seccomp`) starts, so `run` can.
+fn seccomp_item_ok() -> Result<(), String> {
+    // No program for this architecture: the item is a documented FAIL there.
+    if sbx::bwrap::seccomp::Arch::native().is_none() {
+        return Ok(());
+    }
+    let bwrap = bwrap_path()?;
+    let out = run(Command::new(SBX)
+        .args(["check", "--json"])
+        .env("SBX_BWRAP", &bwrap))?;
+    let (stdout, stderr) = text(&out);
+    let report: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| format!("json: {e} (stdout {stdout:?}, stderr {stderr:?})"))?;
+    let seccomp = item(&report, "seccomp")?;
+    if seccomp["status"] != "ok" {
+        return Err(format!("seccomp item: {seccomp}"));
+    }
+    Ok(())
+}
+
 /// A missing bwrap is a failure item with the spawn detail, the two bwrap
 /// steps are reported as not probed, and the host is unavailable (rc 1).
 fn bwrap_missing() -> Result<(), String> {
@@ -325,7 +351,7 @@ fn bwrap_missing() -> Result<(), String> {
     {
         return Err(format!("bwrap item: {bwrap}"));
     }
-    for id in ["bwrap-run", "bwrap-proc"] {
+    for id in ["bwrap-run", "bwrap-proc", "seccomp"] {
         if item(&report, id)?["detail"] != "not probed: bwrap is unavailable" {
             return Err(format!("{id}: {}", item(&report, id)?));
         }
@@ -414,7 +440,8 @@ fn policy_host_mode() -> Result<(), String> {
 
 // ---- Bwrap -----------------------------------------------------------------
 
-/// The human layout: the header, nine item rows, and the network mode line.
+/// The human layout: the header, one row per item (ten since #34), and the
+/// network mode line.
 fn human_shape() -> Result<(), String> {
     let out = run(Command::new(SBX).arg("check"))?;
     let (stdout, _) = text(&out);
@@ -485,8 +512,10 @@ fn nested_no_userns() -> Result<(), String> {
         .flatten()
         .filter(|c| c["status"] == "skip")
         .count();
-    if skipped != 6 {
-        return Err(format!("expected 6 skipped items, saw {skipped}"));
+    // Seven since #34: the `seccomp` item is skipped too (its probe step
+    // needs bwrap-run, which cannot start without user namespaces).
+    if skipped != 7 {
+        return Err(format!("expected 7 skipped items, saw {skipped}"));
     }
     if report["network_mode"] != "unavailable" {
         return Err(format!("network_mode {}", report["network_mode"]));

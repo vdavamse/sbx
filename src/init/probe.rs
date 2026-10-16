@@ -4,7 +4,7 @@
 //! The probe is the SAME stage functions `__init` runs for a real sandbox
 //! (unshare → idmap → netns → ipv6 → listeners → nft-load → nft-verify →
 //! fallback), executed in this throwaway process's fresh namespaces, plus
-//! two nested bwrap launches built from the same flag constants as
+//! three nested bwrap launches (issue #34 adds the seccomp one) built from the same flag constants as
 //! `bwrap::build` (Phase 1: the probe must be sbx's own nested path, not a
 //! `bwrap --version` guess). Every step is recorded as data: the probe never
 //! prints failures to stderr, and it exits 0 whenever it ran — the parent
@@ -18,6 +18,7 @@
 
 use std::ffi::OsString;
 use std::io::Read;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -28,11 +29,13 @@ use serde::{Deserialize, Serialize};
 use super::fdpass::truncate_reason;
 use super::{InitError, netns, rules};
 
-/// The probe protocol version (`ProbeReport::version`).
-pub const PROBE_VERSION: u32 = 1;
+/// The probe protocol version (`ProbeReport::version`). Bumped to 2 for issue
+/// #34's `bwrap-seccomp` step: the parent (`host::facts`) accepts exactly the
+/// version it was built with, so a stale probe is refused, not misread.
+pub const PROBE_VERSION: u32 = 2;
 
 /// The step names, in report order (pinned by `probe_steps_pinned`).
-pub const PROBE_STEPS: [&str; 10] = [
+pub const PROBE_STEPS: [&str; 11] = [
     "unshare",
     "idmap",
     "netns",
@@ -43,6 +46,7 @@ pub const PROBE_STEPS: [&str; 10] = [
     "fallback",
     "bwrap-run",
     "bwrap-proc",
+    "bwrap-seccomp",
 ];
 
 /// Bound on each nested bwrap launch (the parent's whole probe is bounded
@@ -121,7 +125,7 @@ pub fn run_probe(bwrap: Option<PathBuf>, test_break_rules: bool) -> ExitCode {
     }
 }
 
-/// Accumulates the ten steps in order.
+/// Accumulates the steps in order.
 #[derive(Default)]
 struct Steps(Vec<ProbeStep>);
 
@@ -245,6 +249,7 @@ fn bwrap_steps(steps: &mut Steps, bwrap: Option<&Path>) {
     let Some(bwrap) = bwrap else {
         steps.skip("bwrap-run", "skipped: no usable bwrap");
         steps.skip("bwrap-proc", "skipped: no usable bwrap");
+        steps.skip("bwrap-seccomp", "skipped: no usable bwrap");
         return;
     };
     let exe = match std::env::current_exe() {
@@ -257,19 +262,49 @@ fn bwrap_steps(steps: &mut Steps, bwrap: Option<&Path>) {
                 Some(format!("cannot locate the sbx binary: {err}")),
             );
             steps.skip("bwrap-proc", "skipped: bwrap-run failed");
+            steps.skip("bwrap-seccomp", "skipped: bwrap-run failed");
             return;
         }
     };
-    let (exit, stderr) = run_bwrap_child(bwrap, &exe, false);
+    let (exit, stderr) = run_bwrap_child(bwrap, &exe, false, None);
     let run = bwrap_step("bwrap-run", exit, &stderr);
     let run_ok = run.status == StepStatus::Ok;
     steps.0.push(run);
     if !run_ok {
         steps.skip("bwrap-proc", "skipped: bwrap-run failed");
+        steps.skip("bwrap-seccomp", "skipped: bwrap-run failed");
         return;
     }
-    let (exit, stderr) = run_bwrap_child(bwrap, &exe, true);
+    let (exit, stderr) = run_bwrap_child(bwrap, &exe, true, None);
     steps.0.push(bwrap_step("bwrap-proc", exit, &stderr));
+    steps.0.push(seccomp_step(bwrap, &exe));
+}
+
+/// Issue #34: the `bwrap-seccomp` step — a nested launch with `--seccomp N`
+/// (the sealed program memfd `run` uses), proving bwrap installs sbx's
+/// socket-family filter in this host's namespaces and outer policy. The
+/// memfd is created here (the same constructor `run` uses) and made
+/// inheritable for the one child only; the parent closes it right after the
+/// spawn. A failure to create it is a FAIL with its reason (e.g. an arch
+/// without a program), not a skip.
+fn seccomp_step(bwrap: &Path, exe: &Path) -> ProbeStep {
+    let memfd = match crate::bwrap::seccomp::program_memfd() {
+        Ok(fd) => fd,
+        Err(err) => {
+            return ProbeStep {
+                step: "bwrap-seccomp".to_owned(),
+                status: StepStatus::Fail,
+                errno: err.raw_os_error(),
+                reason: Some(
+                    truncate_reason(&format!("cannot prepare the seccomp filter: {err}"))
+                        .to_owned(),
+                ),
+            };
+        }
+    };
+    let (exit, stderr) = run_bwrap_child(bwrap, exe, false, Some(memfd.as_raw_fd()));
+    drop(memfd);
+    bwrap_step("bwrap-seccomp", exit, &stderr)
 }
 
 /// Pure: a bwrap child outcome → a probe step. `ok` iff it exited 0. Any
@@ -314,10 +349,27 @@ pub(crate) fn bwrap_step(name: &'static str, exit: BwrapExit, stderr: &[u8]) -> 
 }
 
 /// Spawn one nested bwrap launch of the probe payload (this binary,
-/// `--version`) and wait for it, bounded. Returns the outcome and the child's
-/// stderr (empty when it did not exit on its own).
-fn run_bwrap_child(bwrap: &Path, exe: &Path, with_proc: bool) -> (BwrapExit, Vec<u8>) {
-    let argv: Vec<OsString> = crate::bwrap::probe_argv(bwrap, exe, with_proc);
+/// `--version`) and wait for it, bounded. `seccomp_fd` (issue #34) is the
+/// program memfd the child inherits: its CLOEXEC is cleared here, so it
+/// survives into bwrap only. Returns the outcome and the child's stderr
+/// (empty when it did not exit on its own).
+fn run_bwrap_child(
+    bwrap: &Path,
+    exe: &Path,
+    with_proc: bool,
+    seccomp_fd: Option<RawFd>,
+) -> (BwrapExit, Vec<u8>) {
+    let argv: Vec<OsString> = crate::bwrap::probe_argv(bwrap, exe, with_proc, seccomp_fd);
+    if let Some(fd) = seccomp_fd {
+        // SAFETY: F_SETFD on the memfd the caller owns; it is closed by the
+        // caller after this spawn returns.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+            return (
+                BwrapExit::SpawnFailed(std::io::Error::last_os_error().to_string()),
+                Vec::new(),
+            );
+        }
+    }
     let spawned = Command::new(&argv[0])
         .args(&argv[1..])
         .env_clear()
@@ -388,10 +440,11 @@ mod tests {
                 "nft-verify",
                 "fallback",
                 "bwrap-run",
-                "bwrap-proc"
+                "bwrap-proc",
+                "bwrap-seccomp"
             ]
         );
-        assert_eq!(PROBE_VERSION, 1);
+        assert_eq!(PROBE_VERSION, 2);
         assert_eq!(BWRAP_PROBE_TIMEOUT, Duration::from_secs(5));
     }
 
@@ -438,7 +491,7 @@ mod tests {
     #[test]
     fn probe_report_json_golden() {
         let report = ProbeReport {
-            version: 1,
+            version: PROBE_VERSION,
             steps: vec![
                 ProbeStep {
                     step: "unshare".into(),
@@ -456,7 +509,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&report).expect("serialises"),
-            r#"{"version":1,"steps":[{"step":"unshare","status":"ok","errno":null,"reason":null},{"step":"bwrap-proc","status":"skip","errno":null,"reason":"skipped: no usable bwrap"}]}"#
+            r#"{"version":2,"steps":[{"step":"unshare","status":"ok","errno":null,"reason":null},{"step":"bwrap-proc","status":"skip","errno":null,"reason":"skipped: no usable bwrap"}]}"#
         );
         let back: ProbeReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
@@ -472,5 +525,6 @@ mod tests {
         assert_eq!(report.steps.len(), PROBE_STEPS.len());
         assert_eq!(report.steps[1].status, StepStatus::Skip);
         assert_eq!(report.steps[9].step, "bwrap-proc");
+        assert_eq!(report.steps[10].step, "bwrap-seccomp");
     }
 }

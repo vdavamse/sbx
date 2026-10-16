@@ -46,12 +46,13 @@ pub enum CapId {
     Bwrap,
     BwrapRun,
     BwrapProc,
+    Seccomp,
     Landlock,
 }
 
 impl CapId {
     /// Every item, in report order.
-    pub const ALL: [CapId; 9] = [
+    pub const ALL: [CapId; 10] = [
         CapId::Userns,
         CapId::Netns,
         CapId::NetnsIpv6,
@@ -60,6 +61,7 @@ impl CapId {
         CapId::Bwrap,
         CapId::BwrapRun,
         CapId::BwrapProc,
+        CapId::Seccomp,
         CapId::Landlock,
     ];
 
@@ -74,6 +76,7 @@ impl CapId {
             CapId::Bwrap => "bwrap",
             CapId::BwrapRun => "bwrap-run",
             CapId::BwrapProc => "bwrap-proc",
+            CapId::Seccomp => "seccomp",
             CapId::Landlock => "landlock",
         }
     }
@@ -271,14 +274,14 @@ pub(crate) mod test_support {
     use std::path::PathBuf;
 
     use crate::bwrap::version::BwrapStatus;
-    use crate::init::probe::{PROBE_STEPS, ProbeReport, ProbeStep, StepStatus};
+    use crate::init::probe::{PROBE_STEPS, PROBE_VERSION, ProbeReport, ProbeStep, StepStatus};
 
     use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, Sysctls};
 
     /// Every probe step ok (the H1 fixture).
     pub(crate) fn ok_steps() -> ProbeReport {
         ProbeReport {
-            version: 1,
+            version: PROBE_VERSION,
             steps: PROBE_STEPS
                 .iter()
                 .map(|name| ProbeStep {

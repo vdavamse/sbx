@@ -22,12 +22,14 @@ use crate::init::fdpass::{AchievedMode, ListenerFds, SetupMsg, StagedFailure, re
 use crate::policy::NetworkMode;
 
 /// The re-exec argv after the program:
-/// `__init --fd C --keep-fd I --parent-pid P --min-mode M [--test-break-rules] -- <argv…>`
-/// (issue #11: `M` is the policy's mode — the weakest mode `__init` may fall
-/// back to).
+/// `__init --fd C --keep-fd I --seccomp-fd S --parent-pid P --min-mode M
+/// [--test-break-rules] -- <argv…>` (issue #11: `M` is the policy's mode — the
+/// weakest mode `__init` may fall back to; issue #34: `S` is the sealed
+/// seccomp-program memfd `__init` verifies and hands to bwrap).
 pub(crate) fn init_argv(
     control_fd: RawFd,
     info_fd: RawFd,
+    seccomp_fd: RawFd,
     parent_pid: u32,
     min_mode: NetworkMode,
     test_break_rules: bool,
@@ -39,6 +41,8 @@ pub(crate) fn init_argv(
         control_fd.to_string().into(),
         "--keep-fd".into(),
         info_fd.to_string().into(),
+        "--seccomp-fd".into(),
+        seccomp_fd.to_string().into(),
         "--parent-pid".into(),
         parent_pid.to_string().into(),
         "--min-mode".into(),
@@ -67,6 +71,7 @@ fn mode_word(mode: NetworkMode) -> &'static str {
 pub(crate) fn init_command(
     control_fd: RawFd,
     info_fd: RawFd,
+    seccomp_fd: RawFd,
     min_mode: NetworkMode,
     test_break_rules: bool,
     launch: &Launch,
@@ -77,6 +82,7 @@ pub(crate) fn init_command(
     cmd.args(init_argv(
         control_fd,
         info_fd,
+        seccomp_fd,
         std::process::id(),
         min_mode,
         test_break_rules,
@@ -347,17 +353,21 @@ mod tests {
             cwd: None,
             passed_env: &Default::default(),
             info_fd: Some(9),
+            seccomp_fd: 11,
         })
         .expect("builds");
-        let argv = init_argv(7, 9, 4242, NetworkMode::Explicit, false, &launch);
+        // Issue #34: `--seccomp-fd 11` follows `--keep-fd 9`.
+        let argv = init_argv(7, 9, 11, 4242, NetworkMode::Explicit, false, &launch);
         assert_eq!(
-            &argv[..10],
+            &argv[..12],
             [
                 "__init",
                 "--fd",
                 "7",
                 "--keep-fd",
                 "9",
+                "--seccomp-fd",
+                "11",
                 "--parent-pid",
                 "4242",
                 "--min-mode",
@@ -366,10 +376,10 @@ mod tests {
             ]
             .map(OsString::from)
         );
-        assert_eq!(&argv[10..], launch.argv());
-        let with_break = init_argv(7, 9, 4242, NetworkMode::Transparent, true, &launch);
+        assert_eq!(&argv[12..], launch.argv());
+        let with_break = init_argv(7, 9, 11, 4242, NetworkMode::Transparent, true, &launch);
         assert_eq!(
-            with_break[8..11],
+            with_break[10..13],
             ["transparent", "--test-break-rules", "--"].map(OsString::from)
         );
     }
