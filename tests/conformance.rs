@@ -10,8 +10,10 @@
 //! * the report is produced and parsed (`kind`, `version`, 69 checks in
 //!   catalog order, matching `--list --json`);
 //! * no check FAILs; the rc matches `summary.conformant`;
-//! * PR1 state: exactly the 19 lab checks are `not-implemented`; the E checks
-//!   are `opt-in` (or `not-implemented` with `SBX_CONFORMANCE_NETWORK=1`);
+//! * PR2 state: every offline check is `ok` (or `warn`); the E checks are
+//!   `opt-in` without `SBX_CONFORMANCE_NETWORK=1` and `ok` with it (E05 may be
+//!   an opt-in skip when `npm` is absent); no capability or not-implemented
+//!   skip exists on a host that can run sandboxes;
 //! * when the host cannot run sandboxes at all, the suite prints
 //!   `SKIP conformance: host cannot run sandboxes` and exits 0.
 //!
@@ -23,10 +25,6 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const SBX: &str = env!("CARGO_BIN_EXE_sbx");
-const PR1_NOT_IMPLEMENTED: [&str; 19] = [
-    "A02", "A03", "A04", "A05", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07",
-    "B08", "B09", "C02", "C07", "F02", "F04",
-];
 const E_IDS: [&str; 6] = ["E01", "E02", "E03", "E04", "E05", "E06"];
 const CATALOG_BOUND: Duration = Duration::from_secs(240);
 
@@ -301,18 +299,14 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         let id = c["id"].as_str().unwrap_or("");
         let kind = c["skip_kind"].as_str();
         let is_e = E_IDS.contains(&id);
-        let want_lab = PR1_NOT_IMPLEMENTED.contains(&id);
-        if want_lab {
-            if c["status"] != "skip" || kind != Some("not-implemented") {
-                return Err(format!(
-                    "{id}: expected a not-implemented skip, got {} {:?}",
-                    c["status"], kind
-                ));
-            }
-        } else if is_e {
-            let ok = (c["status"] == "skip"
-                && kind == Some(if network { "not-implemented" } else { "opt-in" }))
-                || (network && c["status"] == "ok");
+        if is_e {
+            // Without --network: opt-in. With it: ok, or an opt-in skip for a
+            // tool missing on this host (E05 needs npm).
+            let ok = if network {
+                c["status"] == "ok" || (c["status"] == "skip" && kind == Some("opt-in"))
+            } else {
+                c["status"] == "skip" && kind == Some("opt-in")
+            };
             if !ok {
                 return Err(format!(
                     "{id}: unexpected tooling state {} {:?}",

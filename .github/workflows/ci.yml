@@ -13,6 +13,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Issue #13: the nightly network-tier run (the conformance-network job only;
+  # every other job skips scheduled events, see `if:` below).
+  schedule:
+    - cron: "23 5 * * *"
 
 # Least privilege: the jobs only read the repo (checkout).
 permissions:
@@ -35,7 +39,9 @@ permissions:
 # record that what landed on the default branch was green, so a later push
 # must never cancel an in-flight one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The event name is in the group so the nightly schedule run and a push run
+  # on main (same ref) never cancel or queue behind each other.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -43,6 +49,7 @@ env:
 
 jobs:
   lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -65,6 +72,7 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
   msrv:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -85,6 +93,7 @@ jobs:
         run: cargo check --locked --all-targets
 
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     # 20 (was 10): the issue #10 end-to-end smoke builds the musl release binary.
     timeout-minutes: 20
@@ -233,10 +242,10 @@ jobs:
           [ $? -eq 0 ] || { echo "FAIL: sbx check --policy examples/default.json --host"; FAIL=1; }
           exit "$FAIL"
 
-      # Issue #13 (gating): the conformance suite on the release musl binary. PR1
-      # state, asserted exactly: nothing FAILs; the 19 lab checks are
-      # not-implemented skips and the 6 network checks are opt-in, so the command
-      # exits 1 until the lab tier lands (the second PR flips this to rc 0).
+      # Issue #13 (gating): the conformance suite on the release musl binary, PR2
+      # state, asserted exactly: nothing FAILs, every offline check is ok (warn
+      # allowed), and the six network checks are opt-in (no --network here), so
+      # the command exits 0.
       - name: "Conformance (release musl, gating)"
         run: |
           BIN=target/x86_64-unknown-linux-musl/release/sbx
@@ -249,20 +258,22 @@ jobs:
           r = json.load(open(sys.argv[1]))
           rc = int(sys.argv[2])
           assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
+          assert r["network_mode"] != "unavailable", r["network_mode"]
           fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
           assert not fails, f"FAIL checks: {fails}"
-          lab = {"A02", "A03", "A04", "A05", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B09", "C02", "C07", "F02", "F04"}
           net = {"E01", "E02", "E03", "E04", "E05", "E06"}
           non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
-          want = {i: ("skip", "not-implemented") for i in lab} | {i: ("skip", "opt-in") for i in net}
+          want = {i: ("skip", "opt-in") for i in net}
           assert non_ok == want, f"unexpected non-ok set: {non_ok}"
-          assert rc == 1, f"rc {rc} (PR1 expects 1)"
+          offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
+          assert len(offline) == 43 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "63 offline checks must pass"
+          assert rc == 0, f"rc {rc} (PR2 expects 0)"
           PY
           python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
           s = json.load(open(sys.argv[1]))["summary"]
           print("### sbx check --conformance (issue #13)")
-          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['capability_skips']} capability skip, {s['not_implemented']} not implemented, {s['opt_in_skips']} opt-in")
+          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['capability_skips']} capability skip, {s['not_implemented']} not implemented, {s['opt_in_skips']} opt-in, {s['duration_ms']} ms")
           PY
           exit "$FAIL"
 
@@ -304,7 +315,7 @@ jobs:
           PY
           # Issue #13 nested negative tier: no sandbox can be built, so every host,
           # lab and init check is a capability skip (rc 1); the opt-in network checks
-          # are still opt-in (rc 0 for them).
+          # are still opt-in.
           bwrap --unshare-user --disable-userns --dev-bind / / -- "$BIN" check --conformance --json > confnest.json
           RC=$?
           [ "$RC" -eq 1 ] || { echo "FAIL: nested conformance rc $RC (expected 1)"; FAIL=1; }
@@ -394,6 +405,7 @@ jobs:
           exit "$FAIL"
 
   build:
+    if: github.event_name != 'schedule'
     name: build (${{ matrix.target }})
     runs-on: ubuntu-latest
     # Longer budget: release musl compile plus the aarch64 leg's apt-installed
@@ -630,6 +642,7 @@ jobs:
           exit "$FAIL"
 
   deny:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -644,3 +657,72 @@ jobs:
       # committed Cargo.lock. No inputs needed; defaults are exactly the
       # full check on ./Cargo.toml.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  # Issue #13 (PR2): the network tier against the real internet (E01-E06). Runs
+  # on the nightly schedule, on main and on demand; it is non-gating on pull
+  # requests (continue-on-error) and fails loudly on schedule and main.
+  conformance-network:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Same namespace/bubblewrap preparation as the test job; the network tier
+      # also needs curl, git and openssl (npm is optional: E05 may opt-in skip).
+      - name: Prepare environment (userns, bubblewrap, tools)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apt-get update
+          sudo apt-get install -y nftables bubblewrap curl git openssl
+          sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
+            nft_meta nft_immediate nf_nat nft_counter || true
+          unshare -Urn true
+          bwrap --version
+
+      - name: "Conformance network tier (release musl)"
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          set +e
+          "$BIN" check --conformance --network --json > net.json
+          RC=$?
+          FAIL=0
+          python3 - net.json "$RC" <<'PY' || FAIL=1
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          rc = int(sys.argv[2])
+          assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
+          fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
+          assert not fails, f"FAIL checks: {fails}"
+          by = {c["id"]: c for c in r["checks"] if c["tier"] == "network"}
+          for i in ("E01", "E02", "E03", "E04", "E06"):
+              assert by[i]["status"] == "ok", (i, by[i]["status"], by[i]["detail"])
+          e5 = by["E05"]
+          assert e5["status"] == "ok" or (e5["status"] == "skip" and e5.get("skip_kind") == "opt-in"), e5
+          assert rc == 0, f"rc {rc} (the network tier expects 0)"
+          PY
+          # The summary is rendered from the same report (no second suite run).
+          python3 - net.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          s = r["summary"]
+          print("### sbx check --conformance --network (issue #13, network tier)")
+          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['opt_in_skips']} opt-in, {s['duration_ms']} ms")
+          print("")
+          print("| id | status | detail |")
+          print("|---|---|---|")
+          for c in r["checks"]:
+              if c["tier"] == "network":
+                  print(f"| {c['id']} | {c['status']} | {c['detail']} |")
+          PY
+          exit "$FAIL"

@@ -158,7 +158,7 @@ pub fn configure_netns() -> Result<(), InitError> {
 
     let lo = lo_ifindex()?;
     link_up(&mut sock, lo)?;
-    add_sandbox_addr(&mut sock, lo)?;
+    add_lo_addr(&mut sock, lo, SANDBOX_ADDR)?;
     add_default_route(&mut sock, lo)?;
     verify_readback(&mut sock, lo)
 }
@@ -192,7 +192,8 @@ fn link_up(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
 /// `ip addr add 10.255.255.1/32 dev lo` equivalent (F7): scope universe,
 /// permanent flag, CREATE|EXCL. Must run BEFORE the default route (module
 /// docs point 1: EADDRNOTAVAIL otherwise).
-fn add_sandbox_addr(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> {
+/// Add `addr/32` to `lo` (the sandbox address, or a lab fixture address).
+fn add_lo_addr(sock: &mut NetlinkSocket, lo: u32, addr: Ipv4Addr) -> Result<(), InitError> {
     let mut req = rt_addr::Request::new()
         .set_create()
         .set_excl()
@@ -204,15 +205,28 @@ fn add_sandbox_addr(sock: &mut NetlinkSocket, lo: u32) -> Result<(), InitError> 
             ifa_index: lo,
         });
     req.encode()
-        .push_address(SANDBOX_ADDR.into())
-        .push_local(SANDBOX_ADDR.into());
+        .push_address(addr.into())
+        .push_local(addr.into());
     sock.request(&req)
         .map_err(|e| netns_fail(format!("addr request: {e}")).with_errno(e.raw_os_error()))?
         .recv_ack()
         .map_err(|e| {
-            netns_fail(format!("addr add {SANDBOX_ADDR}/32: {e}"))
+            netns_fail(format!("addr add {addr}/32: {e}"))
                 .with_errno(e.as_io_error().raw_os_error())
         })
+}
+
+/// Lab namespace (conformance, issue #13): `lo` UP plus each address as a
+/// `/32`, with no route. Used only by the conformance lab child, which owns
+/// a fresh network namespace; never on the production path.
+pub(crate) fn configure_lab_lo(addrs: &[Ipv4Addr]) -> Result<(), InitError> {
+    let mut sock = NetlinkSocket::new();
+    let lo = lo_ifindex()?;
+    link_up(&mut sock, lo)?;
+    for addr in addrs {
+        add_lo_addr(&mut sock, lo, *addr)?;
+    }
+    Ok(())
 }
 
 /// `ip route add default dev lo src 10.255.255.1` equivalent (F7): table

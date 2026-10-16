@@ -55,7 +55,7 @@ pub struct Scn {
 }
 
 impl Scn {
-    fn named(name: &'static str) -> Self {
+    pub(super) fn named(name: &'static str) -> Self {
         Scn {
             name,
             ..Default::default()
@@ -148,7 +148,7 @@ fn expect_token_line(id: &str) -> impl Fn(&str) -> bool + '_ {
 }
 
 /// The probe-ops JSON for one `sbx run` payload.
-fn payload(ops: Vec<Op>, exe_text: &str) -> Vec<String> {
+pub(super) fn payload(ops: Vec<Op>, exe_text: &str) -> Vec<String> {
     let json = serde_json::to_string(&Ops::new(ops)).unwrap_or_else(|_| "{}".to_owned());
     vec![
         exe_text.to_owned(),
@@ -168,7 +168,7 @@ pub fn read_audit(path: &Path) -> Vec<Value> {
 }
 
 /// Derive the Scn fields from a finished run.
-fn finish_scn(scn: &mut Scn, fin: Finished, audit: &Path, allow_no_done: bool) {
+pub(super) fn finish_scn(scn: &mut Scn, fin: Finished, audit: &Path, allow_no_done: bool) {
     scn.ms = fin.elapsed_ms;
     scn.audit = read_audit(audit);
     match parse_probe(&fin.stdout, allow_no_done) {
@@ -220,7 +220,7 @@ pub fn classify_skip(fin: &Finished) -> Option<String> {
 
 /// Options for one plain scenario.
 #[derive(Default)]
-struct Opts {
+pub(super) struct Opts {
     break_rules: bool,
     timeout: Option<&'static str>,
     fsize: Option<u64>,
@@ -237,7 +237,13 @@ pub fn budget_bound(ops: &[Op]) -> Duration {
     Duration::from_millis(ops.iter().map(Op::budget_ms).sum::<u64>()) + Duration::from_secs(10)
 }
 
-fn plain(env: &Env, name: &'static str, which: Builtin, ops: Vec<Op>, opts: Opts) -> Scn {
+pub(super) fn plain(
+    env: &Env,
+    name: &'static str,
+    which: Builtin,
+    ops: Vec<Op>,
+    opts: Opts,
+) -> Scn {
     let bound = budget_bound(&ops);
     let budget = ops.iter().map(Op::budget_ms).sum::<u64>();
     let mut scn = Scn::named(name);

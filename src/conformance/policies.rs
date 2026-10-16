@@ -12,6 +12,8 @@ pub enum Builtin {
     Transparent,
     /// `p-explicit`: explicit mode, the conformance name only.
     Explicit,
+    /// `p-lab-transparent` (PR2): transparent, the conformance name only.
+    LabTransparent,
     /// `p-none`: mode none (NXDOMAIN for everything).
     NoNetwork,
 }
@@ -32,6 +34,7 @@ pub fn policy_json(which: Builtin, exe: &str, network_tag: Option<&str>) -> Stri
     let (mode, allow, ports): (&str, Vec<&str>, Vec<u16>) = match which {
         Builtin::Transparent => ("transparent", TRANSPARENT_ALLOW.to_vec(), vec![443, 80]),
         Builtin::Explicit => ("explicit", ALLOWED_ONLY.to_vec(), vec![443, 80]),
+        Builtin::LabTransparent => ("transparent", ALLOWED_ONLY.to_vec(), vec![443, 80]),
         Builtin::NoNetwork => ("none", ALLOWED_ONLY.to_vec(), vec![443]),
     };
     let doc: Value = json!({

@@ -293,6 +293,19 @@ pub enum ConformanceRole {
         #[arg(value_name = "OPS")]
         ops: String,
     },
+    /// Lab namespace child (issue #13, PR2): set up the lab, run the lab tier,
+    /// print one JSON line per check.
+    Lab {
+        /// The suite's temp base (holds the probe copy `sbx`).
+        #[arg(long, value_name = "DIR")]
+        base: std::path::PathBuf,
+        /// The run's nonce (names the lab's unique queries).
+        #[arg(long, value_name = "NONCE")]
+        nonce: String,
+        /// Only these lab checks (comma-separated ids); empty runs all of them.
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
 }
 
 /// Parse `--min-mode` / the policy's network mode spelling for clap: exactly
@@ -398,6 +411,9 @@ pub fn run() -> ExitCode {
         Cmd::Conformance {
             role: ConformanceRole::Probe { tag, ops },
         } => crate::conformance::probe::run_probe(tag.as_deref(), &ops),
+        Cmd::Conformance {
+            role: ConformanceRole::Lab { base, nonce, only },
+        } => crate::conformance::lab::run(&base, &nonce, &only),
         Cmd::Run {
             policy,
             session_dir,
