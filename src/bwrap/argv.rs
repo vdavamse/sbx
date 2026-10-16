@@ -8,7 +8,9 @@
 //!  2  --unshare-user --unshare-pid --unshare-ipc --unshare-uts
 //!     --unshare-cgroup-try                        ← never --unshare-net
 //!  3  --disable-userns --cap-drop ALL --die-with-parent --new-session
-//!     --hostname sandbox [--info-fd N]           ← `--info-fd` iff Build.info_fd
+//!     --hostname sandbox [--info-fd N] --seccomp S
+//!                                                ← `--info-fd` iff Build.info_fd;
+//!                                                  `--seccomp` always (issue #34)
 //!  4  --clearenv
 //!  5  --symlink usr/bin /bin      ┐ the four usr-merge shims, in this
 //!     --symlink usr/sbin /sbin    │ fixed order, each SKIPPED when ANY
@@ -187,6 +189,12 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
         argv.push(OsString::from("--info-fd"));
         argv.push(OsString::from(fd.to_string()));
     }
+    // 3b. `--seccomp S` (issue #34): bwrap reads the socket-family filter
+    //     from S until EOF, applies it as the last step before exec (pid 1
+    //     and the payload), and closes S. Always emitted: `Build` carries a
+    //     required fd, so no launch is unfiltered by construction.
+    argv.push(OsString::from("--seccomp"));
+    argv.push(OsString::from(input.seccomp_fd.to_string()));
 
     // 4. The environment is built exclusively from the explicit --setenv
     //    emissions below (module docs point 5).
@@ -507,6 +515,10 @@ mod tests {
         Policy::from_file(&path).unwrap_or_else(|err| panic!("{name} must parse: {err}"))
     }
 
+    /// The seccomp fd every golden carries (issue #34); `HEAD` pins it
+    /// as the literal `10`, so the two must move together.
+    const SECCOMP_FD: i32 = 10;
+
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
     }
@@ -538,6 +550,7 @@ mod tests {
             cwd,
             passed_env,
             info_fd: None,
+            seccomp_fd: SECCOMP_FD,
         };
         build(&input)
             .expect("golden inputs must build")
@@ -566,6 +579,8 @@ mod tests {
         "--new-session",
         "--hostname",
         "sandbox",
+        "--seccomp",
+        "10",
         "--clearenv",
     ];
 
@@ -675,6 +690,7 @@ mod tests {
             cwd: None,
             passed_env: &env,
             info_fd: Some(9),
+            seccomp_fd: SECCOMP_FD,
         };
         let with = build(&input)
             .expect("golden inputs must build")
@@ -688,6 +704,48 @@ mod tests {
         expected.splice(hostname + 2..hostname + 2, os(&["--info-fd", "9"]));
         assert_eq!(with, expected);
         assert_eq!(with.iter().filter(|a| *a == "--info-fd").count(), 1);
+    }
+
+    #[test]
+    fn golden_seccomp_after_info_fd() {
+        // Issue #34: `--seccomp S` follows `--info-fd N` (and is directly
+        // after `--hostname sandbox` when no info fd is given), and the
+        // operand is the builder's fd verbatim.
+        let policy = example("default.json");
+        let env = env_map(&[("LANG", "C.UTF-8")]);
+        let command = os(&["/bin/echo", "hi"]);
+        for (info_fd, seccomp_fd) in [(None, 12), (Some(9), 12), (Some(9), 10)] {
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &env,
+                info_fd,
+                seccomp_fd,
+            };
+            let argv = build(&input)
+                .expect("golden inputs must build")
+                .argv()
+                .to_vec();
+            let pos = argv
+                .iter()
+                .position(|a| a == "--seccomp")
+                .expect("--seccomp present");
+            assert_eq!(argv[pos + 1], OsString::from(seccomp_fd.to_string()));
+            let clearenv = argv.iter().position(|a| a == "--clearenv").unwrap();
+            assert!(pos < clearenv, "--seccomp precedes --clearenv");
+            let hostname = argv.iter().position(|a| a == "--hostname").unwrap();
+            match info_fd {
+                None => assert_eq!(pos, hostname + 2),
+                Some(fd) => {
+                    assert_eq!(argv[hostname + 2], OsString::from("--info-fd"));
+                    assert_eq!(argv[hostname + 3], OsString::from(fd.to_string()));
+                    assert_eq!(pos, hostname + 4);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1340,7 +1398,7 @@ mod tests {
                 }
                 // Two-element flags whose operand is not otherwise
                 // interesting here.
-                "--cap-drop" | "--hostname" => {
+                "--cap-drop" | "--hostname" | "--seccomp" => {
                     events.push(Event::Flag(flag));
                     i += 2;
                 }
@@ -1416,13 +1474,16 @@ mod tests {
         }
 
         #[test]
-        fn prop_info_fd_iff_some(
+        fn prop_seccomp_exactly_once(
             policy_json in prop_policy_json(),
             command in prop_command(),
             info_fd in proptest::option::of(3..=1000i32),
+            seccomp_fd in 3..=1000i32,
         ) {
-            // Issue #10 (Q13): `--info-fd N` occurs exactly once iff info_fd is
-            // Some(N), and the value that follows is N.
+            // Issue #34: `--seccomp` occurs exactly once, before `--clearenv`,
+            // and its operand is the builder's seccomp fd verbatim. Row 16
+            // rejects an info-fd collision, so such inputs are skipped.
+            prop_assume!(info_fd != Some(seccomp_fd));
             let policy = prop_policy(&policy_json);
             let empty = BTreeMap::new();
             let input = Build {
@@ -1433,6 +1494,49 @@ mod tests {
                 cwd: None,
                 passed_env: &empty,
                 info_fd,
+                seccomp_fd,
+            };
+            let argv = build(&input)
+                .expect("generated inputs must build")
+                .argv()
+                .to_vec();
+            let count = argv.iter().filter(|a| a.as_os_str() == OsStr::new("--seccomp")).count();
+            prop_assert_eq!(count, 1);
+            let pos = argv
+                .iter()
+                .position(|a| a.as_os_str() == OsStr::new("--seccomp"))
+                .expect("--seccomp present");
+            let want = seccomp_fd.to_string();
+            prop_assert_eq!(argv[pos + 1].to_str(), Some(want.as_str()));
+            let clearenv = argv
+                .iter()
+                .position(|a| a.as_os_str() == OsStr::new("--clearenv"))
+                .expect("--clearenv present");
+            prop_assert!(pos < clearenv);
+        }
+
+        #[test]
+        fn prop_info_fd_iff_some(
+            policy_json in prop_policy_json(),
+            command in prop_command(),
+            info_fd in proptest::option::of(3..=1000i32),
+        ) {
+            // Issue #10 (Q13): `--info-fd N` occurs exactly once iff info_fd is
+            // Some(N), and the value that follows is N.
+            // Issue #34 row 16: the info fd must differ from the seccomp fd
+            // this test pins (SECCOMP_FD), so that collision is assumed away.
+            prop_assume!(info_fd != Some(SECCOMP_FD));
+            let policy = prop_policy(&policy_json);
+            let empty = BTreeMap::new();
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &empty,
+                info_fd,
+                seccomp_fd: SECCOMP_FD,
             };
             let argv = build(&input)
                 .expect("generated inputs must build")
@@ -1779,6 +1883,7 @@ mod tests {
                 cwd: None,
                 passed_env: &empty,
                 info_fd: None,
+                seccomp_fd: SECCOMP_FD,
             };
             let err = build(&input)
                 .expect_err("an injected NUL byte must be rejected")

@@ -119,6 +119,12 @@ const B_NOT_FOUND: (&str, &str) = (
     "install bubblewrap >= 0.8.0 (for example apt-get install bubblewrap) or set SBX_BWRAP",
 );
 const B_FIX: &str = "install bubblewrap >= 0.8.0 or set SBX_BWRAP to one";
+/// `seccomp` FAIL (issue #34): `run` cannot start without the filter, so this
+/// limits the mode to unavailable (fail closed).
+const R_SECCOMP: (&str, &str) = (
+    "bwrap cannot install sbx's socket-family seccomp filter",
+    "no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with CONFIG_SECCOMP_FILTER=y, and an outer seccomp or container profile that allows prctl(PR_SET_SECCOMP) and seccomp(2) (Kubernetes: a Localhost seccomp profile that allows them, or seccompProfile Unconfined)",
+);
 const L_ENOSYS: (&str, &str) = (
     "Landlock is not supported by this kernel (report-only)",
     "none needed today; kernels >= 5.13 built with CONFIG_SECURITY_LANDLOCK=y provide it",
@@ -135,6 +141,8 @@ const OK_NFT: &str = "nftables NAT redirect loaded and verified";
 const OK_FALLBACK: &str = "default route removable for explicit mode";
 const OK_BWRAP_RUN: &str = "bwrap starts a sandbox inside the sbx namespaces";
 const OK_BWRAP_PROC: &str = "bwrap mounts a fresh /proc";
+const OK_SECCOMP: &str =
+    "bwrap installs sbx's socket-family filter (installation only; denials not probed)";
 
 const SKIP_USERNS: &str = "not probed: user namespaces are unavailable";
 const SKIP_NETNS: &str = "not probed: the sandbox network could not be configured";
@@ -254,6 +262,20 @@ pub fn bwrap_step(id: CapId, evidence: &str) -> Capability {
         errno: None,
         impact: Some(EffectiveMode::Unavailable),
         fix: Some(pinned.1.to_owned()),
+    }
+}
+
+/// A failed `bwrap-seccomp` step (issue #34): bwrap could not install the
+/// filter, or sbx could not prepare it (no program for this arch).
+pub fn seccomp_step(evidence: &str) -> Capability {
+    Capability {
+        id: CapId::Seccomp,
+        status: Status::Fail,
+        detail: R_SECCOMP.0.to_owned(),
+        evidence: Some(evidence.to_owned()),
+        errno: None,
+        impact: Some(EffectiveMode::Unavailable),
+        fix: Some(R_SECCOMP.1.to_owned()),
     }
 }
 
@@ -384,7 +406,7 @@ fn skip_row(id: CapId, detail: &str) -> Capability {
 }
 
 /// The probe steps that feed each probe-derived item, and the ok detail.
-const PROBE_SLOTS: [(CapId, &[&str], &str); 7] = [
+const PROBE_SLOTS: [(CapId, &[&str], &str); 8] = [
     (CapId::Userns, &["unshare", "idmap"], OK_USERNS),
     (CapId::Netns, &["netns", "listeners"], OK_NETNS),
     (CapId::NetnsIpv6, &["ipv6"], OK_IPV6),
@@ -392,6 +414,7 @@ const PROBE_SLOTS: [(CapId, &[&str], &str); 7] = [
     (CapId::Fallback, &["fallback"], OK_FALLBACK),
     (CapId::BwrapRun, &["bwrap-run"], OK_BWRAP_RUN),
     (CapId::BwrapProc, &["bwrap-proc"], OK_BWRAP_PROC),
+    (CapId::Seccomp, &["bwrap-seccomp"], OK_SECCOMP),
 ];
 
 fn stage_of(step: &str) -> Option<Stage> {
@@ -416,7 +439,7 @@ fn find_step<'a>(report: &'a ProbeReport, name: &str) -> Option<&'a ProbeStep> {
 /// the effective network mode (`min` over every item's impact; probe failure
 /// means unavailable).
 pub fn assemble(facts: &HostFacts) -> Report {
-    let mut slots: [Option<Capability>; 9] = Default::default();
+    let mut slots: [Option<Capability>; CapId::ALL.len()] = Default::default();
     let index = |id: CapId| CapId::ALL.iter().position(|c| *c == id).unwrap_or(0);
     let mut probe_error = None;
 
@@ -435,6 +458,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
                 let cap = match step.step.as_str() {
                     "bwrap-run" => bwrap_step(CapId::BwrapRun, &reason),
                     "bwrap-proc" => bwrap_step(CapId::BwrapProc, &reason),
+                    "bwrap-seccomp" => seccomp_step(&reason),
                     name => {
                         let Some(stage) = stage_of(name) else {
                             continue;
@@ -480,9 +504,11 @@ pub fn assemble(facts: &HostFacts) -> Report {
                 }
                 let detail = if userns_failed {
                     SKIP_USERNS
-                } else if matches!(id, CapId::BwrapRun | CapId::BwrapProc) && !bwrap_ok {
+                } else if matches!(id, CapId::BwrapRun | CapId::BwrapProc | CapId::Seccomp)
+                    && !bwrap_ok
+                {
                     SKIP_BWRAP
-                } else if id == CapId::BwrapProc && bwrap_run_failed {
+                } else if matches!(id, CapId::BwrapProc | CapId::Seccomp) && bwrap_run_failed {
                     SKIP_BWRAP_RUN
                 } else if netns_failed {
                     SKIP_NETNS
@@ -1097,7 +1123,7 @@ mod tests {
         let report = assemble(&ok_host());
         assert_eq!(report.network_mode, EffectiveMode::Transparent);
         assert_eq!(report.probe_error, None);
-        assert_eq!(report.capabilities.len(), 9);
+        assert_eq!(report.capabilities.len(), 10);
         assert!(report.capabilities.iter().all(|c| c.status == Status::Ok));
         let ids: Vec<CapId> = report.capabilities.iter().map(|c| c.id).collect();
         assert_eq!(ids, CapId::ALL);

@@ -45,7 +45,11 @@
 //!    that `sbx gc` tombstones while the run is locking is detected and refused
 //!    (125).
 //! 10. **Limitations.** Connections still open at exit get no `close` row. The
-//!     audit log is not fsynced. Background-terminal stdin is /dev/null. Parent
+//!     audit log is not fsynced. Socket families: only AF_UNIX, AF_INET,
+//!     AF_INET6 and AF_NETLINK are creatable (issue #34; everything else is
+//!     EAFNOSUPPORT, including AF_VSOCK), io_uring is ENOSYS, and 32-bit or
+//!     x32 payloads are killed by the filter (SIGSYS, rc 159). See
+//!     [`crate::bwrap::seccomp`]. Background-terminal stdin is /dev/null. Parent
 //!     death: `__init` arms `PR_SET_PDEATHSIG = SIGKILL` right after its signal
 //!     reset and refuses to continue unless its parent is the `run` pid it was
 //!     given (`--parent-pid`), so a `run` that dies before teardown takes the
@@ -75,6 +79,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::bwrap::etc::session_layout;
+use crate::bwrap::seccomp;
 use crate::bwrap::version::{BwrapStatus, classify_version_output, find_bwrap};
 use crate::bwrap::{Build, build};
 use crate::dns::{DnsLimits, DnsServer, FakeIpMap};
@@ -538,9 +543,13 @@ fn execute(
         .materialize()
         .map_err(|err| RunError::new(format!("cannot prepare the session directory: {err}")))?;
 
-    // S8: the bwrap info pipe and the launch argv.
+    // S8: the bwrap info pipe, the seccomp program memfd (issue #34: every
+    // launch is filtered; an unsupported arch refuses here, rc 125), and the
+    // launch argv.
     let (info_read, info_write) = sys::pipe_cloexec()
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
+    let seccomp_memfd = seccomp::program_memfd()
+        .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -549,6 +558,7 @@ fn execute(
         cwd: args.cwd.as_deref(),
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
+        seccomp_fd: seccomp_memfd.as_raw_fd(),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
@@ -559,10 +569,13 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot prepare the control socket: {err}")))?;
     let info_fd = sys::clear_cloexec(info_write.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
+    let seccomp_fd = sys::clear_cloexec(seccomp_memfd.as_fd())
+        .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     let (stdin, stdin_piped) = stdin_mode();
     let mut child = init_command(
         child_fd,
         info_fd,
+        seccomp_fd,
         policy.network.mode,
         args.test_break_rules,
         &launch,
@@ -572,6 +585,7 @@ fn execute(
     .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
     drop(child_end);
     drop(info_write);
+    drop(seccomp_memfd);
 
     // S12: a pidfd for the child (unreaped, so its pid cannot be recycled).
     let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {

@@ -38,6 +38,9 @@ The fake-IP DNS resolver is real (issue #9): A queries for allow-listed names
 get a per-run address from `198.18.0.0/15` that the transparent proxy maps back
 to the name; AAAA gets an empty answer, every other name NXDOMAIN, and nothing
 is ever forwarded upstream (TCP DNS is not served).
+Every `run` installs a seccomp filter that allow-lists four socket families
+(issue #34: `AF_VSOCK` and the other families outside the list fail with
+`EAFNOSUPPORT`; see [Running commands](#running-commands)).
 The internal `__init` helper is
 real (issue #5): `sbx run` (#10) will re-exec it with one end of a
 control socketpair, and it unshares user + network namespaces, brings
@@ -139,6 +142,7 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ok    bwrap       bubblewrap 0.9.0 at /usr/bin/bwrap
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
+  ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
   ok    landlock    Landlock ABI 7 (report-only)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
@@ -149,9 +153,11 @@ The items, in order: `userns` (unprivileged user and network namespaces),
 sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
 `fallback` (the default route can be removed, which the explicit mode needs),
 `bwrap` (the bubblewrap binary and its version), `bwrap-run` and `bwrap-proc`
-(bwrap can start a sandbox here, and mount a fresh `/proc`), and `landlock`
-(report only; sbx does not use Landlock yet). An item is `ok`, `FAIL` (with the
-evidence and a `fix:` line), `skip` (not probed because an item it depends on
+(bwrap can start a sandbox here, and mount a fresh `/proc`), `seccomp` (bwrap
+installs sbx's socket-family filter, see [Running commands](#running-commands):
+a failure here makes the network mode `unavailable`, because the sandbox cannot
+start without the filter), and `landlock` (report only; sbx does not use Landlock
+yet). An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
 **Network modes.** The host provides one of three modes, from strongest to
@@ -213,6 +219,7 @@ platform, the Kubernetes and Docker forms are given:
 | `bwrap-run` | bwrap cannot apply `--disable-userns` because `/proc/sys` is read-only | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
+| `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
 | `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |
 | `landlock` | Landlock is built in but disabled (report only) | add `landlock` to the `lsm=` kernel boot parameter |
 
@@ -326,6 +333,40 @@ payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 explicit proxy's response table is in the `proxy::explicit` module docs (200 for
 an allowed CONNECT; 400, 403, 502 and 504 otherwise).
 
+**Socket families and syscalls (issue #34).** Every `sbx run` installs a seccomp
+filter through bwrap (`--seccomp`), and the payload can create sockets only in
+four families: `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`. Everything else
+fails with `EAFNOSUPPORT` (errno 97): `AF_VSOCK` in particular, which is not
+network-namespaced and reaches the host or hypervisor on VM-backed hosts (WSL2,
+Hyper-V, Kata, Firecracker, cloud VMs), and with it `AF_PACKET`, `AF_XDP`,
+`AF_BLUETOOTH`, `AF_ALG`, `AF_CAN`, `AF_TIPC` and `AF_RDS`. `socketpair(2)` is
+checked the same way. Two behaviour changes follow from the list. `AF_ALG` (the
+kernel crypto API, used by some `openssl` and `cryptsetup` engines) and
+`AF_BLUETOOTH` worked before and now fail. `AF_PACKET` already failed (EPERM) and
+now fails with EAFNOSUPPORT.
+
+The filter also closes the other ways to reach those families:
+
+- **io_uring** (`io_uring_setup`, `io_uring_enter`, `io_uring_register`) returns
+  `ENOSYS`, because `IORING_OP_SOCKET` would create sockets without `socket(2)`.
+  The application sees `ENOSYS` from `io_uring_setup` and falls back: libuv
+  does so on any setup error, and liburing callers can fall back on the error.
+- **32-bit and x32 binaries are unsupported.** The filter checks the audit
+  architecture first, so an i386 or arm32 payload (including the `int 0x80`
+  entry and its `socketcall(2)` path) and an x32-ABI syscall are killed with
+  `SIGSYS`: `sbx run` exits 159 (128+31). Run 64-bit binaries only.
+
+Netlink sockets are allowed for every protocol (they live in the sandbox's own
+network namespace). Other syscalls are not filtered: this is a family allow-list,
+not a syscall allow-list. If bwrap cannot install the filter, the payload never
+starts and `run` reports bwrap's own failure (rc 1, like any other bwrap setup
+failure), not 125. `run` refuses with rc 125 only when sbx itself cannot prepare
+the filter, for example on an architecture without a program (sbx ships
+x86_64 and aarch64 only). `sbx check` reports the `seccomp` item as FAIL in both
+cases. The integration
+suite (`tests/sandbox_run.rs`, scenarios `seccomp-*`) and the CI musl smoke pin
+these results.
+
 **Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
 discovery), and unprivileged user namespaces. Run `sbx check` to see what this
 host provides and what to fix ([Host check](#host-check)). The integration suite
@@ -342,7 +383,7 @@ as shipped), from a native Linux filesystem, with a user-space bubblewrap 0.9.0
 | `/usr/bin/bash -c true` | 1.50 ms | 1.76 ms |
 | `sbx run … -- /usr/bin/bash -c true` | 11.15 ms | 12.01 ms |
 
-Overhead ≈ 9.7 ms, under the 25 ms target. Measure from a native filesystem:
+Overhead ≈ 9.7 ms, under the 25 ms target. Issue #34 (the socket-family seccomp filter) re-measured with the same method on the same host, against the pre-#34 `main` build: mean 11.2 ms versus 10.8 ms (+0.4 ms, within the run-to-run spread of ±0.6–0.8 ms). Measure from a native filesystem:
 on WSL2 the Windows drive (`/mnt/c`, a 9p mount without page caching) adds
 about 14 ms to every exec of the binary (the same build measured there:
 34–37 ms median). A trivial static-pie binary starts in 0.4 ms, and the sbx

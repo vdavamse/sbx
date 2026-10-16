@@ -13,7 +13,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::bwrap::version::{BwrapStatus, classify_version_output, find_bwrap};
-use crate::init::probe::{PROBE_STEPS, ProbeReport};
+use crate::init::probe::{PROBE_STEPS, PROBE_VERSION, ProbeReport};
 
 /// The `--version` bound (`bwrap --version` is instant; this only bounds a
 /// wedged binary).
@@ -286,9 +286,9 @@ pub(crate) fn parse_probe_output(exit: Option<i32>, stdout: &str, stderr: &str) 
         Ok(report) => report,
         Err(_) => return ProbeOutcome::Failed("unparseable probe output".to_owned()),
     };
-    if report.version != 1 {
+    if report.version != PROBE_VERSION {
         return ProbeOutcome::Failed(format!(
-            "probe protocol version {}, expected 1",
+            "probe protocol version {}, expected {PROBE_VERSION}",
             report.version
         ));
     }
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn parse_probe_output_table() {
-        let good = report_json(1, &PROBE_STEPS);
+        let good = report_json(PROBE_VERSION, &PROBE_STEPS);
         assert!(matches!(
             parse_probe_output(Some(0), &good, ""),
             ProbeOutcome::Ran(_)
@@ -367,13 +367,15 @@ mod tests {
             ProbeOutcome::Failed("unparseable probe output".into())
         );
         assert_eq!(
-            parse_probe_output(Some(0), &report_json(2, &PROBE_STEPS), ""),
-            ProbeOutcome::Failed("probe protocol version 2, expected 1".into())
+            parse_probe_output(Some(0), &report_json(1, &PROBE_STEPS), ""),
+            ProbeOutcome::Failed(format!(
+                "probe protocol version 1, expected {PROBE_VERSION}"
+            ))
         );
         let mut swapped = PROBE_STEPS;
         swapped.swap(0, 1);
         assert_eq!(
-            parse_probe_output(Some(0), &report_json(1, &swapped), ""),
+            parse_probe_output(Some(0), &report_json(PROBE_VERSION, &swapped), ""),
             ProbeOutcome::Failed("unexpected probe steps".into())
         );
     }

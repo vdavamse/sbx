@@ -207,6 +207,31 @@ fn scenarios() -> Vec<Scenario> {
             run: scenario_fail_nonsocket_fd,
         },
         Scenario {
+            name: "fail-seccomp-not-memfd",
+            gate: Gate::Always,
+            run: scenario_fail_seccomp_not_memfd,
+        },
+        Scenario {
+            name: "fail-seccomp-wrong-content",
+            gate: Gate::Always,
+            run: scenario_fail_seccomp_wrong_content,
+        },
+        Scenario {
+            name: "fail-seccomp-equals-keep-fd",
+            gate: Gate::Always,
+            run: scenario_fail_seccomp_equals_keep_fd,
+        },
+        Scenario {
+            name: "fail-seccomp-ebadf",
+            gate: Gate::Always,
+            run: scenario_fail_seccomp_ebadf,
+        },
+        Scenario {
+            name: "seccomp-fd-valid-kept",
+            gate: Gate::Userns,
+            run: scenario_seccomp_fd_valid_kept,
+        },
+        Scenario {
             name: "fail-eof-before-go",
             gate: Gate::Userns,
             run: scenario_fail_eof_before_go,
@@ -405,6 +430,24 @@ fn spawn_init_core(
     Ok(spawned)
 }
 
+/// The sealed seccomp-program memfd (issue #34), made inheritable for the
+/// spawn that follows. The caller keeps the returned fd alive across the spawn.
+fn seccomp_memfd() -> Result<(std::os::fd::OwnedFd, std::os::fd::RawFd), String> {
+    use std::os::fd::AsRawFd;
+    let fd =
+        sbx::bwrap::seccomp::program_memfd().map_err(|e| format!("seccomp program memfd: {e}"))?;
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_SETFD on the memfd we own; the spawn that follows is the only
+    // child that should inherit it.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } != 0 {
+        return Err(format!(
+            "clear CLOEXEC on the seccomp memfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((fd, raw))
+}
+
 /// The #10 production spawn contract, modeled exactly (issue #6's
 /// `full-chain-bwrap` scenario): `sbx __init --fd N -- <payload argv>`
 /// with `env_clear()` and NO `ROLE_ENV` — the role reaches the payload
@@ -413,7 +456,10 @@ fn spawn_init_core(
 /// without a PATH (R16 — the scenario's core proof). `own_group` (m4):
 /// the payload tree here is sbx → bwrap monitor → reaper → payload, so a
 /// timeout kill must reach grandchildren holding the stdio pipes.
-fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
+fn spawn_init_env_clear(
+    payload_argv: &[OsString],
+    seccomp_fd: std::os::fd::RawFd,
+) -> Result<Spawned, String> {
     use std::os::unix::process::CommandExt;
 
     let (parent_end, child_end) =
@@ -422,6 +468,7 @@ fn spawn_init_env_clear(payload_argv: &[OsString]) -> Result<Spawned, String> {
         .map_err(|e| format!("prepare_child_end: {e}"))?;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_sbx"));
     cmd.arg("__init").arg("--fd").arg(child_fd.to_string());
+    cmd.arg("--seccomp-fd").arg(seccomp_fd.to_string());
     cmd.arg("--");
     cmd.args(payload_argv);
     // THE production contract: `__init` gets an empty environment (nothing
@@ -964,6 +1011,166 @@ fn scenario_fail_nonsocket_fd() -> Result<(), String> {
     assert_staged_failure(&out, "sbx __init: control:")
 }
 
+/// Issue #34: a fresh sealed memfd holding `bytes`, rewound (the shape of
+/// `bwrap::seccomp::program_memfd`, with arbitrary content for the negative
+/// cases). CLOEXEC is set; [`inheritable`] clears it for one spawn.
+fn sealed_memfd(bytes: &[u8]) -> Result<OwnedFd, String> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: memfd_create with a literal NUL-terminated name.
+    let raw = unsafe {
+        libc::memfd_create(
+            c"sbx-init-test".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    if raw < 0 {
+        return Err(format!("memfd_create: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: a fresh fd this process owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: write from a valid buffer into the memfd we own.
+    let n = unsafe { libc::write(raw, bytes.as_ptr().cast(), bytes.len()) };
+    if usize::try_from(n) != Ok(bytes.len()) {
+        return Err(format!("write memfd: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: F_ADD_SEALS on our memfd.
+    let sealed = unsafe {
+        libc::fcntl(
+            raw,
+            libc::F_ADD_SEALS,
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL,
+        )
+    };
+    if sealed != 0 {
+        return Err(format!("seal memfd: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: lseek on our memfd (bwrap reads from the current offset).
+    unsafe { libc::lseek(raw, 0, libc::SEEK_SET) };
+    Ok(fd)
+}
+
+/// Clears CLOEXEC on `fd` so the next spawn inherits it (the caller closes it
+/// after the spawn, as `run` does for the seccomp memfd).
+fn inheritable(fd: &OwnedFd) -> Result<RawFd, String> {
+    let raw = fd.as_raw_fd();
+    // SAFETY: F_SETFD on an fd this process owns.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, 0) } != 0 {
+        return Err(format!("clear CLOEXEC: {}", io::Error::last_os_error()));
+    }
+    Ok(raw)
+}
+
+/// A non-sealed-memfd fd: a pipe's write end (CLOEXEC cleared for the spawn).
+fn pipe_write_end() -> Result<(OwnedFd, OwnedFd), String> {
+    use std::os::fd::FromRawFd;
+    let mut p = [0 as RawFd; 2];
+    // SAFETY: pipe2 into a two-element array we own.
+    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(format!("pipe2: {}", io::Error::last_os_error()));
+    }
+    // SAFETY: fresh fds from pipe2, owned exclusively from here on.
+    unsafe { Ok((OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1]))) }
+}
+
+/// Spawns `__init --seccomp-fd <fd> <extra>` (control stage), expects the
+/// staged rejection (rc 1, `control`, payload never started) and that stderr
+/// names `want`.
+fn seccomp_reject(what: &str, fd: RawFd, extra: &[&str], want: &str) -> Result<(), String> {
+    let n = fd.to_string();
+    let mut args: Vec<&str> = vec!["--seccomp-fd", &n];
+    args.extend_from_slice(extra);
+    let sp = spawn_init("marker", &args, &payload_self()?)?;
+    let out = finish(sp, what)?;
+    assert_staged_failure(&out, "sbx __init: control:")?;
+    if !out.stderr.contains(want) {
+        return Err(format!("stderr lacks {want:?}: {:?}", out.stderr));
+    }
+    Ok(())
+}
+
+/// Issue #34: a pipe is not a sealed memfd (rejected in the control stage).
+fn scenario_fail_seccomp_not_memfd() -> Result<(), String> {
+    let (rd, wr) = pipe_write_end()?;
+    let fd = inheritable(&wr)?;
+    let res = seccomp_reject(
+        "fail-seccomp-not-memfd child",
+        fd,
+        &[],
+        &format!("--seccomp-fd {fd} is not a sealed memfd"),
+    );
+    drop(rd);
+    drop(wr);
+    res
+}
+
+/// Issue #34: a sealed memfd whose bytes are not sbx's program is rejected —
+/// the content check is what keeps a forged filter out of bwrap.
+fn scenario_fail_seccomp_wrong_content() -> Result<(), String> {
+    let memfd = sealed_memfd(&[0u8; 8])?;
+    let fd = inheritable(&memfd)?;
+    seccomp_reject(
+        "fail-seccomp-wrong-content child",
+        fd,
+        &[],
+        &format!("--seccomp-fd {fd} does not hold sbx's seccomp program"),
+    )
+}
+
+/// Issue #34: `--seccomp-fd` and `--keep-fd` must be distinct fds. The same
+/// pipe write end passes the keep check, then trips the seccomp one.
+fn scenario_fail_seccomp_equals_keep_fd() -> Result<(), String> {
+    let (rd, wr) = pipe_write_end()?;
+    let fd = inheritable(&wr)?;
+    let keep = fd.to_string();
+    let res = seccomp_reject(
+        "fail-seccomp-equals-keep-fd child",
+        fd,
+        &["--keep-fd", &keep],
+        &format!("--seccomp-fd {fd} must differ from --keep-fd"),
+    );
+    drop(rd);
+    drop(wr);
+    res
+}
+
+/// Issue #34: a number that is not an open fd in the child (EBADF).
+fn scenario_fail_seccomp_ebadf() -> Result<(), String> {
+    seccomp_reject(
+        "fail-seccomp-ebadf child",
+        998,
+        &[],
+        "--seccomp-fd 998 is not a valid file descriptor (EBADF)",
+    )
+}
+
+/// Issue #34 (positive): sbx's own program memfd passes every check, is kept
+/// through `__init`'s hygiene, and the payload still runs. The filter itself
+/// is installed by bwrap (pinned by the sandbox_run and sandbox_bwrap suites).
+fn scenario_seccomp_fd_valid_kept() -> Result<(), String> {
+    // No program for this architecture: nothing to keep (the refusal is
+    // exercised by the unit tests of bwrap::seccomp instead).
+    if sbx::bwrap::seccomp::Arch::native().is_none() {
+        return Ok(());
+    }
+    let memfd = sbx::bwrap::seccomp::program_memfd().map_err(|e| format!("program_memfd: {e}"))?;
+    let fd = inheritable(&memfd)?;
+    let n = fd.to_string();
+    let sp = spawn_init("marker", &["--seccomp-fd", &n], &payload_self()?)?;
+    // The production handshake: the listener fds, then the go byte (`__init`
+    // reaches exec only after both).
+    let fds = recv_fds(&sp)?;
+    send_go(&sp)?;
+    let out = finish(sp, "seccomp-fd-valid-kept child")?;
+    drop(fds);
+    if out.rc != 0 || !out.stdout.contains(MARKER) {
+        return Err(format!(
+            "valid seccomp fd must pass: rc {}\nstdout: {:?}\nstderr: {:?}",
+            out.rc, out.stdout, out.stderr
+        ));
+    }
+    Ok(())
+}
+
 /// AC (probe-verified race 1): the parent dies BEFORE the fds arrive —
 /// sendmsg sees EPIPE (MSG_NOSIGNAL makes the detection
 /// disposition-independent), the child aborts staged send-fds rc 1, and
@@ -1174,6 +1381,7 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
         .map_err(|e| format!("materialize {}: {e}", session.display()))?;
     let command = vec![exe.as_os_str().to_os_string()];
     let passed_env = BTreeMap::new();
+    let (_seccomp, seccomp_fd) = seccomp_memfd()?;
     let input = sbx::bwrap::Build {
         policy: &policy,
         session_dir: session,
@@ -1182,10 +1390,11 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
         cwd: None,
         passed_env: &passed_env,
         info_fd: None,
+        seccomp_fd,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 
-    let sp = spawn_init_env_clear(launch.argv())?;
+    let sp = spawn_init_env_clear(launch.argv(), seccomp_fd)?;
     let fds = recv_fds(&sp)?;
     send_go(&sp)?;
     let out = finish(sp, "full-chain-bwrap payload")?;
@@ -1350,7 +1559,7 @@ fn run_probe_child(extra: &[&str]) -> Result<(i32, String, String), String> {
     ))
 }
 
-const PROBE_NAMES: [&str; 10] = [
+const PROBE_NAMES: [&str; 11] = [
     "unshare",
     "idmap",
     "netns",
@@ -1361,10 +1570,11 @@ const PROBE_NAMES: [&str; 10] = [
     "fallback",
     "bwrap-run",
     "bwrap-proc",
+    "bwrap-seccomp",
 ];
 
 /// AC (issue #11, T3): `__init --probe` runs the real stages, prints one JSON
-/// line with the ten steps in order, and exits 0; without `--bwrap` the two
+/// line with the eleven steps in order, and exits 0; without `--bwrap` the
 /// bwrap steps are skipped.
 fn scenario_probe_json() -> Result<(), String> {
     let (rc, stdout, stderr) = run_probe_child(&[])?;
@@ -1437,7 +1647,7 @@ fn scenario_probe_bwrap() -> Result<(), String> {
     }
     let report: sbx::init::probe::ProbeReport =
         serde_json::from_str(stdout.trim()).map_err(|e| format!("probe JSON: {e}"))?;
-    for name in ["bwrap-run", "bwrap-proc"] {
+    for name in ["bwrap-run", "bwrap-proc", "bwrap-seccomp"] {
         let step = report
             .steps
             .iter()

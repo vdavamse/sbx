@@ -55,8 +55,11 @@
 //!    `cmd | head`-style pipe semantics — and re-ignores `SIGPIPE` on the
 //!    failure return so the staged diagnostics stay EPIPE-safe.
 //!    Issue #10 adds two things. The hidden `--keep-fd N` (the bwrap info pipe
-//!    `run` hands through) is the only fd above 2 that survives hygiene, and
-//!    it is validated before any namespace work. The signal mask is reset
+//!    `run` hands through) survives hygiene, and it is validated before any
+//!    namespace work. Issue #34 adds the hidden `--seccomp-fd N` (the sealed
+//!    socket-family program memfd bwrap reads as `--seccomp`), validated the
+//!    same way and content-checked against this binary's own program. The only
+//!    fds above 2 that survive hygiene are `--keep-fd` and `--seccomp-fd`. The signal mask is reset
 //!    first thing: std does not reset the blocked mask across spawn, and
 //!    `run` blocks TERM/INT/HUP/QUIT for its signalfd.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
@@ -342,6 +345,9 @@ pub struct InitArgs {
     pub fd: RawFd,
     /// The bwrap info pipe to keep across the exec (`--keep-fd`, issue #10).
     pub keep_fd: Option<RawFd>,
+    /// The sealed seccomp-program memfd to keep for bwrap (`--seccomp-fd`,
+    /// issue #34). Optional for direct `__init` callers; `run` always passes it.
+    pub seccomp_fd: Option<RawFd>,
     /// Expected parent pid (`--parent-pid`, m6).
     pub parent_pid: Option<i32>,
     /// The weakest network mode the caller accepts — the policy's own mode
@@ -370,6 +376,9 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
     if let Some(keep) = args.keep_fd {
         validate_keep_fd(keep, fd)?; // Stage::Control too (issue #10, Q13)
+    }
+    if let Some(seccomp) = args.seccomp_fd {
+        validate_seccomp_fd(seccomp, fd, args.keep_fd)?; // Stage::Control (issue #34)
     }
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
     netns::write_id_maps(ids)?; // Stage::Idmap
@@ -412,8 +421,15 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     // fd_hygiene scan below is defense in depth.
     drop(listeners);
     drop(sock);
-    fd_hygiene(fd, args.keep_fd);
+    fd_hygiene(fd, &keep_set(args));
     Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
+}
+
+/// The fds that survive [`fd_hygiene`] on purpose (issue #10 and #34): the
+/// bwrap info pipe and the seccomp program memfd. Both are consumed by bwrap
+/// before the payload runs; both were validated in the control stage.
+fn keep_set(args: &InitArgs) -> Vec<RawFd> {
+    args.keep_fd.into_iter().chain(args.seccomp_fd).collect()
 }
 
 /// Validate `--fd` before any namespace work: a bad control fd fails fast
@@ -513,7 +529,7 @@ fn panic_message(payload: &Box<dyn Any + Send>) -> String {
 /// dies at exec anyway. The end-to-end proof is the integration suite's
 /// `check-net` role asserting fds == {0,1,2} after exec (D13 — in-process
 /// closing tests are thread-hostile under parallel cargo test).
-fn fd_hygiene(control: RawFd, keep: Option<RawFd>) {
+fn fd_hygiene(control: RawFd, keep: &[RawFd]) {
     // SAFETY: closing an fd this process owns; EBADF (already closed) is
     // ignored by design.
     unsafe {
@@ -530,14 +546,84 @@ fn fd_hygiene(control: RawFd, keep: Option<RawFd>) {
             libc::close(fd);
         }
     }
-    if let Some(keep) = keep {
-        // Defense in depth (issue #10): the kept fd must survive execvp even
-        // if the caller forgot to clear CLOEXEC on it.
-        // SAFETY: F_SETFD on a fd validated by validate_keep_fd.
+    for &kept in keep {
+        // Defense in depth (issue #10, #34): every kept fd must survive execvp
+        // even if the caller forgot to clear CLOEXEC on it. Each was validated
+        // in the control stage (validate_keep_fd / validate_seccomp_fd).
+        // SAFETY: F_SETFD on an fd validated before the pipeline's hygiene.
         unsafe {
-            libc::fcntl(keep, libc::F_SETFD, 0);
+            libc::fcntl(kept, libc::F_SETFD, 0);
         }
     }
+}
+
+/// Issue #34: `--seccomp-fd` is the sealed memfd holding sbx's socket-family
+/// program ([`crate::bwrap::seccomp`]). bwrap reads it in the sandbox child
+/// and applies the filter as the last step before exec, so a wrong or forged
+/// program would silently change the sandbox. Verified here, before any
+/// namespace work: it must be a sealed memfd (write/grow/shrink sealed)
+/// whose bytes equal this binary's own `native_program_bytes()` (the same
+/// binary is the producer and the verifier). Every failure stages `control`
+/// and exits 1; the offset is rewound because bwrap reads from the current
+/// offset.
+fn validate_seccomp_fd(
+    seccomp: RawFd,
+    control: RawFd,
+    keep: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if seccomp <= 2 {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} must be greater than 2"
+        )));
+    }
+    if seccomp == control {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} must differ from --fd"
+        )));
+    }
+    if keep == Some(seccomp) {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} must differ from --keep-fd"
+        )));
+    }
+    // SAFETY: fstat on a number we were handed; the result is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(seccomp, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} is not a sealed memfd"
+        )));
+    }
+    // SAFETY: fcntl F_GET_SEALS on the fd validated above.
+    let seals = unsafe { libc::fcntl(seccomp, libc::F_GET_SEALS) };
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
+    if seals < 0 || seals & required != required {
+        return Err(fail(format!(
+            "--seccomp-fd {seccomp} is not a sealed memfd"
+        )));
+    }
+    let mismatch = || {
+        fail(format!(
+            "--seccomp-fd {seccomp} does not hold sbx's seccomp program"
+        ))
+    };
+    let expected = crate::bwrap::seccomp::native_program_bytes().ok_or_else(mismatch)?;
+    let mut buf = vec![0u8; expected.len() + 1];
+    // SAFETY: pread into a buffer we own; the file offset is not moved.
+    let n = unsafe { libc::pread(seccomp, buf.as_mut_ptr().cast(), buf.len(), 0) };
+    if usize::try_from(n) != Ok(expected.len()) || buf[..expected.len()] != expected[..] {
+        return Err(mismatch());
+    }
+    // SAFETY: lseek on the validated fd; bwrap reads from the current offset.
+    if unsafe { libc::lseek(seccomp, 0, libc::SEEK_SET) } < 0 {
+        return Err(fail(format!("--seccomp-fd {seccomp} cannot be rewound")));
+    }
+    Ok(())
 }
 
 /// Issue #10 (Q13): `--keep-fd` is the bwrap info pipe `run` hands through.
@@ -573,8 +659,8 @@ fn validate_keep_fd(keep: RawFd, control: RawFd) -> Result<(), InitError> {
 
 /// Pure core of [`fd_hygiene`]'s close set: the scanned fds minus `keep`
 /// (the one fd that survives the re-exec on purpose; issue #10).
-fn fds_to_close(scan: Vec<RawFd>, keep: Option<RawFd>) -> Vec<RawFd> {
-    scan.into_iter().filter(|fd| Some(*fd) != keep).collect()
+fn fds_to_close(scan: Vec<RawFd>, keep: &[RawFd]) -> Vec<RawFd> {
+    scan.into_iter().filter(|fd| !keep.contains(fd)).collect()
 }
 
 /// Issue #10 (E10): empty the calling thread's signal mask. `__init` is
@@ -743,6 +829,7 @@ mod tests {
         InitArgs {
             fd,
             keep_fd,
+            seccomp_fd: None,
             parent_pid,
             min_mode: NetworkMode::Transparent,
             test_break_rules: false,
@@ -988,9 +1075,132 @@ mod tests {
 
     #[test]
     fn fds_to_close_skips_keep() {
-        assert_eq!(fds_to_close(vec![3, 5, 9], Some(5)), vec![3, 9]);
-        assert_eq!(fds_to_close(vec![3, 5], None), vec![3, 5]);
-        assert_eq!(fds_to_close(vec![5], Some(7)), vec![5]);
+        assert_eq!(fds_to_close(vec![3, 5, 9], &[5]), vec![3, 9]);
+        assert_eq!(fds_to_close(vec![3, 5], &[]), vec![3, 5]);
+        assert_eq!(fds_to_close(vec![5], &[7]), vec![5]);
+    }
+
+    /// A memfd holding `bytes`, sealed (write/grow/shrink) or not, rewound.
+    fn memfd_with(bytes: &[u8], seal: bool) -> OwnedFd {
+        // SAFETY: memfd_create with a valid NUL-terminated name; the fd is ours.
+        let raw = unsafe {
+            libc::memfd_create(
+                c"sbx-test".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(raw >= 0, "memfd_create failed");
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: write from a valid buffer to a fd we own.
+        let n = unsafe { libc::write(raw, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(usize::try_from(n).unwrap(), bytes.len());
+        if seal {
+            // SAFETY: F_ADD_SEALS on our memfd.
+            let rc = unsafe {
+                libc::fcntl(
+                    raw,
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK,
+                )
+            };
+            assert_eq!(rc, 0);
+        }
+        // SAFETY: lseek on our memfd.
+        unsafe { libc::lseek(raw, 0, libc::SEEK_SET) };
+        fd
+    }
+
+    #[test]
+    fn validate_seccomp_fd_table() {
+        // No program on this architecture: nothing to validate against.
+        let Some(good) = crate::bwrap::seccomp::native_program_bytes() else {
+            return;
+        };
+        let msg = |s: RawFd, c: RawFd, k: Option<RawFd>| {
+            validate_seccomp_fd(s, c, k)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2, 999, None),
+            "sbx __init: control: --seccomp-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(7, 7, None),
+            "sbx __init: control: --seccomp-fd 7 must differ from --fd"
+        );
+        assert_eq!(
+            msg(7, 999, Some(7)),
+            "sbx __init: control: --seccomp-fd 7 must differ from --keep-fd"
+        );
+        assert_eq!(
+            msg(998, 999, None),
+            "sbx __init: control: --seccomp-fd 998 is not a valid file descriptor (EBADF)"
+        );
+
+        let sealed_good = memfd_with(&good, true);
+        let raw = sealed_good.as_raw_fd();
+        assert!(validate_seccomp_fd(raw, 999, None).is_ok());
+        // Rewound after validation: the offset is 0 for bwrap.
+        // SAFETY: lseek SEEK_CUR reads the offset without moving it.
+        assert_eq!(unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) }, 0);
+
+        // A pipe is not a memfd.
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-element array.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (pr, pw) = (p[0], p[1]);
+        assert_eq!(
+            msg(pw, 999, None),
+            format!("sbx __init: control: --seccomp-fd {pw} is not a sealed memfd")
+        );
+        // SAFETY: closing the pipe ends we just created.
+        unsafe {
+            libc::close(pr);
+            libc::close(pw);
+        }
+
+        let unsealed = memfd_with(&good, false);
+        assert_eq!(
+            msg(unsealed.as_raw_fd(), 999, None),
+            format!(
+                "sbx __init: control: --seccomp-fd {} is not a sealed memfd",
+                unsealed.as_raw_fd()
+            )
+        );
+
+        let wrong = memfd_with(&[0u8; 8], true);
+        assert_eq!(
+            msg(wrong.as_raw_fd(), 999, None),
+            format!(
+                "sbx __init: control: --seccomp-fd {} does not hold sbx's seccomp program",
+                wrong.as_raw_fd()
+            )
+        );
+
+        // A prefix of the right program is not the right program.
+        let short = memfd_with(&good[..good.len() - 8], true);
+        assert!(validate_seccomp_fd(short.as_raw_fd(), 999, None).is_err());
+    }
+
+    #[test]
+    fn fds_to_close_keeps_both_info_and_seccomp() {
+        // Issue #34: the info pipe and the seccomp memfd both survive hygiene;
+        // everything else in the scan is closed.
+        assert_eq!(fds_to_close(vec![3, 5, 9, 12], &[5, 9]), vec![3, 12]);
+        assert_eq!(fds_to_close(vec![4, 5], &[5, 9]), vec![4]);
+    }
+
+    #[test]
+    fn keep_set_is_info_and_seccomp() {
+        // The production helper itself (pipeline() calls it), not a copy.
+        let mut both = args(7, Some(5), None);
+        both.seccomp_fd = Some(9);
+        assert_eq!(keep_set(&both), vec![5, 9]);
+        let mut seccomp_only = args(7, None, None);
+        seccomp_only.seccomp_fd = Some(9);
+        assert_eq!(keep_set(&seccomp_only), vec![9]);
+        assert!(keep_set(&args(7, None, None)).is_empty());
     }
 
     #[test]

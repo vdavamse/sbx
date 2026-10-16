@@ -118,6 +118,11 @@ jobs:
           # Preload modules the ruleset needs (may be builtins; ignore errors).
           sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
             nft_meta nft_immediate nf_nat nft_counter || true
+          # Issue #34 (review): load vsock so the smoke's AF_VSOCK assertion can
+          # discriminate on the runner (without the module the host itself gives
+          # EAFNOSUPPORT and the 97 inside the sandbox proves nothing). May be a
+          # builtin or absent; ignore errors, the smoke reports which case holds.
+          sudo modprobe vsock_loopback || sudo modprobe vsock || true
           # Smoke test: unprivileged user+net namespace must work.
           unshare -Urn true
           echo "unprivileged userns smoke OK"
@@ -156,6 +161,49 @@ jobs:
           OUT=$("$BIN" gc --older-than 1d "$T")
           RC=$?
           [ "$RC" -eq 0 ] && [ "$OUT" = "removed \"$T/s\"" ] && [ ! -e "$T/s" ] || { echo "FAIL: gc of a real session rc $RC: $OUT"; FAIL=1; }
+          # Issue #34: the socket-family filter. AF_VSOCK (a channel that bypasses
+          # the netns; live on VM-backed runners) and AF_PACKET fail with
+          # EAFNOSUPPORT (errno 97) inside the sandbox, through socket(2), the
+          # socketpair(2) variant, and a high-word family spelling (the kernel
+          # keeps only the low 32 bits); AF_UNIX keeps working.
+          # Host baseline (unfiltered, outside sbx): if socket(AF_VSOCK) works
+          # here, the sandbox's errno 97 below is discriminating. If the host
+          # also refuses it, say so (not a failure); the AF_PACKET line (EPERM on
+          # the host, 97 in the sandbox) still proves the filter.
+          HOST=$(python3 - <<'PY'
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+          for label, fam in (("vsock", 40), ("packet", 17)):
+              r = libc.syscall(ctypes.c_long(41), ctypes.c_long(fam), ctypes.c_long(1), ctypes.c_long(0))
+              print("host", label, "ok" if r >= 0 else "errno %d" % ctypes.get_errno())
+          PY
+          )
+          echo "$HOST"
+          if printf '%s\n' "$HOST" | grep -qx 'host vsock ok'; then
+            echo "host vsock baseline: socket(AF_VSOCK) works unfiltered; the sandbox errno 97 is discriminating"
+          else
+            echo "vsock unavailable on host — assertion not discriminating (the AF_PACKET line still proves the filter)"
+          fi
+          PROG=$(cat <<'PY'
+          import ctypes, socket as s
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+          def raw(nr, *args):
+              r = libc.syscall(ctypes.c_long(nr), *[ctypes.c_long(a) for a in args])
+              return "ok" if r >= 0 else "errno %d" % ctypes.get_errno()
+          pair = (ctypes.c_int * 2)()
+          print("vsock", raw(41, 40, 1, 0))
+          print("packet", raw(41, 17, 1, 0))
+          print("hiword", raw(41, (1 << 32) | 40, 1, 0))
+          print("socketpair-vsock", raw(53, 40, 1, 0, ctypes.addressof(pair)))
+          s.socket(s.AF_UNIX, s.SOCK_STREAM).close()
+          print("unix ok")
+          PY
+          )
+          OUT=$("$BIN" run --policy "$T/bench.json" --session-dir "$T/s" -- /usr/bin/python3 -c "$PROG")
+          RC=$?
+          printf '%s\n' "$OUT" | grep -qx 'vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'packet errno 97' && printf '%s\n' "$OUT" | grep -qx 'hiword errno 97' && printf '%s\n' "$OUT" | grep -qx 'socketpair-vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'unix ok' && [ "$RC" -eq 0 ] || { echo "FAIL: socket-family filter rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
       # Issue #11: the real `sbx check` on the runner (gating). Every host item

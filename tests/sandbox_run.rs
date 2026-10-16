@@ -88,6 +88,14 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
     };
     match role {
         "exit" => arg(0).parse::<u8>().unwrap_or(1),
+        // #34: raw socket-family and io_uring probes (see `sockets_role`).
+        "sockets" => sockets_role(),
+        // #34: this process's and pid 1's Seccomp mode, and its fd set.
+        "seccomp-status" => seccomp_status_role(),
+        // #34: an x32-ABI syscall, which the filter kills (SIGSYS, rc 159).
+        "x32-syscall" => x32_syscall_role(),
+        // #34: an i386 compat syscall through `int 0x80`, which the arch gate kills.
+        "int80-syscall" => int80_role(),
         // #12: writes a marker into the session's work dir (/work).
         "mark" => match fs::write("/work/marker", b"marked") {
             Ok(()) => 0,
@@ -335,6 +343,184 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
 }
 
 /// Every environment variable as `ENV KEY=<hex value>`, sorted.
+/// #34: raw socket-family probes through the `syscall` entry point, so the
+/// family argument reaches the kernel untruncated (the high-word cases). One
+/// `SOCK <label> <ok|errno=N>` line per probe; `ok` closes the fd at once.
+fn sockets_role() -> u8 {
+    use libc::{c_int, c_long};
+    const STREAM: c_long = 1;
+    const RAW: c_long = 3;
+    let report = |label: &str, ret: c_long| {
+        if ret < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            println!("SOCK {label} errno={errno}");
+        } else {
+            println!("SOCK {label} ok");
+            // SAFETY: the kernel returned a new fd we own.
+            unsafe { libc::close(ret as c_int) };
+        }
+    };
+    let sock = |family: c_long, ty: c_long, proto: c_long| -> c_long {
+        // SAFETY: a plain socket(2) through syscall(2) with integer arguments.
+        unsafe { libc::syscall(libc::SYS_socket, family, ty, proto) as c_long }
+    };
+    // Families that must fail with EAFNOSUPPORT (97).
+    let denied: [(&str, c_long); 8] = [
+        ("vsock", 40),
+        ("packet", 17),
+        ("xdp", 44),
+        ("alg", 38),
+        ("bluetooth", 31),
+        ("unspec", 0),
+        ("above-max", 255),
+        ("vsock-hiword", (1 << 32) | 40),
+    ];
+    for (label, family) in denied {
+        report(label, sock(family, STREAM, 0));
+    }
+    // #34 (review s1): the syscall NUMBER with high bits set, family VSOCK.
+    // The filter reads the 32-bit `nr` field, so this is socket(2) to it and
+    // is refused before the kernel decides what the number means.
+    // SAFETY: a syscall with integer arguments.
+    report("vsock-hiword-nr", unsafe {
+        libc::syscall(
+            ((1 << 32) | libc::SYS_socket) as c_long,
+            40 as c_long,
+            STREAM,
+            0 as c_long,
+        ) as c_long
+    });
+    // Families that must keep working.
+    let allowed: [(&str, c_long, c_long, c_long); 5] = [
+        ("unix", 1, STREAM, 0),
+        ("inet", 2, STREAM, 0),
+        ("inet6", 10, STREAM, 0),
+        ("netlink-route", 16, RAW, 0),
+        ("unix-hiword", (1 << 32) | 1, STREAM, 0),
+    ];
+    for (label, family, ty, proto) in allowed {
+        report(label, sock(family, ty, proto));
+    }
+    // socketpair(2) shares the family check.
+    for (label, family) in [("socketpair-vsock", 40), ("socketpair-unix", 1)] {
+        let mut pair = [0 as c_int; 2];
+        // SAFETY: socketpair(2) into a two-element array we own.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_socketpair,
+                family,
+                STREAM,
+                0 as c_long,
+                pair.as_mut_ptr() as c_long,
+            ) as c_long
+        };
+        if ret == 0 {
+            println!("SOCK {label} ok");
+            // SAFETY: the kernel returned two new fds we own.
+            unsafe {
+                libc::close(pair[0]);
+                libc::close(pair[1]);
+            }
+        } else {
+            report(label, ret);
+        }
+    }
+    // io_uring: the three syscalls answer ENOSYS (the filter runs before the
+    // kernel reads any argument, so NULL pointers are fine here).
+    // SAFETY: syscall(2) with integer and NULL arguments.
+    unsafe {
+        report(
+            "uring-setup",
+            libc::syscall(libc::SYS_io_uring_setup, 1 as c_long, 0 as c_long) as c_long,
+        );
+        report(
+            "uring-enter",
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+            ) as c_long,
+        );
+        report(
+            "uring-register",
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+                0 as c_long,
+            ) as c_long,
+        );
+    }
+    0
+}
+
+/// #34: `Seccomp:` for this process and pid 1, and the open fd numbers (the
+/// fd this role's own directory read holds is excluded). The seccomp memfd
+/// must not leak into the payload: bwrap closes it, so only 0–2 remain.
+fn seccomp_status_role() -> u8 {
+    for pid in ["self", "1"] {
+        let text = fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+        let mode = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Seccomp:"))
+            .map_or("missing", str::trim);
+        println!("STATUS {pid} {mode}");
+    }
+    let own_dir = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
+    let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+        return 1;
+    };
+    let mut fds: Vec<i32> = Vec::new();
+    for entry in entries.flatten() {
+        if fs::read_link(entry.path()).ok().as_deref() == Some(own_dir.as_path()) {
+            continue;
+        }
+        if let Some(n) = entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            fds.push(n);
+        }
+    }
+    fds.sort_unstable();
+    for fd in fds {
+        println!("FD {fd}");
+    }
+    0
+}
+
+/// #34: an x32 syscall (bit 30 set). The filter kills the process.
+#[cfg(target_arch = "x86_64")]
+fn x32_syscall_role() -> u8 {
+    // SAFETY: a syscall with the x32 bit; the filter kills before the kernel
+    // acts on it, so no state is touched.
+    unsafe { libc::syscall((0x4000_0000u32 | 39) as libc::c_long) };
+    3
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn x32_syscall_role() -> u8 {
+    3
+}
+
+/// #34: a 32-bit compat getpid through `int 0x80`. The arch gate kills.
+#[cfg(target_arch = "x86_64")]
+fn int80_role() -> u8 {
+    // SAFETY: the i386 compat gate with eax = 20 (getpid); the filter kills
+    // the process on the wrong audit arch before the kernel acts on it.
+    unsafe {
+        std::arch::asm!("int 0x80", inout("eax") 20i32 => _);
+    }
+    3
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn int80_role() -> u8 {
+    3
+}
+
 fn print_env() {
     let mut vars: Vec<(String, Vec<u8>)> = std::env::vars_os()
         .map(|(k, v)| (k.to_string_lossy().into_owned(), v.into_vec()))
@@ -509,6 +695,36 @@ fn scenarios() -> Vec<Scenario> {
             name: "bwrap-missing-125",
             gate: Always,
             run: bwrap_missing_125,
+        },
+        Scenario {
+            name: "seccomp-vsock-eafnosupport",
+            gate: Bwrap,
+            run: seccomp_vsock_eafnosupport,
+        },
+        Scenario {
+            name: "seccomp-allowed-families",
+            gate: Bwrap,
+            run: seccomp_allowed_families,
+        },
+        Scenario {
+            name: "seccomp-io-uring-enosys",
+            gate: Bwrap,
+            run: seccomp_io_uring_enosys,
+        },
+        Scenario {
+            name: "seccomp-status",
+            gate: Bwrap,
+            run: seccomp_status,
+        },
+        Scenario {
+            name: "seccomp-x32-killed-159",
+            gate: Bwrap,
+            run: seccomp_x32_killed_159,
+        },
+        Scenario {
+            name: "seccomp-int80-killed-159",
+            gate: Bwrap,
+            run: seccomp_int80_killed_159,
         },
         Scenario {
             name: "exit-code-passthrough",
@@ -1199,6 +1415,171 @@ fn run_role_case(
     let args = sbx_args(&policy, &session, extra, &payload(role_args));
     let done = run_sbx(&args)?;
     Ok((done, dir))
+}
+
+/// #34: the `SOCK` lines of one `sockets` run, label → value.
+fn seccomp_sockets() -> Result<std::collections::BTreeMap<String, String>, String> {
+    let (done, dir) = run_role_case("seccomp-sockets", "sockets", &[], |_| {}, &[])?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)?;
+    let mut map = std::collections::BTreeMap::new();
+    for line in done.stdout.lines() {
+        if let Some(rest) = line.strip_prefix("SOCK ") {
+            let (label, value) = rest
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed SOCK line {line:?}"))?;
+            map.insert(label.to_owned(), value.to_owned());
+        }
+    }
+    Ok(map)
+}
+
+fn expect_socket(
+    map: &std::collections::BTreeMap<String, String>,
+    label: &str,
+    want: &str,
+) -> Result<(), String> {
+    match map.get(label) {
+        Some(got) if got == want => Ok(()),
+        other => Err(format!("socket probe {label}: want {want}, got {other:?}")),
+    }
+}
+
+/// #34 AC1: every family outside the allow-list, reached by any route the
+/// probes cover, fails with EAFNOSUPPORT (97) — AF_VSOCK included, and the
+/// high-word spelling of it.
+fn seccomp_vsock_eafnosupport() -> Result<(), String> {
+    // Host baseline, outside any filter: does socket(AF_VSOCK) work here? If
+    // it does, the sandbox's errno 97 below is discriminating; if the host
+    // also refuses (no vsock module), the scenario still asserts 97 but says
+    // so instead of implying the filter was proven by it.
+    // SAFETY: a plain socket(2) with integer arguments, closed at once.
+    let host = unsafe {
+        libc::syscall(
+            libc::SYS_socket,
+            40 as libc::c_long,
+            1 as libc::c_long,
+            0 as libc::c_long,
+        ) as libc::c_long
+    };
+    let host_vsock = if host >= 0 {
+        // SAFETY: the kernel returned a fresh fd this process owns.
+        unsafe { libc::close(host as i32) };
+        "ok".to_owned()
+    } else {
+        format!(
+            "errno {}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        )
+    };
+    if host_vsock == "ok" {
+        println!("host vsock baseline (unfiltered): ok — the sandbox errno 97 is discriminating");
+    } else {
+        println!(
+            "host vsock baseline (unfiltered): {host_vsock} — vsock unavailable on this host; the 97 below does not prove the filter by itself"
+        );
+    }
+    let map = seccomp_sockets()?;
+    for label in [
+        "vsock",
+        "packet",
+        "xdp",
+        "alg",
+        "bluetooth",
+        "unspec",
+        "above-max",
+        "vsock-hiword",
+        "vsock-hiword-nr",
+        "socketpair-vsock",
+    ] {
+        expect_socket(&map, label, "errno=97")?;
+    }
+    Ok(())
+}
+
+/// #34 AC2: the allow-listed families keep working (AF_INET6 is allowed by
+/// design; it fails later on the disabled IPv6 stack, not here).
+fn seccomp_allowed_families() -> Result<(), String> {
+    let map = seccomp_sockets()?;
+    for label in [
+        "unix",
+        "inet",
+        "inet6",
+        "netlink-route",
+        "unix-hiword",
+        "socketpair-unix",
+    ] {
+        expect_socket(&map, label, "ok")?;
+    }
+    Ok(())
+}
+
+/// #34: io_uring setup, enter and register answer ENOSYS (38), so libuv and
+/// liburing fall back instead of creating sockets through IORING_OP_SOCKET.
+fn seccomp_io_uring_enosys() -> Result<(), String> {
+    let map = seccomp_sockets()?;
+    for label in ["uring-setup", "uring-enter", "uring-register"] {
+        expect_socket(&map, label, "errno=38")?;
+    }
+    Ok(())
+}
+
+/// #34: bwrap installed the filter in pid 1 and in the payload (`Seccomp: 2`
+/// is SECCOMP_MODE_FILTER), and the memfd did not leak (fds are exactly 0–2).
+fn seccomp_status() -> Result<(), String> {
+    let (done, dir) = run_role_case("seccomp-status", "seccomp-status", &[], |_| {}, &[])?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)?;
+    for want in ["STATUS self 2", "STATUS 1 2"] {
+        if !done.stdout.lines().any(|line| line == want) {
+            return Err(format!("missing {want:?}\nstdout: {:?}", done.stdout));
+        }
+    }
+    let fds: Vec<&str> = done
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("FD "))
+        .collect();
+    if fds != ["0", "1", "2"] {
+        return Err(format!("payload fds must be exactly 0-2, got {fds:?}"));
+    }
+    Ok(())
+}
+
+/// #34: an x32 syscall is killed by the filter: SIGSYS, so rc 128+31 = 159.
+fn seccomp_x32_killed_159() -> Result<(), String> {
+    if !cfg!(target_arch = "x86_64") {
+        println!("SKIP seccomp-x32-killed-159: the x32 ABI is x86_64-only");
+        return Ok(());
+    }
+    let (done, dir) = run_role_case("seccomp-x32", "x32-syscall", &[], |_| {}, &[])?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 159)
+}
+
+/// #34: the i386 `int 0x80` compat entry is killed by the arch gate (rc 159).
+/// Baseline first: the same role run directly, outside sbx. On a kernel
+/// without IA32 emulation the unfiltered `int 0x80` faults (SIGSEGV), so
+/// there is no compat path to close and the scenario reports SKIP; with
+/// emulation the filter must turn the call into SIGSYS (rc 159).
+fn seccomp_int80_killed_159() -> Result<(), String> {
+    if !cfg!(target_arch = "x86_64") {
+        println!("SKIP seccomp-int80-killed-159: the int 0x80 compat entry is x86_64-only");
+        return Ok(());
+    }
+    let baseline = Command::new(payload_exe())
+        .env(ROLE_ENV, "int80-syscall")
+        .status()
+        .map_err(|e| format!("spawn int80 baseline: {e}"))?;
+    if baseline.code() != Some(3) {
+        println!(
+            "SKIP seccomp-int80-killed-159: unfiltered int 0x80 does not complete here ({baseline})"
+        );
+        return Ok(());
+    }
+    let (done, dir) = run_role_case("seccomp-int80", "int80-syscall", &[], |_| {}, &[])?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 159)
 }
 
 fn exit_code_passthrough() -> Result<(), String> {

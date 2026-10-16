@@ -33,9 +33,12 @@
 //!    session leaves. The host root is never bound (`AbsolutePath` rejects
 //!    `/` — a type-level guarantee since the validity invariant landed),
 //!    the session dir's PARENT is never bound (only the `work/`, `home/`,
-//!    `tmp/` leaves), and there is no fd-passing (`--ro-bind-data` is
-//!    impossible: #5's `fd_hygiene` closes every fd > 2 before exec —
-//!    hence on-disk synthetic files, Q6).
+//!    `tmp/` leaves), and there is no *filesystem* fd-passing
+//!    (`--ro-bind-data` is impossible: #5's `fd_hygiene` closes every fd
+//!    not explicitly kept before exec — hence on-disk synthetic files, Q6).
+//!    The only fds bwrap receives are the info pipe (`--info-fd`) and the
+//!    seccomp program memfd (`--seccomp`, issue #34), both consumed by
+//!    bwrap before the payload runs.
 //! 4. **Order is semantics** — bwrap applies filesystem ops in argv order.
 //!    All mounts sort by (dest ascending byte order, priority ascending):
 //!    byte order puts ancestors before descendants (ro parent before nested
@@ -73,7 +76,10 @@
 //!    `/proc`; `cgroup-try` tolerates hosts without a cgroup ns) and
 //!    `--disable-userns --cap-drop ALL --die-with-parent --new-session
 //!    --hostname sandbox [--info-fd N]` (`--info-fd` only when
-//!    `Build::info_fd` is set — issue #10's pid-1 discovery, Q13).
+//!    `Build::info_fd` is set — issue #10's pid-1 discovery, Q13) and
+//!    `--seccomp S` ALWAYS (issue #34: the socket-family filter, see
+//!    [`seccomp`]; bwrap installs it as the last step before exec in both
+//!    pid 1 and the payload).
 //!    `--disable-userns` needs bwrap ≥ 0.8
 //!    ([`version::BWRAP_MIN`]); it works because `--unshare-user` is
 //!    present (the kernel rejects disable-userns without a private userns).
@@ -121,6 +127,7 @@
 //!     CWE-59/TOCTOU class; see [`etc`]'s module docs).
 
 pub mod etc;
+pub mod seccomp;
 pub mod version;
 
 // Private: the argv layout is the module's implementation detail — `build`
@@ -187,6 +194,13 @@ pub struct Build<'a> {
     /// `--info-fd n` (bwrap writes `{"child-pid": …}` there after clone); the fd
     /// must survive into bwrap — `sbx __init --keep-fd n`. Must be > 2 (row 15).
     pub info_fd: Option<RawFd>,
+    /// The socket-family seccomp program fd (issue #34): the sealed memfd
+    /// from [`seccomp::program_memfd`]. Required, not optional — every
+    /// launch is filtered by construction. Emitted as `--seccomp n`
+    /// (bwrap reads the program from it and closes it); `sbx __init
+    /// --seccomp-fd n` must carry it through fd hygiene. Must be > 2 and
+    /// differ from `info_fd` (row 16).
+    pub seccomp_fd: RawFd,
 }
 
 /// A complete, validated bwrap invocation.
@@ -414,6 +428,20 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             )));
         }
     }
+    // Row 16 (issue #34): the seccomp fd must be above the std streams and
+    // must not collide with the info pipe (two distinct fds, one each role).
+    if input.seccomp_fd <= 2 {
+        return Err(BwrapError(format!(
+            "seccomp fd must be greater than 2 (got {})",
+            input.seccomp_fd
+        )));
+    }
+    if input.info_fd == Some(input.seccomp_fd) {
+        return Err(BwrapError(format!(
+            "seccomp fd must differ from the info fd (got {})",
+            input.seccomp_fd
+        )));
+    }
     // The argv layout itself has no failure modes (module docs point 1) —
     // but the assembly output gets one final sweep before it is trusted.
     let argv = argv::assemble(input);
@@ -455,8 +483,16 @@ pub const PROBE_PAYLOAD_DEST: &str = "/.sbx-probe";
 /// (all four — the probe has no policy binds to skip them for), the host's
 /// `/usr` read-only, sbx itself as the payload (`--version`, no dependency on
 /// `/usr/bin/true`), and optionally a fresh `/proc` — the one mount that
-/// fails on masked-/proc hosts. Pure. Nothing here is policy-derived.
-pub fn probe_argv(bwrap: &Path, payload: &Path, with_proc: bool) -> Vec<OsString> {
+/// fails on masked-/proc hosts. `seccomp_fd` (issue #34), when given, adds
+/// `--seccomp N` after the hardening block — the `bwrap-seccomp` probe step
+/// uses it to prove bwrap installs sbx's filter. Pure. Nothing here is
+/// policy-derived.
+pub fn probe_argv(
+    bwrap: &Path,
+    payload: &Path,
+    with_proc: bool,
+    seccomp_fd: Option<RawFd>,
+) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![bwrap.as_os_str().to_os_string()];
     argv.extend(
         argv::NAMESPACE_FLAGS
@@ -468,6 +504,9 @@ pub fn probe_argv(bwrap: &Path, payload: &Path, with_proc: bool) -> Vec<OsString
             .iter()
             .map(|flag| OsString::from(*flag)),
     );
+    if let Some(fd) = seccomp_fd {
+        argv.extend(["--seccomp".to_owned(), fd.to_string()].map(OsString::from));
+    }
     argv.push(OsString::from("--clearenv"));
     for (dest, target) in argv::USR_MERGE_SHIMS {
         argv.extend(["--symlink", target, dest].map(OsString::from));
@@ -500,14 +539,24 @@ mod probe_argv_tests {
 
     #[test]
     fn probe_argv_golden() {
-        let with_proc = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), true);
+        let with_proc = probe_argv(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/opt/sbx"),
+            true,
+            None,
+        );
         let expected = "/usr/bin/bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try --disable-userns --cap-drop ALL --die-with-parent --new-session --hostname sandbox --clearenv --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --ro-bind-try /usr /usr --ro-bind /opt/sbx /.sbx-probe --proc /proc --dev /dev -- /.sbx-probe --version";
         let got: Vec<String> = with_proc
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert_eq!(got.join(" "), expected);
-        let without = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), false);
+        let without = probe_argv(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/opt/sbx"),
+            false,
+            None,
+        );
         let without_text: Vec<String> = without
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -520,13 +569,40 @@ mod probe_argv_tests {
 
     #[test]
     fn probe_argv_shares_flags_with_build() {
-        let argv = probe_argv(Path::new("/usr/bin/bwrap"), Path::new("/opt/sbx"), false);
+        let argv = probe_argv(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/opt/sbx"),
+            false,
+            None,
+        );
         let want: Vec<OsString> = argv::NAMESPACE_FLAGS
             .iter()
             .chain(argv::HARDENING_FLAGS.iter())
             .map(|f| OsString::from(*f))
             .collect();
         assert_eq!(&argv[1..1 + want.len()], want.as_slice());
+    }
+
+    #[test]
+    fn probe_argv_seccomp_golden() {
+        // Issue #34: `--seccomp N` sits after the hardening block, before
+        // --clearenv; None leaves the argv unchanged (probe_argv_golden).
+        let argv = probe_argv(
+            Path::new("/usr/bin/bwrap"),
+            Path::new("/opt/sbx"),
+            false,
+            Some(9),
+        );
+        let got: Vec<String> = argv
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let text = got.join(" ");
+        assert!(
+            text.contains("--hostname sandbox --seccomp 9 --clearenv"),
+            "{text}"
+        );
+        assert_eq!(got.iter().filter(|a| *a == "--seccomp").count(), 1);
     }
 
     #[test]
@@ -612,6 +688,10 @@ mod tests {
         OsString::from_vec(bytes.to_vec())
     }
 
+    /// The seccomp fd of the baseline input (any value > 2 that differs
+    /// from the info fd; the argv goldens carry it verbatim).
+    const BASE_SECCOMP_FD: RawFd = 10;
+
     /// The valid baseline input — each error-pin case breaks exactly one
     /// row of the validation table.
     fn base_input<'a>(
@@ -627,6 +707,7 @@ mod tests {
             cwd: None,
             passed_env,
             info_fd: None,
+            seccomp_fd: BASE_SECCOMP_FD,
         }
     }
 
@@ -842,6 +923,19 @@ mod tests {
         assert_eq!(err(&info), "info fd must be greater than 2 (got 0)");
         info.info_fd = Some(3);
         assert!(build(&info).is_ok());
+
+        // Row 16 (issue #34): the seccomp fd must be above the std streams
+        // and distinct from the info fd.
+        let mut sec = base_input(&policy, &command, &no_env);
+        sec.seccomp_fd = 2;
+        assert_eq!(err(&sec), "seccomp fd must be greater than 2 (got 2)");
+        sec.seccomp_fd = 0;
+        assert_eq!(err(&sec), "seccomp fd must be greater than 2 (got 0)");
+        sec.seccomp_fd = 9;
+        sec.info_fd = Some(9);
+        assert_eq!(err(&sec), "seccomp fd must differ from the info fd (got 9)");
+        sec.info_fd = Some(8);
+        assert!(build(&sec).is_ok());
     }
 
     #[test]

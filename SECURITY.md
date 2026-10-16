@@ -33,6 +33,13 @@ Please **do not** file a public issue for a security report.
   running past the timeout without being killed; gaps in the audit trail;
   vulnerabilities in `sbx` itself, its dependencies, or its unprivileged
   setup path (`sbx __init`).
+- **In scope — socket families (issue #34):** the seccomp filter that bwrap
+  installs allow-lists the socket families `sbx run` creates (`AF_UNIX`,
+  `AF_INET`, `AF_INET6`, `AF_NETLINK`). Any way for a payload to create a socket
+  of another family, or to reach one through an io_uring, x32 or i386 entry, is
+  a sandbox escape in scope. Netlink protocol semantics and host-side pathname
+  unix sockets exposed through the filesystem policy are not covered by the
+  family filter (filesystem and netlink policy are separate concerns).
 - **Out of scope — the product working as designed:** untrusted code
   misbehaving *within* the sandbox: writing inside its writable mounts, or
   talking to allow-listed destinations. Note: v1 enforces a wall-clock
