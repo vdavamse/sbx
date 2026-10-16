@@ -118,6 +118,11 @@ jobs:
           # Preload modules the ruleset needs (may be builtins; ignore errors).
           sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
             nft_meta nft_immediate nf_nat nft_counter || true
+          # Issue #34 (review): load vsock so the smoke's AF_VSOCK assertion can
+          # discriminate on the runner (without the module the host itself gives
+          # EAFNOSUPPORT and the 97 inside the sandbox proves nothing). May be a
+          # builtin or absent; ignore errors, the smoke reports which case holds.
+          sudo modprobe vsock_loopback || sudo modprobe vsock || true
           # Smoke test: unprivileged user+net namespace must work.
           unshare -Urn true
           echo "unprivileged userns smoke OK"
@@ -161,6 +166,25 @@ jobs:
           # EAFNOSUPPORT (errno 97) inside the sandbox, through socket(2), the
           # socketpair(2) variant, and a high-word family spelling (the kernel
           # keeps only the low 32 bits); AF_UNIX keeps working.
+          # Host baseline (unfiltered, outside sbx): if socket(AF_VSOCK) works
+          # here, the sandbox's errno 97 below is discriminating. If the host
+          # also refuses it, say so (not a failure); the AF_PACKET line (EPERM on
+          # the host, 97 in the sandbox) still proves the filter.
+          HOST=$(python3 - <<'PY'
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+          for label, fam in (("vsock", 40), ("packet", 17)):
+              r = libc.syscall(ctypes.c_long(41), ctypes.c_long(fam), ctypes.c_long(1), ctypes.c_long(0))
+              print("host", label, "ok" if r >= 0 else "errno %d" % ctypes.get_errno())
+          PY
+          )
+          echo "$HOST"
+          if printf '%s\n' "$HOST" | grep -qx 'host vsock ok'; then
+            echo "host vsock baseline: socket(AF_VSOCK) works unfiltered; the sandbox errno 97 is discriminating"
+          else
+            echo "vsock unavailable on host — assertion not discriminating (the AF_PACKET line still proves the filter)"
+          fi
           PROG=$(cat <<'PY'
           import ctypes, socket as s
           libc = ctypes.CDLL(None, use_errno=True)

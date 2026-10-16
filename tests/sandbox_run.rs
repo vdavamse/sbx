@@ -384,7 +384,7 @@ fn sockets_role() -> u8 {
     // SAFETY: a syscall with integer arguments.
     report("vsock-hiword-nr", unsafe {
         libc::syscall(
-            ((1i64 << 32) | 41) as c_long,
+            ((1 << 32) | libc::SYS_socket) as c_long,
             40 as c_long,
             STREAM,
             0 as c_long,
@@ -1449,6 +1449,36 @@ fn expect_socket(
 /// probes cover, fails with EAFNOSUPPORT (97) — AF_VSOCK included, and the
 /// high-word spelling of it.
 fn seccomp_vsock_eafnosupport() -> Result<(), String> {
+    // Host baseline, outside any filter: does socket(AF_VSOCK) work here? If
+    // it does, the sandbox's errno 97 below is discriminating; if the host
+    // also refuses (no vsock module), the scenario still asserts 97 but says
+    // so instead of implying the filter was proven by it.
+    // SAFETY: a plain socket(2) with integer arguments, closed at once.
+    let host = unsafe {
+        libc::syscall(
+            libc::SYS_socket,
+            40 as libc::c_long,
+            1 as libc::c_long,
+            0 as libc::c_long,
+        ) as libc::c_long
+    };
+    let host_vsock = if host >= 0 {
+        // SAFETY: the kernel returned a fresh fd this process owns.
+        unsafe { libc::close(host as i32) };
+        "ok".to_owned()
+    } else {
+        format!(
+            "errno {}",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        )
+    };
+    if host_vsock == "ok" {
+        println!("host vsock baseline (unfiltered): ok — the sandbox errno 97 is discriminating");
+    } else {
+        println!(
+            "host vsock baseline (unfiltered): {host_vsock} — vsock unavailable on this host; the 97 below does not prove the filter by itself"
+        );
+    }
     let map = seccomp_sockets()?;
     for label in [
         "vsock",
@@ -1518,6 +1548,10 @@ fn seccomp_status() -> Result<(), String> {
 
 /// #34: an x32 syscall is killed by the filter: SIGSYS, so rc 128+31 = 159.
 fn seccomp_x32_killed_159() -> Result<(), String> {
+    if !cfg!(target_arch = "x86_64") {
+        println!("SKIP seccomp-x32-killed-159: the x32 ABI is x86_64-only");
+        return Ok(());
+    }
     let (done, dir) = run_role_case("seccomp-x32", "x32-syscall", &[], |_| {}, &[])?;
     let _ = fs::remove_dir_all(&dir);
     expect_rc(&done, 159)
@@ -1529,6 +1563,10 @@ fn seccomp_x32_killed_159() -> Result<(), String> {
 /// there is no compat path to close and the scenario reports SKIP; with
 /// emulation the filter must turn the call into SIGSYS (rc 159).
 fn seccomp_int80_killed_159() -> Result<(), String> {
+    if !cfg!(target_arch = "x86_64") {
+        println!("SKIP seccomp-int80-killed-159: the int 0x80 compat entry is x86_64-only");
+        return Ok(());
+    }
     let baseline = Command::new(payload_exe())
         .env(ROLE_ENV, "int80-syscall")
         .status()
