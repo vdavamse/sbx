@@ -522,6 +522,11 @@ pub fn probe_argv(
     argv
 }
 
+/// The pinned infra PATH the payload receives (conformance H04 compares it).
+pub fn infra_path() -> &'static str {
+    argv::INFRA_PATH
+}
+
 /// The infrastructure `/etc` paths every sandbox binds (`--host` pre-check).
 pub fn infra_etc_paths() -> &'static [&'static str] {
     &argv::INFRA_ETC

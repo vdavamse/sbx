@@ -8,6 +8,8 @@
 //! - `check`  — host capability report (issue #11), policy validation and
 //!   JSON Schema (real since #3)
 //! - `gc`     — session-directory garbage collection (real since #12)
+//! - `check --conformance` — the executable conformance suite (issue #13;
+//!   the hidden `__conformance probe` is its in-sandbox side)
 //! - `__init` — re-exec'd namespace helper (real since #5; hidden — #10's
 //!   `run` is its only production caller)
 //!
@@ -139,7 +141,7 @@ pub enum Cmd {
         policy: Option<PathBuf>,
 
         /// Print the policy JSON Schema (draft 2020-12) to stdout and exit.
-        #[arg(long, conflicts_with_all = ["policy", "host", "json", "test_break_rules"])]
+        #[arg(long, conflicts_with_all = ["policy", "host", "json", "test_break_rules", "conformance"])]
         print_schema: bool,
 
         /// With --policy: also check that this host can run the policy.
@@ -154,6 +156,24 @@ pub enum Cmd {
         /// (issue #11, Q6 precedent).
         #[arg(long, hide = true)]
         test_break_rules: bool,
+        /// Run the conformance suite: every security guarantee as an executable check.
+        #[arg(long, conflicts_with_all = ["policy", "print_schema", "host", "test_break_rules"])]
+        conformance: bool,
+        /// With --conformance: also run the network tier (needs internet access).
+        #[arg(long, requires = "conformance", conflicts_with = "list")]
+        network: bool,
+        /// With --conformance: run only these checks or groups (A01, A, allow-list; comma-separated or repeated).
+        #[arg(
+            long,
+            value_name = "ID|GROUP",
+            value_delimiter = ',',
+            requires = "conformance",
+            conflicts_with = "list"
+        )]
+        only: Vec<String>,
+        /// With --conformance: list the checks without running them.
+        #[arg(long, requires = "conformance")]
+        list: bool,
     },
 
     /// Delete session directories older than a cutoff.
@@ -171,6 +191,12 @@ pub enum Cmd {
         root: PathBuf,
     },
 
+    /// Internal conformance roles (hidden; issue #13).
+    #[command(name = "__conformance", hide = true)]
+    Conformance {
+        #[command(subcommand)]
+        role: ConformanceRole,
+    },
     /// Internal namespace helper, re-exec'd by `run` (hidden; real since #5).
     #[command(name = "__init", hide = true)]
     Init {
@@ -255,6 +281,20 @@ pub enum Cmd {
     },
 }
 
+/// Roles of the hidden `__conformance` subcommand (issue #13).
+#[derive(Debug, Subcommand)]
+pub enum ConformanceRole {
+    /// In-sandbox probe: run the ops, print one JSON line per op.
+    Probe {
+        /// An exact token for /proc scans; otherwise ignored.
+        #[arg(long, value_name = "TOKEN")]
+        tag: Option<String>,
+        /// The OPS document (JSON).
+        #[arg(value_name = "OPS")]
+        ops: String,
+    },
+}
+
 /// Parse `--min-mode` / the policy's network mode spelling for clap: exactly
 /// `transparent`, `explicit` or `none` (issue #11).
 pub fn parse_network_mode(s: &str) -> Result<NetworkMode, String> {
@@ -273,6 +313,23 @@ pub fn parse_network_mode(s: &str) -> Result<NetworkMode, String> {
 /// validate-only form, which must stay probe-free, so `--json` and
 /// `--test-break-rules` need a host report.
 pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
+    if let Cmd::Check {
+        conformance: true,
+        only,
+        ..
+    } = &cli.command
+    {
+        if !only.is_empty() {
+            if let Err(bad) = crate::conformance::catalog::select(only) {
+                return Err(Cli::command().error(
+                    clap::error::ErrorKind::InvalidValue,
+                    format!(
+                        "unknown conformance check or group `{bad}` (ids A01..H06, groups A..H or names such as allow-list; see --list)"
+                    ),
+                ));
+            }
+        }
+    }
     if let Cmd::Check {
         policy: Some(_),
         host: false,
@@ -325,6 +382,22 @@ pub fn run() -> ExitCode {
         err.exit();
     }
     match cli.command {
+        Cmd::Check {
+            conformance: true,
+            network,
+            only,
+            list,
+            json,
+            ..
+        } => crate::conformance::check(crate::conformance::ConformanceArgs {
+            network,
+            only,
+            list,
+            json,
+        }),
+        Cmd::Conformance {
+            role: ConformanceRole::Probe { tag, ops },
+        } => crate::conformance::probe::run_probe(tag.as_deref(), &ops),
         Cmd::Run {
             policy,
             session_dir,
@@ -742,10 +815,19 @@ mod tests {
                 host,
                 json,
                 test_break_rules,
+                conformance,
+                ..
             } => {
                 assert_eq!(
-                    (policy, print_schema, host, json, test_break_rules),
-                    (None, false, false, false, false)
+                    (
+                        policy,
+                        print_schema,
+                        host,
+                        json,
+                        test_break_rules,
+                        conformance
+                    ),
+                    (None, false, false, false, false, false)
                 );
             }
             other => panic!("expected Cmd::Check, got {other:?}"),
@@ -1246,5 +1328,128 @@ mod tests {
     #[test]
     fn clap_config_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    // ---- issue #13: `check --conformance` and the hidden `__conformance`.
+
+    fn kind_of(args: &[&str]) -> Option<ErrorKind> {
+        let mut full = vec!["sbx"];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).err().map(|e| e.kind())
+    }
+
+    #[test]
+    fn check_conformance_parses() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "check",
+            "--conformance",
+            "--only",
+            "a01,B",
+            "--network",
+        ])
+        .expect("parses");
+        match cli.command {
+            Cmd::Check {
+                conformance,
+                network,
+                only,
+                list,
+                ..
+            } => {
+                assert!(conformance && network && !list);
+                assert_eq!(only, ["a01", "B"]);
+            }
+            other => panic!("expected Cmd::Check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conformance_conflicts_with_policy_host_print_schema_and_break_rules() {
+        for extra in [
+            vec!["--policy", "p.json"],
+            vec!["--host"],
+            vec!["--print-schema"],
+            vec!["--test-break-rules"],
+        ] {
+            let mut args = vec!["check", "--conformance"];
+            args.extend(extra.iter().copied());
+            assert_eq!(
+                kind_of(&args),
+                Some(ErrorKind::ArgumentConflict),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn conformance_only_flags_need_conformance() {
+        assert_eq!(
+            kind_of(&["check", "--network"]),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+        assert_eq!(
+            kind_of(&["check", "--only", "A01"]),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+        assert_eq!(
+            kind_of(&["check", "--list"]),
+            Some(ErrorKind::MissingRequiredArgument)
+        );
+    }
+
+    #[test]
+    fn list_conflicts_with_only() {
+        assert_eq!(
+            kind_of(&["check", "--conformance", "--list", "--only", "A01"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test]
+    fn list_conflicts_with_network() {
+        assert_eq!(
+            kind_of(&["check", "--conformance", "--list", "--network"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test]
+    fn only_unknown_selector_is_a_validate_error() {
+        let cli = Cli::try_parse_from(["sbx", "check", "--conformance", "--only", "Z99"])
+            .expect("parses");
+        let err = validate(&cli).expect_err("Z99 is unknown");
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+        let ok = Cli::try_parse_from(["sbx", "check", "--conformance", "--only", "a01,B"])
+            .expect("parses");
+        assert!(validate(&ok).is_ok());
+    }
+
+    #[test]
+    fn hidden_conformance_subcommand_is_not_in_help() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(!help.contains("__conformance"), "{help}");
+        let check = Cli::command()
+            .find_subcommand_mut("check")
+            .expect("check")
+            .render_help()
+            .to_string();
+        assert!(check.contains("--conformance"));
+    }
+
+    #[test]
+    fn conformance_probe_parses_tag_and_ops() {
+        let cli = Cli::try_parse_from(["sbx", "__conformance", "probe", "--tag", "t", "{}"])
+            .expect("parses");
+        match cli.command {
+            Cmd::Conformance {
+                role: ConformanceRole::Probe { tag, ops },
+            } => {
+                assert_eq!(tag.as_deref(), Some("t"));
+                assert_eq!(ops, "{}");
+            }
+            other => panic!("expected the probe role, got {other:?}"),
+        }
     }
 }

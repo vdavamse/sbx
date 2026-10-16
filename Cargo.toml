@@ -98,3 +98,11 @@ harness = false
 [[test]]
 name = "sandbox_run"
 harness = false
+
+# Issue #13 conformance suite: drives the real `sbx check --conformance` and
+# the hidden probe; libtest's threads would make the bounded process-group waits
+# and the nested-namespace controls harder to reason about, the same rationale
+# as the suites above (hand-rolled, SKIP-with-message).
+[[test]]
+name = "conformance"
+harness = false
