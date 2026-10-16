@@ -356,16 +356,8 @@ fn s1() -> Scn {
                 "transparent",
                 "port 853 is not in the policy port list",
             ),
-            deny(
-                "127.0.0.1:50052",
-                "explicit-connect",
-                "denied dial to 127.0.0.1:443: loopback address (127.0.0.0/8, ::1/128)",
-            ),
-            deny(
-                &format!("{TRANS}:50053"),
-                "transparent",
-                "denied dial to 127.0.0.1:443: loopback address (127.0.0.0/8, ::1/128)",
-            ),
+            deny("127.0.0.1:50052", "explicit-connect", &d02_reason()),
+            deny(&format!("{TRANS}:50053"), "transparent", &d02_reason()),
         ],
     );
     s.ctl.insert("d01.own", Ok(()));
@@ -1140,4 +1132,57 @@ fn s13_walk_truncated_by_its_budget_is_a_warn() {
     w.data["truncated"] = json!(true);
     let r = evaluate("D05", &m);
     assert_eq!(r.status, Status::Warn, "{r:?}");
+}
+
+#[test]
+fn d02_accepts_the_ipv6_first_resolution_of_localhost() {
+    // Review: the CI runner's /etc/hosts lists `::1 localhost` first, so the
+    // guard's denial names [::1]:443. The check must accept it, pinned to the
+    // leg and the client.
+    let v6: std::net::SocketAddr = "[::1]:443".parse().unwrap();
+    let v4: std::net::SocketAddr = "127.0.0.1:443".parse().unwrap();
+    let reasons = super::loopback_reasons(&[v6, v4]);
+    assert_eq!(reasons.len(), 2);
+    assert!(
+        reasons[0].starts_with("denied dial to [::1]:443: loopback"),
+        "{reasons:?}"
+    );
+    let mut m = good();
+    let s1 = m.get_mut("S1").unwrap();
+    for r in s1.audit.iter_mut() {
+        let client = r["client"].as_str().unwrap_or("").to_owned();
+        if client == format!("{TRANS}:50053") || client == "127.0.0.1:50052" {
+            r["reason"] = json!(reasons[0].clone());
+        }
+    }
+    let r = super::d02_with(&m, &[v6, v4]);
+    assert!(r.is_ok(), "{r:?}");
+}
+
+#[test]
+fn d02_rejects_a_denial_for_some_other_address_and_lists_the_rows() {
+    let v6: std::net::SocketAddr = "[::1]:443".parse().unwrap();
+    let mut m = good();
+    let s1 = m.get_mut("S1").unwrap();
+    for r in s1.audit.iter_mut() {
+        if r["client"] == "127.0.0.1:50052" {
+            r["reason"] = json!("denied dial to 10.0.0.1:443: private-use address (RFC 1918)");
+        }
+    }
+    let err = super::d02_with(&m, &[v6]).expect_err("the explicit leg has no loopback row");
+    assert!(err.msg.contains("127.0.0.1:50052"), "{}", err.msg);
+    assert!(
+        err.ev.iter().any(|e| e.contains("10.0.0.1")),
+        "evidence must show the actual rows: {:?}",
+        err.ev
+    );
+}
+
+/// The loopback denial text for `localhost` as this host resolves it (first
+/// loopback address in resolver order), built by the product's builders.
+fn d02_reason() -> String {
+    super::loopback_reasons(&super::localhost_addrs())
+        .into_iter()
+        .next()
+        .expect("localhost resolves to a loopback address on the test host")
 }

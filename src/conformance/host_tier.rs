@@ -230,12 +230,41 @@ fn leg_no_bytes(s: &Scn, id: &str) -> Result<(), F> {
 /// A probe-leg assertion: the audit has a deny row for this leg's client,
 /// through `via`, with `reason`.
 fn leg_denied(s: &Scn, id: &str, via: &str, reason: &str) -> Result<(), F> {
+    leg_denied_any(s, id, via, &[reason.to_owned()])
+}
+
+/// The audit rows the probe leg `id` produced (matched by its client address),
+/// for failure diagnostics: a "no row" failure shows what the audit actually says.
+fn rows_for_client(s: &Scn, client: &str) -> Vec<String> {
+    s.audit
+        .iter()
+        .filter(|r| r["client"].as_str() == Some(client))
+        .map(|r| {
+            format!(
+                "audit: via={} event={} verdict={} reason={}",
+                r["via"].as_str().unwrap_or("-"),
+                r["event"].as_str().unwrap_or("-"),
+                r["verdict"].as_str().unwrap_or("-"),
+                r["reason"].as_str().unwrap_or("-")
+            )
+        })
+        .collect()
+}
+
+/// A leg's deny row must carry one of `reasons` (exact product texts), through
+/// `via`, for the leg's own client address. A failure lists the rows that the
+/// audit has for that client.
+fn leg_denied_any(s: &Scn, id: &str, via: &str, reasons: &[String]) -> Result<(), F> {
     let r = op(s, id)?;
     let l = local(r)?;
-    need(
-        denied(s, &l, via, reason),
-        format!("no audit deny row for {id} ({l}) via {via}: {reason}"),
-    )
+    if reasons.iter().any(|reason| denied(s, &l, via, reason)) {
+        return Ok(());
+    }
+    Err(F {
+        msg: format!("no audit deny row for {id} ({l}) via {via} with any of {reasons:?}"),
+        ev: rows_for_client(s, &l),
+        control: false,
+    })
 }
 
 /// A control: the named dns query was answered with one fake IP.
@@ -329,10 +358,14 @@ fn a01(s: &Scns) -> R {
             answers(aaaa)
         ),
     )?;
-    need(
-        dns_row(s1, &local(a)?, "answered", ""),
-        "no audit dns answered row for the A query's client",
-    )?;
+    let l = local(a)?;
+    if !dns_row(s1, &l, "answered", "") {
+        return Err(F {
+            msg: format!("no audit dns answered row for the A query's client ({l})"),
+            ev: rows_for_client(s1, &l),
+            control: false,
+        });
+    }
     Ok(format!("allowed name answered with {}", ips[0]))
 }
 
@@ -347,15 +380,19 @@ fn a07(s: &Scns) -> R {
             rcode(d)
         ),
     )?;
-    need(
-        dns_row(
-            s1,
-            &local(d)?,
-            "denied",
-            "other.conformance.test is not in the policy allow list",
-        ),
-        "no audit dns denied row for the other.conformance.test query",
-    )?;
+    let l = local(d)?;
+    if !dns_row(
+        s1,
+        &l,
+        "denied",
+        "other.conformance.test is not in the policy allow list",
+    ) {
+        return Err(F {
+            msg: format!("no audit dns denied row for the other.conformance.test query ({l})"),
+            ev: rows_for_client(s1, &l),
+            control: false,
+        });
+    }
     let c = op(s1, "a07.connect")?;
     need(
         status_code(c) == "403",
@@ -756,12 +793,45 @@ fn d01(s: &Scns) -> R {
     Ok("host 127.0.0.1 TCP services unreachable".to_owned())
 }
 
+/// The loopback denial texts for the given resolved addresses: one per address
+/// the egress guard refuses as loopback, built by the product's own builders
+/// (`proxy::Rejected::DialDenied` over `egress::guard`), so no text is retyped.
+pub fn loopback_reasons(addrs: &[std::net::SocketAddr]) -> Vec<String> {
+    use crate::egress::{Denied, guard};
+    use crate::proxy::Rejected;
+    addrs
+        .iter()
+        .filter_map(|a| match guard(a.ip()) {
+            Err(denied) if denied == Denied::Loopback => {
+                Some(Rejected::DialDenied { addr: *a, denied }.reason())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// What `localhost:443` resolves to on this host, in resolver order.
+pub fn localhost_addrs() -> Vec<std::net::SocketAddr> {
+    std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 443))
+        .map(|it| it.collect())
+        .unwrap_or_default()
+}
+
 fn d02(s: &Scns) -> R {
+    d02_with(s, &localhost_addrs())
+}
+
+/// D02 given the host's resolution of `localhost`. Any address that the guard
+/// refuses as loopback is an accepted denial text: the proxy resolves the name
+/// itself, and on a host whose /etc/hosts lists `::1 localhost` first the
+/// denial names `[::1]:443` (review: the CI runner's /etc/hosts is that shape).
+fn d02_with(s: &Scns, resolved: &[std::net::SocketAddr]) -> R {
     let s1 = sc(s, "S1")?;
-    let lo = std::net::ToSocketAddrs::to_socket_addrs(&("localhost", 443))
-        .map(|mut it| it.any(|a| a.ip().is_loopback()))
-        .unwrap_or(false);
-    ctl(lo, "localhost does not resolve to loopback on this host")?;
+    let reasons = loopback_reasons(resolved);
+    ctl(
+        !reasons.is_empty(),
+        "localhost does not resolve to a loopback address on this host",
+    )?;
     let c = op(s1, "d02.connect")?;
     need(
         status_code(c) == "400",
@@ -775,12 +845,7 @@ fn d02(s: &Scns) -> R {
             first_line(cl)
         ),
     )?;
-    leg_denied(
-        s1,
-        "d02.cnlo",
-        "explicit-connect",
-        "denied dial to 127.0.0.1:443: loopback",
-    )?;
+    leg_denied_any(s1, "d02.cnlo", "explicit-connect", &reasons)?;
     let dns = op(s1, "d02.dns")?;
     need(
         rcode(dns) == 0 && a_ips(dns).len() == 1 && in_fake_range(a_ips(dns)[0]),
@@ -790,12 +855,7 @@ fn d02(s: &Scns) -> R {
         ),
     )?;
     leg_no_bytes(s1, "d02.hello")?;
-    leg_denied(
-        s1,
-        "d02.hello",
-        "transparent",
-        "denied dial to 127.0.0.1:443: loopback",
-    )?;
+    leg_denied_any(s1, "d02.hello", "transparent", &reasons)?;
     Ok("host loopback unreachable through both proxies".to_owned())
 }
 
@@ -969,10 +1029,13 @@ fn d09(s: &Scns) -> R {
     )?;
     leg_no_bytes(b, "d.bfake")?;
     let bl = local(op(b, "d.bfake")?)?;
-    need(
-        denied(b, &bl, "transparent", &format!("unknown fake IP {ip}")),
-        format!("B audit has no `unknown fake IP {ip}` row for its leg"),
-    )?;
+    if !denied(b, &bl, "transparent", &format!("unknown fake IP {ip}")) {
+        return Err(F {
+            msg: format!("B audit has no `unknown fake IP {ip}` row for its leg ({bl})"),
+            ev: rows_for_client(b, &bl),
+            control: false,
+        });
+    }
     Ok("another session's fake IP is unknown here".to_owned())
 }
 
