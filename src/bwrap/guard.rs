@@ -31,7 +31,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::argv::{AliasCheck, Kind, PathCheck};
+use super::argv::{AliasCheck, BindSpec, Kind, PathCheck};
 
 /// A refusal reason (the `run` layer adds the `sbx run: ` prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +266,62 @@ pub fn verify_aliases(aliases: &[AliasCheck]) -> Result<(), GuardError> {
     Ok(())
 }
 
+/// Whether two binds' real sources nest the same way their lexical sources
+/// do: `lb` under `lc` lexically must mean `rb` under `rc` with the same suffix,
+/// and the reverse; equal lexical sources need equal real sources.
+fn nests_consistently(lb: &Path, lc: &Path, rb: &Path, rc: &Path) -> bool {
+    if lb == lc {
+        return rb == rc;
+    }
+    if let Ok(rel) = lb.strip_prefix(lc) {
+        return rb == rc.join(rel);
+    }
+    if let Ok(rel) = lc.strip_prefix(lb) {
+        return rc == rb.join(rel);
+    }
+    false
+}
+
+/// N19 (#40): refuses a policy or session bind whose real source overlaps
+/// another bind's real source, when the overlap is not the lexical nesting.
+/// Such a bind is mounted under a path the payload can rename or re-create
+/// through a symbolic link into a writable tree, so no pin or walk on its
+/// lexical chain can hold. Applies whenever either bind is writable: two
+/// read-only binds cannot be changed by the payload. Binds that do not exist
+/// are skipped.
+pub fn verify_binds(binds: &[BindSpec]) -> Result<(), GuardError> {
+    let mut cache = BTreeMap::new();
+    let real: Vec<Option<PathBuf>> = binds.iter().map(|b| realpath(&b.src, &mut cache)).collect();
+    for (i, b) in binds.iter().enumerate() {
+        let Some(rb) = &real[i] else { continue };
+        for (j, c) in binds.iter().enumerate().skip(i + 1) {
+            let Some(rc) = &real[j] else { continue };
+            if !(b.writable || c.writable) {
+                continue;
+            }
+            if !(rb.starts_with(rc) || rc.starts_with(rb)) {
+                continue;
+            }
+            if nests_consistently(&b.src, &c.src, rb, rc) {
+                continue;
+            }
+            let kind = |w: bool| if w { "writable" } else { "read-only" };
+            return Err(GuardError(format!(
+                "the {} bind {:?} (mounted at {:?}) resolves on the host to {:?}, which overlaps the {} bind {:?} (mounted at {:?}, resolving to {:?}) through a host symbolic link; refusing to start because the payload could change the shared tree and swap the source between runs; bind the real path instead",
+                kind(b.writable),
+                b.src,
+                b.dest,
+                rb,
+                kind(c.writable),
+                c.src,
+                c.dest,
+                rc
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The check-time hard-link scan budget: directory entries visited under one
 /// deny path before the scan stops and says so (Q6; a run never scans).
 pub const LINK_SCAN_BUDGET: usize = 10_000;
@@ -454,6 +510,47 @@ mod tests {
         assert!(verify(&check(&d, &["ä", "ß"], Kind::Dir, false)).is_ok());
         std::os::unix::fs::symlink(d.join("ä"), d.join("ü")).unwrap();
         assert!(verify(&check(&d, &["ü", "ß"], Kind::Dir, false)).is_err());
+    }
+
+    fn bind(src: PathBuf, writable: bool) -> BindSpec {
+        BindSpec {
+            dest: src.display().to_string(),
+            src,
+            writable,
+        }
+    }
+
+    #[test]
+    fn host_alias_overlap_is_refused_ro_and_rw() {
+        // N19: `lnk -> real`; ro lnk/p next to rw real (or rw lnk/p) is refused.
+        let d = tmp("n19");
+        std::fs::create_dir_all(d.join("real/p")).unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("lnk")).unwrap();
+        let rw_real = bind(d.join("real"), true);
+        let ro_alias = bind(d.join("lnk/p"), false);
+        let err = verify_binds(&[ro_alias.clone(), rw_real.clone()]).unwrap_err();
+        assert!(
+            err.to_string().contains("through a host symbolic link"),
+            "{err}"
+        );
+        let rw_alias = bind(d.join("lnk/p"), true);
+        assert!(verify_binds(&[rw_real.clone(), rw_alias]).is_err());
+        // Two read-only binds cannot be changed by the payload: allowed.
+        let ro_real = bind(d.join("real"), false);
+        assert!(verify_binds(&[ro_alias, ro_real]).is_ok());
+        // No alias at all: lexical nesting is fine.
+        assert!(verify_binds(&[rw_real, bind(d.join("real/p"), false)]).is_ok());
+    }
+
+    #[test]
+    fn consistent_alias_nesting_is_allowed() {
+        // `lnk2 -> real2`: lnk2 rw and lnk2/sub ro nest the same way their
+        // real paths do, so the overlap is the lexical one.
+        let d = tmp("n19ok");
+        std::fs::create_dir_all(d.join("real2/sub")).unwrap();
+        std::os::unix::fs::symlink(d.join("real2"), d.join("lnk2")).unwrap();
+        let binds = [bind(d.join("lnk2"), true), bind(d.join("lnk2/sub"), false)];
+        assert!(verify_binds(&binds).is_ok());
     }
 
     #[test]

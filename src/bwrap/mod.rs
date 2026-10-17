@@ -150,7 +150,7 @@ pub mod version;
 // (below) is the public face together with `etc` (layout/materialization)
 // and `version` (discovery), mirroring `init`'s two-tier visibility.
 mod argv;
-pub use argv::{AliasCheck, Kind, PathCheck, Plan, path_plan};
+pub use argv::{AliasCheck, BindSpec, Kind, PathCheck, Plan, path_plan};
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -246,6 +246,11 @@ impl Launch {
     /// The pre-launch host-symlink alias checks (#40, Q5).
     pub fn alias_checks(&self) -> &[AliasCheck] {
         &self.plan.aliases
+    }
+
+    /// The policy and session binds for the host-alias overlap check (N19).
+    pub fn bind_specs(&self) -> &[BindSpec] {
+        &self.plan.binds
     }
 
     /// A [`std::process::Command`] for this launch, with the `env_clear()`

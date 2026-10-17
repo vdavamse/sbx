@@ -777,6 +777,9 @@ fn mount_chains_item(plan: &crate::bwrap::Plan, seams: &Seams<'_>) -> PolicyItem
             reasons.push(err.to_string());
         }
     }
+    if let Err(err) = crate::bwrap::guard::verify_binds(&plan.binds) {
+        reasons.push(err.to_string());
+    }
     reasons.dedup();
     let n = plan.checks.len();
     if reasons.is_empty() {

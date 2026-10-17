@@ -163,6 +163,11 @@ fn scenarios() -> Vec<Scenario> {
             run: policy_host_planted_under_ro_fails,
         },
         Scenario {
+            name: "policy-host-n19-host-alias-fails",
+            gate: Gate::Bwrap,
+            run: policy_host_n19_host_alias_fails,
+        },
+        Scenario {
             name: "policy-host-pin-cost-warn",
             gate: Gate::Bwrap,
             run: policy_host_pin_cost_warn,
@@ -807,6 +812,45 @@ fn policy_host_pin_cost_warn() -> Result<(), String> {
     }
     if cost["detail"].as_str().unwrap_or("").is_empty() {
         return Err("pin-cost has no detail".into());
+    }
+    Ok(())
+}
+
+/// N19 (PR #47): a host-symlink alias of a writable bind's real tree fails
+/// `mount-chains`, the same refusal `run` makes before spawning.
+fn policy_host_n19_host_alias_fails() -> Result<(), String> {
+    let dir = scratch("n19-check");
+    let real = dir.join("real");
+    fs::create_dir_all(real.join("p")).map_err(|e| e.to_string())?;
+    let lnk = dir.join("lnk");
+    std::os::unix::fs::symlink(&real, &lnk).map_err(|e| e.to_string())?;
+    let policy = dir.join("policy.json");
+    let body = format!(
+        r#"{{"version":1,"filesystem":{{"ro":["/usr",{:?}],"rw":[{:?}],"deny":[]}},"network":{{"mode":"transparent","allow":[],"ports":[]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"5s","output_bytes":1000}}}}"#,
+        lnk.join("p").display().to_string(),
+        real.display().to_string(),
+    );
+    fs::write(&policy, body).map_err(|e| e.to_string())?;
+    let out = run(Command::new(SBX)
+        .args(["check", "--policy"])
+        .arg(&policy)
+        .args(["--host", "--json"])
+        .env("SBX_BWRAP", bwrap_path()?))?;
+    let (stdout, _) = text(&out);
+    let _ = fs::remove_dir_all(&dir);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| format!("json: {e}: {stdout}"))?;
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "fail"
+        || !chains["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("symbolic link")
+    {
+        return Err(format!("mount-chains: {chains}"));
+    }
+    if report["policy"]["runnable"] != false {
+        return Err("a host-alias overlap must not be runnable".into());
     }
     Ok(())
 }

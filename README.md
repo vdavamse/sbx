@@ -379,8 +379,11 @@ path bwrap will resolve under a policy bind (read-only or writable, #39, #40):
 
 The check runs once, before the spawn. It does not stop a writer that is not a sandbox of
 this exact policy (another policy, an older sbx, a host process, a host bind-mount alias
-of the tree) from changing the tree during the window; on bwrap before 0.12.0 that window
-is a known residual (R26 in `docs/threat-model.md`). Hard links made on the host to a denied
+of the tree) from changing the tree during the window. On bwrap before 0.12.0 that window
+is a known residual (R26 in `docs/threat-model.md`, Medium when policies share a writable
+tree): **do not share an `rw` tree between policies on bwrap before 0.12.0**, and do not let
+host tools write into an `rw` tree while sandboxes run. A bind whose host source reaches
+another bind\'s tree through a symbolic link is refused (N19): bind the real path. Hard links made on the host to a denied
 file, and host bind-mount aliases, are not detected at run time; `sbx check` warns about
 hard links (`deny-links`).
 

@@ -574,7 +574,7 @@ fn execute(
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
-    // S8a (#39/#40): before anything is spawned, verify every path bwrap
+    // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
     // will resolve under a writable bind (fd-relative, no symlinks, nothing
     // missing), and that no deny mask is reachable through a host symlink.
     // Refusal is 125 with nothing created.
@@ -582,6 +582,8 @@ fn execute(
         crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
     }
     crate::bwrap::guard::verify_aliases(launch.alias_checks())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    crate::bwrap::guard::verify_binds(launch.bind_specs())
         .map_err(|err| RunError::new(err.to_string()))?;
 
     // S9–S11: the control socketpair and the single spawn window.

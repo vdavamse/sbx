@@ -998,6 +998,16 @@ fn scenarios() -> Vec<Scenario> {
             run: nested_deny_under_deny_runs,
         },
         Scenario {
+            name: "prelaunch-n19-host-alias-ro-125",
+            gate: Bwrap,
+            run: prelaunch_n19_host_alias_ro_125,
+        },
+        Scenario {
+            name: "prelaunch-n19-host-alias-rw-125",
+            gate: Bwrap,
+            run: prelaunch_n19_host_alias_rw_125,
+        },
+        Scenario {
             name: "prelaunch-alias-of-deny-125",
             gate: Bwrap,
             run: prelaunch_alias_of_deny_125,
@@ -4103,6 +4113,42 @@ fn nested_deny_under_deny_runs() -> Result<(), String> {
     }
     if t.proj.join("a/b").exists() {
         return Err("the nested deny's parent was created on the host".into());
+    }
+    Ok(())
+}
+
+/// N19 (PR #47): `lnk -> real`, a read-only bind of `lnk/p` next to the
+/// writable `real`. The bind is nested only through the host alias, so no pin
+/// or walk on its lexical chain could hold. Refused before the spawn, with
+/// nothing changed on the host.
+fn n19_tree(tag: &str) -> Result<(Tree, PathBuf, PathBuf), String> {
+    let t = Tree::new(tag);
+    let real = t.dir.join("real");
+    fs::create_dir_all(real.join("p")).map_err(|e| e.to_string())?;
+    let lnk = t.dir.join("lnk");
+    symlink(&real, &lnk).map_err(|e| e.to_string())?;
+    Ok((t, real, lnk))
+}
+
+fn prelaunch_n19_host_alias_ro_125() -> Result<(), String> {
+    let (t, real, lnk) = n19_tree("n19-ro")?;
+    let mut pol = t.policy(&[&real], &[], &[]);
+    pol.ro_extra = vec![lnk.join("p").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "through a host symbolic link")?;
+    if !real.join("p").is_dir() {
+        return Err("the host directory changed".into());
+    }
+    Ok(())
+}
+
+fn prelaunch_n19_host_alias_rw_125() -> Result<(), String> {
+    let (t, real, lnk) = n19_tree("n19-rw")?;
+    let pol = t.policy(&[&real, &lnk.join("p")], &[], &[]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "through a host symbolic link")?;
+    if real.join("p").join("WRITTEN").exists() {
+        return Err("a payload file reached the host".into());
     }
     Ok(())
 }

@@ -371,6 +371,16 @@ pub struct AliasCheck {
     pub dest: String,
 }
 
+/// One mount source for the overlap check: a policy or session bind, with its
+/// lexical source (the host path it names), its dest, and whether it is
+/// writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindSpec {
+    pub src: PathBuf,
+    pub dest: String,
+    pub writable: bool,
+}
+
 /// Everything `guard` verifies before spawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -378,6 +388,8 @@ pub struct Plan {
     pub aliases: Vec<AliasCheck>,
     /// The number of pins added (intermediate directories), for the cost note.
     pub pins: usize,
+    /// The policy and session binds, for the host-alias overlap check (N19).
+    pub binds: Vec<BindSpec>,
 }
 
 /// The pinned mount list and the pre-launch plan for a filesystem policy.
@@ -391,12 +403,22 @@ fn plan_mounts(
     let pins = pinned.len() - mounts.len();
     let checks = path_checks(&mounts, &pinned, denies);
     let aliases = alias_checks(&mounts, denies);
+    let binds = mounts
+        .iter()
+        .filter(|m| m.prio != PRIO_INFRA)
+        .map(|m| BindSpec {
+            src: m.src.clone(),
+            dest: m.dest.clone(),
+            writable: m.op == BindOp::Rw,
+        })
+        .collect();
     (
         pinned,
         Plan {
             checks,
             aliases,
             pins,
+            binds,
         },
     )
 }
