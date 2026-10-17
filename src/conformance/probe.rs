@@ -16,7 +16,7 @@ use std::os::linux::net::SocketAddrExt;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{SocketAddr as UnixSockAddr, UnixListener, UnixStream};
 use std::process::{Command, ExitCode, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::{Name, RData, RecordType};
@@ -254,6 +254,31 @@ pub enum Op {
         #[serde(default = "server_53")]
         server: String,
     },
+    /// Repeated connect + ClientHello + one-line read (PR2, issue #13). Every
+    /// attempt appends `<mono_ms> ok:<line>` or `<mono_ms> err:<kind>` to `log`
+    /// (`mono_ms` is CLOCK_MONOTONIC, see [`mono_ms`]).
+    /// With `hold_first`, the first successful socket stays open for the loop;
+    /// `hold_token` (when set) is sent on it as one TLS application-data record,
+    /// so the fixture can pin its record to exactly this connection.
+    TcpLoop {
+        id: String,
+        target: Target,
+        sni: String,
+        #[serde(default = "tl_interval")]
+        interval_ms: u64,
+        duration_ms: u64,
+        #[serde(default = "t300")]
+        attempt_timeout_ms: u64,
+        log: String,
+        #[serde(default)]
+        hold_first: bool,
+        #[serde(default)]
+        hold_token: String,
+    },
+}
+
+fn tl_interval() -> u64 {
+    100
 }
 
 impl Op {
@@ -284,7 +309,8 @@ impl Op {
             | Op::ListenTcp { id, .. }
             | Op::ListenAbstract { id, .. }
             | Op::Write { id, .. }
-            | Op::DnsFlood { id, .. } => id,
+            | Op::DnsFlood { id, .. }
+            | Op::TcpLoop { id, .. } => id,
         }
     }
 
@@ -316,6 +342,7 @@ impl Op {
             Op::ListenAbstract { .. } => "listen_abstract",
             Op::Write { .. } => "write",
             Op::DnsFlood { .. } => "dns_flood",
+            Op::TcpLoop { .. } => "tcp_loop",
         }
     }
 }
@@ -407,12 +434,113 @@ struct State {
     stdin_eof: bool,
 }
 
+/// Monotonic milliseconds (`CLOCK_MONOTONIC`). Every timing comparison in the
+/// lab uses this clock: it is shared by every process on the host (bwrap runs
+/// no time namespace) and it never jumps backwards, unlike `CLOCK_REALTIME`.
+pub fn mono_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into the valid, local timespec only.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 /// Unix time in milliseconds.
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// First source port of the per-run allocator. The range sits below Linux's
+/// default ephemeral range (32768-60999), so the kernel never picks one of
+/// these for an unbound socket.
+const SRC_PORT_BASE: u16 = 20_000;
+const SRC_PORT_LAST: u16 = 32_000;
+static NEXT_SRC_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(SRC_PORT_BASE);
+
+/// Connect with a source port unique to this probe process (issue #13 review).
+///
+/// Why: in transparent mode every leg of one `sbx run` reaches the proxy from
+/// the same sandbox address to the same listener. When two legs reuse an
+/// ephemeral port, conntrack rewrites the later leg's source port on the reply
+/// tuple collision, so the audit row carries a port the probe never had. A
+/// unique port per leg means no two reply tuples can collide.
+///
+/// IPv4 only (the audit rows the checks pin are IPv4); other families use a
+/// plain connect. A bind collision (`EADDRINUSE`) retries with the next port.
+pub(crate) fn dial(addr: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
+    let SocketAddr::V4(v4) = addr else {
+        return TcpStream::connect_timeout(&addr, timeout);
+    };
+    let mut last = io::Error::new(io::ErrorKind::AddrInUse, "no free source port");
+    for _ in 0..16 {
+        let port = NEXT_SRC_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if port > SRC_PORT_LAST {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the probe ran out of source ports",
+            ));
+        }
+        match dial_from(v4, port, timeout) {
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => last = e,
+            other => return other,
+        }
+    }
+    Err(last)
+}
+
+fn dial_from(dst: std::net::SocketAddrV4, port: u16, timeout: Duration) -> io::Result<TcpStream> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    // SAFETY: plain socket(2)/bind(2)/setsockopt(2)/connect(2) on a fresh fd we
+    // own (wrapped in OwnedFd straight away); every sockaddr is a local,
+    // fully-initialised struct whose size is passed along.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owned = OwnedFd::from_raw_fd(fd);
+        let mut src: libc::sockaddr_in = std::mem::zeroed();
+        src.sin_family = libc::AF_INET as libc::sa_family_t;
+        src.sin_port = port.to_be();
+        if libc::bind(
+            fd,
+            &src as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let tv = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        let mut dst_sa: libc::sockaddr_in = std::mem::zeroed();
+        dst_sa.sin_family = libc::AF_INET as libc::sa_family_t;
+        dst_sa.sin_port = dst.port().to_be();
+        dst_sa.sin_addr.s_addr = u32::from_ne_bytes(dst.ip().octets());
+        if libc::connect(
+            fd,
+            &dst_sa as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(TcpStream::from(owned))
+    }
 }
 
 fn errno_of(e: &io::Error) -> Option<i32> {
@@ -933,6 +1061,30 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
             Ok(()) => ok_result(&id, name, true, None, "written".into(), json!({})),
             Err(e) => ok_result(&id, name, false, errno_of(&e), e.to_string(), json!({})),
         },
+        Op::TcpLoop {
+            target,
+            sni,
+            interval_ms,
+            duration_ms,
+            attempt_timeout_ms,
+            log,
+            hold_first,
+            hold_token,
+            ..
+        } => run_tcp_loop(
+            &id,
+            &LoopSpec {
+                target,
+                sni,
+                interval_ms: *interval_ms,
+                duration_ms: *duration_ms,
+                attempt_timeout_ms: *attempt_timeout_ms,
+                log,
+                hold_first: *hold_first,
+                hold_token: hold_token.clone(),
+            },
+            st,
+        ),
         Op::DnsFlood {
             prefix,
             count,
@@ -1015,7 +1167,7 @@ fn dns_query_at(
         let addr: SocketAddr = server.parse().map_err(|e: std::net::AddrParseError| {
             io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
         })?;
-        let mut s = TcpStream::connect_timeout(&addr, timeout)?;
+        let mut s = dial(addr, timeout)?;
         let local = s.local_addr().map(|a| a.to_string()).unwrap_or_default();
         s.set_read_timeout(Some(timeout))?;
         s.set_write_timeout(Some(timeout))?;
@@ -1051,14 +1203,135 @@ pub fn resolve_a(name: &str) -> io::Result<Ipv4Addr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no A record for {name}")))
 }
 
-fn run_tcp(
-    id: &str,
-    target: &Target,
-    steps: &[Step],
-    connect_timeout_ms: u64,
-    st: &State,
-) -> OpResult {
-    let resolved: Result<SocketAddr, io::Error> = match target {
+/// The fields of one `tcp_loop` op (keeps `run_tcp_loop` within clippy's arity).
+struct LoopSpec<'a> {
+    target: &'a Target,
+    sni: &'a str,
+    interval_ms: u64,
+    duration_ms: u64,
+    attempt_timeout_ms: u64,
+    log: &'a str,
+    hold_first: bool,
+    hold_token: String,
+}
+
+/// `tcp_loop`: attempts until the duration ends (see [`Op::TcpLoop`]).
+fn run_tcp_loop(id: &str, spec: &LoopSpec<'_>, st: &State) -> OpResult {
+    let fail = |e: io::Error, what: String| {
+        ok_result(
+            id,
+            "tcp_loop",
+            false,
+            errno_of(&e),
+            what,
+            json!({"attempts": 0, "ok": 0}),
+        )
+    };
+    let addr = match resolve_target(spec.target, st) {
+        Ok(a) => a,
+        Err(e) => {
+            let what = e.to_string();
+            return fail(e, what);
+        }
+    };
+    let mut log = match fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(spec.log)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            let what = format!("open {}: {e}", spec.log);
+            return fail(e, what);
+        }
+    };
+    let hello = crate::proxy::hello::build_client_hello(Some(spec.sni), &[]);
+    let timeout = Duration::from_millis(spec.attempt_timeout_ms);
+    let end = Instant::now() + Duration::from_millis(spec.duration_ms);
+    let (mut attempts, mut oks) = (0u64, 0u64);
+    let mut held: Option<TcpStream> = None;
+    while Instant::now() < end {
+        attempts += 1;
+        let keep = spec.hold_first && held.is_none();
+        let (status, kept) = loop_attempt(addr, &hello, timeout, keep, spec.hold_token.as_bytes());
+        if status.starts_with("ok:") {
+            oks += 1;
+        }
+        if held.is_none() {
+            held = kept;
+        }
+        let _ = log.write_all(format!("{} {status}\n", mono_ms()).as_bytes());
+        std::thread::sleep(Duration::from_millis(spec.interval_ms));
+    }
+    ok_result(
+        id,
+        "tcp_loop",
+        attempts > 0,
+        None,
+        format!("{attempts} attempts, {oks} ok"),
+        json!({"attempts": attempts, "ok": oks}),
+    )
+}
+
+/// One `tcp_loop` attempt: connect, ClientHello, one line back. The socket is
+/// returned only when `keep` is set and the attempt succeeded.
+fn loop_attempt(
+    addr: SocketAddr,
+    hello: &[u8],
+    timeout: Duration,
+    keep: bool,
+    hold_token: &[u8],
+) -> (String, Option<TcpStream>) {
+    let mut s = match dial(addr, timeout) {
+        Ok(s) => s,
+        Err(e) => return (format!("err:{:?}", e.kind()), None),
+    };
+    let _ = s.set_read_timeout(Some(timeout));
+    let _ = s.set_write_timeout(Some(timeout));
+    if let Err(e) = s.write_all(hello) {
+        return (format!("err:{:?}", e.kind()), None);
+    }
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match s.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                line.push(byte[0]);
+                if line.len() > 512 {
+                    break;
+                }
+            }
+            Err(e) => return (format!("err:{:?}", e.kind()), None),
+        }
+    }
+    if line.is_empty() {
+        return ("err:eof".to_owned(), None);
+    }
+    let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+    if keep && !hold_token.is_empty() {
+        // The held connection's own marker: a valid TLS application-data record.
+        if s.write_all(&tls_app_record(hold_token)).is_err() {
+            return ("err:hold-token".to_owned(), None);
+        }
+    }
+    let kept = keep.then_some(s);
+    (format!("ok:{text}"), kept)
+}
+
+/// One TLS application-data record (version 3.3) carrying `payload`.
+fn tls_app_record(payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x17, 0x03, 0x03];
+    v.extend((payload.len() as u16).to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// The address a `tcp` or `tcp_loop` target names (a name is resolved through
+/// the sandbox's own fake DNS, as the `dns` op does).
+fn resolve_target(target: &Target, st: &State) -> io::Result<SocketAddr> {
+    match target {
         Target::Addr { addr } => {
             let text = subst_listen(addr, st.listen_port);
             text.parse::<SocketAddr>()
@@ -1078,7 +1351,17 @@ fn run_tcp(
                     .parse::<SocketAddr>()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))
             }),
-    };
+    }
+}
+
+fn run_tcp(
+    id: &str,
+    target: &Target,
+    steps: &[Step],
+    connect_timeout_ms: u64,
+    st: &State,
+) -> OpResult {
+    let resolved = resolve_target(target, st);
     let addr = match resolved {
         Ok(a) => a,
         Err(e) => {
@@ -1092,10 +1375,7 @@ fn run_tcp(
             );
         }
     };
-    let mut stream = match TcpStream::connect_timeout(
-        &addr,
-        Duration::from_millis(connect_timeout_ms),
-    ) {
+    let mut stream = match dial(addr, Duration::from_millis(connect_timeout_ms)) {
         Ok(s) => s,
         Err(e) => {
             let detail = format!("connect {addr}: {e}");
@@ -1155,7 +1435,30 @@ fn run_tcp(
 }
 
 /// The pinned 41-byte GREASE ECH payload (a fixed, non-secret blob).
-pub const ECH_GREASE: [u8; 41] = [0x5c; 41];
+/// The GREASE-ECH extension body the B08 check offers: a well-formed outer
+/// ECHClientHello (type 0, HKDF-SHA256/AES-128-GCM, config id 1, a 32-byte
+/// enc, a 16-byte payload). The PR1 filler (41 bytes of 0x5c) is not a
+/// well-formed ECH body: the proxy's parser then rejects the whole hello as
+/// malformed, and B08 would no longer test the "offers ECH" rule.
+pub const ECH_GREASE: [u8; 58] = {
+    let mut b = [0x22u8; 58];
+    b[0] = 0x00; // ECHClientHelloType: outer
+    b[1] = 0x00;
+    b[2] = 0x01; // kdf: HKDF-SHA256
+    b[3] = 0x00;
+    b[4] = 0x01; // aead: AES-128-GCM
+    b[5] = 0x01; // config_id
+    b[6] = 0x00;
+    b[7] = 0x20; // enc length 32
+    let mut k = 8;
+    while k < 40 {
+        b[k] = 0x11;
+        k += 1;
+    }
+    b[40] = 0x00;
+    b[41] = 0x10; // payload length 16
+    b
+};
 
 fn lossy(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
@@ -1684,6 +1987,11 @@ impl Op {
             Op::Sleep { ms, .. } => *ms,
             Op::WaitStdin { timeout_ms, .. } => *timeout_ms,
             Op::DnsFlood { count, .. } => u64::from(*count) * 50,
+            Op::TcpLoop {
+                duration_ms,
+                attempt_timeout_ms,
+                ..
+            } => duration_ms + attempt_timeout_ms + 2000,
             _ => 0,
         }
     }

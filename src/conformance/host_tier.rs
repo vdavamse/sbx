@@ -33,7 +33,7 @@ pub struct F {
     pub control: bool,
 }
 
-fn fail(msg: impl Into<String>) -> F {
+pub(super) fn fail(msg: impl Into<String>) -> F {
     F {
         msg: msg.into(),
         ev: Vec::new(),
@@ -41,7 +41,7 @@ fn fail(msg: impl Into<String>) -> F {
     }
 }
 
-fn ctl_fail(msg: impl Into<String>) -> F {
+pub(super) fn ctl_fail(msg: impl Into<String>) -> F {
     F {
         msg: format!("control failed: {}", msg.into()),
         ev: Vec::new(),
@@ -49,16 +49,16 @@ fn ctl_fail(msg: impl Into<String>) -> F {
     }
 }
 
-fn need(cond: bool, msg: impl Into<String>) -> Result<(), F> {
+pub(super) fn need(cond: bool, msg: impl Into<String>) -> Result<(), F> {
     if cond { Ok(()) } else { Err(fail(msg)) }
 }
 
-fn ctl(cond: bool, msg: impl Into<String>) -> Result<(), F> {
+pub(super) fn ctl(cond: bool, msg: impl Into<String>) -> Result<(), F> {
     if cond { Ok(()) } else { Err(ctl_fail(msg)) }
 }
 
 /// Turn any evidence-read failure inside a control into a control failure.
-fn as_ctl(f: F) -> F {
+pub(super) fn as_ctl(f: F) -> F {
     ctl_fail(f.msg)
 }
 
@@ -93,7 +93,7 @@ pub fn implemented(id: &str) -> bool {
     !scenarios_of(id).is_empty()
 }
 
-fn sc<'a>(s: &'a Scns, name: &str) -> Result<&'a Scn, F> {
+pub(super) fn sc<'a>(s: &'a Scns, name: &str) -> Result<&'a Scn, F> {
     let scn = s
         .get(name)
         .ok_or_else(|| fail(format!("scenario {name} was not run")))?;
@@ -103,7 +103,7 @@ fn sc<'a>(s: &'a Scns, name: &str) -> Result<&'a Scn, F> {
     Ok(scn)
 }
 
-fn op<'a>(s: &'a Scn, id: &str) -> Result<&'a OpResult, F> {
+pub(super) fn op<'a>(s: &'a Scn, id: &str) -> Result<&'a OpResult, F> {
     if let Some(e) = &s.probe_err {
         return Err(fail(format!("probe did not run in {}: {e}", s.name)));
     }
@@ -116,7 +116,7 @@ fn op<'a>(s: &'a Scn, id: &str) -> Result<&'a OpResult, F> {
 }
 
 /// The leg's local address (the audit `client` for that connection).
-fn local(r: &OpResult) -> Result<String, F> {
+pub(super) fn local(r: &OpResult) -> Result<String, F> {
     r.data["local_addr"]
         .as_str()
         .filter(|x| !x.is_empty())
@@ -124,26 +124,26 @@ fn local(r: &OpResult) -> Result<String, F> {
         .ok_or_else(|| fail(format!("probe result {} reports no local_addr", r.id)))
 }
 
-fn rcode(r: &OpResult) -> i64 {
+pub(super) fn rcode(r: &OpResult) -> i64 {
     r.data["rcode"].as_i64().unwrap_or(-1)
 }
 
-fn a_ips(r: &OpResult) -> Vec<Ipv4Addr> {
+pub(super) fn a_ips(r: &OpResult) -> Vec<Ipv4Addr> {
     r.data["a"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str()?.parse().ok()).collect())
         .unwrap_or_default()
 }
 
-fn answers(r: &OpResult) -> i64 {
+pub(super) fn answers(r: &OpResult) -> i64 {
     r.data["answers"].as_i64().unwrap_or(-1)
 }
 
-fn errno(r: &OpResult) -> Option<i32> {
+pub(super) fn errno(r: &OpResult) -> Option<i32> {
     r.errno
 }
 
-fn errno_name(e: Option<i32>) -> String {
+pub(super) fn errno_name(e: Option<i32>) -> String {
     match e {
         None => "no errno".to_owned(),
         Some(n) => format!(
@@ -157,23 +157,23 @@ fn errno_name(e: Option<i32>) -> String {
     }
 }
 
-fn in_fake_range(ip: Ipv4Addr) -> bool {
+pub(super) fn in_fake_range(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 198 && (o[1] & 0xFE) == 18
 }
 
-fn connected(r: &OpResult) -> bool {
+pub(super) fn connected(r: &OpResult) -> bool {
     r.data["connected"].as_bool().unwrap_or(false)
 }
 
-fn read_len(r: &OpResult) -> u64 {
+pub(super) fn read_len(r: &OpResult) -> u64 {
     r.data["reads"]
         .as_array()
         .map(|a| a.iter().map(|x| x["len"].as_u64().unwrap_or(0)).sum())
         .unwrap_or(0)
 }
 
-fn reads_text(r: &OpResult) -> String {
+pub(super) fn reads_text(r: &OpResult) -> String {
     r.data["reads"]
         .as_array()
         .map(|a| {
@@ -185,7 +185,7 @@ fn reads_text(r: &OpResult) -> String {
         .unwrap_or_default()
 }
 
-fn status_code(r: &OpResult) -> String {
+pub(super) fn status_code(r: &OpResult) -> String {
     reads_text(r)
         .split_whitespace()
         .nth(1)
@@ -193,12 +193,12 @@ fn status_code(r: &OpResult) -> String {
         .to_owned()
 }
 
-fn first_line(r: &OpResult) -> String {
+pub(super) fn first_line(r: &OpResult) -> String {
     reads_text(r).lines().next().unwrap_or("").to_owned()
 }
 
 /// Whether the audit has a deny row for this leg: client, via and reason.
-fn denied(s: &Scn, client: &str, via: &str, reason: &str) -> bool {
+pub(super) fn denied(s: &Scn, client: &str, via: &str, reason: &str) -> bool {
     s.audit.iter().any(|r| {
         r["event"] == "deny"
             && r["client"].as_str() == Some(client)
@@ -209,7 +209,7 @@ fn denied(s: &Scn, client: &str, via: &str, reason: &str) -> bool {
 
 /// Whether the audit has a dns row for this client with the given verdict,
 /// and reason text containing `reason` (empty = any).
-fn dns_row(s: &Scn, client: &str, verdict: &str, reason: &str) -> bool {
+pub(super) fn dns_row(s: &Scn, client: &str, verdict: &str, reason: &str) -> bool {
     s.audit.iter().any(|r| {
         r["event"] == "dns"
             && r["client"].as_str() == Some(client)
@@ -219,7 +219,7 @@ fn dns_row(s: &Scn, client: &str, verdict: &str, reason: &str) -> bool {
 }
 
 /// A probe-leg assertion: no bytes came back on the leg.
-fn leg_no_bytes(s: &Scn, id: &str) -> Result<(), F> {
+pub(super) fn leg_no_bytes(s: &Scn, id: &str) -> Result<(), F> {
     let r = op(s, id)?;
     need(
         read_len(r) == 0,
@@ -229,13 +229,13 @@ fn leg_no_bytes(s: &Scn, id: &str) -> Result<(), F> {
 
 /// A probe-leg assertion: the audit has a deny row for this leg's client,
 /// through `via`, with `reason`.
-fn leg_denied(s: &Scn, id: &str, via: &str, reason: &str) -> Result<(), F> {
+pub(super) fn leg_denied(s: &Scn, id: &str, via: &str, reason: &str) -> Result<(), F> {
     leg_denied_any(s, id, via, &[reason.to_owned()])
 }
 
 /// The audit rows the probe leg `id` produced (matched by its client address),
 /// for failure diagnostics: a "no row" failure shows what the audit actually says.
-fn rows_for_client(s: &Scn, client: &str) -> Vec<String> {
+pub(super) fn rows_for_client(s: &Scn, client: &str) -> Vec<String> {
     s.audit
         .iter()
         .filter(|r| r["client"].as_str() == Some(client))
@@ -254,7 +254,7 @@ fn rows_for_client(s: &Scn, client: &str) -> Vec<String> {
 /// A leg's deny row must carry one of `reasons` (exact product texts), through
 /// `via`, for the leg's own client address. A failure lists the rows that the
 /// audit has for that client.
-fn leg_denied_any(s: &Scn, id: &str, via: &str, reasons: &[String]) -> Result<(), F> {
+pub(super) fn leg_denied_any(s: &Scn, id: &str, via: &str, reasons: &[String]) -> Result<(), F> {
     let r = op(s, id)?;
     let l = local(r)?;
     if reasons.iter().any(|reason| denied(s, &l, via, reason)) {
@@ -268,7 +268,7 @@ fn leg_denied_any(s: &Scn, id: &str, via: &str, reasons: &[String]) -> Result<()
 }
 
 /// A control: the named dns query was answered with one fake IP.
-fn answered_ctl(s: &Scn, id: &str) -> Result<(), F> {
+pub(super) fn answered_ctl(s: &Scn, id: &str) -> Result<(), F> {
     let r = op(s, id).map_err(as_ctl)?;
     ctl(
         rcode(r) == 0 && a_ips(r).len() == 1 && in_fake_range(a_ips(r)[0]),
@@ -277,13 +277,13 @@ fn answered_ctl(s: &Scn, id: &str) -> Result<(), F> {
 }
 
 /// A control on a probe result: the op must have succeeded.
-fn ctl_ok(s: &Scn, id: &str) -> Result<(), F> {
+pub(super) fn ctl_ok(s: &Scn, id: &str) -> Result<(), F> {
     let r = op(s, id).map_err(as_ctl)?;
     ctl(r.ok, format!("{id} did not succeed"))
 }
 
 /// A scenario control recorded by the runner (`ctl` map): must be `Ok`.
-fn ctl_key(s: &Scn, key: &str) -> Result<(), F> {
+pub(super) fn ctl_key(s: &Scn, key: &str) -> Result<(), F> {
     match s.ctl.get(key) {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(ctl_fail(format!("{key}: {e}"))),
@@ -292,7 +292,7 @@ fn ctl_key(s: &Scn, key: &str) -> Result<(), F> {
 }
 
 /// A scenario lifecycle assertion (`ctl` map entry): must be `Ok`.
-fn assert_key(s: &Scn, key: &str) -> Result<(), F> {
+pub(super) fn assert_key(s: &Scn, key: &str) -> Result<(), F> {
     match s.ctl.get(key) {
         Some(Ok(())) => Ok(()),
         Some(Err(e)) => Err(fail(format!("{key}: {e}"))),
@@ -300,13 +300,13 @@ fn assert_key(s: &Scn, key: &str) -> Result<(), F> {
     }
 }
 
-fn fin_of(s: &Scn) -> Result<&super::spawn::Finished, F> {
+pub(super) fn fin_of(s: &Scn) -> Result<&super::spawn::Finished, F> {
     s.fin
         .as_ref()
         .ok_or_else(|| fail(format!("sbx run did not run in {}", s.name)))
 }
 
-fn rc_is(s: &Scn, want: i32) -> Result<(), F> {
+pub(super) fn rc_is(s: &Scn, want: i32) -> Result<(), F> {
     let fin = fin_of(s)?;
     need(
         fin.rc == Some(want),
@@ -314,7 +314,7 @@ fn rc_is(s: &Scn, want: i32) -> Result<(), F> {
     )
 }
 
-fn socket_fails(s: &Scn, id: &str, expect: Option<i32>) -> Result<(), F> {
+pub(super) fn socket_fails(s: &Scn, id: &str, expect: Option<i32>) -> Result<(), F> {
     let r = op(s, id)?;
     need(
         !r.data["created"].as_bool().unwrap_or(true),
@@ -338,7 +338,7 @@ fn socket_fails(s: &Scn, id: &str, expect: Option<i32>) -> Result<(), F> {
 
 // ---------------------------------------------------------------- group A
 
-fn a01(s: &Scns) -> R {
+pub(super) fn a01(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let a = op(s1, "a01.a")?;
     let ips = a_ips(a);
@@ -369,7 +369,7 @@ fn a01(s: &Scns) -> R {
     Ok(format!("allowed name answered with {}", ips[0]))
 }
 
-fn a07(s: &Scns) -> R {
+pub(super) fn a07(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     answered_ctl(s1, "a01.a")?;
     let d = op(s1, "a07.dns")?;
@@ -410,7 +410,7 @@ fn a07(s: &Scns) -> R {
     Ok("non-allowed name: NXDOMAIN and CONNECT 403".to_owned())
 }
 
-fn a08(s: &Scns) -> R {
+pub(super) fn a08(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     answered_ctl(s1, "a08.pypi")?;
     let d = op(s1, "a08.dns")?;
@@ -436,7 +436,7 @@ fn a08(s: &Scns) -> R {
     Ok("notpypi.org denied on DNS, CONNECT and SNI".to_owned())
 }
 
-fn a09(s: &Scns) -> R {
+pub(super) fn a09(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     answered_ctl(s1, "a08.pypi")?;
     for (dns_id, connect_id, hello_id, name) in [
@@ -469,7 +469,7 @@ fn a09(s: &Scns) -> R {
     Ok("pypi.org.evil.com and the IDN lookalike denied on DNS, CONNECT and SNI".to_owned())
 }
 
-fn a10(s: &Scns) -> R {
+pub(super) fn a10(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let c = op(s1, "a10.connect")?;
     need(
@@ -491,7 +491,7 @@ fn a10(s: &Scns) -> R {
     Ok("IP literals denied on CONNECT, absolute-form and transparent paths".to_owned())
 }
 
-fn a11(s: &Scns) -> R {
+pub(super) fn a11(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     answered_ctl(s1, "a01.a")?;
     leg_no_bytes(s1, "a11.hello")?;
@@ -518,7 +518,7 @@ fn a11(s: &Scns) -> R {
     Ok("non-allowed port on an allowed name denied on both legs".to_owned())
 }
 
-fn b10(s: &Scns) -> R {
+pub(super) fn b10(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let a10 = op(s1, "a10.abs").map_err(as_ctl)?;
     ctl(
@@ -566,7 +566,7 @@ fn b10(s: &Scns) -> R {
 
 // ---------------------------------------------------------------- group C
 
-fn c01(s: &Scns) -> R {
+pub(super) fn c01(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let l = op(s1, "c01.links")?;
     let names: Vec<String> = l.data["names"]
@@ -584,7 +584,7 @@ fn c01(s: &Scns) -> R {
     Ok("only lo in the sandbox network namespace".to_owned())
 }
 
-fn c03(s: &Scns) -> R {
+pub(super) fn c03(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     leg_no_bytes(s1, "c03.tcp")?;
     leg_denied(
@@ -596,7 +596,7 @@ fn c03(s: &Scns) -> R {
     Ok("direct TCP to port 22 denied".to_owned())
 }
 
-fn c04(s: &Scns) -> R {
+pub(super) fn c04(s: &Scns) -> R {
     let s2 = sc(s, "S2").map_err(as_ctl)?;
     let c = op(s2, "c04.connect").map_err(as_ctl)?;
     ctl(
@@ -623,7 +623,7 @@ fn c04(s: &Scns) -> R {
     Ok("explicit fallback has no route; mode none answers NXDOMAIN".to_owned())
 }
 
-fn c05(s: &Scns) -> R {
+pub(super) fn c05(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     for id in ["c05.u123", "c05.u443"] {
         let u = op(s1, id)?;
@@ -638,7 +638,7 @@ fn c05(s: &Scns) -> R {
     Ok("UDP to ports other than 53 fails with EPERM".to_owned())
 }
 
-fn c06(s: &Scns) -> R {
+pub(super) fn c06(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let a8 = op(s1, "c06.a8")?;
     need(
@@ -667,7 +667,7 @@ fn c06(s: &Scns) -> R {
     Ok("UDP/53 to any resolver answered by the fake DNS".to_owned())
 }
 
-fn c08(s: &Scns) -> R {
+pub(super) fn c08(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     leg_no_bytes(s1, "c08.dns_tcp")?;
     leg_denied(
@@ -686,7 +686,7 @@ fn c08(s: &Scns) -> R {
     Ok("DNS over TCP/53 and DoT/853 denied".to_owned())
 }
 
-fn c09(s: &Scns) -> R {
+pub(super) fn c09(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     for id in ["c09.v6", "c09.v6lo"] {
         let r = op(s1, id)?;
@@ -708,27 +708,27 @@ fn c09(s: &Scns) -> R {
     Ok("IPv6 unusable inside the sandbox".to_owned())
 }
 
-fn c10(s: &Scns) -> R {
+pub(super) fn c10(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     socket_fails(s1, "c10.raw4", None)?;
     socket_fails(s1, "c10.raw6", None)?;
     Ok("raw IP sockets cannot be created".to_owned())
 }
 
-fn c11(s: &Scns) -> R {
+pub(super) fn c11(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     socket_fails(s1, "c11.packet", Some(libc::EAFNOSUPPORT))?;
     socket_fails(s1, "c11.xdp", Some(libc::EAFNOSUPPORT))?;
     Ok("AF_PACKET and AF_XDP sockets cannot be created".to_owned())
 }
 
-fn c12(s: &Scns) -> R {
+pub(super) fn c12(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     socket_fails(s1, "c12.icmp", None)?;
     Ok("ICMP ping sockets cannot be created".to_owned())
 }
 
-fn c13(s: &Scns) -> R {
+pub(super) fn c13(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     let d = op(s1, "c13.dump").map_err(as_ctl)?;
     let names: Vec<String> = d.data["names"]
@@ -753,7 +753,7 @@ fn c13(s: &Scns) -> R {
     Ok("netlink link, address and route changes fail with EPERM".to_owned())
 }
 
-fn c14(s: &Scns) -> R {
+pub(super) fn c14(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     socket_fails(s1, "c14.vs_stream", Some(libc::EAFNOSUPPORT))?;
     socket_fails(s1, "c14.vs_seq", Some(libc::EAFNOSUPPORT))?;
@@ -762,7 +762,7 @@ fn c14(s: &Scns) -> R {
 
 // ---------------------------------------------------------------- group D
 
-fn d01(s: &Scns) -> R {
+pub(super) fn d01(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     ctl_key(s1, "d01.own").map_err(|f| ctl_fail(f.msg))?;
     let before = s1
@@ -817,7 +817,7 @@ pub fn localhost_addrs() -> Vec<std::net::SocketAddr> {
         .unwrap_or_default()
 }
 
-fn d02(s: &Scns) -> R {
+pub(super) fn d02(s: &Scns) -> R {
     d02_with(s, &localhost_addrs())
 }
 
@@ -825,7 +825,7 @@ fn d02(s: &Scns) -> R {
 /// refuses as loopback is an accepted denial text: the proxy resolves the name
 /// itself, and on a host whose /etc/hosts lists `::1 localhost` first the
 /// denial names `[::1]:443` (review: the CI runner's /etc/hosts is that shape).
-fn d02_with(s: &Scns, resolved: &[std::net::SocketAddr]) -> R {
+pub(super) fn d02_with(s: &Scns, resolved: &[std::net::SocketAddr]) -> R {
     let s1 = sc(s, "S1")?;
     let reasons = loopback_reasons(resolved);
     ctl(
@@ -859,7 +859,7 @@ fn d02_with(s: &Scns, resolved: &[std::net::SocketAddr]) -> R {
     Ok("host loopback unreachable through both proxies".to_owned())
 }
 
-fn d03(s: &Scns) -> R {
+pub(super) fn d03(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     ctl_key(s1, "d03.own").map_err(|f| ctl_fail(f.msg))?;
     let r = op(s1, "d03.abs")?;
@@ -873,7 +873,7 @@ fn d03(s: &Scns) -> R {
     Ok("host abstract unix sockets unreachable".to_owned())
 }
 
-fn d04(s: &Scns) -> R {
+pub(super) fn d04(s: &Scns) -> R {
     let s1 = sc(s, "S1")?;
     ctl_key(s1, "d04.own").map_err(|f| ctl_fail(f.msg))?;
     let r = op(s1, "d04.path")?;
@@ -888,7 +888,7 @@ fn d04(s: &Scns) -> R {
 }
 
 /// D05: `Ok(pass)`, `Ok(Err(warn))` for visible or non-exhaustive, `Err` for a broken control.
-fn d05(s: &Scns) -> Result<R, F> {
+pub(super) fn d05(s: &Scns) -> Result<R, F> {
     let s13 = sc(s, "S13")?;
     let w = op(s13, "d05.walk").map_err(as_ctl)?;
     let visited = w.data["visited"].as_u64().unwrap_or(0);
@@ -930,7 +930,7 @@ fn d05(s: &Scns) -> Result<R, F> {
     ))
 }
 
-fn d06(s: &Scns) -> R {
+pub(super) fn d06(s: &Scns) -> R {
     let a = sc(s, "S11a")?;
     let b = sc(s, "S11b")?;
     let listen = op(a, "d.listen").map_err(as_ctl)?;
@@ -962,7 +962,7 @@ fn d06(s: &Scns) -> R {
     Ok("concurrent session cannot reach another's 127.0.0.1 listener".to_owned())
 }
 
-fn d07(s: &Scns) -> R {
+pub(super) fn d07(s: &Scns) -> R {
     let a = sc(s, "S11a")?;
     let b = sc(s, "S11b")?;
     ctl_ok(a, "d.abs").map_err(|f| ctl_fail(f.msg))?;
@@ -978,7 +978,7 @@ fn d07(s: &Scns) -> R {
     Ok("concurrent session cannot reach another's abstract socket".to_owned())
 }
 
-fn d08(s: &Scns) -> R {
+pub(super) fn d08(s: &Scns) -> R {
     let a = sc(s, "S11a")?;
     let b = sc(s, "S11b")?;
     ctl_ok(a, "d.write").map_err(|f| ctl_fail(f.msg))?;
@@ -1009,7 +1009,7 @@ fn d08(s: &Scns) -> R {
     Ok("concurrent session cannot see another's files".to_owned())
 }
 
-fn d09(s: &Scns) -> R {
+pub(super) fn d09(s: &Scns) -> R {
     let a = sc(s, "S11a")?;
     let b = sc(s, "S11b")?;
     let ip = a
@@ -1041,7 +1041,7 @@ fn d09(s: &Scns) -> R {
 
 // ---------------------------------------------------------------- F, G
 
-fn f01(s: &Scns) -> R {
+pub(super) fn f01(s: &Scns) -> R {
     let s10 = sc(s, "S10")?;
     ctl_key(s10, "f01.seen")?;
     let fin = fin_of(s10)?;
@@ -1056,7 +1056,7 @@ fn f01(s: &Scns) -> R {
     Ok("SIGKILL removes the whole sandbox process tree".to_owned())
 }
 
-fn f05(s: &Scns) -> R {
+pub(super) fn f05(s: &Scns) -> R {
     let s4 = sc(s, "S4")?;
     let fin = fin_of(s4)?;
     need(
@@ -1082,7 +1082,7 @@ fn f05(s: &Scns) -> R {
     Ok("nftables load failure under a transparent policy: rc 125".to_owned())
 }
 
-fn f06(s: &Scns) -> R {
+pub(super) fn f06(s: &Scns) -> R {
     let s5 = sc(s, "S5")?;
     ctl(
         s5.nums.get("audit_bytes").copied().unwrap_or(0) >= 15000,
@@ -1104,7 +1104,7 @@ fn f06(s: &Scns) -> R {
     Ok("audit write failure ends the run with rc 125".to_owned())
 }
 
-fn g01(s: &Scns) -> R {
+pub(super) fn g01(s: &Scns) -> R {
     let s6 = sc(s, "S6")?;
     ctl_key(s6, "g01.seen")?;
     rc_is(s6, 0)?;
@@ -1112,7 +1112,7 @@ fn g01(s: &Scns) -> R {
     Ok("natural exit kills setsid'd background processes".to_owned())
 }
 
-fn g02(s: &Scns) -> R {
+pub(super) fn g02(s: &Scns) -> R {
     let s7 = sc(s, "S7")?;
     ctl_key(s7, "g02.seen")?;
     rc_is(s7, 124)?;
@@ -1125,7 +1125,7 @@ fn g02(s: &Scns) -> R {
     Ok("timeout (rc 124) kills background processes".to_owned())
 }
 
-fn g03(s: &Scns) -> R {
+pub(super) fn g03(s: &Scns) -> R {
     for (name, rc) in [("S8a", 143), ("S8b", 130), ("S8c", 129)] {
         let scn = sc(s, name)?;
         ctl_key(scn, "g03.seen")?;
@@ -1135,7 +1135,7 @@ fn g03(s: &Scns) -> R {
     Ok("SIGTERM, SIGINT and SIGHUP kill background processes".to_owned())
 }
 
-fn g04(s: &Scns) -> R {
+pub(super) fn g04(s: &Scns) -> R {
     let s9 = sc(s, "S9")?;
     ctl_key(s9, "g04.seen")?;
     rc_is(s9, 0)?;
@@ -1151,7 +1151,7 @@ fn g04(s: &Scns) -> R {
     Ok("a background process holding stdout does not keep sbx alive".to_owned())
 }
 
-fn g05(s: &Scns) -> R {
+pub(super) fn g05(s: &Scns) -> R {
     let s6 = sc(s, "S6")?;
     let s6b = sc(s, "S6b")?;
     // The netns inode is a control: without it the membership check has no subject.
@@ -1166,7 +1166,7 @@ fn g05(s: &Scns) -> R {
 
 // ---------------------------------------------------------------- H, D10
 
-fn env_matched(s12: &Scn) -> Result<(&OpResult, Vec<i64>), F> {
+pub(super) fn env_matched(s12: &Scn) -> Result<(&OpResult, Vec<i64>), F> {
     let r = op(s12, "h01.env")?;
     let matched: Vec<i64> = r.data["matched"]
         .as_array()
@@ -1175,7 +1175,7 @@ fn env_matched(s12: &Scn) -> Result<(&OpResult, Vec<i64>), F> {
     Ok((r, matched))
 }
 
-fn h01(s: &Scns) -> R {
+pub(super) fn h01(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let (_, matched) = env_matched(s12).map_err(as_ctl)?;
     ctl(
@@ -1189,7 +1189,7 @@ fn h01(s: &Scns) -> R {
     Ok("the caller's environment is not visible to the payload".to_owned())
 }
 
-fn h02(s: &Scns) -> R {
+pub(super) fn h02(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let me = op(s12, "h02.self").map_err(as_ctl)?;
     ctl(
@@ -1207,7 +1207,7 @@ fn h02(s: &Scns) -> R {
     Ok("/proc/1/environ is empty".to_owned())
 }
 
-fn h03(s: &Scns) -> R {
+pub(super) fn h03(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let r = op(s12, "h03.scan").map_err(as_ctl)?;
     ctl(
@@ -1222,7 +1222,7 @@ fn h03(s: &Scns) -> R {
     Ok("no /proc/*/environ contains the caller's secret".to_owned())
 }
 
-fn h04(s: &Scns) -> R {
+pub(super) fn h04(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let (r, _) = env_matched(s12)?;
     let names: Vec<String> = r.data["names"]
@@ -1268,7 +1268,7 @@ fn h04(s: &Scns) -> R {
     Ok("the payload environment is the policy plus infra".to_owned())
 }
 
-fn h05(s: &Scns) -> R {
+pub(super) fn h05(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     ctl_key(s12, "fd-cloexec-cleared")?;
     let r = op(s12, "h05.fds")?;
@@ -1283,7 +1283,7 @@ fn h05(s: &Scns) -> R {
     Ok("inherited non-CLOEXEC descriptors do not reach the payload".to_owned())
 }
 
-fn h06(s: &Scns) -> R {
+pub(super) fn h06(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let home = s12.notes.get("host_home").cloned().unwrap_or_default();
     let host = std::fs::symlink_metadata(&home).is_ok();
@@ -1310,7 +1310,7 @@ fn h06(s: &Scns) -> R {
     Ok("the caller's HOME and processes are invisible".to_owned())
 }
 
-fn d10(s: &Scns) -> R {
+pub(super) fn d10(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let p = op(s12, "d10.procs")?;
     let pids = p.data["pids"].as_array().map(Vec::len).unwrap_or(99);
@@ -1370,11 +1370,11 @@ pub fn evaluate(id: &str, s: &Scns) -> CheckResult {
     }
 }
 
-fn fail_result(id: &str, f: F) -> CheckResult {
+pub(super) fn fail_result(id: &str, f: F) -> CheckResult {
     CheckResult::new(id, Status::Fail, f.msg).with_evidence(f.ev)
 }
 
-fn eval_plain(id: &str, s: &Scns) -> R {
+pub(super) fn eval_plain(id: &str, s: &Scns) -> R {
     match id {
         "A01" => a01(s),
         "A07" => a07(s),

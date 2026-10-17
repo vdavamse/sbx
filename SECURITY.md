@@ -43,7 +43,9 @@ Please **do not** file a public issue for a security report.
 - **In scope — conformance (issue #13):** a `FAIL` from `sbx check --conformance`
   on a host where `sbx check` reports the needed network mode is a sandbox
   defect; attach the JSON report and the kept artifacts directory. `warn` rows
-  (D05) describe policy hazards, not defects.
+  (D05) describe policy hazards, not defects. The lab tier's upstreams are all
+  local (`9.9.9.9` inside the lab's own network namespace); the network tier
+  (`--network`) is the only part that reaches the real internet.
 - **Out of scope — the product working as designed:** untrusted code
   misbehaving *within* the sandbox: writing inside its writable mounts, or
   talking to allow-listed destinations. Note: v1 enforces a wall-clock

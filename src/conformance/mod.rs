@@ -6,8 +6,8 @@
 //!    and nothing needed by a selected check was missing (see [`report`]).
 //! 2. Tiers: host scenarios (`sbx run` with a built-in policy and a probe
 //!    payload), the init tier (F03, the production `sbx __init`), the lab tier
-//!    (PR2; its checks report not-implemented here) and the network tier
-//!    (opt-in, PR2).
+//!    (`lab.rs`: a nested user/net/mount child with local fixtures, see
+//!    `lab_tier.rs`) and the opt-in network tier (`network_tier.rs`).
 //! 3. Scenarios: one `sbx run` feeds several checks; evaluators are pure
 //!    functions over the recorded evidence. Scenarios run lazily, so `--only`
 //!    runs only what is needed.
@@ -36,8 +36,12 @@
 //! out of v1 (built-in policies only).
 
 pub mod catalog;
+pub mod fixtures;
 pub mod host_tier;
 pub mod init_tier;
+pub mod lab;
+pub mod lab_tier;
+pub mod network_tier;
 pub mod policies;
 pub mod probe;
 pub mod report;
@@ -54,7 +58,7 @@ use catalog::{CATALOG, Need, Tier};
 use report::{CheckResult, LabStatus, Report, SkipKind};
 use scenarios::{Env, Scn};
 
-use crate::host::{EffectiveMode, classify, facts};
+use crate::host::{EffectiveMode, Status, classify, facts};
 
 /// The offline-tier budget (§12).
 pub const OFFLINE_BUDGET: Duration = Duration::from_secs(120);
@@ -130,6 +134,7 @@ pub fn check(args: ConformanceArgs) -> ExitCode {
     };
     let deadline = started + OFFLINE_BUDGET;
     let mut memo: BTreeMap<&'static str, Scn> = BTreeMap::new();
+    let mut lab = LabMemo::new(lab_selection(selected.as_ref()));
     let mut results: Vec<CheckResult> = Vec::new();
     for d in CATALOG.iter() {
         let selected_here = selected.as_ref().is_none_or(|s| s.contains(d.id));
@@ -141,17 +146,14 @@ pub fn check(args: ConformanceArgs) -> ExitCode {
             ));
             continue;
         }
-        let r = run_one(d, mode, args.network, &env, &mut memo, deadline);
+        let r = run_one(d, mode, args.network, &env, &mut memo, &mut lab, deadline);
         results.push(r);
     }
     let report = Report {
         sbx_version: env!("CARGO_PKG_VERSION"),
         kernel,
         network_mode: mode,
-        lab: LabStatus {
-            status: "not-run",
-            detail: Some("the lab tier lands in the second #13 PR".to_owned()),
-        },
+        lab: lab.status(),
         network_requested: args.network,
         only: if args.only.is_empty() {
             None
@@ -244,32 +246,31 @@ fn run_one(
     network: bool,
     env: &Env,
     memo: &mut BTreeMap<&'static str, Scn>,
+    lab: &mut LabMemo,
     deadline: Instant,
 ) -> CheckResult {
     match d.tier {
         Tier::Network => {
-            if !network {
-                return CheckResult::skip(
-                    d.id,
-                    SkipKind::OptIn,
-                    "network tier not requested (add --network)",
-                );
-            }
-            CheckResult::skip(
-                d.id,
-                SkipKind::NotImplemented,
-                "the network tier lands in the second #13 PR",
-            )
+            // The network tier's 300 s allowance starts at its first check.
+            let net_deadline = *lab
+                .net_deadline
+                .get_or_insert_with(|| Instant::now() + network_tier::NETWORK_BOUND);
+            network_tier::run(d.id, env, mode, network, net_deadline)
         }
         Tier::Lab => {
             if let Some(why) = host_cannot(mode, d) {
                 return CheckResult::skip(d.id, SkipKind::Capability, why);
             }
-            CheckResult::skip(
-                d.id,
-                SkipKind::NotImplemented,
-                "the lab tier lands in the second #13 PR",
-            )
+            if Instant::now() > deadline {
+                return CheckResult::skip(
+                    d.id,
+                    SkipKind::Capability,
+                    "suite budget (120 s) exhausted",
+                );
+            }
+            // The lab child gets the lesser of its own 60 s and the suite budget left.
+            let left = deadline.saturating_duration_since(Instant::now());
+            lab.result(d.id, env, left.min(lab::LAB_BOUND))
         }
         Tier::Init => {
             if let Some(why) = host_cannot(mode, d) {
@@ -359,4 +360,92 @@ fn hosts_has_foreign_entries() -> bool {
                 !(ip.starts_with("127.") || ip == "::1") && parts.next().is_some()
             })
     })
+}
+
+/// The L checks the lab child must run: the selected ones (empty = none).
+fn lab_selection(selected: Option<&std::collections::BTreeSet<&'static str>>) -> Vec<String> {
+    CATALOG
+        .iter()
+        .filter(|d| d.tier == Tier::Lab)
+        .filter(|d| selected.is_none_or(|s| s.contains(d.id)))
+        .map(|d| d.id.to_owned())
+        .collect()
+}
+
+/// The lab child runs at most once per suite; its outcome serves every L check.
+struct LabMemo {
+    only: Vec<String>,
+    outcome: Option<lab::LabOutcome>,
+    /// The network tier's deadline, set when its first check runs.
+    net_deadline: Option<Instant>,
+}
+
+impl LabMemo {
+    fn new(only: Vec<String>) -> Self {
+        LabMemo {
+            only,
+            outcome: None,
+            net_deadline: None,
+        }
+    }
+
+    fn result(&mut self, id: &str, env: &Env, budget: Duration) -> CheckResult {
+        if self.only.is_empty() {
+            return CheckResult::skip(id, SkipKind::NotSelected, report::NOT_SELECTED);
+        }
+        let outcome = self
+            .outcome
+            .get_or_insert_with(|| lab::spawn_tier(env, &self.only, &env.nonce, budget));
+        match outcome {
+            lab::LabOutcome::Ran(results) => results
+                .iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    CheckResult::new(
+                        id,
+                        Status::Fail,
+                        "lab tier produced no result for this check",
+                    )
+                }),
+            lab::LabOutcome::Unavailable { stage, reason } => CheckResult::skip(
+                id,
+                SkipKind::Capability,
+                format!("lab unavailable: {stage}: {reason}"),
+            ),
+            lab::LabOutcome::TimedOut => {
+                CheckResult::new(id, Status::Fail, "lab tier exceeded its 60 s bound")
+            }
+            lab::LabOutcome::Broken(why) => CheckResult::new(
+                id,
+                Status::Fail,
+                format!("lab tier output unreadable: {why}"),
+            ),
+        }
+    }
+
+    fn status(&self) -> LabStatus {
+        match &self.outcome {
+            None => LabStatus {
+                status: "not-run",
+                detail: None,
+            },
+            Some(lab::LabOutcome::Ran(_)) => LabStatus {
+                status: "ok",
+                detail: None,
+            },
+            Some(lab::LabOutcome::Unavailable { stage, reason }) => LabStatus {
+                status: "unavailable",
+                detail: Some(format!("{stage}: {reason}")),
+            },
+            Some(lab::LabOutcome::TimedOut) => LabStatus {
+                status: "unavailable",
+                detail: Some("the lab tier exceeded its 60 s bound".to_owned()),
+            },
+            Some(lab::LabOutcome::Broken(why)) => LabStatus {
+                status: "unavailable",
+                detail: Some(why.clone()),
+            },
+        }
+    }
 }

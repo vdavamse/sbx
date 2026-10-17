@@ -55,7 +55,7 @@ pub struct Scn {
 }
 
 impl Scn {
-    fn named(name: &'static str) -> Self {
+    pub(super) fn named(name: &'static str) -> Self {
         Scn {
             name,
             ..Default::default()
@@ -148,7 +148,7 @@ fn expect_token_line(id: &str) -> impl Fn(&str) -> bool + '_ {
 }
 
 /// The probe-ops JSON for one `sbx run` payload.
-fn payload(ops: Vec<Op>, exe_text: &str) -> Vec<String> {
+pub(super) fn payload(ops: Vec<Op>, exe_text: &str) -> Vec<String> {
     let json = serde_json::to_string(&Ops::new(ops)).unwrap_or_else(|_| "{}".to_owned());
     vec![
         exe_text.to_owned(),
@@ -168,7 +168,7 @@ pub fn read_audit(path: &Path) -> Vec<Value> {
 }
 
 /// Derive the Scn fields from a finished run.
-fn finish_scn(scn: &mut Scn, fin: Finished, audit: &Path, allow_no_done: bool) {
+pub(super) fn finish_scn(scn: &mut Scn, fin: Finished, audit: &Path, allow_no_done: bool) {
     scn.ms = fin.elapsed_ms;
     scn.audit = read_audit(audit);
     match parse_probe(&fin.stdout, allow_no_done) {
@@ -220,7 +220,7 @@ pub fn classify_skip(fin: &Finished) -> Option<String> {
 
 /// Options for one plain scenario.
 #[derive(Default)]
-struct Opts {
+pub(super) struct Opts {
     break_rules: bool,
     timeout: Option<&'static str>,
     fsize: Option<u64>,
@@ -229,6 +229,9 @@ struct Opts {
     allow_no_done: bool,
     /// Ignore a `Finished` refusal (F05 expects it): do not classify.
     expect_refusal: bool,
+    /// Observe the token's survivors after the run's exit and before the
+    /// cleanup kill, recording the lifecycle assertion under this key.
+    observe_gone: Option<(&'static str, String)>,
 }
 
 /// One scenario from start to finish: policy, session, ops, and the bounded wait.
@@ -237,7 +240,13 @@ pub fn budget_bound(ops: &[Op]) -> Duration {
     Duration::from_millis(ops.iter().map(Op::budget_ms).sum::<u64>()) + Duration::from_secs(10)
 }
 
-fn plain(env: &Env, name: &'static str, which: Builtin, ops: Vec<Op>, opts: Opts) -> Scn {
+pub(super) fn plain(
+    env: &Env,
+    name: &'static str,
+    which: Builtin,
+    ops: Vec<Op>,
+    opts: Opts,
+) -> Scn {
     let bound = budget_bound(&ops);
     let budget = ops.iter().map(Op::budget_ms).sum::<u64>();
     let mut scn = Scn::named(name);
@@ -268,7 +277,11 @@ fn plain(env: &Env, name: &'static str, which: Builtin, ops: Vec<Op>, opts: Opts
         Ok(r) => r,
         Err(e) => return Scn::unavailable(name, format!("cannot spawn sbx run: {e}")),
     };
-    let fin = r.wait_bounded(started + bound);
+    r.wait_exit(started + bound);
+    if let Some((key, token)) = &opts.observe_gone {
+        gone_check(&mut scn, key, token, None);
+    }
+    let fin = r.finish();
     if opts.expect_refusal {
         let mut s = scn.clone();
         s.ms = fin.elapsed_ms;
@@ -845,6 +858,8 @@ fn s5(env: &Env) -> Scn {
         Opts {
             fsize: Some(16384),
             allow_no_done: true,
+            // Survivors: rc 125 kills the group; the bg must be gone within 5 s.
+            observe_gone: Some(("f06.gone", token.clone())),
             ..Default::default()
         },
     );
@@ -854,8 +869,6 @@ fn s5(env: &Env) -> Scn {
         .unwrap_or(0);
     s.nums.insert("audit_bytes", audit_len);
     s.notes.insert("token", token.clone());
-    // Survivors: rc 125 kills the group; the bg must be gone within 5 s.
-    gone_check(&mut s, "f06.gone", &token, None);
     s
 }
 
@@ -911,9 +924,10 @@ fn s6(env: &Env) -> Vec<Scn> {
     }
     s6.notes.insert("token", token.clone());
     r.close_stdin();
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s6, fin, &audit, false);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s6, "g01.gone", &token, netns.as_deref());
+    let fin = r.finish();
+    finish_scn(&mut s6, fin, &audit, false);
     out.push(s6);
     // S6b: the same session dir is reusable.
     let mut s6b = Scn::named("S6b");
@@ -979,9 +993,10 @@ fn s7(env: &Env) -> Scn {
             Err("token not alive before the timeout".to_owned())
         },
     );
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "g02.gone", &token, None);
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }
@@ -1039,9 +1054,10 @@ fn s8(env: &Env) -> Vec<Scn> {
             },
         );
         r.signal(sig);
-        let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-        finish_scn(&mut s, fin, &audit, true);
+        r.wait_exit(Instant::now() + Duration::from_secs(10));
         gone_check(&mut s, "g03.gone", &token, None);
+        let fin = r.finish();
+        finish_scn(&mut s, fin, &audit, true);
         s.nums.insert("signal", sig as u64);
         s.notes.insert("token", token);
         out.push(s);
@@ -1093,9 +1109,10 @@ fn s9(env: &Env) -> Scn {
             Err("token not alive when the background process was spawned".to_owned())
         },
     );
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "g04.gone", &token, None);
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }
@@ -1150,9 +1167,10 @@ fn s10(env: &Env) -> Scn {
             .insert("netns_members_before", pids_in_netns(n).len() as u64);
     }
     r.sigkill();
-    let fin = r.wait_bounded(Instant::now() + Duration::from_secs(10));
-    finish_scn(&mut s, fin, &audit, true);
+    r.wait_exit(Instant::now() + Duration::from_secs(10));
     gone_check(&mut s, "f01.gone", &token, netns.as_deref());
+    let fin = r.finish();
+    finish_scn(&mut s, fin, &audit, true);
     s.notes.insert("token", token);
     s
 }

@@ -283,6 +283,19 @@ pub(crate) fn hello_fills_record(raw: &[u8]) -> Option<bool> {
     hs_len.checked_add(4).map(|end| end == rec_len)
 }
 
+/// The SNI of one complete ClientHello record, parsed by rustls (the parser
+/// the test fixtures use). `Some(Some(name))`: SNI present; `Some(None)`:
+/// parsed, no SNI; `None`: not a parseable complete hello. Used by the
+/// conformance lab's TLS fixture (issue #13); not on the production path.
+pub(crate) fn sni_of(raw: &[u8]) -> Option<Option<String>> {
+    let mut acceptor = rustls::server::Acceptor::default();
+    acceptor.read_tls(&mut std::io::Cursor::new(raw)).ok()?;
+    match acceptor.accept() {
+        Ok(Some(accepted)) => Some(accepted.client_hello().server_name().map(str::to_owned)),
+        _ => None,
+    }
+}
+
 /// Read + inspect the ClientHello on 443 (module docs points 2/3). Returns
 /// the FULL replay buffer (hello record + any pipelined bytes) on success.
 /// The decision timeout is applied by the CALLER ([`crate::proxy::decide`])

@@ -89,6 +89,9 @@ mod listeners;
 mod netns;
 mod rules;
 
+// Conformance lab child (issue #13): the lab namespace helpers.
+pub(crate) use netns::{OuterIds, configure_lab_lo, write_id_maps};
+
 use std::any::Any;
 use std::ffi::OsString;
 use std::fmt;

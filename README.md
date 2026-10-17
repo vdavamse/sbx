@@ -247,7 +247,7 @@ runs in CI.
   sockets, other sessions' listeners, files and fake IPs, and host processes
   are unreachable.
 - **E: tooling** (`tooling`, network tier): real `curl`, `git`, `pip` and `npm`
-  through the policy; opt-in with `--network`.
+  through the policy, and the real-network negatives; opt-in with `--network`.
 - **F: fail-closed** (`fail-closed`): SIGKILL, SIGSTOP and a missing proxy leave
   no path open; a broken nftables load or audit log ends the run with rc 125.
 - **G: cleanup** (`cleanup`): background processes die on exit, timeout and
@@ -259,7 +259,8 @@ The tiers: **host** (a `sbx run` per scenario, built-in policies), **init**
 (the production `sbx __init` with the listeners dropped), **lab** (an
 unprivileged nested user, network and mount namespace with a local fixture on
 9.9.9.9 and a lab DNS that never touches the real network), and **network**
-(opt-in, real hosts). The offline tiers need no root and never dial an upstream.
+(opt-in, real hosts). The offline tiers need no root and never dial a real
+upstream: every lab upstream is local.
 Their files live under `$TMPDIR/sbx-conformance-*`, with two documented
 exceptions: the D04 control socket `/tmp/sbxc-<8 hex>.s` (kept short because
 `sun_path` is 108 bytes), and, when `$TMPDIR` lies under `$HOME`, the base
@@ -284,10 +285,27 @@ few seconds (the budget is 120 s).
 A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
 hazard, not a defect. It goes away when issue #35 lands.
 
-**Status.** The host and init tiers are implemented. The lab tier (A02–A06, A12,
-B01–B09, C02, C07, F02, F04) lands in a follow-up PR; until then those 19 checks
-report `not implemented` and the command exits `1`. The network tier is also
-still to come. Operator policies are not supported by `--conformance` in v1.
+**Lab tier.** The 19 lab checks (A02–A06, A12, B01–B09, C02, C07, F02, F04) run
+inside a child that unshares user, network and mount namespaces: no root, and
+`lo` gets `9.9.9.9` (the fixture) and the trap addresses. The lab's
+`resolv.conf` and `nsswitch.conf` are bound over the host's (`/etc/hosts` is
+not touched). Its DNS answers `*.conformance.test` only and never forwards, and
+it logs every query so the checks can prove that. The lab does not disable
+`nscd`: a host name cache can only make A02–A06 fail (their "lab DNS saw the
+name" control is absent), never pass without the proxy's own lookup. The lab
+child dies with `sbx check` (`PR_SET_PDEATHSIG`), and its timing uses the
+monotonic clock, which every process on the host shares. If the host cannot create a
+nested user namespace, the lab checks are capability skips (rc `1`) with the
+stage that failed, never passes. The lab is bounded to 60 s.
+
+**Network tier.** `--network` runs six real tool checks (E01–E06) against
+pypi.org, github.com, registry.npmjs.org and example.com, one `sbx run` each,
+within a 300 s total allowance. E06 first proves the same policy reaches
+pypi.org, so its negatives cannot pass vacuously. A missing tool (`curl`, `git`, `python3` with
+pip, `npm`) is an opt-in skip, not a failure. The CI job `conformance-network`
+runs it nightly; it does not gate pull requests.
+
+Operator policies are not supported by `--conformance` in v1.
 
 ## Running commands
 
