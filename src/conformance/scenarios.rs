@@ -116,6 +116,8 @@ pub fn group_of(name: &str) -> &'static str {
         "S9" => "S9",
         "S10" => "S10",
         "S11a" | "S11b" => "S11",
+        "S14" => "S14",
+        "S15" => "S15",
         _ => "?",
     }
 }
@@ -124,6 +126,8 @@ pub fn group_of(name: &str) -> &'static str {
 pub fn run_group(env: &Env, group: &str) -> Vec<Scn> {
     match group {
         "S12" => s12(env),
+        "S14" => vec![s14(env)],
+        "S15" => vec![s15(env)],
         "S1" => vec![s1(env)],
         "S13" => vec![s13(env)],
         "S2" => s2(env),
@@ -1436,4 +1440,200 @@ fn s12(env: &Env) -> Vec<Scn> {
     s.notes.insert("home_applicable", home_ok.to_string());
     s.notes.insert("host_home", host_home);
     vec![s]
+}
+
+/// The #40 tree for D11: a writable root `rw`, a nested writable bind
+/// `rw/n/m` (C1), a deny `rw/n/m/a/s` holding a token, and an unpinned sibling
+/// `rw/c` for the control.
+fn d11_tree(rw: &Path) -> std::io::Result<()> {
+    let _ = fs::remove_dir_all(rw);
+    fs::create_dir_all(rw.join("n/m/a/s"))?;
+    fs::create_dir_all(rw.join("c"))?;
+    fs::write(rw.join("n/m/a/s/token"), b"TOKEN")
+}
+
+/// S14 (D11, #40): a deny mask survives the payload's renames of its parents,
+/// including a parent of a NESTED writable bind (C1). Run 1: renaming `rw/n`
+/// (the nested bind's parent) and `n/m/a` (the deny's parent) is EBUSY, the
+/// masked token is ENOENT, and the control renames the unpinned sibling `c`.
+/// Run 2 (same session) cannot reach the token through a renamed name. The
+/// host token is read after the runs.
+fn s14(env: &Env) -> Scn {
+    let mut scn = Scn::named("S14");
+    let rw = env.base.join("d11").join("rw");
+    if let Err(e) = d11_tree(&rw) {
+        return Scn::unavailable("S14", format!("cannot prepare the tree: {e}"));
+    }
+    let rw_s = rw.to_string_lossy().into_owned();
+    let nest = format!("{rw_s}/n/m");
+    let deny = format!("{nest}/a/s");
+    let text = policies::fs_policy_json(
+        &env.exe_text,
+        &[rw_s.clone(), nest.clone()],
+        std::slice::from_ref(&deny),
+    );
+    let Ok(policy) = policies::write_policy(&env.base, "p-S14", &text) else {
+        return Scn::unavailable("S14", "cannot write policy".to_owned());
+    };
+    let session = env.base.join("s-S14");
+    let audit = env.base.join("a-S14.jsonl");
+    let ops1 = vec![
+        hello("d11.hello"),
+        Op::Rename {
+            id: "d11.ren".into(),
+            from: format!("{rw_s}/n"),
+            to: format!("{rw_s}/n2"),
+        },
+        Op::Rename {
+            id: "d11.ren2".into(),
+            from: format!("{nest}/a"),
+            to: format!("{nest}/a2"),
+        },
+        Op::Stat {
+            id: "d11.tok".into(),
+            path: format!("{deny}/token"),
+        },
+        Op::Rename {
+            id: "d11.ctl".into(),
+            from: format!("{rw_s}/c"),
+            to: format!("{rw_s}/c2"),
+        },
+    ];
+    let bound = budget_bound(&ops1);
+    let mut r = match SbxRun::new(&env.exe, &policy, &session, payload(ops1, &env.exe_text))
+        .audit(&audit)
+        .spawn()
+    {
+        Ok(r) => r,
+        Err(e) => return Scn::unavailable("S14", format!("cannot spawn sbx run: {e}")),
+    };
+    r.wait_exit(Instant::now() + bound);
+    let fin = r.finish();
+    finish_scn(&mut scn, fin, &audit, false);
+
+    // Run 2, same session: the token must not be reachable under the old
+    // parent name, nor under the name a rename would have left behind.
+    let ops2 = vec![
+        hello("d11.run2.hello"),
+        Op::Stat {
+            id: "d11.run2.tok".into(),
+            path: format!("{rw_s}/n2/m/a/s/token"),
+        },
+    ];
+    let bound2 = budget_bound(&ops2);
+    let audit2 = env.base.join("a-S14b.jsonl");
+    let verdict = match SbxRun::new(&env.exe, &policy, &session, payload(ops2, &env.exe_text))
+        .audit(&audit2)
+        .spawn()
+    {
+        Ok(mut r2) => {
+            r2.wait_exit(Instant::now() + bound2);
+            let fin2 = r2.finish();
+            match parse_probe(&fin2.stdout, false) {
+                Ok(p) => match (p.get("d11.run2.hello"), p.get("d11.run2.tok")) {
+                    (Some(h), Some(t)) if h.ok && t.errno == Some(libc::ENOENT) => Ok(()),
+                    (Some(_), Some(t)) => Err(format!(
+                        "run 2 reached the token under a renamed parent: stat errno {:?}",
+                        t.errno
+                    )),
+                    _ => Err(format!("run 2 probe incomplete: rc {:?}", fin2.rc)),
+                },
+                Err(e) => Err(format!("run 2 probe unreadable: {e}")),
+            }
+        }
+        Err(e) => Err(format!("cannot spawn run 2: {e}")),
+    };
+    scn.ctl.insert("d11.run2", verdict);
+    let token =
+        fs::read_to_string(rw.join("n/m/a/s/token")).unwrap_or_else(|e| format!("unreadable: {e}"));
+    scn.notes.insert("token", token);
+    scn
+}
+
+/// S15 (D12): a symlink planted inside an rw path on a mount chain is refused
+/// before launch. The harness plants `rw/a -> /oldroot<outside>` (the CVE
+/// form). Run A must be refused with rc 125 and nothing created outside. The
+/// control is the same policy over a real directory, which must run (rc 0).
+fn s15(env: &Env) -> Scn {
+    let mut scn = Scn::named("S15");
+    let root = env.base.join("d12");
+    let rw = root.join("rw");
+    let outside = root.join("outside");
+    let _ = fs::remove_dir_all(&root);
+    let prepared = fs::create_dir_all(rw.join("c"))
+        .and_then(|()| fs::create_dir_all(&outside))
+        .and_then(|()| fs::write(outside.join("key"), b"KEY"))
+        .and_then(|()| {
+            std::os::unix::fs::symlink(format!("/oldroot{}", outside.display()), rw.join("a"))
+        });
+    if let Err(e) = prepared {
+        return Scn::unavailable("S15", format!("cannot prepare the tree: {e}"));
+    }
+    let rw_s = rw.to_string_lossy().into_owned();
+    let deny = vec![format!("{rw_s}/a/secrets")];
+    let text = policies::fs_policy_json(&env.exe_text, std::slice::from_ref(&rw_s), &deny);
+    let Ok(policy) = policies::write_policy(&env.base, "p-S15", &text) else {
+        return Scn::unavailable("S15", "cannot write policy".to_owned());
+    };
+    let session = env.base.join("s-S15");
+    let hello_ops = || vec![hello("d12.hello")];
+    let bound = budget_bound(&hello_ops());
+
+    // Run A: the planted state is refused before the spawn.
+    let audit_a = env.base.join("a-S15.jsonl");
+    let mut a = match SbxRun::new(
+        &env.exe,
+        &policy,
+        &session,
+        payload(hello_ops(), &env.exe_text),
+    )
+    .audit(&audit_a)
+    .spawn()
+    {
+        Ok(r) => r,
+        Err(e) => return Scn::unavailable("S15", format!("cannot spawn sbx run: {e}")),
+    };
+    let started = Instant::now();
+    a.wait_exit(started + bound);
+    let fin_a = a.finish();
+    scn.ms = fin_a.elapsed_ms;
+    let outside_now = fs::read_dir(&outside)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|e| format!("unreadable: {e}"));
+    scn.notes.insert("outside", outside_now);
+    scn.probe_err = Some("refused before the probe ran".to_owned());
+    scn.fin = Some(fin_a);
+
+    // Control: the same policy over a real directory runs.
+    let _ = fs::remove_file(rw.join("a"));
+    let control = fs::create_dir_all(rw.join("a/secrets")).map_err(|e| e.to_string());
+    let control = control.and_then(|()| {
+        let audit_b = env.base.join("a-S15b.jsonl");
+        let mut b = SbxRun::new(
+            &env.exe,
+            &policy,
+            &session,
+            payload(hello_ops(), &env.exe_text),
+        )
+        .audit(&audit_b)
+        .spawn()
+        .map_err(|e| format!("cannot spawn the control: {e}"))?;
+        b.wait_exit(Instant::now() + bound);
+        let fin_b = b.finish();
+        if fin_b.rc == Some(0) && fin_b.stdout.iter().any(|l| l.contains("d12.hello")) {
+            Ok(())
+        } else {
+            Err(format!(
+                "control run: rc {:?}, stderr {:?}",
+                fin_b.rc, fin_b.stderr
+            ))
+        }
+    });
+    scn.ctl.insert("d12.control", control);
+    scn
 }

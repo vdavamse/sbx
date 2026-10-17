@@ -31,6 +31,14 @@ use std::path::{Path, PathBuf};
 /// always carries).
 pub const BWRAP_MIN: (u32, u32, u32) = (0, 8, 0);
 
+/// The first bwrap release that fixes CVE-2026-87766 (GHSA-pxhw-h44j-8pfx):
+/// bwrap resolves each bind dest and deny mask with `openat2(RESOLVE_IN_ROOT)`.
+/// `BWRAP_MIN` stays at 0.8.0 (Q4): distributions backport fixes and this
+/// version string cannot show that, so `sbx check` WARNS below this version
+/// when the policy has mount paths under its binds, and never refuses on it.
+/// sbx's own pre-launch guard (#39) covers the same shapes on every version.
+pub const BWRAP_CVE_FIXED: (u32, u32, u32) = (0, 12, 0);
+
 /// Parse `bwrap --version` output — strict grammar, fail-closed.
 ///
 /// The trimmed input must start with the literal `bubblewrap` followed by

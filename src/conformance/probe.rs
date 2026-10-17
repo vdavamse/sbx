@@ -247,6 +247,13 @@ pub enum Op {
         path: String,
         text: String,
     },
+    /// `rename(2)` (#40, D11): the result carries the errno (EBUSY when a
+    /// pinned mountpoint is involved).
+    Rename {
+        id: String,
+        from: String,
+        to: String,
+    },
     DnsFlood {
         id: String,
         prefix: String,
@@ -309,6 +316,7 @@ impl Op {
             | Op::ListenTcp { id, .. }
             | Op::ListenAbstract { id, .. }
             | Op::Write { id, .. }
+            | Op::Rename { id, .. }
             | Op::DnsFlood { id, .. }
             | Op::TcpLoop { id, .. } => id,
         }
@@ -341,6 +349,7 @@ impl Op {
             Op::ListenTcp { .. } => "listen_tcp",
             Op::ListenAbstract { .. } => "listen_abstract",
             Op::Write { .. } => "write",
+            Op::Rename { .. } => "rename",
             Op::DnsFlood { .. } => "dns_flood",
             Op::TcpLoop { .. } => "tcp_loop",
         }
@@ -613,7 +622,7 @@ pub fn run_probe(tag: Option<&str>, ops_json: &str) -> ExitCode {
 fn destructive(op: &Op) -> bool {
     match op {
         Op::Netlink { action, .. } => action != "dump_links",
-        Op::Write { .. } => true,
+        Op::Write { .. } | Op::Rename { .. } => true,
         _ => false,
     }
 }
@@ -1059,6 +1068,10 @@ fn execute(op: &Op, st: &mut State) -> OpResult {
         }
         Op::Write { path, text, .. } => match fs::write(path, text) {
             Ok(()) => ok_result(&id, name, true, None, "written".into(), json!({})),
+            Err(e) => ok_result(&id, name, false, errno_of(&e), e.to_string(), json!({})),
+        },
+        Op::Rename { from, to, .. } => match fs::rename(from, to) {
+            Ok(()) => ok_result(&id, name, true, None, "renamed".into(), json!({})),
             Err(e) => ok_result(&id, name, false, errno_of(&e), e.to_string(), json!({})),
         },
         Op::TcpLoop {
@@ -2142,6 +2155,11 @@ mod tests {
                 path: "/p".into(),
                 text: "t".into(),
             },
+            Op::Rename {
+                id: "rn".into(),
+                from: "/p".into(),
+                to: "/q".into(),
+            },
             Op::DnsFlood {
                 id: "df".into(),
                 prefix: "p".into(),
@@ -2151,10 +2169,10 @@ mod tests {
         ]);
         let text = serde_json::to_string(&ops).unwrap();
         let back: Ops = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.ops.len(), 24);
+        assert_eq!(back.ops.len(), 25);
         assert_eq!(serde_json::to_string(&back).unwrap(), text);
         assert_eq!(back.ops[0].name(), "hello");
-        assert_eq!(back.ops[23].id(), "df");
+        assert_eq!(back.ops[24].id(), "df");
     }
 
     #[test]

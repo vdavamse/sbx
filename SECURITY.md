@@ -40,6 +40,15 @@ Please **do not** file a public issue for a security report.
   a sandbox escape in scope. Netlink protocol semantics and host-side pathname
   unix sockets exposed through the filesystem policy are not covered by the
   family filter (filesystem and netlink policy are separate concerns).
+- **In scope — mount paths under writable binds (issues #39, #40):** a
+  payload that can write a `rw` tree must not be able to make `sbx run` create,
+  mount over, or expose a host path. A symlink planted in a writable tree, a
+  deny mask renamed away by its payload, or a read-only bind reached through a
+  renamed parent, are sandbox escapes in scope; `sbx run` refuses the planted
+  shapes before launch (rc 125, `D12`) and pins the deny parents (`D11`). A
+  race by a concurrent writer outside the same policy, and bwrap before 0.12.0
+  itself, are documented residuals (`docs/threat-model.md` R26, R27), not
+  silently accepted.
 - **In scope — conformance (issue #13):** a `FAIL` from `sbx check --conformance`
   on a host where `sbx check` reports the needed network mode is a sandbox
   defect; attach the JSON report and the kept artifacts directory. `warn` rows

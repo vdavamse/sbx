@@ -149,7 +149,7 @@ impl BindOp {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Mount {
     op: BindOp,
     src: PathBuf,
@@ -157,11 +157,12 @@ struct Mount {
     prio: u8,
 }
 
-/// Assemble the complete argv — infallible: [`super::build`] validated
-/// every input first (module docs point 2), and the layout itself has no
-/// failure modes. Deterministic: identical inputs ⇒ byte-identical argv
-/// (proptest P6).
-pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
+/// Assemble the complete argv and the pre-launch plan (#39/#40) — infallible:
+/// [`super::build`] validated every input first (module docs point 2), and
+/// the layout itself has no failure modes. Deterministic: identical inputs ⇒
+/// byte-identical argv (proptest P6). The plan is computed from the same
+/// merged, pinned mount list as the argv, so the two cannot drift.
+pub(super) fn assemble(input: &Build<'_>) -> (Vec<OsString>, Plan) {
     let layout = session_layout(input.session_dir);
     let mut argv: Vec<OsString> = Vec::new();
 
@@ -202,8 +203,8 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
 
     // The merged mount list (element 6) — computed before the shims
     // because the shim skip rule needs the bind dests.
-    let mounts = merged_mounts(input, &layout);
     let denies = sorted_denies(&input.policy.filesystem.deny);
+    let (mounts, plan) = plan_mounts(&input.policy.filesystem, &layout, &denies);
 
     // 5. The usr-merge shims (module docs point 8), each skipped when any
     //    bind dest or deny path EQUALS OR IS UNDER its dest
@@ -325,7 +326,220 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
     argv.push(OsString::from("--"));
     argv.extend(input.command.iter().cloned());
 
-    argv
+    (argv, plan)
+}
+
+/// What the pre-launch verifier (`guard`, #39/#40) must establish about one
+/// path bwrap will resolve under a policy or session cover mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    /// A deny mask or a pin: must be a directory.
+    Dir,
+    /// A bind: the final component's type must equal the type of this
+    /// bind source.
+    LikeSource(PathBuf),
+}
+
+/// One path check. `target` is a bind dest, a pin, or a deny path under the
+/// mount `origin`; its host location is `root` joined with `rel` (components
+/// below the cover, lexically canonical).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCheck {
+    pub target: String,
+    /// The dest of the nearest cover (the message's mount).
+    pub origin: String,
+    pub root: PathBuf,
+    pub rel: Vec<String>,
+    pub kind: Kind,
+    /// The target is a pin (an intermediate directory added by sbx).
+    pub pinned: bool,
+    /// The cover is a writable bind (false: a read-only bind).
+    pub writable: bool,
+    /// The cover may legitimately lack the suffix: a session leaf (exclusively
+    /// ours under the session lock: bwrap creates it), or a read-only bind
+    /// (bwrap refuses to create anything there, and the walk only refuses
+    /// links and wrong types). A writable policy cover requires the suffix.
+    pub allow_missing: bool,
+}
+
+/// A host-symlink alias check (#40, Q5): a deny path and a policy bind whose
+/// host realpaths overlap without the mapping being the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasCheck {
+    pub deny: String,
+    pub src: PathBuf,
+    pub dest: String,
+}
+
+/// Everything `guard` verifies before spawn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub checks: Vec<PathCheck>,
+    pub aliases: Vec<AliasCheck>,
+    /// The number of pins added (intermediate directories), for the cost note.
+    pub pins: usize,
+}
+
+/// The pinned mount list and the pre-launch plan for a filesystem policy.
+fn plan_mounts(
+    fs: &crate::policy::Filesystem,
+    layout: &SessionLayout,
+    denies: &[&str],
+) -> (Vec<Mount>, Plan) {
+    let mounts = merged_mounts(fs, layout);
+    let pinned = with_pins(&mounts, denies);
+    let pins = pinned.len() - mounts.len();
+    let checks = path_checks(&mounts, &pinned, denies);
+    let aliases = alias_checks(&mounts, denies);
+    (
+        pinned,
+        Plan {
+            checks,
+            aliases,
+            pins,
+        },
+    )
+}
+
+/// The pure plan for `sbx check` (`None`: the session-leaf mounts are counted
+/// but not verified, since their root does not exist yet) or for a concrete
+/// session directory (the run's own plan).
+pub fn path_plan(policy: &crate::policy::Policy, session_dir: Option<&std::path::Path>) -> Plan {
+    let denies = sorted_denies(&policy.filesystem.deny);
+    let layout =
+        session_layout(session_dir.unwrap_or(std::path::Path::new("/nonexistent-sbx-session")));
+    plan_mounts(&policy.filesystem, &layout, &denies).1
+}
+
+/// The deepest mount (last emitted at the deepest dest) STRICTLY above `t`.
+fn cover<'m>(mounts: &'m [Mount], t: &str) -> Option<&'m Mount> {
+    mounts
+        .iter()
+        .filter(|m| m.dest != t && at_or_under(t, &m.dest))
+        .max_by_key(|m| m.dest.len())
+        .and_then(|best| mounts.iter().rev().find(|m| m.dest == best.dest))
+}
+
+fn rel_of<'a>(t: &'a str, base: &str) -> Vec<&'a str> {
+    t[base.len()..]
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// The deny paths that are not under another deny path. A deny under another
+/// deny is masked inside that tmpfs: bwrap creates it there, not on the host,
+/// so it needs no pins and no walk (`sbx check` and the S8a walk agree).
+fn outer_denies<'a>(denies: &[&'a str]) -> Vec<&'a str> {
+    denies
+        .iter()
+        .copied()
+        .filter(|d| !denies.iter().any(|o| o != d && at_or_under(d, o)))
+        .collect()
+}
+
+/// #40: pin every intermediate directory between a WRITABLE policy cover and
+/// a target: every policy bind (read-only or writable, at any nesting: C1)
+/// and every outer deny mask. A rename or rmdir of a pinned directory is
+/// EBUSY, so the nested binds and masks below it cannot be moved. Session-leaf
+/// covers get no pins (the content there is the payload's own). Pins are
+/// src == dest under the cover, so no host path outside the rw tree becomes
+/// visible.
+fn with_pins(mounts: &[Mount], denies: &[&str]) -> Vec<Mount> {
+    let targets: Vec<&str> = mounts
+        .iter()
+        .filter(|m| m.prio != PRIO_SESSION)
+        .map(|m| m.dest.as_str())
+        .chain(outer_denies(denies))
+        .collect();
+    let mut pins: Vec<Mount> = Vec::new();
+    for t in targets {
+        let Some(c) = cover(mounts, t) else { continue };
+        if c.op != BindOp::Rw || c.prio != PRIO_POLICY {
+            continue;
+        }
+        let comps = rel_of(t, &c.dest);
+        let mut dest = c.dest.clone();
+        let mut src = c.src.clone();
+        for comp in &comps[..comps.len().saturating_sub(1)] {
+            dest.push('/');
+            dest.push_str(comp);
+            src.push(comp);
+            if mounts.iter().any(|m| m.dest == dest) || pins.iter().any(|m| m.dest == dest) {
+                continue;
+            }
+            pins.push(Mount {
+                op: BindOp::Rw,
+                src: src.clone(),
+                dest: dest.clone(),
+                prio: PRIO_POLICY,
+            });
+        }
+    }
+    let mut all: Vec<Mount> = mounts.to_vec();
+    all.extend(pins);
+    all.sort_by(|a, b| {
+        a.dest
+            .as_bytes()
+            .cmp(b.dest.as_bytes())
+            .then(a.prio.cmp(&b.prio))
+    });
+    all
+}
+
+/// The checks: one per target (every mount dest, pins included, and every
+/// outer deny) whose nearest cover is a policy or session mount. Covers are
+/// looked up in the pre-pin list; pins are then ordinary intermediate
+/// targets, so the walk visits parents first, and the first failure names the
+/// shallowest bad component.
+fn path_checks(mounts: &[Mount], pinned: &[Mount], denies: &[&str]) -> Vec<PathCheck> {
+    let mut out = Vec::new();
+    let mut targets: Vec<(&str, Kind, bool)> = Vec::new();
+    for m in pinned {
+        // A pin is a directory that exists only in the pinned list.
+        let is_pin = !mounts.iter().any(|x| x.dest == m.dest);
+        let kind = if is_pin {
+            Kind::Dir
+        } else {
+            Kind::LikeSource(m.src.clone())
+        };
+        targets.push((m.dest.as_str(), kind, is_pin));
+    }
+    targets.extend(
+        outer_denies(denies)
+            .into_iter()
+            .map(|d| (d, Kind::Dir, false)),
+    );
+    for (t, kind, pinned) in targets {
+        let Some(c) = cover(mounts, t) else { continue };
+        out.push(PathCheck {
+            target: t.to_owned(),
+            origin: c.dest.clone(),
+            root: c.src.clone(),
+            rel: rel_of(t, &c.dest).into_iter().map(str::to_owned).collect(),
+            kind,
+            pinned,
+            writable: c.op == BindOp::Rw,
+            allow_missing: c.op == BindOp::Ro || c.prio == PRIO_SESSION,
+        });
+    }
+    out
+}
+
+/// One alias check per (deny, policy bind) pair (Q5). Pairs are cheap to
+/// enumerate; `guard` canonicalizes each distinct path once.
+fn alias_checks(mounts: &[Mount], denies: &[&str]) -> Vec<AliasCheck> {
+    let mut out = Vec::new();
+    for m in mounts.iter().filter(|m| m.prio == PRIO_POLICY) {
+        for d in denies {
+            out.push(AliasCheck {
+                deny: (*d).to_owned(),
+                src: m.src.clone(),
+                dest: m.dest.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn setenv(argv: &mut Vec<OsString>, name: &str, value: &OsStr) {
@@ -349,16 +563,16 @@ fn at_or_under(path: &str, root: &str) -> bool {
 
 /// The merged, deduped, sorted mount list (module docs point 4; layout
 /// element 6).
-fn merged_mounts(input: &Build<'_>, layout: &SessionLayout) -> Vec<Mount> {
+fn merged_mounts(fs: &crate::policy::Filesystem, layout: &SessionLayout) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
     // Prio 0 — the policy lists in written order (ro, then rw). Src ==
     // dest == the written path: zero normalization (the policy
     // AbsolutePath contract — stored string == what bwrap sees).
-    for path in &input.policy.filesystem.ro {
+    for path in &fs.ro {
         mounts.push(policy_mount(BindOp::Ro, path));
     }
-    for path in &input.policy.filesystem.rw {
+    for path in &fs.rw {
         mounts.push(policy_mount(BindOp::Rw, path));
     }
 
@@ -947,6 +1161,89 @@ mod tests {
     }
 
     #[test]
+    fn golden_pin_chain_under_rw() {
+        // Golden 13 (#40): under the writable /srv/proj, the read-only
+        // /srv/proj/a/ro and the deny /srv/proj/a/b/s each get their
+        // intermediate directories pinned as rw self-binds (src == dest, so
+        // nothing outside the rw tree becomes visible). The payload's
+        // rename or rmdir of /srv/proj/a or /srv/proj/a/b is then EBUSY, so
+        // the deny mask cannot be renamed away. The deny stays last.
+        let policy = policy_of(&base_with(&[(
+            r#""ro": [], "rw": [], "deny": []"#,
+            r#""ro": ["/srv/proj/a/ro"], "rw": ["/srv/proj"], "deny": ["/srv/proj/a/b/s"]"#,
+        )]));
+        let argv = golden_argv(&policy, &BTreeMap::new());
+        assert_eq!(
+            argv,
+            expected(&[
+                HEAD,
+                SHIMS,
+                INFRA_BINDS_NO_POLICY,
+                &SESSION_BINDS[..3],
+                &[
+                    "--bind",
+                    "/srv/proj",
+                    "/srv/proj",
+                    "--bind",
+                    "/srv/proj/a",
+                    "/srv/proj/a",
+                    "--bind",
+                    "/srv/proj/a/b",
+                    "/srv/proj/a/b",
+                    "--ro-bind",
+                    "/srv/proj/a/ro",
+                    "/srv/proj/a/ro",
+                ],
+                &SESSION_BINDS[3..],
+                WORK_BIND,
+                PROC_DEV,
+                &["--tmpfs", "/srv/proj/a/b/s"],
+                INFRA_ENV,
+                TAIL,
+            ])
+        );
+    }
+
+    #[test]
+    fn golden_pins_for_rw_in_rw() {
+        // C1 (#40, reviewer): a writable bind nested under a writable cover
+        // is pinned too. /srv/proj/a is an intermediate between the cover
+        // /srv/proj and the nested rw /srv/proj/a/nest; without the pin, the
+        // payload could rename /srv/proj/a and re-create it, moving the
+        // nested bind's parent away (the deny-mask and nested-ro bypasses).
+        let policy = policy_of(&base_with(&[(
+            r#""ro": [], "rw": [], "deny": []"#,
+            r#""ro": [], "rw": ["/srv/proj", "/srv/proj/a/nest"], "deny": []"#,
+        )]));
+        let argv = golden_argv(&policy, &BTreeMap::new());
+        assert_eq!(
+            argv,
+            expected(&[
+                HEAD,
+                SHIMS,
+                INFRA_BINDS_NO_POLICY,
+                &SESSION_BINDS[..3],
+                &[
+                    "--bind",
+                    "/srv/proj",
+                    "/srv/proj",
+                    "--bind",
+                    "/srv/proj/a",
+                    "/srv/proj/a",
+                    "--bind",
+                    "/srv/proj/a/nest",
+                    "/srv/proj/a/nest",
+                ],
+                &SESSION_BINDS[3..],
+                WORK_BIND,
+                PROC_DEV,
+                INFRA_ENV,
+                TAIL,
+            ])
+        );
+    }
+
+    #[test]
     fn golden_explicit_proxy_env() {
         // Golden 6 (Q4): explicit mode ⇒ the 8 proxy vars in the fixed
         // emission order (ALL/HTTP/HTTPS/NO uppercase, then the lowercase
@@ -1428,6 +1725,89 @@ mod tests {
         }
     }
 
+    /// P-pin (#40, C1): for every policy bind T (read-only or writable) and
+    /// every outer deny T whose nearest mount is a policy rw cover R (no other
+    /// policy path lies between R and T), every directory strictly between R
+    /// and T is a --bind dest emitted before T's own mount, so the payload
+    /// cannot rename or rmdir it.
+    fn assert_pins(
+        policy_json: &str,
+        command: &[OsString],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let policy = prop_policy(policy_json);
+        let argv = golden_argv_full(&policy, &BTreeMap::new(), None, command);
+        let (flags, _) = split_tail(&argv, command);
+        let events = parse_flags(flags);
+        let rw: Vec<&str> = policy
+            .filesystem
+            .rw
+            .iter()
+            .map(AbsolutePath::as_str)
+            .collect();
+        let all: Vec<&str> = policy
+            .filesystem
+            .ro
+            .iter()
+            .chain(&policy.filesystem.rw)
+            .map(AbsolutePath::as_str)
+            .collect();
+        let denies: Vec<&str> = policy
+            .filesystem
+            .deny
+            .iter()
+            .map(AbsolutePath::as_str)
+            .collect();
+        // Outer denies only: a deny under another deny is masked inside it.
+        let outer: Vec<&str> = denies
+            .iter()
+            .copied()
+            .filter(|d| !denies.iter().any(|o| o != d && at_or_under(d, o)))
+            .collect();
+        let mut targets: Vec<&str> = all.clone();
+        targets.extend(outer.iter().copied());
+        for t in targets {
+            let is_deny = outer.contains(&t);
+            let Some(cover) = rw
+                .iter()
+                .filter(|r| **r != t && at_or_under(t, r))
+                .max_by_key(|r| r.len())
+            else {
+                continue;
+            };
+            // Another policy path between the cover and the target (at the
+            // target itself only for a deny: a bind there is its own mount)
+            // makes that path the nearest cover instead.
+            if all.iter().any(|p| {
+                *p != *cover && at_or_under(t, p) && at_or_under(p, cover) && (*p != t || is_deny)
+            }) {
+                continue;
+            }
+            let target_pos = events.iter().position(|e| match e {
+                Event::Bind { dest, .. } => dest == t,
+                Event::Tmpfs { dest } => dest == t,
+                _ => false,
+            });
+            prop_assert!(target_pos.is_some(), "target {t:?} is not masked or bound");
+            let comps: Vec<&str> = t[cover.len()..]
+                .split('/')
+                .filter(|c| !c.is_empty())
+                .collect();
+            let mut here = (*cover).to_owned();
+            for comp in &comps[..comps.len() - 1] {
+                here.push('/');
+                here.push_str(comp);
+                let pos = events
+                    .iter()
+                    .position(|e| matches!(e, Event::Bind { dest, .. } if *dest == here));
+                prop_assert!(
+                    pos.is_some() && pos < target_pos,
+                    "intermediate {here:?} between {cover:?} and {t:?} must be pinned before it: {events:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn prop_ancestors_first_and_deny_last(
@@ -1471,6 +1851,45 @@ mod tests {
                     events
                 );
             }
+        }
+
+        #[test]
+        fn prop_pins_cover_every_intermediate(
+            policy_json in prop_policy_json(),
+            command in prop_command(),
+        ) {
+            assert_pins(&policy_json, &command)?;
+        }
+
+        // The generic generator rarely nests a deny under an rw path at depth
+        // 2 or more, so this one builds the nested shapes exactly: a writable
+        // root, an optional nested writable bind (C1), an optional ro sibling
+        // and a deny at depth 2 to 4, so the pins are not vacuous.
+        #[test]
+        fn prop_pins_cover_nested_denies(
+            root in prop_segment(),
+            chain in proptest::collection::vec(prop_segment(), 2..=4),
+            with_ro in any::<bool>(),
+            with_nested_rw in any::<bool>(),
+            command in prop_command(),
+        ) {
+            let rw_root = format!("/p{root}");
+            let deny = format!("{rw_root}/{}", chain.join("/"));
+            let mut ro: Vec<String> = Vec::new();
+            if with_ro {
+                ro.push(format!("{rw_root}/zz/ro"));
+            }
+            let mut rw = vec![rw_root.clone()];
+            if with_nested_rw {
+                rw.push(format!("{rw_root}/{}", chain[..chain.len() - 1].join("/")));
+            }
+            let json = format!(
+                r#"{{"version": 1, "filesystem": {{"ro": {}, "rw": {}, "deny": {}}}, "network": {{"mode": "transparent", "allow": [], "ports": []}}, "env": {{"pass": [], "set": {{}}}}, "limits": {{"timeout": "120s", "output_bytes": 10485760}}}}"#,
+                json_list(&ro),
+                json_list(&rw),
+                json_list(std::slice::from_ref(&deny)),
+            );
+            assert_pins(&json, &command)?;
         }
 
         #[test]
@@ -1598,10 +2017,16 @@ mod tests {
                 ]
                 .map(PathBuf::into_os_string),
             );
+            // Pins (#40) are src == dest self-binds of directories that lie
+            // under a policy rw path: already visible writable, so no new
+            // host path is exposed.
+            let rw_paths: Vec<&str> = policy.filesystem.rw.iter().map(AbsolutePath::as_str).collect();
             for event in &events {
                 if let Event::Bind { src, dest } = event {
+                    let pin = src.as_os_str() == OsStr::new(dest.as_str())
+                        && rw_paths.iter().any(|rw| at_or_under(dest, rw) && dest != rw);
                     prop_assert!(
-                        allowed.contains(src),
+                        allowed.contains(src) || pin,
                         "bind src outside the allow-list union: {:?}",
                         src
                     );

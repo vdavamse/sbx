@@ -1,4 +1,4 @@
-//! The host tier's 43 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
+//! The host tier's 45 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
 //! the scenario plan and the pure evaluators over scenario evidence.
 //!
 //! Evaluation rules (review fixes):
@@ -76,6 +76,8 @@ pub fn scenarios_of(id: &str) -> &'static [&'static str] {
         "C04" => &["S2", "S3"],
         "D06" | "D07" | "D08" | "D09" => &["S11a", "S11b"],
         "D10" | "H01" | "H02" | "H03" | "H04" | "H05" | "H06" => &["S12"],
+        "D11" => &["S14"],
+        "D12" => &["S15"],
         "F01" => &["S10"],
         "F05" => &["S4"],
         "F06" => &["S5"],
@@ -1310,6 +1312,72 @@ pub(super) fn h06(s: &Scns) -> R {
     Ok("the caller's HOME and processes are invisible".to_owned())
 }
 
+/// D11 (#40): a deny mask survives the payload's renames of its parents, one
+/// of them the parent of a nested writable bind (C1). Controls first: the
+/// rename of an unpinned sibling succeeds, so EBUSY is the pin's doing. Then
+/// the renames are EBUSY, the masked token is ENOENT, run 2 in the same
+/// session cannot reach it, and the host token is intact.
+pub(super) fn d11(s: &Scns) -> R {
+    let a = sc(s, "S14")?;
+    ctl_ok(a, "d11.hello").map_err(|f| ctl_fail(f.msg))?;
+    ctl_ok(a, "d11.ctl").map_err(|f| ctl_fail(f.msg))?;
+    for id in ["d11.ren", "d11.ren2"] {
+        let ren = op(a, id)?;
+        need(
+            !ren.ok && errno(ren) == Some(libc::EBUSY),
+            format!(
+                "{id}: rename of a pinned parent: expected EBUSY, got {}",
+                errno_name(errno(ren))
+            ),
+        )?;
+    }
+    let tok = op(a, "d11.tok")?;
+    need(
+        errno(tok) == Some(libc::ENOENT),
+        format!(
+            "the masked token: expected ENOENT, got {}",
+            errno_name(errno(tok))
+        ),
+    )?;
+    assert_key(a, "d11.run2")?;
+    let host = a.notes.get("token").map(String::as_str).unwrap_or("");
+    need(
+        host == "TOKEN",
+        format!("the host token changed or vanished: {host:?}"),
+    )?;
+    Ok("a deny mask under an rw path survives ancestor renames, nested binds included".to_owned())
+}
+
+/// D12 (#40, #39): a symlink planted inside an rw path on a mount chain is
+/// refused before launch: rc 125, the pinned text, and nothing created
+/// outside. Control first: the same policy over a real directory runs.
+pub(super) fn d12(s: &Scns) -> R {
+    let a = sc(s, "S15")?;
+    ctl_key(a, "d12.control")?;
+    let fin = fin_of(a)?;
+    need(
+        fin.rc == Some(125),
+        format!("planted symlink: expected rc 125, got {:?}", fin.rc),
+    )?;
+    need(
+        fin.stderr.contains("it is a symbolic link") && fin.stderr.contains("refusing to start"),
+        format!(
+            "stderr lacks the pinned refusal: {:?}",
+            fin.stderr.lines().next().unwrap_or("")
+        ),
+    )?;
+    need(
+        !fin.stdout.iter().any(|l| l.contains("d12.hello")),
+        "the probe ran despite the refusal",
+    )?;
+    let outside = a.notes.get("outside").map(String::as_str).unwrap_or("?");
+    need(
+        outside == "key",
+        format!("the host target changed: entries {outside:?}"),
+    )?;
+    Ok("a symlink planted inside an rw path is refused before launch".to_owned())
+}
+
 pub(super) fn d10(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let p = op(s12, "d10.procs")?;
@@ -1404,6 +1472,8 @@ pub(super) fn eval_plain(id: &str, s: &Scns) -> R {
         "D08" => d08(s),
         "D09" => d09(s),
         "D10" => d10(s),
+        "D11" => d11(s),
+        "D12" => d12(s),
         "F01" => f01(s),
         "F05" => f05(s),
         "F06" => f06(s),

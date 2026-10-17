@@ -623,9 +623,9 @@ result: NOT conformant (1 FAIL)
     }
 
     #[test]
-    fn list_json_has_69_rows() {
+    fn list_json_has_71_rows() {
         let v: serde_json::Value = serde_json::from_str(&render_list_json()).unwrap();
-        assert_eq!(v["checks"].as_array().unwrap().len(), 69);
+        assert_eq!(v["checks"].as_array().unwrap().len(), 71);
         assert_eq!(v["kind"], "conformance-catalog");
     }
 
@@ -635,7 +635,7 @@ result: NOT conformant (1 FAIL)
         let v: serde_json::Value = serde_json::from_str(&render_json(&r)).unwrap();
         assert_eq!(v["kind"], "conformance");
         assert_eq!(v["version"], 1);
-        assert_eq!(v["checks"].as_array().unwrap().len(), 69);
+        assert_eq!(v["checks"].as_array().unwrap().len(), 71);
         assert_eq!(v["checks"][0]["id"], "A01");
         assert!(v["summary"]["conformant"] == false);
     }
