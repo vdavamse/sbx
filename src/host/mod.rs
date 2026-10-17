@@ -32,6 +32,7 @@ use std::process::ExitCode;
 
 use serde::Serialize;
 
+use crate::bwrap::version::BwrapStatus;
 use crate::policy::{NetworkMode, Policy};
 
 /// Report items, in report order (`CapId::ALL`). The `as_str` names are the
@@ -192,7 +193,7 @@ pub struct PolicyCheck {
 }
 
 /// One policy check (`id` in the fixed order `network-mode`, `infra-etc`,
-/// `policy-paths`, `deny-paths`).
+/// `policy-paths`, `deny-paths`, `mount-chains`, `bwrap-cve`, `deny-links`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyItem {
     pub id: &'static str,
@@ -237,12 +238,26 @@ pub fn check(args: CheckArgs) -> ExitCode {
     let mut report = classify::assemble(&facts);
     if args.host {
         if let Some((path, parsed)) = &policy {
-            report.policy = Some(classify::policy_check(
+            let bwrap = match &facts.bwrap {
+                BwrapStatus::Ok { version, .. } => Some(*version),
+                _ => None,
+            };
+            let exists = |p: &Path| std::fs::metadata(p).is_ok();
+            let is_non_dir = |p: &Path| std::fs::metadata(p).is_ok_and(|m| !m.is_dir());
+            report.policy = Some(classify::policy_check_with(
                 path,
                 parsed,
                 report.network_mode,
-                &|p: &Path| std::fs::metadata(p).is_ok(),
-                &|p: &Path| std::fs::metadata(p).is_ok_and(|m| !m.is_dir()),
+                &classify::Seams {
+                    exists: &exists,
+                    is_non_dir: &is_non_dir,
+                    verify: &crate::bwrap::guard::verify,
+                    alias: &|a: &crate::bwrap::AliasCheck| {
+                        crate::bwrap::guard::verify_aliases(std::slice::from_ref(a))
+                    },
+                    bwrap,
+                    hard_links: &crate::bwrap::guard::hard_links_under,
+                },
             ));
         }
     }

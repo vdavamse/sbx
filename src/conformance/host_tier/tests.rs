@@ -627,7 +627,41 @@ pub fn good() -> Scns {
     m.insert("S11b", s11b());
     m.insert("S12", s12());
     m.insert("S13", s13());
+    m.insert("S14", s14());
+    m.insert("S15", s15());
     m
+}
+
+fn s14() -> Scn {
+    let mut s = scn(
+        "S14",
+        vec![
+            op("d11.hello", true, None, json!({})),
+            op("d11.ren", false, Some(libc::EBUSY), json!({})),
+            op("d11.ren2", false, Some(libc::EBUSY), json!({})),
+            op("d11.tok", false, Some(libc::ENOENT), json!({})),
+            op("d11.ctl", true, None, json!({})),
+        ],
+        vec![],
+    );
+    s.notes.insert("token", "TOKEN".to_owned());
+    s.ctl.insert("d11.run2", Ok(()));
+    s
+}
+
+fn s15() -> Scn {
+    let mut s = scn("S15", vec![], vec![]);
+    s.probe = None;
+    s.probe_err = Some("refused before the probe ran".to_owned());
+    s.fin = Some(fin(
+        Some(125),
+        "sbx run: unsafe filesystem path \"/x/rw/a\": it is a symbolic link (on the way to \"/x/rw/a/secrets\" inside the rw path \"/x/rw\"); refusing to start because bwrap would follow it during setup",
+        vec![],
+        12,
+    ));
+    s.ctl.insert("d12.control", Ok(()));
+    s.notes.insert("outside", "key".to_owned());
+    s
 }
 
 fn s1_of(m: &mut Scns) -> &mut Scn {
@@ -800,6 +834,23 @@ fn bad(id: &str, control: bool) -> Option<Scns> {
         ("D09", true) => edit!(m.get_mut("S11a").unwrap(), "d.dns", |r: &mut OpResult| r
             .data["rcode"] =
             json!(3)),
+        ("D11", false) => edit!(m.get_mut("S14").unwrap(), "d11.ren", |r: &mut OpResult| {
+            r.ok = true;
+            r.errno = None;
+        }),
+        ("D11", true) => edit!(m.get_mut("S14").unwrap(), "d11.ctl", |r: &mut OpResult| {
+            r.ok = false;
+            r.errno = Some(libc::EXDEV);
+        }),
+        ("D12", false) => {
+            m.get_mut("S15").unwrap().fin.as_mut().unwrap().rc = Some(0);
+        }
+        ("D12", true) => {
+            m.get_mut("S15")
+                .unwrap()
+                .ctl
+                .insert("d12.control", Err("control run failed".into()));
+        }
         ("D10", false) => edit!(
             m.get_mut("S12").unwrap(),
             "d10.procs",

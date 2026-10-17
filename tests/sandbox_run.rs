@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::symlink;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
@@ -927,6 +928,121 @@ fn scenarios() -> Vec<Scenario> {
             run: bwrap_version_timeout_124,
         },
         Scenario {
+            name: "prelaunch-deny-chain-symlink-125",
+            gate: Bwrap,
+            run: prelaunch_deny_chain_symlink_125,
+        },
+        Scenario {
+            name: "prelaunch-deny-leaf-symlink-125",
+            gate: Bwrap,
+            run: prelaunch_deny_leaf_symlink_125,
+        },
+        Scenario {
+            name: "prelaunch-deny-missing-125",
+            gate: Bwrap,
+            run: prelaunch_deny_missing_125,
+        },
+        Scenario {
+            name: "prelaunch-deny-is-file-125",
+            gate: Bwrap,
+            run: prelaunch_deny_is_file_125,
+        },
+        Scenario {
+            name: "prelaunch-nested-ro-chain-symlink-125",
+            gate: Bwrap,
+            run: prelaunch_nested_ro_chain_symlink_125,
+        },
+        Scenario {
+            name: "prelaunch-nested-ro-leaf-symlink-125",
+            gate: Bwrap,
+            run: prelaunch_nested_ro_leaf_symlink_125,
+        },
+        Scenario {
+            name: "prelaunch-nested-ro-relative-leaf-125",
+            gate: Bwrap,
+            run: prelaunch_nested_ro_relative_leaf_125,
+        },
+        Scenario {
+            name: "c1-nested-rw-parent-rename-ebusy",
+            gate: Bwrap,
+            run: c1_nested_rw_parent_rename_ebusy,
+        },
+        Scenario {
+            name: "c1-nested-ro-write-through-renamed-parent",
+            gate: Bwrap,
+            run: c1_nested_ro_write_through_renamed_parent,
+        },
+        Scenario {
+            name: "prelaunch-planted-under-ro-cover-125",
+            gate: Bwrap,
+            run: prelaunch_planted_under_ro_cover_125,
+        },
+        Scenario {
+            name: "prelaunch-deny-under-plain-ro-125",
+            gate: Bwrap,
+            run: prelaunch_deny_under_plain_ro_125,
+        },
+        Scenario {
+            name: "c1-concurrent-source-swap-no-escape",
+            gate: Bwrap,
+            run: c1_concurrent_source_swap_no_escape,
+        },
+        Scenario {
+            name: "prelaunch-bind-containing-deny-via-link-125",
+            gate: Bwrap,
+            run: prelaunch_bind_containing_deny_via_link_125,
+        },
+        Scenario {
+            name: "nested-deny-under-deny-runs",
+            gate: Bwrap,
+            run: nested_deny_under_deny_runs,
+        },
+        Scenario {
+            name: "prelaunch-n19-host-alias-ro-125",
+            gate: Bwrap,
+            run: prelaunch_n19_host_alias_ro_125,
+        },
+        Scenario {
+            name: "prelaunch-n19-host-alias-rw-125",
+            gate: Bwrap,
+            run: prelaunch_n19_host_alias_rw_125,
+        },
+        Scenario {
+            name: "prelaunch-alias-of-deny-125",
+            gate: Bwrap,
+            run: prelaunch_alias_of_deny_125,
+        },
+        Scenario {
+            name: "prelaunch-reused-session-leaf-symlink-125",
+            gate: Bwrap,
+            run: prelaunch_reused_session_leaf_symlink_125,
+        },
+        Scenario {
+            name: "pin-rename-of-deny-chain-ebusy",
+            gate: Bwrap,
+            run: pin_rename_of_deny_chain_ebusy,
+        },
+        Scenario {
+            name: "pin-rename-of-nested-ro-ebusy",
+            gate: Bwrap,
+            run: pin_rename_of_nested_ro_ebusy,
+        },
+        Scenario {
+            name: "pin-legit-deny-depth2-fresh-and-reused",
+            gate: Bwrap,
+            run: pin_legit_deny_depth2_fresh_and_reused,
+        },
+        Scenario {
+            name: "pin-cross-pin-rename-is-exdev",
+            gate: Bwrap,
+            run: pin_cross_pin_rename_is_exdev,
+        },
+        Scenario {
+            name: "session-leaf-deny-fresh-and-reused",
+            gate: Bwrap,
+            run: session_leaf_deny_fresh_and_reused,
+        },
+        Scenario {
             name: "bwrap-version-signal-143",
             gate: Always,
             run: bwrap_version_signal_143,
@@ -1019,6 +1135,7 @@ struct Pol {
     output_bytes: u64,
     rw: Vec<String>,
     ro_extra: Vec<String>,
+    deny: Vec<String>,
     role: Option<String>,
     env_set: Vec<(String, String)>,
     env_pass: Vec<String>,
@@ -1034,6 +1151,7 @@ impl Pol {
             output_bytes: 1 << 20,
             rw: Vec::new(),
             ro_extra: Vec::new(),
+            deny: Vec::new(),
             role: Some(role.to_owned()),
             env_set: Vec::new(),
             env_pass: Vec::new(),
@@ -1070,7 +1188,7 @@ impl Pol {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
+            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[{deny}]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
             mode = self.mode,
             ro_extra = self
                 .ro_extra
@@ -1080,6 +1198,12 @@ impl Pol {
                 .join(""),
             rw = self
                 .rw
+                .iter()
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            deny = self
+                .deny
                 .iter()
                 .map(|p| format!("{p:?}"))
                 .collect::<Vec<_>>()
@@ -3449,5 +3573,582 @@ fn run_vs_gc_race() -> Result<(), String> {
         return Err(format!("tombstones survived the final gc: {left:?}"));
     }
     let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+// ---- Pre-launch path verification and pins (#39 / #40) ---------------------
+
+/// A host tree for the #39/#40 scenarios: `proj` is the writable tree, and
+/// `outside` is a host directory the payload must never be able to reach
+/// (it holds one file, `key`). Removed on drop.
+struct Tree {
+    dir: PathBuf,
+    proj: PathBuf,
+    outside: PathBuf,
+}
+
+impl Tree {
+    fn new(tag: &str) -> Self {
+        let dir = scratch(tag);
+        let proj = dir.join("proj");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&proj).expect("proj");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("key"), b"HOSTKEY\n").expect("key");
+        Self { dir, proj, outside }
+    }
+
+    fn session(&self) -> PathBuf {
+        self.dir.join("s")
+    }
+
+    /// The CVE form of a host path: bwrap 0.9 resolves it from `/oldroot`.
+    fn oldroot(path: &Path) -> PathBuf {
+        PathBuf::from(format!("/oldroot{}", path.display()))
+    }
+
+    /// Fails unless the host outside directory holds exactly its key file.
+    fn outside_untouched(&self) -> Result<(), String> {
+        let names = entries(&self.outside)?;
+        if names == ["key"] {
+            Ok(())
+        } else {
+            Err(format!("host outside directory changed: {names:?}"))
+        }
+    }
+
+    fn policy(&self, rw: &[&Path], ro: &[&Path], deny: &[&Path]) -> Pol {
+        let mut pol = Pol::new("exit");
+        pol.rw = rw.iter().map(|p| p.display().to_string()).collect();
+        pol.ro_extra = ro.iter().map(|p| p.display().to_string()).collect();
+        pol.deny = deny.iter().map(|p| p.display().to_string()).collect();
+        pol
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Sorted entry names of a host directory.
+fn entries(dir: &Path) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map_err(|e| format!("read {dir:?}: {e}"))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// A `/bin/sh -c` payload.
+fn sh(script: &str) -> Vec<OsString> {
+    vec!["/bin/sh".into(), "-c".into(), script.into()]
+}
+
+/// Writes the policy into `t.dir` and runs `script` in `session`.
+fn run_script(t: &Tree, pol: &Pol, session: &Path, script: &str) -> Result<Done, String> {
+    let policy = pol.write(&t.dir);
+    run_sbx(&sbx_args(&policy, session, &[], &sh(script)))
+}
+
+/// A planted symlink must refuse before spawn (rc 125, pinned text), and the
+/// host target must stay untouched.
+fn expect_planted_refusal(t: &Tree, args: &[OsString], needle: &str) -> Result<(), String> {
+    expect_refusal(args, needle)?;
+    t.outside_untouched()
+}
+
+fn prelaunch_deny_chain_symlink_125() -> Result<(), String> {
+    // #39 / CVE-2026-87766 shape: a payload turned the deny's parent into a
+    // symlink to a host path, and the CVE form is an /oldroot path.
+    let t = Tree::new("pl-chain");
+    symlink(Tree::oldroot(&t.outside), t.proj.join("a")).map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/secrets")]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")?;
+    if t.proj.join("a").symlink_metadata().is_err() {
+        return Err("the planted symlink disappeared".into());
+    }
+    Ok(())
+}
+
+fn prelaunch_deny_leaf_symlink_125() -> Result<(), String> {
+    let t = Tree::new("pl-leaf");
+    fs::create_dir_all(t.proj.join("a")).map_err(|e| e.to_string())?;
+    symlink(Tree::oldroot(&t.outside), t.proj.join("a/secrets")).map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/secrets")]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+fn prelaunch_deny_missing_125() -> Result<(), String> {
+    // Q1: a missing deny under a writable bind is refused (bwrap would
+    // otherwise create it, and its parents, on the host).
+    let t = Tree::new("pl-miss");
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/secrets")]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "does not exist")?;
+    if t.proj.join("a").exists() {
+        return Err("the host parent of the missing deny was created".into());
+    }
+    Ok(())
+}
+
+fn prelaunch_deny_is_file_125() -> Result<(), String> {
+    let t = Tree::new("pl-file");
+    fs::create_dir_all(t.proj.join("a")).map_err(|e| e.to_string())?;
+    fs::write(t.proj.join("a/secrets"), b"x").map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/secrets")]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "is not a directory")
+}
+
+fn prelaunch_nested_ro_chain_symlink_125() -> Result<(), String> {
+    let t = Tree::new("pl-nro");
+    fs::create_dir_all(t.proj.join("a2/ro")).map_err(|e| e.to_string())?;
+    symlink(Tree::oldroot(&t.outside), t.proj.join("a")).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+fn prelaunch_nested_ro_leaf_symlink_125() -> Result<(), String> {
+    // The nested-bind SOURCE swap (F): the ro leaf is a symlink to a host dir.
+    let t = Tree::new("pl-nrl");
+    fs::create_dir_all(t.proj.join("a")).map_err(|e| e.to_string())?;
+    symlink(&t.outside, t.proj.join("a/ro")).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+fn prelaunch_nested_ro_relative_leaf_125() -> Result<(), String> {
+    // F, as a payload writes it: a RELATIVE symlink that climbs out of the
+    // rw tree to a host directory holding a secret. bwrap 0.9 resolves bind
+    // sources through host symlinks, so the walk must refuse it.
+    let t = Tree::new("pl-rel");
+    let secret = t.dir.join("hostsecret");
+    fs::create_dir_all(&secret).map_err(|e| e.to_string())?;
+    fs::write(secret.join("key"), b"HOSTKEY\n").map_err(|e| e.to_string())?;
+    fs::create_dir_all(t.proj.join("a")).map_err(|e| e.to_string())?;
+    let depth = t.proj.join("a").components().count() - 1;
+    let up: String = "../".repeat(depth);
+    let target = format!(
+        "{up}{}",
+        secret.strip_prefix("/").unwrap_or(&secret).display()
+    );
+    symlink(target, t.proj.join("a/ro")).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "it is a symbolic link")?;
+    if fs::read_dir(&secret).map_err(|e| e.to_string())?.count() != 1 {
+        return Err("the host secret directory changed".into());
+    }
+    Ok(())
+}
+
+fn prelaunch_alias_of_deny_125() -> Result<(), String> {
+    // Q5: a read-only bind through a host symlink exposes the deny's inode
+    // at another path, so the mask would not cover it. Refused at run time.
+    let t = Tree::new("pl-alias");
+    fs::create_dir_all(t.proj.join("secrets")).map_err(|e| e.to_string())?;
+    let alias = t.dir.join("alias");
+    symlink(&t.proj, &alias).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[], &[], &[&t.proj.join("secrets")]);
+    pol.ro_extra = vec![alias.display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "reachable on the host")
+}
+
+fn prelaunch_reused_session_leaf_symlink_125() -> Result<(), String> {
+    // E: a reused session's home leaf is payload-writable across runs. Run 1
+    // creates `/root/.cache` in the leaf; the harness then plants a symlink
+    // there, as a payload would.
+    let t = Tree::new("pl-reuse");
+    let pol = t.policy(&[], &[], &[Path::new("/root/.cache/x")]);
+    let session = t.session();
+    let first = run_script(&t, &pol, &session, "true")?;
+    expect_rc(&first, 0)?;
+    let cache = session.join("home/.cache");
+    if cache.symlink_metadata().is_err() {
+        return Err(format!("run 1 did not create {cache:?}"));
+    }
+    fs::remove_dir_all(&cache).map_err(|e| e.to_string())?;
+    symlink(Tree::oldroot(&t.outside), &cache).map_err(|e| e.to_string())?;
+    let args = sbx_args(&pol.write(&t.dir), &session, &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+fn pin_rename_of_deny_chain_ebusy() -> Result<(), String> {
+    // A: the payload renames the deny's parent. The pin makes the rename
+    // EBUSY, so the mask still hides the file on the next run.
+    let t = Tree::new("pin-a");
+    fs::create_dir_all(t.proj.join("a/secrets")).map_err(|e| e.to_string())?;
+    fs::write(t.proj.join("a/secrets/key"), b"TOKEN\n").map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/secrets")]);
+    let session = t.session();
+    let p = t.proj.display();
+    let script = format!(
+        "if mv {p}/a {p}/a2 2>/dev/null; then echo RENAMED; else echo BLOCKED; fi; \
+         if test -e {p}/a2/secrets/key; then echo LEAK; fi"
+    );
+    let first = run_script(&t, &pol, &session, &script)?;
+    expect_rc(&first, 0)?;
+    if !first.stdout.contains("BLOCKED") || first.stdout.contains("RENAMED") {
+        return Err(format!("the rename was not blocked: {:?}", first.stdout));
+    }
+    if t.proj.join("a2").exists() || !t.proj.join("a/secrets/key").exists() {
+        return Err("host tree changed under the pinned rename".into());
+    }
+    let second = run_script(
+        &t,
+        &pol,
+        &session,
+        &format!("cat {p}/a/secrets/key; echo done"),
+    )?;
+    expect_rc(&second, 0)?;
+    if second.stdout.contains("TOKEN") {
+        return Err(format!(
+            "the deny mask leaked on run 2: {:?}",
+            second.stdout
+        ));
+    }
+    Ok(())
+}
+
+fn pin_rename_of_nested_ro_ebusy() -> Result<(), String> {
+    // C: a rename of the parent of a nested ro bind would have let run 2
+    // write through the renamed-away path. Blocked by the pin; the ro bind
+    // stays read-only.
+    let t = Tree::new("pin-c");
+    fs::create_dir_all(t.proj.join("a/ro")).map_err(|e| e.to_string())?;
+    fs::write(t.proj.join("a/ro/f"), b"orig\n").map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let session = t.session();
+    let p = t.proj.display();
+    let script = format!(
+        "if mv {p}/a {p}/a2 2>/dev/null; then echo RENAMED; else echo BLOCKED; fi; \
+         if echo X > {p}/a/ro/f 2>/dev/null; then echo WROTE; else echo RO_OK; fi"
+    );
+    let first = run_script(&t, &pol, &session, &script)?;
+    expect_rc(&first, 0)?;
+    if !first.stdout.contains("BLOCKED") || !first.stdout.contains("RO_OK") {
+        return Err(format!("nested ro was not protected: {:?}", first.stdout));
+    }
+    if fs::read(t.proj.join("a/ro/f")).map_err(|e| e.to_string())? != b"orig\n" {
+        return Err("the host ro file changed".into());
+    }
+    Ok(())
+}
+
+fn pin_legit_deny_depth2_fresh_and_reused() -> Result<(), String> {
+    // A legitimate depth-2 deny with an ro sibling and a writable tree still
+    // runs, on a fresh session and again on the reused one.
+    let t = Tree::new("pin-ok");
+    fs::create_dir_all(t.proj.join("a/b/secrets")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(t.proj.join("a/ro")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(t.proj.join("x")).map_err(|e| e.to_string())?;
+    fs::write(t.proj.join("a/b/secrets/key"), b"TOKEN\n").map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/b/secrets")]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let p = t.proj.display();
+    let script =
+        format!("test ! -e {p}/a/b/secrets/key && touch {p}/x/new && test -f {p}/x/new && echo OK");
+    for _ in 0..2 {
+        let done = run_script(&t, &pol, &t.session(), &script)?;
+        expect_rc(&done, 0)?;
+        if !done.stdout.contains("OK") {
+            return Err(format!("legit payload failed: {:?}", done.stdout));
+        }
+    }
+    if !t.proj.join("x/new").exists() {
+        return Err("the payload's write did not reach the host".into());
+    }
+    Ok(())
+}
+
+fn pin_cross_pin_rename_is_exdev() -> Result<(), String> {
+    // Documents the semantics (Risks in the design): a rename across a pinned
+    // directory boundary fails with EXDEV. `mv` falls back to copy and
+    // succeeds; a raw rename would not.
+    let t = Tree::new("pin-exdev");
+    fs::create_dir_all(t.proj.join("a/b/s")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(t.proj.join("c")).map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a/b/s")]);
+    let p = t.proj.display();
+    let script =
+        format!("echo x > {p}/a/f && mv {p}/a/f {p}/a/g && mv {p}/a/g {p}/c/g && echo MOVED");
+    let done = run_script(&t, &pol, &t.session(), &script)?;
+    expect_rc(&done, 0)?;
+    if fs::read(t.proj.join("c/g")).map_err(|e| e.to_string())? != b"x\n" {
+        return Err("the cross-pin move did not reach the host".into());
+    }
+    Ok(())
+}
+
+fn session_leaf_deny_fresh_and_reused() -> Result<(), String> {
+    // A deny under a session leaf (/root, /tmp) is created by bwrap inside
+    // the leaf, which is allowed (the leaf is exclusively ours).
+    let t = Tree::new("leaf-ok");
+    let pol = t.policy(
+        &[],
+        &[],
+        &[Path::new("/root/.cache/x"), Path::new("/tmp/deep/er")],
+    );
+    let script = "test -d /root/.cache/x && test -d /tmp/deep/er && echo OK";
+    for _ in 0..2 {
+        let done = run_script(&t, &pol, &t.session(), script)?;
+        expect_rc(&done, 0)?;
+        if !done.stdout.contains("OK") {
+            return Err(format!("session-leaf deny missing: {:?}", done.stdout));
+        }
+    }
+    Ok(())
+}
+
+// ---- Reviewer findings on #39/#40 (C1, M1, M2, m1) ---------------------------
+
+/// C1 (a1): a writable parent of a nested writable bind is renamed by the
+/// payload. The parent is pinned, so the rename is EBUSY and the deny mask
+/// keeps hiding the secret on the next run.
+fn c1_nested_rw_parent_rename_ebusy() -> Result<(), String> {
+    let t = Tree::new("c1-a1");
+    let x = t.proj.clone();
+    let qp = x.join("q/p");
+    fs::create_dir_all(qp.join("a/s")).map_err(|e| e.to_string())?;
+    fs::write(qp.join("a/s/key"), b"SECRET\n").map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&x, &qp], &[], &[&qp.join("a/s")]);
+    let session = t.session();
+    let (xs, qs) = (x.display(), qp.display());
+    let script =
+        format!("if mv {xs}/q {xs}/q2 2>/dev/null; then echo RENAMED; else echo BLOCKED; fi");
+    let first = run_script(&t, &pol, &session, &script)?;
+    expect_rc(&first, 0)?;
+    if !first.stdout.contains("BLOCKED") || first.stdout.contains("RENAMED") {
+        return Err(format!(
+            "the nested rw parent was renamed: {:?}",
+            first.stdout
+        ));
+    }
+    let second = run_script(
+        &t,
+        &pol,
+        &session,
+        &format!("cat {xs}/q2/p/a/s/key 2>/dev/null; cat {qs}/a/s/key 2>/dev/null; echo done"),
+    )?;
+    expect_rc(&second, 0)?;
+    if second.stdout.contains("SECRET") {
+        return Err(format!("the secret leaked on run 2: {:?}", second.stdout));
+    }
+    if !t.proj.join("q/p/a/s/key").exists() {
+        return Err("the host tree changed".into());
+    }
+    Ok(())
+}
+
+/// C1 (a2): the payload renames the parent of a nested read-only bind and
+/// then writes through the renamed path. Neither works: the rename is EBUSY
+/// and the ro bind stays read-only.
+fn c1_nested_ro_write_through_renamed_parent() -> Result<(), String> {
+    let t = Tree::new("c1-a2");
+    let x = t.proj.clone();
+    let qp = x.join("q/p");
+    let ro = qp.join("a/r");
+    fs::create_dir_all(&ro).map_err(|e| e.to_string())?;
+    fs::write(ro.join("f"), b"ORIG\n").map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&x, &qp], &[], &[]);
+    pol.ro_extra = vec![ro.display().to_string()];
+    let session = t.session();
+    let (xs, qs) = (x.display(), qp.display());
+    let script = format!(
+        "if mv {xs}/q {xs}/q2 2>/dev/null; then echo RENAMED; else echo BLOCKED; fi; \
+         if echo PWNED > {qs}/a/r/f 2>/dev/null; then echo WROTE; else echo RO_OK; fi"
+    );
+    let first = run_script(&t, &pol, &session, &script)?;
+    expect_rc(&first, 0)?;
+    if !first.stdout.contains("BLOCKED") || !first.stdout.contains("RO_OK") {
+        return Err(format!("nested ro was writable: {:?}", first.stdout));
+    }
+    let second = run_script(
+        &t,
+        &pol,
+        &session,
+        &format!("echo PWNED > {xs}/q2/p/a/r/f 2>/dev/null && echo WROTE2; echo done"),
+    )?;
+    expect_rc(&second, 0)?;
+    if second.stdout.contains("WROTE2") {
+        return Err("run 2 wrote through a renamed parent".into());
+    }
+    if fs::read(ro.join("f")).map_err(|e| e.to_string())? != b"ORIG\n" {
+        return Err("the host ro file changed".into());
+    }
+    Ok(())
+}
+
+/// M1 (a3): a deny under a read-only bind, with a symlink planted in the
+/// read-only tree (by a different policy's writer). bwrap's setup-time mkdir
+/// would follow it to the host, so the run is refused before the spawn.
+fn prelaunch_planted_under_ro_cover_125() -> Result<(), String> {
+    let t = Tree::new("pl-a3");
+    let y = t.proj.clone();
+    let r = y.join("r");
+    fs::create_dir_all(r.join("a2/s")).map_err(|e| e.to_string())?;
+    symlink(Tree::oldroot(&t.outside), r.join("a")).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&y], &[], &[&r.join("a/s")]);
+    pol.ro_extra = vec![r.display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+/// M1 (a3b): a deny under a plain read-only bind, planted symlink.
+fn prelaunch_deny_under_plain_ro_125() -> Result<(), String> {
+    let t = Tree::new("pl-a3b");
+    let z = t.proj.join("z");
+    fs::create_dir_all(&z).map_err(|e| e.to_string())?;
+    symlink(Tree::oldroot(&t.outside), z.join("a")).map_err(|e| e.to_string())?;
+    let mut pol = Pol::new("exit");
+    pol.ro_extra = vec![z.display().to_string()];
+    pol.deny = vec![z.join("a/s").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_planted_refusal(&t, &args, "it is a symbolic link")
+}
+
+/// C1 (a4): a payload flips a nested-bind parent between a real directory and
+/// a relative link to a host directory while other same-policy runs start. No
+/// run may read the host key or write into the host directory. The flipping
+/// payload runs for the whole loop, and at least 200 probe runs are made.
+fn c1_concurrent_source_swap_no_escape() -> Result<(), String> {
+    let t = Tree::new("c1-a4");
+    let x = t.proj.clone();
+    let qp = x.join("q/p");
+    fs::create_dir_all(&qp).map_err(|e| e.to_string())?;
+    let hs = t.dir.join("hs/p");
+    fs::create_dir_all(&hs).map_err(|e| e.to_string())?;
+    fs::write(hs.join("HOSTKEY"), b"HOSTKEY\n").map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&x, &qp], &[], &[]);
+    let policy = pol.write(&t.dir);
+    let (xs, qs) = (x.display(), qp.display());
+    let flip = format!(
+        "cd {xs}; end=$(( $(date +%s) + 6 )); while [ $(date +%s) -lt $end ]; do mv q qr; ln -s ../hs q; sleep 0.002; rm -f q; mv qr q; sleep 0.002; done"
+    );
+    let flipper = Proc::spawn(
+        &sbx_args(&policy, &t.dir.join("sess-flip"), &[], &sh(&flip)),
+        |_| {},
+    )?;
+    std::thread::sleep(Duration::from_millis(500));
+    let mut leaks = 0u32;
+    let mut runs = 0u32;
+    let mut refused = 0u32;
+    for i in 0..200 {
+        let script = format!(
+            "cat {qs}/HOSTKEY 2>/dev/null; cat {xs}/qr/p/HOSTKEY 2>/dev/null; touch {qs}/WRITTEN{i} 2>/dev/null; touch {xs}/qr/p/WRITTEN{i} 2>/dev/null; true"
+        );
+        let done = run_sbx(&sbx_args(
+            &policy,
+            &t.dir.join(format!("sess-{i}")),
+            &[],
+            &sh(&script),
+        ))?;
+        runs += 1;
+        if done.rc == 125 {
+            refused += 1;
+        }
+        if done.stdout.contains("HOSTKEY") {
+            leaks += 1;
+        }
+    }
+    let _ = flipper.finish(Duration::from_secs(30));
+    let written = entries(&hs)?.into_iter().filter(|n| n != "HOSTKEY").count();
+    if runs < 200 {
+        return Err(format!("only {runs} probe runs"));
+    }
+    if leaks != 0 {
+        return Err(format!(
+            "{leaks} of {runs} runs read the host key ({refused} refused)"
+        ));
+    }
+    if written != 0 {
+        return Err(format!(
+            "{written} files were written into the host directory"
+        ));
+    }
+    Ok(())
+}
+
+/// M2 (a5 T6): a read-only bind whose host source is a link into a deny path
+/// exposes the masked directory at another path. Refused before launch.
+fn prelaunch_bind_containing_deny_via_link_125() -> Result<(), String> {
+    let t = Tree::new("pl-a5");
+    let secrets = t.proj.join("secrets/sub");
+    fs::create_dir_all(&secrets).map_err(|e| e.to_string())?;
+    fs::write(secrets.join("key"), b"TOPSECRET\n").map_err(|e| e.to_string())?;
+    let lnk = t.dir.join("lnk");
+    symlink(&secrets, &lnk).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[], &[], &[&t.proj.join("secrets")]);
+    pol.ro_extra = vec![lnk.display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "reached through a host symbolic link")
+}
+
+/// m1 (a5 T2): a deny nested under another deny whose directory does not
+/// exist. The outer mask hides it inside the tmpfs, so the run starts; the
+/// nested one is not refused, and nothing is created on the host.
+fn nested_deny_under_deny_runs() -> Result<(), String> {
+    let t = Tree::new("nd");
+    fs::create_dir_all(t.proj.join("a")).map_err(|e| e.to_string())?;
+    fs::write(t.proj.join("a/k"), b"K").map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[&t.proj.join("a"), &t.proj.join("a/b/s")]);
+    let p = t.proj.display();
+    let done = run_script(&t, &pol, &t.session(), &format!("ls -A {p}/a; echo done"))?;
+    expect_rc(&done, 0)?;
+    if !done.stdout.contains("done") || done.stdout.contains("k") {
+        return Err(format!("unexpected listing: {:?}", done.stdout));
+    }
+    if t.proj.join("a/b").exists() {
+        return Err("the nested deny's parent was created on the host".into());
+    }
+    Ok(())
+}
+
+/// N19 (PR #47): `lnk -> real`, a read-only bind of `lnk/p` next to the
+/// writable `real`. The bind is nested only through the host alias, so no pin
+/// or walk on its lexical chain could hold. Refused before the spawn, with
+/// nothing changed on the host.
+fn n19_tree(tag: &str) -> Result<(Tree, PathBuf, PathBuf), String> {
+    let t = Tree::new(tag);
+    let real = t.dir.join("real");
+    fs::create_dir_all(real.join("p")).map_err(|e| e.to_string())?;
+    let lnk = t.dir.join("lnk");
+    symlink(&real, &lnk).map_err(|e| e.to_string())?;
+    Ok((t, real, lnk))
+}
+
+fn prelaunch_n19_host_alias_ro_125() -> Result<(), String> {
+    let (t, real, lnk) = n19_tree("n19-ro")?;
+    let mut pol = t.policy(&[&real], &[], &[]);
+    pol.ro_extra = vec![lnk.join("p").display().to_string()];
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "through a host symbolic link")?;
+    if !real.join("p").is_dir() {
+        return Err("the host directory changed".into());
+    }
+    Ok(())
+}
+
+fn prelaunch_n19_host_alias_rw_125() -> Result<(), String> {
+    let (t, real, lnk) = n19_tree("n19-rw")?;
+    let pol = t.policy(&[&real, &lnk.join("p")], &[], &[]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "through a host symbolic link")?;
+    if real.join("p").join("WRITTEN").exists() {
+        return Err("a payload file reached the host".into());
+    }
     Ok(())
 }

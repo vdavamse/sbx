@@ -2,7 +2,7 @@
 //! check (issue #13).
 //!
 //! 1. Contract: `check --conformance [--network] [--only ID|GROUP,...] [--list]
-//!    [--json]` prints 69 checks in catalog order; rc 0 only when nothing failed
+//!    [--json]` prints 71 checks in catalog order; rc 0 only when nothing failed
 //!    and nothing needed by a selected check was missing (see [`report`]).
 //! 2. Tiers: host scenarios (`sbx run` with a built-in policy and a probe
 //!    payload), the init tier (F03, the production `sbx __init`), the lab tier

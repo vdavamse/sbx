@@ -9,7 +9,12 @@
 //!    row (S4); the audit file opens before anything is spawned (S5); the only
 //!    spawn before the window is `bwrap --version` (S6); the `__init` spawn is
 //!    the only one inside the fd window (S9–S11); the network runtime is first
-//!    polled and reported ready before the go byte is sent (S16–S17).
+//!    polled and reported ready before the go byte is sent (S16–S17). S8a
+//!    (#39/#40) runs after the argv is built and before the spawn: the
+//!    pre-launch guard verifies every path bwrap resolves under a writable
+//!    bind (`bwrap::guard`), and refuses with rc 125 if any is a symlink,
+//!    is missing or has the wrong type, or if a deny is reachable through a
+//!    host symlink alias. Nothing is spawned, and nothing is created.
 //! 3. **Teardown and pid-1 identity.** Pid 1 of the sandbox is learned from
 //!    bwrap's `--info-fd` (`child-pid`), verified (`PPid == bwrap`, `NSpid` last
 //!    `== 1`), and killed through its pidfd. Waiting on that pidfd proves the whole
@@ -44,7 +49,14 @@
 //!    flock). The session mtime is touched at start and end (#12). A session
 //!    that `sbx gc` tombstones while the run is locking is detected and refused
 //!    (125).
-//! 10. **Limitations.** Connections still open at exit get no `close` row. The
+//! 10. **Limitations.** Pins (#40) make a cross-directory `rename(2)` or `link(2)`
+//!     across a pinned boundary fail with EXDEV, so raw-rename tools (some
+//!     package managers' atomic moves) fail inside a sandbox whose policy has a
+//!     bind or deny under an `rw` path at depth 2 or more; `mv` copies
+//!     instead. A missing deny path under an `rw` bind is refused (bwrap would
+//!     create it on the host). The guard's check and bwrap's setup are separate
+//!     steps: a writer outside the same policy can race them on bwrap before
+//!     0.12.0 (R26). Connections still open at exit get no `close` row. The
 //!     audit log is not fsynced. Socket families: only AF_UNIX, AF_INET,
 //!     AF_INET6 and AF_NETLINK are creatable (issue #34; everything else is
 //!     EAFNOSUPPORT, including AF_VSOCK), io_uring is ENOSYS, and 32-bit or
@@ -561,6 +573,18 @@ fn execute(
         seccomp_fd: seccomp_memfd.as_raw_fd(),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
+
+    // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
+    // will resolve under a writable bind (fd-relative, no symlinks, nothing
+    // missing), and that no deny mask is reachable through a host symlink.
+    // Refusal is 125 with nothing created.
+    for check in launch.path_checks() {
+        crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
+    }
+    crate::bwrap::guard::verify_aliases(launch.alias_checks())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    crate::bwrap::guard::verify_binds(launch.bind_specs())
+        .map_err(|err| RunError::new(err.to_string()))?;
 
     // S9–S11: the control socketpair and the single spawn window.
     let (parent_end, child_end) = fdpass::control_socketpair()

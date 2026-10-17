@@ -47,6 +47,23 @@ pub fn policy_json(which: Builtin, exe: &str, network_tag: Option<&str>) -> Stri
     serde_json::to_string_pretty(&doc).unwrap_or_default()
 }
 
+/// A filesystem policy for the #40 scenarios (D11, D12): mode none, `/usr`
+/// and the sbx binary read-only, the given rw and deny paths.
+pub fn fs_policy_json(exe: &str, rw: &[String], deny: &[String]) -> String {
+    let mut ro = vec![json!("/usr")];
+    if !exe.starts_with("/usr/") {
+        ro.push(json!(exe));
+    }
+    let doc: Value = json!({
+        "version": 1,
+        "filesystem": {"ro": ro, "rw": rw, "deny": deny},
+        "network": {"mode": "none", "allow": ALLOWED_ONLY, "ports": [443]},
+        "env": {"pass": [], "set": {}},
+        "limits": {"timeout": "30s", "output_bytes": 1048576}
+    });
+    serde_json::to_string_pretty(&doc).unwrap_or_default()
+}
+
 /// Write a policy file under `dir`, returning its path.
 pub fn write_policy(dir: &Path, name: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join(format!("{name}.json"));
