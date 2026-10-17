@@ -53,6 +53,12 @@ Please **do not** file a public issue for a security report.
   host is a known limitation, not a reportable vulnerability. The sandbox
   contains the command; it does not make the command benign.
 
+- **Documented residuals.** The guarantees and residual risks are in
+  [docs/threat-model.md](docs/threat-model.md). A residual listed there is a
+  known limitation, not a defect. A report is in scope when it shows a way past
+  the bound that a residual states (for example egress to a name the policy does
+  not allow), or a guarantee failing.
+
 ## Response
 
 Reports are triaged best-effort by the maintainer. Expect an
