@@ -17,9 +17,12 @@ timeout and an audit trail, and tears everything down on exit.
   (namespaces, nftables); there are no macOS or Windows plans.
 - **No eBPF cgroup firewall.** Egress filtering uses nftables inside the
   sandbox's network namespace, which works unprivileged (proven by the
-  issue #1 spike, `spikes/nft-load`).
+  issue #1 spike, `spikes/nft-load`). Why: see the
+  [threat model](docs/threat-model.md#81-why-not-an-ebpf-cgroup-firewall).
 - **No TLS interception in v1.** The egress proxy passes TLS through and
-  filters on SNI/IP; no MITM CA is installed inside the sandbox.
+  filters on SNI/IP; no MITM CA is installed inside the sandbox. Why, and
+  the domain-fronting residual it leaves: see the
+  [threat model](docs/threat-model.md#84-why-tls-passthrough-in-v1).
 
 ## Status
 
@@ -235,7 +238,8 @@ pre-check is tracked as a follow-up.
 
 `sbx check --conformance` runs every security guarantee as an executable check:
 69 checks in eight groups, the same code that `cargo test --test conformance`
-runs in CI.
+runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
+checks that prove it, and lists what they do not prove.
 
 - **A: allow list** (`allow-list`): allowed names resolve and reach the upstream;
   everything else is refused on DNS, CONNECT and TLS.
@@ -608,3 +612,6 @@ Apache-2.0 — see [LICENSE](LICENSE).
 
 Sandbox escapes and other vulnerabilities: please report them privately —
 see [SECURITY.md](SECURITY.md).
+
+Threat model and security guarantees, with the residual risks:
+[docs/threat-model.md](docs/threat-model.md).
