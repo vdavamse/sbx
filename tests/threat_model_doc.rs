@@ -1,17 +1,22 @@
 //! Consistency checks for `docs/threat-model.md` (issue #14).
 //!
 //! The threat model cites conformance checks by id and cites code as
-//! `src/<file>.rs:<identifier>`. This test keeps those citations honest:
+//! `src/<file>.rs:<identifier>`, `src/<file>.rs` and "module docs point N".
+//! This test keeps those citations honest:
 //!
 //! * every backticked check id in the document exists in the catalog;
 //! * every catalog check is cited in the guarantee table (section 6);
 //! * every "N checks" / "N catalog checks" / "N executable checks" statement in
-//!   the document and the README equals the catalog size;
-//! * every `src/...:identifier` reference names a file that exists and an
-//!   identifier that occurs in it as a whole word;
+//!   the document and the README equals the catalog size (trailing punctuation
+//!   is ignored);
+//! * every `src/` path cited exists, and every `src/<file>.rs:<identifier>`
+//!   reference (and each bare identifier in a comma-separated list after it)
+//!   occurs as code (not only in comments) in that file;
+//! * every "module docs point N" names a numbered point (`//! N. `) in its file;
 //! * README.md and SECURITY.md link the document.
 //!
-//! No regex crate is used; the scanners are hand-written.
+//! The scanners are hand-written (no regex crate). The identifier check is a
+//! whole-word search of non-comment lines, not a parse.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -24,8 +29,12 @@ const LINK: &str = "docs/threat-model.md";
 const SECTION6_START: &str = "## 6. ";
 const SECTION6_END: &str = "## 7. ";
 
+fn repo_path(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
 fn read_repo_file(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let path = repo_path(rel);
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
@@ -35,6 +44,21 @@ fn read_repo_file(rel: &str) -> String {
 fn is_check_id(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.len() == 3 && b[0].is_ascii_uppercase() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
+}
+
+/// A bare Rust-identifier-looking token (no dashes, dots, spaces or slashes).
+fn is_ident_like(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    let first_ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_');
+    first_ok
+        && tok.len() >= 2
+        && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !is_check_id(tok)
+}
+
+/// Strips non-alphanumeric characters from both ends of a word.
+fn clean_word(w: &str) -> &str {
+    w.trim_matches(|c: char| !c.is_alphanumeric())
 }
 
 /// The non-fenced lines of a Markdown document (lines inside ``` fences are dropped).
@@ -97,7 +121,7 @@ fn section6_rows(doc: &str) -> Vec<&str> {
 fn stated_check_counts(lines: &[&str]) -> Vec<usize> {
     let mut out = Vec::new();
     for line in lines {
-        let words: Vec<&str> = line.split_whitespace().collect();
+        let words: Vec<&str> = line.split_whitespace().map(clean_word).collect();
         for (i, w) in words.iter().enumerate() {
             let Ok(n) = w.parse::<usize>() else { continue };
             let next = words.get(i + 1).copied();
@@ -125,19 +149,84 @@ fn contains_word(text: &str, word: &str) -> bool {
     })
 }
 
-/// `src/...:identifier` code spans, as (path, identifier). The identifier is
-/// the last `::` segment of the text after the first colon.
-fn source_refs(lines: &[&str]) -> Vec<(String, String)> {
-    lines
-        .iter()
-        .flat_map(|l| code_spans(l))
-        .filter(|s| s.starts_with("src/") && s.contains(':'))
-        .filter_map(|s| {
-            let (path, ident) = s.split_once(':')?;
-            let last = ident.rsplit("::").next()?.trim();
-            Some((path.to_owned(), last.to_owned()))
-        })
-        .collect()
+/// The non-comment lines of a Rust source file, joined.
+fn code_only(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// True when the file has a module-doc point `//! N. ...`.
+fn module_point_defined(text: &str, n: usize) -> bool {
+    let prefix = format!("{n}. ");
+    text.lines().any(|l| {
+        l.trim_start()
+            .strip_prefix("//!")
+            .is_some_and(|rest| rest.trim_start().starts_with(&prefix))
+    })
+}
+
+/// Everything the source-reference check collects from the document.
+#[derive(Default)]
+struct SourceRefs {
+    /// `src/<file>:<identifier>` spans: (path, identifier).
+    with_ident: Vec<(String, String)>,
+    /// Bare identifiers in a comma-separated list after a `src/` span: (path, identifier).
+    list_idents: Vec<(String, String)>,
+    /// `src/<file>` spans without an identifier.
+    path_only: Vec<String>,
+    /// "module docs point N" / "module docs points N and M": (path, N).
+    points: Vec<(String, usize)>,
+}
+
+fn collect_source_refs(lines: &[&str]) -> SourceRefs {
+    let mut refs = SourceRefs::default();
+    for line in lines {
+        let parts: Vec<&str> = line.split('`').collect();
+        // Code spans are the odd-indexed parts; `parts[k + 1]` is the prose
+        // between the closing backtick of span k and the opening one of the next.
+        let mut chain: Option<String> = None;
+        for k in (1..parts.len()).step_by(2) {
+            let span = parts[k];
+            let sep = parts.get(k + 1).copied().unwrap_or("");
+            if span.starts_with("src/") {
+                match span.split_once(':') {
+                    Some((path, ident)) => {
+                        let last = ident.rsplit("::").next().unwrap_or(ident).trim();
+                        refs.with_ident.push((path.to_owned(), last.to_owned()));
+                        chain = Some(path.to_owned());
+                    }
+                    None => {
+                        refs.path_only.push(span.to_owned());
+                        chain = Some(span.to_owned());
+                    }
+                }
+                if let Some(idx) = sep.find("docs point") {
+                    let words = sep[idx + "docs point".len()..]
+                        .trim_start_matches('s')
+                        .split_whitespace()
+                        .take(4);
+                    let path = span.split(':').next().unwrap_or(span).to_owned();
+                    for w in words {
+                        if let Ok(n) = clean_word(w).parse::<usize>() {
+                            refs.points.push((path.clone(), n));
+                        } else if !matches!(clean_word(w), "and" | "or") {
+                            break;
+                        }
+                    }
+                }
+            } else if let Some(file) = chain.clone() {
+                if is_ident_like(span) {
+                    refs.list_idents.push((file, span.to_owned()));
+                }
+            }
+            if sep != ", " {
+                chain = None;
+            }
+        }
+    }
+    refs
 }
 
 #[test]
@@ -197,26 +286,44 @@ fn stated_check_counts_match_the_catalog() {
 #[test]
 fn source_references_resolve() {
     let doc = read_repo_file(DOC);
-    let refs = source_refs(&prose_lines(&doc));
+    let refs = collect_source_refs(&prose_lines(&doc));
     assert!(
-        !refs.is_empty(),
-        "{DOC} has no src/...:identifier references"
+        !refs.with_ident.is_empty() && !refs.points.is_empty(),
+        "{DOC} has no src references to check"
     );
 
-    let mut broken = Vec::new();
-    for (path, ident) in &refs {
-        let full = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path);
+    let mut problems = Vec::new();
+    let mut check_ident = |path: &str, ident: &str| {
+        let full = repo_path(path);
         match fs::read_to_string(&full) {
-            Err(_) => broken.push(format!("{path} (file missing)")),
-            Ok(text) if !contains_word(&text, ident) => {
-                broken.push(format!("{path}:{ident} (identifier not found)"));
+            Err(_) => problems.push(format!("{path} (file missing)")),
+            Ok(text) => {
+                if !contains_word(&code_only(&text), ident) {
+                    problems.push(format!("{path}:{ident} (no code occurrence)"));
+                }
+            }
+        }
+    };
+    for (path, ident) in refs.with_ident.iter().chain(refs.list_idents.iter()) {
+        check_ident(path, ident);
+    }
+    for path in &refs.path_only {
+        if !repo_path(path).exists() {
+            problems.push(format!("{path} (path missing)"));
+        }
+    }
+    for (path, n) in &refs.points {
+        match fs::read_to_string(repo_path(path)) {
+            Err(_) => problems.push(format!("{path} (file missing, module docs point {n})")),
+            Ok(text) if !module_point_defined(&text, *n) => {
+                problems.push(format!("{path}: no module docs point {n}"));
             }
             Ok(_) => {}
         }
     }
     assert!(
-        broken.is_empty(),
-        "{DOC} has references that do not resolve: {broken:?}"
+        problems.is_empty(),
+        "{DOC} has src references that do not resolve: {problems:?}"
     );
 }
 
