@@ -613,6 +613,7 @@ impl Holder {
                 duration_ms: end.duration_ms,
                 net_mode: Some(self.net_mode),
                 truncated: end.truncated,
+                dns_poisoned: false,
                 reason: &end.reason,
             },
         ));
@@ -644,6 +645,7 @@ impl Holder {
                     duration_ms: ms,
                     net_mode: Some(self.net_mode),
                     truncated: false,
+                    dns_poisoned: false,
                     reason: "the attach process exited without reporting the call end",
                 },
             ));
@@ -688,6 +690,7 @@ outcome: "terminated",
 duration_ms: ms,
 net_mode: Some(self.net_mode),
 truncated: false,
+dns_poisoned: false,
 reason: "the session stopped while the call was running; it was killed after the grace period",
 }));
         }

@@ -215,6 +215,8 @@ pub(crate) struct CallExit<'a> {
     pub(crate) duration_ms: u64,
     pub(crate) net_mode: Option<&'static str>,
     pub(crate) truncated: bool,
+    /// The session's fake-IP map was poisoned (the exit row's `dns_poisoned`).
+    pub(crate) dns_poisoned: bool,
     pub(crate) reason: &'a str,
 }
 
@@ -226,10 +228,12 @@ pub(crate) fn call_exit_row(ts: String, call: &CallExit<'_>) -> Row {
     row.exit = Some(ExitFields {
         code: call.code,
         outcome: call.outcome,
-        signal: (call.outcome == "signaled").then(|| call.code - 128),
+        // The same rule as a plain run's `outcome_signal`: a signalled or
+        // terminated outcome carries its signal (`code - 128`).
+        signal: matches!(call.outcome, "signaled" | "terminated").then(|| call.code - 128),
         duration_ms: call.duration_ms,
         output_truncated: call.truncated,
-        dns_poisoned: false,
+        dns_poisoned: call.dns_poisoned,
         net_mode: call.net_mode,
         call_id: Some(call.call_id),
     });
@@ -996,5 +1000,77 @@ mod tests {
             ))
             .ends_with(",\"net_mode\":\"explicit\"}\n")
         );
+    }
+
+    /// Review 2 of #57: a call row and a plain run's exit row agree on every key
+    /// and on every fact they share, for every outcome.
+    #[test]
+    fn call_exit_row_matches_the_plain_exit_row_for_every_outcome() {
+        use crate::run::plan::{exit_code, exit_reason, outcome_label};
+        let ts = "2026-11-05T00:00:00.000Z".to_owned();
+        let duration = Duration::from_millis(1234);
+        let outcomes = [
+            Outcome::Exited(3),
+            Outcome::Signaled(9),
+            Outcome::TimedOut(Duration::from_secs(2)),
+            Outcome::Terminated(15),
+            Outcome::Failed("boom".to_owned()),
+        ];
+        for o in outcomes {
+            let plain = serde_json::to_value(exit_row_for(
+                ts.clone(),
+                &o,
+                duration,
+                false,
+                false,
+                Some("transparent"),
+                Some(7),
+            ))
+            .unwrap();
+            let reason = exit_reason(&o);
+            let call = serde_json::to_value(call_exit_row(
+                ts.clone(),
+                &CallExit {
+                    call_id: 7,
+                    code: exit_code(&o),
+                    outcome: outcome_label(&o),
+                    duration_ms: 1234,
+                    net_mode: Some("transparent"),
+                    truncated: false,
+                    dns_poisoned: false,
+                    reason: &reason,
+                },
+            ))
+            .unwrap();
+            let keys = |v: &serde_json::Value| -> Vec<String> {
+                v.as_object().unwrap().keys().cloned().collect()
+            };
+            assert_eq!(
+                keys(&plain),
+                keys(&call),
+                "{o:?}: same keys in the same order"
+            );
+            assert_eq!(plain, call, "{o:?}: the shared facts agree");
+        }
+    }
+
+    #[test]
+    fn terminated_call_rows_carry_their_signal_like_plain_rows() {
+        let row = call_exit_row(
+            "t".to_owned(),
+            &CallExit {
+                call_id: 1,
+                code: 143,
+                outcome: "terminated",
+                duration_ms: 0,
+                net_mode: None,
+                truncated: false,
+                dns_poisoned: false,
+                reason: "stopped",
+            },
+        );
+        let v = serde_json::to_value(row).unwrap();
+        assert_eq!(v["signal"], 15);
+        assert_eq!(v["outcome"], "terminated");
     }
 }
