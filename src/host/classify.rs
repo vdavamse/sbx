@@ -886,20 +886,26 @@ fn deny_links_item(policy: &Policy, hard_links: &dyn Fn(&Path) -> Vec<String>) -
         .chain(policy.filesystem.rw.iter())
         .map(|p| p.as_path())
         .collect();
-    let found: Vec<String> = policy
+    // Candidates: denies under a policy path, deduplicated. Then the outer
+    // ones among the candidates only, so a deny above every policy path does
+    // not hide a nested candidate from the scan.
+    let mut candidates: Vec<&Path> = policy
         .filesystem
         .deny
         .iter()
         .map(|deny| deny.as_path())
         .filter(|deny| policy_paths.iter().any(|root| deny.starts_with(root)))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let found: Vec<String> = candidates
+        .iter()
         .filter(|deny| {
-            !policy
-                .filesystem
-                .deny
+            !candidates
                 .iter()
-                .any(|outer| outer.as_path() != *deny && deny.starts_with(outer.as_path()))
+                .any(|outer| outer != *deny && deny.starts_with(outer))
         })
-        .flat_map(hard_links)
+        .flat_map(|deny| hard_links(deny))
         .collect();
     if found.is_empty() {
         return PolicyItem {
@@ -1863,6 +1869,21 @@ mod tests {
             Vec::new()
         };
         let seams = new_seams(&all, &no, &ok, Some((0, 12, 0)), &links);
+        let _ = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        assert_eq!(
+            *scanned.borrow(),
+            vec![std::path::PathBuf::from("/usr/lib/secret")]
+        );
+
+        // A deny above every policy path is not a candidate, so it does not
+        // hide a nested candidate; duplicates are scanned once.
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr/lib"],"rw":[],"deny":["/usr","/usr/lib/secret","/usr/lib/secret"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        scanned.borrow_mut().clear();
         let _ = policy_check_with(
             "p.json",
             &policy_of(json),
