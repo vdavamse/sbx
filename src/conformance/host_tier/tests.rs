@@ -1442,3 +1442,25 @@ fn d14_any_read_error_other_than_not_found_is_a_fail() {
     let (st, detail, _) = status_of("D14", &m);
     assert_eq!(st, Status::Fail, "{detail}");
 }
+
+#[test]
+fn s16_host_read_of_a_missing_file_is_what_d14_requires() {
+    // Pins the runner/evaluator contract: CI once failed D14 because the
+    // runner wrote ErrorKind's Display ("entity not found") while the
+    // evaluator expects the Debug name.
+    use crate::conformance::scenarios::host_read;
+    let dir = std::env::temp_dir().join(format!("sbx-d14-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(host_read(&dir.join("missing")), "absent: NotFound");
+    std::fs::write(dir.join("f"), "RO").unwrap();
+    assert_eq!(host_read(&dir.join("f")), "RO");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut m = good();
+    m.get_mut("S16").unwrap().notes.insert(
+        "ro_new",
+        host_read(std::path::Path::new("/nonexistent/sbx-d14")),
+    );
+    let (st, detail, _) = status_of("D14", &m);
+    assert_eq!(st, Status::Ok, "{detail}");
+}

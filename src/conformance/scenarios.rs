@@ -1668,6 +1668,12 @@ pub fn d13_paths(exe: &str, base: &str) -> Vec<String> {
         .collect()
 }
 
+/// S16's host re-read: the file's text, or `absent: <ErrorKind Debug>`
+/// (`absent: NotFound` for a missing file — the exact text D14 requires).
+pub fn host_read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| format!("absent: {:?}", e.kind()))
+}
+
 /// The #45 tree: `fs/ro` (read-only bind) with `file` (text `RO`), `visible`
 /// and the denied `secret/token`; `fs/rw` (writable bind) with `visible` and
 /// the denied `secret/token`; `fs/outside`, a sibling the policy never names.
@@ -1781,8 +1787,7 @@ fn s16(env: &Env) -> Scn {
     let fin = r.finish();
     finish_scn(&mut scn, fin, &audit, false);
 
-    let read =
-        |p: PathBuf| fs::read_to_string(&p).unwrap_or_else(|e| format!("absent: {}", e.kind()));
+    let read = |p: PathBuf| host_read(&p);
     scn.notes.insert(
         "d13.paths",
         serde_json::to_string(&hidden).unwrap_or_default(),
