@@ -15,7 +15,7 @@ use crate::init::fdpass::StagedFailure;
 use crate::init::probe::{ProbeReport, ProbeStep, StepStatus};
 use crate::policy::{NetworkMode, Policy};
 
-use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts};
+use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
 use super::{
     CapId, Capability, EffectiveMode, PolicyCheck, PolicyItem, REPORT_VERSION, Report, Status,
 };
@@ -595,18 +595,21 @@ pub fn check_mode(required: NetworkMode, provided: EffectiveMode) -> Result<(), 
     }
 }
 
-/// The policy against the host: four items in the fixed order `network-mode`,
-/// `infra-etc`, `policy-paths`, `deny-paths`. `exists` and `is_non_dir` are the
-/// filesystem seams (`metadata` based in production, injected in tests).
+/// The policy against the host: five items in the fixed order `network-mode`,
+/// `infra-etc`, `policy-paths`, `deny-paths`, `bind-sockets`. `exists`,
+/// `is_non_dir` and `sockets` are the filesystem seams (`metadata` and
+/// [`super::facts::socket_scan`] in production, injected in tests).
+/// `bind-sockets` is a WARN, never a FAIL: the policy still runs.
 pub fn policy_check(
     path: &str,
     policy: &Policy,
     provided: EffectiveMode,
     exists: &dyn Fn(&Path) -> bool,
     is_non_dir: &dyn Fn(&Path) -> bool,
+    sockets: &dyn Fn(&[&Path], &[&Path]) -> SocketScan,
 ) -> PolicyCheck {
     let required = policy.network.mode;
-    let mut checks = Vec::with_capacity(4);
+    let mut checks = Vec::with_capacity(5);
 
     let network = match check_mode(required, provided) {
         Ok(()) => PolicyItem {
@@ -699,12 +702,71 @@ pub fn policy_check(
         "deny the parent directory instead",
     ));
 
-    let runnable = checks.iter().all(|c| c.status == Status::Ok);
+    let deny: Vec<&Path> = policy.filesystem.deny.iter().map(|p| p.as_path()).collect();
+    checks.push(bind_sockets_item(&sockets(&ro_rw, &deny), ro_rw.len()));
+
+    let runnable = checks.iter().all(|c| c.status != Status::Fail);
     PolicyCheck {
         path: path.to_owned(),
         required,
         runnable,
         checks,
+    }
+}
+
+/// Shown socket paths in the `bind-sockets` detail before "and N more".
+const BIND_SOCKETS_SHOWN: usize = 10;
+
+/// The `bind-sockets` item (issue #35): a unix socket file under a policy
+/// `ro`/`rw` bind is reachable from the sandbox, because a read-only bind
+/// does not block `connect()` (docker.sock, D-Bus, ssh-agent, nscd). WARN,
+/// not FAIL: binding one can be deliberate. Conformance `D05` is the
+/// in-sandbox twin.
+fn bind_sockets_item(scan: &SocketScan, roots: usize) -> PolicyItem {
+    if !scan.found.is_empty() {
+        let mut shown: Vec<String> = scan
+            .found
+            .iter()
+            .take(BIND_SOCKETS_SHOWN)
+            .map(|p| p.display().to_string())
+            .collect();
+        if scan.found.len() > BIND_SOCKETS_SHOWN {
+            shown.push(format!(
+                "and {} more",
+                scan.found.len() - BIND_SOCKETS_SHOWN
+            ));
+        }
+        let partial = if scan.truncated {
+            " (the scan hit its bound; the list may be incomplete)"
+        } else {
+            ""
+        };
+        return PolicyItem {
+            id: "bind-sockets",
+            status: Status::Warn,
+            detail: format!(
+                "unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): {}{partial}",
+                shown.join(", ")
+            ),
+            fix: Some(
+                "remove the directories that hold them from filesystem.ro/rw, or add them to filesystem.deny"
+                    .to_owned(),
+            ),
+        };
+    }
+    if scan.truncated {
+        return PolicyItem {
+            id: "bind-sockets",
+            status: Status::Warn,
+            detail: "the socket scan of filesystem.ro/rw hit its bound; no unix socket file found so far (not exhaustive)".to_owned(),
+            fix: Some("narrow filesystem.ro/rw".to_owned()),
+        };
+    }
+    PolicyItem {
+        id: "bind-sockets",
+        status: Status::Ok,
+        detail: format!("no unix socket files under the {roots} filesystem.ro/rw paths"),
+        fix: None,
     }
 }
 
@@ -740,6 +802,7 @@ mod tests {
     use super::*;
     use crate::host::facts::Sysctls;
     use crate::init::fdpass::StagedFailure;
+    use std::path::PathBuf;
 
     fn f(stage: Stage, errno: Option<i32>, reason: &str) -> StagedFailure {
         StagedFailure {
@@ -1417,6 +1480,10 @@ mod tests {
         );
     }
 
+    fn no_sockets(_: &[&Path], _: &[&Path]) -> SocketScan {
+        SocketScan::default()
+    }
+
     fn policy_of(json: &str) -> Policy {
         Policy::from_json_str(json).expect("policy parses")
     }
@@ -1433,13 +1500,14 @@ mod tests {
             EffectiveMode::Transparent,
             &all_exist,
             &|_| false,
+            &no_sockets,
         );
         assert!(ok.runnable, "{ok:?}");
         assert_eq!(
             ok.checks[0].detail,
             "policy requires transparent; this host provides transparent"
         );
-        assert_eq!(ok.checks[1].detail, "all 7 infrastructure /etc paths exist");
+        assert_eq!(ok.checks[1].detail, "all 6 infrastructure /etc paths exist");
         assert_eq!(ok.checks[2].detail, "all 2 filesystem.ro/rw paths exist");
         assert_eq!(
             ok.checks[3].detail,
@@ -1453,6 +1521,7 @@ mod tests {
             EffectiveMode::Transparent,
             &missing_ro,
             &|_| false,
+            &no_sockets,
         );
         assert!(!r.runnable);
         assert_eq!(r.checks[2].status, Status::Fail);
@@ -1468,6 +1537,7 @@ mod tests {
             EffectiveMode::Transparent,
             &all_exist,
             &all_files,
+            &no_sockets,
         );
         assert_eq!(r.checks[3].status, Status::Fail);
         assert!(
@@ -1488,6 +1558,7 @@ mod tests {
             EffectiveMode::Explicit,
             &all_exist,
             &|_| false,
+            &no_sockets,
         );
         assert_eq!(r.checks[0].status, Status::Fail);
         assert_eq!(
@@ -1502,9 +1573,108 @@ mod tests {
             EffectiveMode::Transparent,
             &no_infra,
             &|_| false,
+            &no_sockets,
         );
         assert_eq!(r.checks[1].status, Status::Fail);
         assert!(r.checks[1].detail.starts_with("missing or inaccessible infrastructure paths (bwrap binds them and aborts without them): "));
+    }
+
+    /// Issue #35: socket files under binds WARN (still runnable), the deny
+    /// list reaches the scanner, and a truncated scan is a WARN too.
+    #[test]
+    fn policy_bind_sockets_warns() {
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/run"],"deny":["/run/secret"]},"network":{"mode":"explicit","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let policy = policy_of(json);
+        let r = policy_check(
+            "p.json",
+            &policy,
+            EffectiveMode::Explicit,
+            &|_| true,
+            &|_| false,
+            &no_sockets,
+        );
+        assert_eq!(r.checks.len(), 5);
+        assert_eq!(r.checks[4].id, "bind-sockets");
+        assert_eq!(r.checks[4].status, Status::Ok);
+        assert_eq!(
+            r.checks[4].detail,
+            "no unix socket files under the 2 filesystem.ro/rw paths"
+        );
+
+        let seen = std::cell::RefCell::new((Vec::new(), Vec::new()));
+        let found = |roots: &[&Path], skip: &[&Path]| {
+            *seen.borrow_mut() = (
+                roots.iter().map(|p| p.to_path_buf()).collect::<Vec<_>>(),
+                skip.iter().map(|p| p.to_path_buf()).collect::<Vec<_>>(),
+            );
+            SocketScan {
+                found: (0..12)
+                    .map(|i| PathBuf::from(format!("/run/s{i:02}.sock")))
+                    .collect(),
+                truncated: false,
+            }
+        };
+        let r = policy_check(
+            "p.json",
+            &policy,
+            EffectiveMode::Explicit,
+            &|_| true,
+            &|_| false,
+            &found,
+        );
+        assert!(r.runnable, "a WARN must not block the policy: {r:?}");
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(r.checks[4].detail.starts_with("unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): /run/s00.sock, "), "{}", r.checks[4].detail);
+        assert!(
+            r.checks[4].detail.ends_with("/run/s09.sock, and 2 more"),
+            "{}",
+            r.checks[4].detail
+        );
+        assert!(r.checks[4].fix.is_some());
+        let (roots, skip) = seen.into_inner();
+        assert_eq!(roots, vec![PathBuf::from("/usr"), PathBuf::from("/run")]);
+        assert_eq!(skip, vec![PathBuf::from("/run/secret")]);
+
+        let truncated = |_: &[&Path], _: &[&Path]| SocketScan {
+            found: vec![],
+            truncated: true,
+        };
+        let r = policy_check(
+            "p.json",
+            &policy,
+            EffectiveMode::Explicit,
+            &|_| true,
+            &|_| false,
+            &truncated,
+        );
+        assert!(r.runnable);
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(
+            r.checks[4].detail.ends_with("(not exhaustive)"),
+            "{}",
+            r.checks[4].detail
+        );
+
+        let both = |_: &[&Path], _: &[&Path]| SocketScan {
+            found: vec![PathBuf::from("/run/docker.sock")],
+            truncated: true,
+        };
+        let r = policy_check(
+            "p.json",
+            &policy,
+            EffectiveMode::Explicit,
+            &|_| true,
+            &|_| false,
+            &both,
+        );
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(
+            r.checks[4].detail.ends_with(
+                ": /run/docker.sock (the scan hit its bound; the list may be incomplete)"
+            ),
+            "{}",
+            r.checks[4].detail
+        );
     }
 
     #[test]
@@ -1516,6 +1686,7 @@ mod tests {
             EffectiveMode::Explicit,
             &|_| true,
             &|_| false,
+            &no_sockets,
         );
         assert!(r.runnable);
     }

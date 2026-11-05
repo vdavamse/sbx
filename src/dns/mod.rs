@@ -52,9 +52,9 @@
 //! 9. **Residuals for #14.** (a) A client can exfiltrate data by encoding it
 //!    into labels under an allowed suffix (`<data>.<allowed suffix>`). The
 //!    resolver never forwards, but a connect to such a name later makes the
-//!    host resolve it. (b) Host `/etc/hosts` entries bound into the sandbox
-//!    resolve names to REAL addresses, so the proxy denies them with
-//!    `UnknownFakeIp` (fail closed). (c) A policy that binds the nscd or
+//!    host resolve it. (b) Closed by #35: the sandbox's `/etc/hosts` is
+//!    generated (loopback `localhost` only), so no host entry resolves a
+//!    name to a REAL address past this resolver. (c) A policy that binds the nscd or
 //!    systemd-resolved socket (`/run`, `/var/run`) bypasses this resolver. (d)
 //!    Unique subdomains exhaust the pool and flood the audit sink.
 //! 10. **Why hickory.** The wire codec is `hickory-proto` 0.25.2 with no
