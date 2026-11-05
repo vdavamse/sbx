@@ -20,8 +20,10 @@
 //! (the holder stand-in) unshares a fresh user and network namespace and parks;
 //! the probe captures its namespace descriptors, and a second child (the
 //! joiner, forked so the probe keeps its own namespaces) runs
-//! [`crate::run::keepalive::join::join_namespaces`] on them. Both children are
-//! bounded by [`KEEP_ALIVE_PROBE_TIMEOUT`] and reaped on every path.
+//! [`crate::run::keepalive::join::join_namespaces`] on them. The step has one
+//! deadline, [`KEEP_ALIVE_PROBE_TIMEOUT`], shared by its two children: the
+//! holder's readiness and the joiner's answer come out of the same budget. Both
+//! children are reaped on every path.
 //!
 //! Budget: the parent (`host::facts`) bounds the whole probe at `PROBE_TIMEOUT`
 //! (20 s). The bounded steps add up to `BWRAP_PROBE_LAUNCHES` x 5 s for the
