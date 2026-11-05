@@ -378,9 +378,11 @@ fn seccomp_item_ok() -> Result<(), String> {
 
 /// Issue #18: where unprivileged user namespaces work, the `keep-alive` item is
 /// ok (a pidfd, and a same-uid setns into a fresh user and network namespace).
-/// The gate is the userns item, so this runs on a host without bwrap (this
-/// developer host: the probe needs no bwrap for these steps) and in CI's nested
-/// tier alike; the item never limits the network mode, so rc is not checked.
+/// The gate is `Gate::Userns`, so the scenario runs on a host without bwrap
+/// (this developer host: the probe needs no bwrap for these steps) and skips
+/// where userns is unavailable. CI's nested `--disable-userns` tier is one
+/// such host, so it skips there, not runs. The item never limits the network
+/// mode, so rc is not checked.
 fn keep_alive_item_ok() -> Result<(), String> {
     let (_, report) = sbx_json(&["check", "--json"])?;
     let ka = item(&report, "keep-alive")?;
