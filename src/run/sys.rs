@@ -249,6 +249,69 @@ pub(crate) fn stdin_tty_foreground() -> (bool, bool) {
     }
 }
 
+/// `getifaddrs(3)`: the host's own IPv4/IPv6 interface addresses, for the
+/// egress guard's host-address deny set (issue #41). Called in the PARENT,
+/// i.e. the host network namespace the proxy dials from.
+///
+/// Interfaces flagged `IFF_LOOPBACK` are skipped: their usual addresses
+/// (127/8, ::1) are already denied by the guard's tables, and the
+/// conformance lab binds its public fixture address to `lo` inside its own
+/// namespace. A public address configured on `lo` (a DSR/anycast VIP) is
+/// therefore not covered — threat-model R12 records it.
+pub(crate) fn host_interface_addrs() -> io::Result<Vec<std::net::IpAddr>> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // Owns the getifaddrs list: freed exactly once on every exit path,
+    // including a panic between the call and the end of the walk.
+    struct List(*mut libc::ifaddrs);
+    impl Drop for List {
+        fn drop(&mut self) {
+            // SAFETY: self.0 came from a successful getifaddrs and is freed
+            // only here; no reference into the list outlives the List.
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes a freshly allocated list head into `head`.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let list = List(head);
+    let mut out = Vec::new();
+    let mut cur = list.0;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a non-null node of the list `list` owns, which
+        // is still alive.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_flags & (libc::IFF_LOOPBACK as libc::c_uint) != 0 {
+            continue;
+        }
+        // SAFETY: ifa_addr is non-null and points to a sockaddr; unaligned
+        // reads avoid relying on the allocator's alignment.
+        let family = unsafe { std::ptr::addr_of!((*ifa.ifa_addr).sa_family).read_unaligned() };
+        match i32::from(family) {
+            libc::AF_INET => {
+                // SAFETY: AF_INET ⇒ the storage is a sockaddr_in.
+                let sin =
+                    unsafe { std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in) };
+                out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    sin.sin_addr.s_addr,
+                ))));
+            }
+            libc::AF_INET6 => {
+                // SAFETY: AF_INET6 ⇒ the storage is a sockaddr_in6.
+                let sin6 =
+                    unsafe { std::ptr::read_unaligned(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +381,38 @@ mod tests {
         child.wait().expect("reap");
         // The process is gone: SIGKILL through its pidfd reports ESRCH, which is Ok.
         pidfd_kill(pidfd.as_fd()).expect("ESRCH must be Ok");
+    }
+
+    #[test]
+    fn host_interface_addrs_lists_no_loopback() {
+        // Smoke test (hermetic on any runner): the call succeeds and no
+        // 127/8 or ::1 address — which only a loopback interface carries on
+        // a normal host — is reported. The IFF_LOOPBACK skip itself is
+        // exercised end to end by the conformance lab, whose 9.9.9.9 fixture
+        // on `lo` would otherwise be denied.
+        let addrs = host_interface_addrs().expect("getifaddrs");
+        // Non-vacuity: if the kernel lists an UP non-loopback interface
+        // that carries an address, the wrapper must report something.
+        let up_non_lo = std::fs::read_dir("/sys/class/net")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name() != "lo")
+            .any(|e| {
+                std::fs::read_to_string(e.path().join("operstate")).is_ok_and(|s| s.trim() == "up")
+            });
+        let v4_routes = std::fs::read_to_string("/proc/net/route")
+            .map(|s| s.lines().skip(1).any(|l| !l.starts_with("lo")))
+            .unwrap_or(false);
+        if up_non_lo && v4_routes {
+            assert!(
+                !addrs.is_empty(),
+                "an UP interface with routes, but no addresses"
+            );
+        }
+        assert!(
+            addrs.iter().all(|a| !a.is_loopback()),
+            "loopback-interface address leaked: {addrs:?}"
+        );
     }
 }

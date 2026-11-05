@@ -10,9 +10,11 @@
 //! 2. **Fail-closed** — every path that is not an explicit allow denies:
 //!    normalization failure ⇒ `None`; empty allow list ⇒ `None`;
 //!    [`guard`] denies the full IANA special-purpose registries (fetched
-//!    2025-10-09) plus multicast and the deprecated-but-delisted ranges.
-//!    Outside the tables is dialable *by design*: the allow list decides
-//!    names, the guard decides addresses.
+//!    2025-10-09) plus multicast, the deprecated-but-delisted ranges and
+//!    the public-space cloud platform endpoints (Azure wireserver,
+//!    issue #41); [`guard_host`] additionally denies the host's own
+//!    interface addresses ([`HostAddrs`]). Outside those is dialable *by
+//!    design*: the allow list decides names, the guard decides addresses.
 //! 3. **Normalization seam** — strip exactly one trailing ASCII root dot,
 //!    then [`Domain::parse`]: the same single pipeline as policy time. The
 //!    asymmetry is deliberate — policy authors write dot-less names and are
@@ -140,6 +142,8 @@ pub enum Denied {
     Transition, // Teredo 2001::/32, 6to4 2002::/16, local-use NAT64 64:ff9b:1::/48 — blanket
     Deprecated, // 192.88.99.0/24, ::/96 compatible, fec0::/10, ORCHID 2001:10::/28
     Reserved, // 240/4 (incl. limited broadcast), 192.0.0.0/24, AS112/AMT/DDAS112/SRv6, 2001::/23 umbrella
+    PlatformEndpoint, // cloud platform endpoints in public space: Azure wireserver 168.63.129.16/32
+    HostAddress, // one of the host's own interface addresses (HostAddrs, gathered at run start)
 }
 
 impl Denied {
@@ -167,6 +171,8 @@ impl Denied {
                 "deprecated special-purpose address (IPv4-compatible, site-local, ORCHID, or 6to4 relay anycast)"
             }
             Denied::Reserved => "reserved special-purpose address (IANA registry)",
+            Denied::PlatformEndpoint => "cloud platform endpoint in public address space",
+            Denied::HostAddress => "one of the host's own interface addresses",
         }
     }
 }
@@ -187,7 +193,9 @@ impl std::error::Error for Denied {}
 /// reason (#10 logs [`Denied::reason`]; #7/#8 compose "denied dial to
 /// {addr}: {denied}" through `Display`). The tables cover the full IANA IPv4/IPv6
 /// special-purpose registries (both "Last Updated 2025-10-09") plus
-/// multicast and the deprecated-but-delisted ranges. Embedded-IPv4 forms
+/// multicast, the deprecated-but-delisted ranges and the public-space
+/// cloud platform endpoints ([`Denied::PlatformEndpoint`]; the host's own
+/// addresses are [`guard_host`]'s job). Embedded-IPv4 forms
 /// whose layout an RFC *guarantees* (mapped `::ffff:0:0/96`, NAT64 WKP
 /// `64:ff9b::/96`) unwrap and recurse, so the denial reports the INNER
 /// reason and a public embedded address stays dialable on
@@ -228,6 +236,67 @@ pub fn guard(addr: IpAddr) -> Result<(), Denied> {
             }
             Ok(())
         }
+    }
+}
+
+/// The host's own interface addresses: the second address-side deny set
+/// (issue #41, threat-model R12).
+///
+/// The proxy dials from the HOST network namespace, so an allowed name
+/// resolving to one of the host's own (public) addresses would reach any
+/// host service bound to the wildcard address. [`guard`]'s tables cannot
+/// know these addresses; `sbx run` gathers them once at run start
+/// (`run::sys::host_interface_addrs`) and hands the set to the connector,
+/// which applies [`guard_host`] to every resolved address and to the
+/// connected peer.
+///
+/// Pure data: building and querying a set does no I/O. Lookup is
+/// canonicalized like [`guard`]: a mapped (`::ffff:a.b.c.d`) or NAT64-WKP
+/// (`64:ff9b::a.b.c.d`) form of a host IPv4 address matches too.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostAddrs {
+    // Sorted and deduplicated (binary-search lookup; deterministic Debug).
+    addrs: Vec<IpAddr>,
+}
+
+impl HostAddrs {
+    /// A set from the given addresses (duplicates and order irrelevant).
+    pub fn new(addrs: impl IntoIterator<Item = IpAddr>) -> Self {
+        let mut addrs: Vec<IpAddr> = addrs.into_iter().map(canonical).collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        Self { addrs }
+    }
+
+    /// Whether `addr` (canonicalized) is one of the host's addresses.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        self.addrs.binary_search(&canonical(addr)).is_ok()
+    }
+
+    /// The addresses, sorted (tests only).
+    #[cfg(test)]
+    fn as_slice(&self) -> &[IpAddr] {
+        &self.addrs
+    }
+}
+
+/// [`guard`] plus the host's own addresses: the tables decide first (so a
+/// host's private or link-local address keeps its sharper reason), then
+/// membership in `host` denies with [`Denied::HostAddress`].
+pub fn guard_host(addr: IpAddr, host: &HostAddrs) -> Result<(), Denied> {
+    guard(addr)?;
+    if host.contains(addr) {
+        return Err(Denied::HostAddress);
+    }
+    Ok(())
+}
+
+// Unwrap the RFC-guaranteed embedded-IPv4 forms (the same families guard()
+// recurses on) so a host set stays keyed on the plain IPv4 address.
+fn canonical(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V6(v6) => embedded_v4(v6.to_bits()).map_or(addr, IpAddr::V4),
+        IpAddr::V4(_) => addr,
     }
 }
 
@@ -307,6 +376,22 @@ const fn v6(prefix: Ipv6Addr, mask: u32, denied: Denied) -> V6Row {
 // by DESCENDING mask length; equal-length rows pairwise disjoint ⇒
 // first-match-wins always yields the most specific reason.
 static V4_TABLE: &[V4Row] = &[
+    // Cloud platform endpoint in PUBLIC space — not an IANA special-purpose
+    // entry (issue #41, threat-model R12): Azure's wireserver
+    // 168.63.129.16 (VM agent, health probes, DHCP and the platform DNS
+    // resolver). Reachable from every Azure VM, so an allowed name an
+    // attacker points here would otherwise be dialled. The other providers'
+    // metadata endpoints already fall in tabled ranges: 169.254.169.254
+    // (AWS/GCP/Azure IMDS, DigitalOcean, OpenStack) and 169.254.0.23
+    // (Tencent) in 169.254/16, 100.100.100.200 (Alibaba) in 100.64/10,
+    // 192.0.0.192 (Oracle) in 192.0.0.0/24, fd00:ec2::254 (AWS IMDSv6) and
+    // fd20:ce::254 (GCP) in fc00::/7 — pinned by
+    // provider_metadata_endpoints_denied.
+    v4(
+        Ipv4Addr::new(168, 63, 129, 16),
+        32,
+        Denied::PlatformEndpoint,
+    ),
     // IETF Protocol Assignments, RFC 6890 §2.1 — folds the registry's
     // more specific /24 sub-entries (verdict-identical): 192.0.0.0/29
     // IPv4 Service Continuity Prefix (RFC 7335), 192.0.0.8/32 dummy
@@ -1302,6 +1387,90 @@ mod tests {
         }
     }
 
+    // ---- guard(): platform endpoints + guard_host() (issue #41) -------------------
+
+    #[test]
+    fn platform_endpoint_denied_exactly() {
+        // The wireserver is a /32 in public space: exactly that address is
+        // denied, in every embedded form guard() recurses on; its numeric
+        // neighbours stay dialable (the row must not widen).
+        for addr in [
+            "168.63.129.16",
+            "::ffff:168.63.129.16",
+            "64:ff9b::a83f:8110",
+        ] {
+            assert_eq!(guard(ip(addr)), Err(Denied::PlatformEndpoint), "{addr}");
+        }
+        for addr in ["168.63.129.15", "168.63.129.17", "168.63.128.16"] {
+            assert_eq!(guard(ip(addr)), Ok(()), "{addr}");
+        }
+    }
+
+    #[test]
+    fn provider_metadata_endpoints_denied() {
+        // Issue #41: "other provider metadata endpoints outside 169.254/16".
+        // Every known one is denied — most by an IANA range they happen to
+        // sit in. A new provider endpoint in public space needs its own
+        // PlatformEndpoint row.
+        for (addr, why) in [
+            ("169.254.169.254", Denied::LinkLocal), // AWS/GCP/Azure IMDS, DO, OpenStack
+            ("169.254.170.2", Denied::LinkLocal),   // AWS ECS task metadata
+            ("169.254.0.23", Denied::LinkLocal),    // Tencent Cloud
+            ("100.100.100.200", Denied::SharedAddressSpace), // Alibaba Cloud
+            ("192.0.0.192", Denied::Reserved),      // Oracle Cloud (OCI) IMDS
+            ("fd00:ec2::254", Denied::UniqueLocal), // AWS IMDS over IPv6
+            ("fd20:ce::254", Denied::UniqueLocal),  // GCP metadata over IPv6
+            ("168.63.129.16", Denied::PlatformEndpoint), // Azure wireserver
+        ] {
+            assert_eq!(guard(ip(addr)), Err(why), "{addr}");
+        }
+    }
+
+    #[test]
+    fn host_addrs_deny_own_addresses() {
+        let host = HostAddrs::new([
+            ip("203.0.114.7"),
+            ip("2a01:4f8::7"),
+            ip("203.0.114.7"), // duplicate collapses
+        ]);
+        assert_eq!(host.as_slice().len(), 2);
+        for addr in [
+            "203.0.114.7",
+            "::ffff:203.0.114.7", // mapped form of a host v4
+            "64:ff9b::cb00:7207", // NAT64 WKP form of a host v4
+            "2a01:4f8::7",
+        ] {
+            assert_eq!(
+                guard_host(ip(addr), &host),
+                Err(Denied::HostAddress),
+                "{addr}"
+            );
+        }
+        for addr in ["203.0.114.8", "2a01:4f8::8", "1.1.1.1"] {
+            assert_eq!(guard_host(ip(addr), &host), Ok(()), "{addr}");
+        }
+    }
+
+    #[test]
+    fn guard_host_tables_take_precedence() {
+        // A host's private/link-local/loopback addresses keep the table's
+        // sharper reason; the empty set degrades to guard() exactly.
+        let host = HostAddrs::new([ip("10.0.0.5"), ip("fe80::1"), ip("168.63.129.16")]);
+        assert_eq!(
+            guard_host(ip("10.0.0.5"), &host),
+            Err(Denied::PrivateNetwork)
+        );
+        assert_eq!(guard_host(ip("fe80::1"), &host), Err(Denied::LinkLocal));
+        assert_eq!(
+            guard_host(ip("168.63.129.16"), &host),
+            Err(Denied::PlatformEndpoint)
+        );
+        let none = HostAddrs::default();
+        for addr in ["127.0.0.1", "8.8.8.8", "::1", "2606:4700::1111"] {
+            assert_eq!(guard_host(ip(addr), &none), guard(ip(addr)), "{addr}");
+        }
+    }
+
     // ---- guard(): taxonomy + table invariants -------------------------------------
 
     #[test]
@@ -1311,7 +1480,7 @@ mod tests {
         fn assert_error<T: std::error::Error>() {}
         assert_error::<Denied>();
 
-        // All 13 variants' pinned reason() strings — exhaustive. The
+        // All 15 variants' pinned reason() strings — exhaustive. The
         // exhaustive match in reason() means a new variant without a
         // pinned message fails to COMPILE; this table means a changed
         // message fails the test.
@@ -1356,8 +1525,16 @@ mod tests {
                 Denied::Reserved,
                 "reserved special-purpose address (IANA registry)",
             ),
+            (
+                Denied::PlatformEndpoint,
+                "cloud platform endpoint in public address space",
+            ),
+            (
+                Denied::HostAddress,
+                "one of the host's own interface addresses",
+            ),
         ];
-        assert_eq!(cases.len(), 13, "Denied has exactly 13 variants");
+        assert_eq!(cases.len(), 15, "Denied has exactly 15 variants");
         for (variant, expected) in cases {
             assert_eq!(variant.reason(), expected, "{variant:?}");
             assert_eq!(
@@ -1615,6 +1792,7 @@ mod tests {
         (0x0a00_0000, 0x0aff_ffff, Denied::PrivateNetwork), // 10.0.0.0/8
         (0x6440_0000, 0x647f_ffff, Denied::SharedAddressSpace), // 100.64.0.0/10
         (0x7f00_0000, 0x7fff_ffff, Denied::Loopback),    // 127.0.0.0/8
+        (0xa83f_8110, 0xa83f_8110, Denied::PlatformEndpoint), // 168.63.129.16/32
         (0xa9fe_0000, 0xa9fe_ffff, Denied::LinkLocal),   // 169.254.0.0/16
         (0xac10_0000, 0xac1f_ffff, Denied::PrivateNetwork), // 172.16.0.0/12
         (0xc000_0000, 0xc000_00ff, Denied::Reserved),    // 192.0.0.0/24
