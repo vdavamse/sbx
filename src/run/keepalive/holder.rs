@@ -563,3 +563,55 @@ impl Extra for Holder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// A blocking reader and the holder's write end. `pipe_cloexec` makes both
+    /// ends non-blocking, so the read end is switched back for the test reader.
+    fn pipe() -> (std::fs::File, OwnedFd) {
+        let (r, w) = sys::pipe_cloexec().expect("pipe");
+        set_blocking(&r).expect("blocking read end");
+        (std::fs::File::from(r), w)
+    }
+
+    #[test]
+    fn ready_is_reported_once_and_nothing_follows() {
+        let (mut r, w) = pipe();
+        let mut hold = Hold::new(w, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME);
+        hold.signal_ready();
+        hold.signal_ready();
+        hold.fail("too late");
+        drop(hold); // closes the write end, so the read below ends
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"R");
+    }
+
+    #[test]
+    fn failure_is_reported_as_e_and_capped() {
+        let (mut r, w) = pipe();
+        let mut hold = Hold::new(w, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME);
+        let long = "x".repeat(5000);
+        hold.fail(&long);
+        drop(hold);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got[0], b'E');
+        assert_eq!(got.len(), 1 + MAX_MESSAGE);
+    }
+
+    #[test]
+    fn failure_cut_keeps_utf8_whole() {
+        let (mut r, w) = pipe();
+        let mut hold = Hold::new(w, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME);
+        let text = format!("{}é", "a".repeat(MAX_MESSAGE - 1));
+        hold.fail(&text);
+        drop(hold);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert!(std::str::from_utf8(&got[1..]).is_ok());
+    }
+}

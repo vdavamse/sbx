@@ -456,4 +456,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(wide);
         let _ = std::fs::remove_dir_all(dir);
     }
+    #[test]
+    fn descriptors_travel_with_the_header_and_work_on_the_far_side() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (r, w) = crate::run::sys::pipe_cloexec().unwrap();
+        send_frame(&a, b'A', b"policy", &[w.as_raw_fd()]).unwrap();
+        drop(w); // only the received copy keeps the pipe open
+        let (frame, fds) = recv_frame(&b).unwrap();
+        assert_eq!(frame.op, b'A');
+        assert_eq!(frame.payload, b"policy");
+        assert_eq!(fds.len(), 1);
+        let mut far = std::fs::File::from(fds.into_iter().next().unwrap());
+        far.write_all(b"via-scm").unwrap();
+        drop(far);
+        // `pipe_cloexec` makes the read end non-blocking; a test reader wants blocking reads.
+        unsafe {
+            let flags = libc::fcntl(r.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(r.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        let mut got = String::new();
+        std::fs::File::from(r).read_to_string(&mut got).unwrap();
+        assert_eq!(got, "via-scm");
+    }
+
+    #[test]
+    fn recv_reports_eof_when_the_peer_closes_before_a_header() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        assert!(matches!(
+            recv_frame(&b),
+            Err(super::super::proto::ProtoError::Eof)
+        ));
+    }
+
+    #[test]
+    fn peer_creds_names_this_process_and_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let (pid, uid) = peer_creds(&a).unwrap();
+        assert_eq!(pid, std::process::id() as libc::pid_t);
+        assert_eq!(uid, euid());
+    }
 }

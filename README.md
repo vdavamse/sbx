@@ -107,6 +107,12 @@ sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] [--audit FILE]
         [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
         -- COMMAND [ARGS...]
+sbx run --keep-alive --policy policy.json --session-dir DIR
+        [--idle-timeout DURATION] [--max-lifetime DURATION]
+        [--audit FILE] -- COMMAND [ARGS...]
+sbx attach --policy policy.json --session-dir DIR [--cwd PATH]
+        [--timeout DURATION] -- COMMAND [ARGS...]
+sbx stop --session-dir DIR
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -638,6 +644,58 @@ about 14 ms to every exec of the binary (the same build measured there:
 binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
 build is not the cost. CI runs on ext4 and reports the number on every run
 (report-only, with a warning at ≥ 25 ms).
+
+## Persistent sessions
+
+`sbx run --keep-alive` starts a session. The command after `--` is its
+resident, and a holder process stays alive with the session's namespaces, proxies
+and audit writer, so later commands can join it. `sbx attach` runs a command in a
+running session, and `sbx stop` ends it. Use this when a process from one call
+(a dev server, say) must stay reachable from the next. No daemon is needed.
+
+```
+sbx run --keep-alive --policy P --session-dir S -- npm run dev   # returns once the session is up
+sbx attach --policy P --session-dir S -- curl -s http://127.0.0.1:3000/
+sbx stop --session-dir S
+```
+
+- **Opt in.** Plain `sbx run` is unchanged. `--keep-alive` is the only way to
+  create a session.
+- **Same policy.** Attach refuses a policy that is not byte-identical to the
+  session's policy (rc 125, the reason on stderr). Nothing runs in that case.
+- **Each call is a sandbox.** Every attached call gets its own bwrap, with its
+  own pid namespace, mounts and seccomp filter, built as for `sbx run`. Calls
+  and the resident share the session's network namespace and its localhost
+  ports. That sharing is what makes a dev server reachable, and it is a documented
+  exception to isolation (S19, R31).
+- **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
+  run for that long. `--max-lifetime` (default 8h) ends it after that long
+  regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
+  exit ends the session too. Each end kills the resident and every running call,
+  writes their exit rows, and removes the control socket.
+- **Output.** The holder's output (the resident's stdout and stderr) goes to
+  `S/holder.log`, not to the caller, and it is bounded by `limits.output_bytes`.
+  Attached calls print to the caller as in `sbx run`.
+- **Death.** If the holder is killed, the resident and every attached call die
+  too (S20). A later `sbx run --keep-alive` on the same directory starts a new
+  session.
+- **Transparent mode only.** An attach to a session that runs in explicit mode
+  is refused (rc 125). Its nftables rules are what the join re-verifies.
+- **Audit.** With `--audit`, the session writes one file. Each call's exit row
+  carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
+  rows carry no `call_id` (R30).
+
+**Exit codes**
+
+| command | rc | meaning |
+|---|---|---|
+| `run --keep-alive` | 0 | the session is up (the holder keeps running) |
+| `run --keep-alive` | 125 | the session could not start; the reason is on stderr |
+| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h) |
+| `attach` | the call's own rc | as in `sbx run`: 124 on `--timeout`, 128+N on a signal |
+| `attach` | 125 | refused or failed: no session, a different policy, an explicit-mode session, or the holder exited |
+| `stop` | 0 | the session is stopped, or nothing was running |
+| `stop` | 125 | the holder refused the stop or could not be reached |
 
 ## Garbage collection
 
