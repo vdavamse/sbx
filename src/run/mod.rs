@@ -457,18 +457,6 @@ fn cgroup_for(policy: &Policy) -> Result<Option<cgroup::SandboxCgroup>, Early> {
         .map_err(|err| RunError::new(err.to_string()).into())
 }
 
-/// Removes the limited cgroup when the run (or call) is over: declared after
-/// the sandbox handle, so it drops after teardown has reaped the tree.
-struct CgroupGuard(Option<cgroup::SandboxCgroup>);
-
-impl Drop for CgroupGuard {
-    fn drop(&mut self) {
-        if let Some(cg) = self.0.take() {
-            cg.remove();
-        }
-    }
-}
-
 /// The `bwrap --version` gate (S6): the only spawn before the fd window. Bounded
 /// by the run deadline and interruptible by sbx's signals (a slow or hung
 /// `bwrap` must not outlive `--timeout`; the child is killed on overrun).
@@ -804,7 +792,9 @@ fn execute(
             return Err(RunError::new(err.to_string()).into());
         }
     }
-    let _cgroup_guard = CgroupGuard(limits_cgroup);
+    // `limits_cgroup` lives to the end of this function: teardown (which
+    // takes the sandbox by value) has reaped the tree before it drops and
+    // removes the child cgroup. Every early return above removes it too.
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);

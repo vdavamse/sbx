@@ -317,12 +317,16 @@ fn run_call(
                     let _ = child.wait();
                     return Err(RunError::new(err.to_string()).into());
                 }
-                (spawned, _) => spawned,
+                // Both failed: the stuck-in-the-cgroup error is the one to
+                // report (the spawn error is secondary).
+                (Err(_), Err(err)) => return Err(RunError::new(err.to_string()).into()),
+                (spawned, Ok(())) => spawned,
             }
         }
     };
     let child = spawned.map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
-    let _cgroup_guard = crate::run::CgroupGuard(limits_cgroup);
+    // `limits_cgroup` drops (and removes the child cgroup) at the end of the
+    // call, after teardown; early returns remove it too.
     drop(info_write);
     drop(seccomp_memfd);
     drop(user_ns);

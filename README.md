@@ -519,8 +519,13 @@ systemd-run --user --scope -p Delegate=yes sbx run --policy p.json --session-dir
 sbx then moves itself into a leaf (`sbx-supervisor`), enables the `memory` and
 `pids` controllers for its cgroup's children and creates `sbx-sandbox-<pid>`,
 removed after the run. When the cgroup is not delegated, lacks a controller, or
-holds other processes, a run with either limit is refused (125, `need a
-delegated cgroup v2`): the limit is never dropped silently. With
+holds other processes (sbx's own `--keep-alive` launcher excepted), a run with
+either limit is refused (125, `need a delegated cgroup v2`): the limit is never
+dropped silently. With `memory_bytes`, a host where swap is active but not
+accounted for cgroups (`swapaccount=0`) is refused too, since the limit could
+not keep the sandbox out of swap. sbx checks that its cgroup is writable, not
+who manages it: run as root it can restructure any cgroup it sits in alone, so
+give it a dedicated scope (`Delegate=yes`). With
 `--keep-alive`, each run and each attached call gets its own child cgroup, so
 the limits apply per call; an `sbx attach` needs the same delegation.
 
