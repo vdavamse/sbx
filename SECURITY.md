@@ -68,7 +68,9 @@ Please **do not** file a public issue for a security report.
   timeout and optional per-process `RLIMIT_*` limits (`limits.processes`,
   `open_files`, `file_bytes`, `address_space_bytes`) and run-level caps
   (deny-mask tmpfs size, concurrent proxy connections, fake-IP names), but
-  no cgroup CPU/memory quotas and no disk quotas; resource exhaustion affecting the host is a known
+  optional cgroup v2 `limits.memory_bytes` and `limits.pids` (they need a
+  delegated cgroup; without one such a run is refused), no CPU quotas and no
+  disk quotas; resource exhaustion affecting the host is a known
   limitation (threat model R14), not a reportable vulnerability. The sandbox
   contains the command; it does not make the command benign.
 

@@ -284,7 +284,10 @@ fn run_call(
         None => None,
     };
     let (stdin, stdin_piped) = stdin_mode();
-    let child = join_command(
+    // Issue #43: the call's cgroup limits. The join execs bwrap at once (no go
+    // byte), so sbx spawns from inside the child cgroup (`spawn_inside`).
+    let limits_cgroup = crate::run::cgroup_for(policy)?;
+    let mut command = join_command(
         JoinFds {
             user: user_fd,
             net: net_fd,
@@ -299,9 +302,27 @@ fn run_call(
         &crate::init::rlimit::from_limits(&policy.limits),
         &launch,
         stdin,
-    )
-    .spawn()
-    .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    );
+    let spawned = match &limits_cgroup {
+        None => command.spawn(),
+        Some(cg) => {
+            let (spawned, back) = cg
+                .spawn_inside(|| command.spawn())
+                .map_err(|err| RunError::new(err.to_string()))?;
+            match (spawned, back) {
+                (Ok(mut child), Err(err)) => {
+                    // sbx stayed in the sandbox cgroup: refuse rather than
+                    // supervise from inside the limited cgroup.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RunError::new(err.to_string()).into());
+                }
+                (spawned, _) => spawned,
+            }
+        }
+    };
+    let child = spawned.map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    let _cgroup_guard = crate::run::CgroupGuard(limits_cgroup);
     drop(info_write);
     drop(seccomp_memfd);
     drop(user_ns);

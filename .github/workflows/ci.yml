@@ -236,6 +236,68 @@ jobs:
           printf '%s\n' "$OUT" | grep -qx 'vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'packet errno 97' && printf '%s\n' "$OUT" | grep -qx 'hiword errno 97' && printf '%s\n' "$OUT" | grep -qx 'socketpair-vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'unix ok' && [ "$RC" -eq 0 ] || { echo "FAIL: socket-family filter rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
+      # Issue #43: cgroup v2 limits (limits.memory_bytes, limits.pids) on the
+      # static musl release binary. The runner has no delegated cgroup for its
+      # user, so the step makes one with sudo (root creates it and hands it to
+      # the runner user, as systemd's Delegate=yes would), then runs sbx ALONE
+      # in it: sbx moves itself into a supervisor leaf, enables memory and pids
+      # for the children, and puts the sandbox in its own child cgroup.
+      - name: "Smoke: cgroup v2 limits (release musl)"
+        run: |
+          set +e
+          FAIL=0
+          BIN="$PWD/target/x86_64-unknown-linux-musl/release/sbx"
+          T=$(mktemp -d)
+          mk_policy() {
+            cat > "$T/$1.json" <<JSON
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"none","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"60s","output_bytes":1048576,$2}}
+          JSON
+          }
+          mk_policy mem '"memory_bytes":67108864'
+          mk_policy pids '"pids":24'
+          # 1. Fail closed: in the step's own (shared, undelegated) cgroup a set
+          #    limit refuses with 125 and the reason; nothing runs.
+          "$BIN" run --policy "$T/mem.json" --session-dir "$T/s0" -- /usr/bin/true 2> refuse.err
+          RC=$?
+          [ "$RC" -eq 125 ] || { echo "FAIL: undelegated run rc $RC (expected 125)"; cat refuse.err; FAIL=1; }
+          grep -q "need a delegated cgroup v2" refuse.err || { echo "FAIL: refusal text:"; cat refuse.err; FAIL=1; }
+          # 2. A delegated cgroup for the runner user.
+          CG=/sys/fs/cgroup/sbx-ci-$$
+          sudo mkdir "$CG"
+          sudo chown -R "$(id -u):$(id -g)" "$CG"
+          cat "$CG/cgroup.controllers"
+          # Runs CMD with the calling subshell moved into $CG first, so sbx is
+          # the only process there once it execs.
+          in_cg() { ( echo "$BASHPID" | sudo tee "$CG/cgroup.procs" > /dev/null; exec "$@" ); }
+          # memory: a 256 MiB allocation under a 64 MiB limit is OOM-killed.
+          in_cg "$BIN" run --policy "$T/mem.json" --session-dir "$T/s1" -- \
+            /usr/bin/python3 -c 'b = bytearray(256 << 20); b[::4096] = b"x" * len(b[::4096]); print("allocated")' > mem.out 2> mem.err
+          RC=$?
+          [ "$RC" -eq 137 ] || { echo "FAIL: memory limit rc $RC (expected 137, OOM SIGKILL)"; cat mem.out mem.err; FAIL=1; }
+          grep -q allocated mem.out && { echo "FAIL: the allocation succeeded"; FAIL=1; }
+          # pids: forking stops below the 24-task limit (bwrap and the payload
+          # already hold some), and the run itself still ends normally.
+          in_cg "$BIN" run --policy "$T/pids.json" --session-dir "$T/s2" -- \
+            /usr/bin/python3 -c '
+          import os, time
+          n = 0
+          try:
+              while n < 200:
+                  if os.fork() == 0:
+                      time.sleep(30); os._exit(0)
+                  n += 1
+          except OSError as e:
+              print("forked", n, "then", e.errno)
+          ' > pids.out 2> pids.err
+          RC=$?
+          cat pids.out
+          N=$(sed -n 's/^forked \([0-9]*\) then 11$/\1/p' pids.out)
+          [ -n "$N" ] && [ "$N" -lt 24 ] || { echo "FAIL: pids limit: rc $RC"; cat pids.out pids.err; FAIL=1; }
+          # The sandbox child cgroup is removed after each run.
+          ls "$CG"
+          ls -d "$CG"/sbx-sandbox-* 2>/dev/null && { echo "FAIL: sandbox cgroup left behind"; FAIL=1; }
+          exit "$FAIL"
+
       # Issue #19: the Landlock layer on the static musl release binary.
       # The runner's Landlock ABI is printed so a skipped layer is visible in the
       # log. The payload must see `mkdir` at `/` fail under the layer (EACCES),
