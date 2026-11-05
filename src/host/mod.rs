@@ -192,7 +192,7 @@ pub struct PolicyCheck {
 }
 
 /// One policy check (`id` in the fixed order `network-mode`, `infra-etc`,
-/// `policy-paths`, `deny-paths`).
+/// `policy-paths`, `deny-paths`, `bind-sockets`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyItem {
     pub id: &'static str,
@@ -243,6 +243,7 @@ pub fn check(args: CheckArgs) -> ExitCode {
                 report.network_mode,
                 &|p: &Path| std::fs::metadata(p).is_ok(),
                 &|p: &Path| std::fs::metadata(p).is_ok_and(|m| !m.is_dir()),
+                &facts::socket_scan,
             ));
         }
     }

@@ -575,7 +575,6 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
                     expected: &req.host,
                     port: 80,
                     source: NameSource::ConnectTarget,
-                    strict_framing: true,
                 };
                 let replay = http::inspect_http_with(&mut chained, &check, limits).await?;
                 (replay, RelayMode::CloseOnUpstreamEof)

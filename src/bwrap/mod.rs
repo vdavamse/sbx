@@ -291,7 +291,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // TOCTOU-prone spellings like /etc/.. alias host directories through
     // the pure layout joins) and NOT the host root or an alias of it
     // ("/", "//"): with --session-dir /, materialize() would rewrite the
-    // host's OWN /etc/{resolv.conf,passwd,group} and the leaves would
+    // host's OWN /etc/{resolv.conf,hosts,passwd,group} and the leaves would
     // bind the host's /home and /tmp rw into the sandbox. One helper with
     // materialize()'s pre-I/O guard (etc::check_session_dir) so both
     // public seams reject identically — materialize is callable WITHOUT
@@ -353,7 +353,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // in either direction. Policy mounts use src == dest == the written
     // path, so an ancestor-or-equal bind (rw /var with the session at
     // /var/lib/sbx/s1, or the session dir itself) hands the payload
-    // host-side write access to <session>/etc/{resolv.conf,passwd,group}:
+    // host-side write access to <session>/etc/{resolv.conf,hosts,passwd,group}:
     // the SAME inodes the generated ro-binds expose at /etc/* — ro-ness
     // is per-mount, not per-file, and the read-only-synthetic-/etc-files
     // guarantee would be silently void (a payload-planted symlink there
@@ -597,8 +597,27 @@ pub fn infra_etc_paths() -> &'static [&'static str] {
 
 /// The `/etc` files sbx generates itself (`--host` pre-check: a deny entry
 /// equal to one of these masks a generated file).
-pub fn generated_etc_paths() -> [&'static str; 3] {
-    ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+pub fn generated_etc_paths() -> [&'static str; 4] {
+    [
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/passwd",
+        "/etc/resolv.conf",
+    ]
+}
+
+/// Sandbox destinations sbx mounts over AFTER every policy bind (argv
+/// elements 6–7): the session leaves (`/root`, `/tmp`, `/work`, prio 2) and
+/// `--proc /proc --dev /dev`. A policy bind at one of these is not visible
+/// there (`sbx check --host` `bind-sockets`, issue #35).
+pub fn shadowed_dests() -> [&'static str; 5] {
+    [
+        "/dev",
+        "/proc",
+        etc::DEST_HOME,
+        etc::DEST_TMP,
+        etc::DEST_WORK,
+    ]
 }
 
 #[cfg(test)]
@@ -677,9 +696,19 @@ mod probe_argv_tests {
     fn etc_path_tables_pinned() {
         assert_eq!(
             generated_etc_paths(),
-            ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+            [
+                "/etc/group",
+                "/etc/hosts",
+                "/etc/passwd",
+                "/etc/resolv.conf"
+            ]
         );
-        assert_eq!(infra_etc_paths().len(), 7);
+        assert_eq!(infra_etc_paths().len(), 6);
+        assert!(!infra_etc_paths().contains(&"/etc/hosts"));
+        assert_eq!(
+            shadowed_dests(),
+            ["/dev", "/proc", "/root", "/tmp", "/work"]
+        );
     }
 }
 

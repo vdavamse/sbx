@@ -62,7 +62,7 @@ pub fn render_human(r: &Report) -> String {
                 item.id,
                 item.detail
             );
-            if item.status == Status::Fail {
+            if matches!(item.status, Status::Fail | Status::Warn) {
                 if let Some(fix) = &item.fix {
                     let _ = writeln!(out, "{:indent$}fix: {fix}", "", indent = POLICY_INDENT);
                 }
@@ -370,6 +370,39 @@ network mode: unavailable (no policy can run until the failed items are fixed)
         assert_eq!(render_json(&r), J1);
     }
 
+    /// Review of #48: a WARN policy row renders with its `fix:` line and
+    /// does not make the policy non-runnable or the exit code non-zero.
+    #[test]
+    fn policy_section_warn_row() {
+        let mut r = assemble(&ok_host());
+        let policy = crate::policy::Policy::from_json_str(
+            r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/run"],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#,
+        )
+        .expect("policy");
+        r.policy = Some(crate::host::classify::policy_check(
+            "examples/p.json",
+            &policy,
+            EffectiveMode::Transparent,
+            &|_| true,
+            &|_| false,
+            &|_, _| crate::host::facts::SocketScan {
+                found: vec!["/run/docker.sock".into()],
+                truncated: false,
+            },
+        ));
+        let text = render_human(&r);
+        assert!(
+            text.contains("  warn  bind-sockets  unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): /run/docker.sock\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("fix: remove the directories that hold them from filesystem.ro/rw, or add them to filesystem.deny\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("policy: can run on this host\n"), "{text}");
+        assert_eq!(exit_code(&r), 0);
+    }
+
     #[test]
     fn policy_section_golden() {
         let mut r = assemble(&ok_host());
@@ -383,6 +416,7 @@ network mode: unavailable (no policy can run until the failed items are fixed)
             EffectiveMode::Explicit,
             &|_| false,
             &|_| false,
+            &|_, _| crate::host::facts::SocketScan::default(),
         ));
         let text = render_human(&r);
         assert!(

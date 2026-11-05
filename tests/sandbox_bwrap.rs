@@ -476,6 +476,7 @@ for p in /home /opt /var /srv /mnt /sys /etc/shadow /etc/machine-id /dev/console
   if test -e "$p"; then echo "SBX-BW-MARKER LEAK $p"; fi
 done
 echo "SBX-BW-MARKER passwd-count=$(grep -c '^root:x:0:0:root:/root:/bin/bash$' /etc/passwd)"
+echo "SBX-BW-MARKER hosts=$(tr '\n' '|' < /etc/hosts)"
 "#;
     let out = run_payload(bwrap, &session, BASE_POLICY, &no_env(), script)
         .expect("allowlist-only-visible payload run");
@@ -510,6 +511,11 @@ echo "SBX-BW-MARKER passwd-count=$(grep -c '^root:x:0:0:root:/root:/bin/bash$' /
         has_marker(&out, "passwd-count=1"),
         "/etc/passwd must be the synthetic one (exactly the pinned root \
          entry):\n{}",
+        out.stdout
+    );
+    assert!(
+        has_marker(&out, "hosts=127.0.0.1 localhost|::1 localhost|"),
+        "/etc/hosts must be the synthetic loopback-only one (issue #35):\n{}",
         out.stdout
     );
     house_print(&format!("PASS {NAME}"));

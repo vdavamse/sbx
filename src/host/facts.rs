@@ -304,9 +304,248 @@ pub(crate) fn parse_probe_output(exit: Option<i32>, stdout: &str, stderr: &str) 
     ProbeOutcome::Ran(report)
 }
 
+/// Entry bound of [`socket_scan`] (issue #35): the default policy's `/usr`
+/// is ~70k entries, so this leaves an order of magnitude of headroom while
+/// bounding a policy that binds a huge tree.
+pub const SOCKET_SCAN_MAX_ENTRIES: usize = 500_000;
+
+/// Depth bound of [`socket_scan`] below each root.
+pub const SOCKET_SCAN_MAX_DEPTH: usize = 32;
+
+/// What [`socket_scan`] saw: the socket files (sorted, deduped) and whether a
+/// bound cut the walk short (then `found` is not exhaustive).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SocketScan {
+    pub found: Vec<PathBuf>,
+    pub truncated: bool,
+}
+
+/// Walk `roots` (the policy `ro`/`rw` binds) for unix socket files the payload
+/// can reach (issue #35): a read-only bind does not block `connect()`.
+/// Production entry point of [`socket_scan_bounded`] with the sandbox's
+/// shadowed destinations ([`crate::bwrap::shadowed_dests`]) and the
+/// [`SOCKET_SCAN_MAX_ENTRIES`]/[`SOCKET_SCAN_MAX_DEPTH`] bounds.
+pub fn socket_scan(roots: &[&Path], skip: &[&Path]) -> SocketScan {
+    let shadows = crate::bwrap::shadowed_dests();
+    let shadows: Vec<&Path> = shadows.iter().map(Path::new).collect();
+    socket_scan_bounded(
+        roots,
+        skip,
+        &shadows,
+        SOCKET_SCAN_MAX_ENTRIES,
+        SOCKET_SCAN_MAX_DEPTH,
+    )
+}
+
+/// The bounded walk behind [`socket_scan`].
+///
+/// - `skip` (the deny masks) hides every path at or under it, roots
+///   included: bwrap's deny `--tmpfs` mounts come after every bind.
+/// - `shadow` (destinations sbx mounts over AFTER the policy binds: the
+///   session leaves and `/proc`, `/dev`) hides what is at or under it in a
+///   root's walk, unless the root lies strictly below that shadow. Such a
+///   root is its own bind, which sorts and mounts after the shadow.
+/// - Roots follow symlinks (bwrap's bind does). Entries below them are
+///   `lstat`ed and not followed: inside the sandbox a link resolves against
+///   the sandbox view, which only holds other binds, walked as their own
+///   roots.
+/// - Unreadable directories are skipped. They are unreadable to the payload
+///   too (same uid).
+/// - `truncated` is set when `max_entries` stops the walk (`found` is then
+///   partial) or a directory sits at `max_depth`.
+pub fn socket_scan_bounded(
+    roots: &[&Path],
+    skip: &[&Path],
+    shadow: &[&Path],
+    max_entries: usize,
+    max_depth: usize,
+) -> SocketScan {
+    use std::os::unix::fs::FileTypeExt;
+
+    // The shadows that apply to the walk of `root`.
+    let shadows_for = |root: &Path| -> Vec<&Path> {
+        shadow
+            .iter()
+            .copied()
+            .filter(|s| !(root.starts_with(s) && root != *s))
+            .collect()
+    };
+    let hidden = |p: &Path, shadows: &[&Path]| {
+        skip.iter().any(|s| p.starts_with(s)) || shadows.iter().any(|s| p.starts_with(s))
+    };
+
+    let mut sorted: Vec<&Path> = roots.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let mut kept: Vec<&Path> = Vec::new();
+    for root in sorted {
+        // A root under an earlier root is walked as part of it, unless that
+        // walk hides it (a shadow over it that the earlier root does not
+        // escape): then it is its own bind and walked separately.
+        let covered = kept
+            .iter()
+            .any(|k| root.starts_with(k) && !hidden(root, &shadows_for(k)));
+        if !covered {
+            kept.push(root);
+        }
+    }
+
+    let mut scan = SocketScan::default();
+    let mut visited = 0usize;
+    'roots: for root in kept {
+        let shadows = shadows_for(root);
+        if hidden(root, &shadows) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(root) else {
+            continue;
+        };
+        if meta.file_type().is_socket() {
+            scan.found.push(root.to_path_buf());
+            continue;
+        }
+        if !meta.is_dir() {
+            continue;
+        }
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > max_entries {
+                    scan.truncated = true;
+                    break 'roots;
+                }
+                let path = entry.path();
+                if hidden(&path, &shadows) {
+                    continue;
+                }
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_socket() {
+                    scan.found.push(path);
+                } else if kind.is_dir() {
+                    if depth + 1 < max_depth {
+                        stack.push((path, depth + 1));
+                    } else {
+                        scan.truncated = true;
+                    }
+                }
+            }
+        }
+    }
+    scan.found.sort();
+    scan.found.dedup();
+    scan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #35: sockets under a root are found, deny-masked subtrees and
+    /// symlinks are not followed, overlapping roots are walked once.
+    #[test]
+    fn socket_scan_finds_sockets_and_honours_skip() {
+        let base = std::env::temp_dir().join(format!("sbx-socket-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("run/user")).expect("mkdir");
+        fs::create_dir_all(base.join("denied")).expect("mkdir");
+        let a = base.join("run/docker.sock");
+        let b = base.join("run/user/agent.sock");
+        let hidden = base.join("denied/x.sock");
+        let _l1 = std::os::unix::net::UnixListener::bind(&a).expect("bind");
+        let _l2 = std::os::unix::net::UnixListener::bind(&b).expect("bind");
+        let _l3 = std::os::unix::net::UnixListener::bind(&hidden).expect("bind");
+        std::os::unix::fs::symlink(&a, base.join("link.sock")).expect("symlink");
+        fs::write(base.join("plain"), b"x").expect("write");
+
+        let run = base.join("run");
+        let denied = base.join("denied");
+        let scan = socket_scan(&[base.as_path(), run.as_path()], &[denied.as_path()]);
+        assert_eq!(scan.found, vec![a.clone(), b.clone()]);
+        assert!(!scan.truncated);
+
+        // A root that is itself a socket is reported; a missing root is not.
+        let scan = socket_scan(&[a.as_path(), Path::new("/nonexistent/sbx-scan")], &[]);
+        assert_eq!(scan.found, vec![a.clone()]);
+
+        // A skipped root is not walked at all.
+        let scan = socket_scan(&[run.as_path()], &[run.as_path()]);
+        assert!(scan.found.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("sbx-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("mkdir");
+        base
+    }
+
+    /// Review of #48: a root equal to a shadow (session tmp over `/tmp`) is
+    /// hidden; a root strictly below it is its own bind and walked; a
+    /// shadow inside a root hides that subtree only.
+    #[test]
+    fn socket_scan_honours_shadows() {
+        let base = scratch("socket-scan-shadow");
+        let tmp = base.join("tmp");
+        let x = tmp.join("x");
+        fs::create_dir_all(&x).expect("mkdir");
+        let top = tmp.join("X0");
+        let below = x.join("agent.sock");
+        let outside = base.join("run.sock");
+        let _l1 = std::os::unix::net::UnixListener::bind(&top).expect("bind");
+        let _l2 = std::os::unix::net::UnixListener::bind(&below).expect("bind");
+        let _l3 = std::os::unix::net::UnixListener::bind(&outside).expect("bind");
+        let shadow = [tmp.as_path()];
+
+        let scan = socket_scan_bounded(&[tmp.as_path()], &[], &shadow, 1000, 8);
+        assert!(scan.found.is_empty(), "{scan:?}");
+        let scan = socket_scan_bounded(&[tmp.as_path(), x.as_path()], &[], &shadow, 1000, 8);
+        assert_eq!(scan.found, vec![below.clone()]);
+        // base covers tmp, but tmp is shadowed inside base's walk: only x
+        // (its own root) and the socket outside the shadow are reachable.
+        let scan = socket_scan_bounded(&[base.as_path(), x.as_path()], &[], &shadow, 1000, 8);
+        assert_eq!(scan.found, vec![outside.clone(), below.clone()]);
+        let scan = socket_scan_bounded(&[base.as_path()], &[], &shadow, 1000, 8);
+        assert_eq!(scan.found, vec![outside.clone()]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Review of #48: both bounds set `truncated`, and a directory symlink
+    /// below a root is not followed.
+    #[test]
+    fn socket_scan_bounds_and_dir_symlinks() {
+        let base = scratch("socket-scan-bounds");
+        let deep = base.join("a/b");
+        fs::create_dir_all(&deep).expect("mkdir");
+        let sock = deep.join("s.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        std::os::unix::fs::symlink(base.join("a"), base.join("dirlink")).expect("symlink");
+
+        let scan = socket_scan_bounded(&[base.as_path()], &[], &[], 1000, 8);
+        assert_eq!(
+            scan.found,
+            vec![sock.clone()],
+            "dirlink must not be followed"
+        );
+        assert!(!scan.truncated);
+
+        let scan = socket_scan_bounded(&[base.as_path()], &[], &[], 1000, 2);
+        assert!(scan.found.is_empty());
+        assert!(scan.truncated, "a directory at max_depth truncates");
+
+        let scan = socket_scan_bounded(&[base.as_path()], &[], &[], 2, 8);
+        assert!(scan.truncated, "max_entries truncates");
+
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn parse_sysctl_table() {
