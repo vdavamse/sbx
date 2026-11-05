@@ -7,7 +7,7 @@
 //! controls) harder to reason about. The same reasoning as `sandbox_check`.
 //!
 //! Gates (SKIP-with-message, exit 0; any assertion failure exits 1):
-//! * the report is produced and parsed (`kind`, `version`, 78 checks in
+//! * the report is produced and parsed (`kind`, `version`, 81 checks in
 //!   catalog order, matching `--list --json`);
 //! * no check FAILs; the rc matches `summary.conformant`;
 //! * PR2 state: every offline check is `ok` (or `warn`); the E checks are
@@ -106,13 +106,13 @@ fn list_scenario() -> Result<(), String> {
         .lines()
         .filter(|l| l.starts_with("  ") && l.len() > 6)
         .count();
-    if rows != 78 {
-        return Err(format!("--list printed {rows} rows, expected 78"));
+    if rows != 81 {
+        return Err(format!("--list printed {rows} rows, expected 81"));
     }
     let json = sbx(&["check", "--conformance", "--list", "--json"])?;
     let v: serde_json::Value =
         serde_json::from_str(&text(&json)).map_err(|e| format!("--list --json: {e}"))?;
-    if v["kind"] != "conformance-catalog" || v["checks"].as_array().map(Vec::len) != Some(78) {
+    if v["kind"] != "conformance-catalog" || v["checks"].as_array().map(Vec::len) != Some(81) {
         return Err("--list --json: wrong shape".to_owned());
     }
     Ok(())
@@ -272,7 +272,7 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         .iter()
         .map(|c| c["id"].as_str().unwrap_or(""))
         .collect();
-    if got != want || got.len() != 78 {
+    if got != want || got.len() != 81 {
         return Err(format!(
             "report ids differ from the catalog: {} entries",
             got.len()
