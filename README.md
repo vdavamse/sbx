@@ -676,7 +676,11 @@ sbx stop --session-dir S
   run for that long. `--max-lifetime` (default 8h) ends it after that long
   regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
   exit ends the session too. Each end kills the resident and every running call,
-  writes their exit rows, and removes the control socket.
+  writes their exit rows, and removes the control socket. The clock starts when
+  `run --keep-alive` starts, so setup counts toward `--max-lifetime`.
+- **Policy timeout.** The resident is not bound by the policy's `limits.timeout`.
+  Only the session lifetime (`--max-lifetime`) bounds it. Each attached call is
+  bounded by its own `--timeout`, or by `limits.timeout` when that is absent.
 - **Output.** The holder's output (the resident's stdout and stderr) goes to
   `S/holder.log`, not to the caller, and it is bounded by `limits.output_bytes`.
   Attached calls print to the caller as in `sbx run`.
@@ -692,7 +696,9 @@ sbx stop --session-dir S
   is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
   path that is or contains the session directory is refused. Only a policy path
   that reaches it through a symlink is not caught (R35). A same-uid
-  client can hold the control loop for up to 2 s per connection (R34).
+  client can hold the control loop for up to 2 s per connection, in batches of
+  8 connections per wake (R34). Each connection has one 2 s deadline for its
+  request and its reply.
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
   rows carry no `call_id` (R30).
