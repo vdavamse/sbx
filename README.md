@@ -204,8 +204,8 @@ parts of the optional layer the kernel provides, see **Landlock layer** under [R
 and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
 into a fresh user and network namespace, the two things `run --keep-alive` and
 `attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
-failure is a `warn` and never limits the network mode, as `landlock` does, so a
-host that runs plain sandboxes still exits 0.
+failure is a `warn`. Like `landlock`, it is report only: it never limits the
+network mode, so a host that runs plain sandboxes still exits 0.
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
@@ -281,6 +281,7 @@ platform, the Kubernetes and Docker forms are given:
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
 | `keep-alive` | `pidfd_open` is refused (ENOSYS below Linux 5.3, or an outer seccomp profile) (report only) | run sbx on Linux 5.3 or newer; Kubernetes: a Localhost seccomp profile that allows `pidfd_open`, or `seccompProfile` Unconfined |
+| `keep-alive` | the holder stand-in's `unshare(CLONE_NEWUSER\|CLONE_NEWNET)` is refused (EPERM or EACCES). The probe's own namespace was created, so only the nested user and network namespaces are refused; report only | allow nested `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNET)` for this user (a seccomp or container profile that blocks them; Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | an unprivileged `setns` into a fresh user and network namespace is refused (EPERM or EACCES; report only) | allow `setns(CLONE_NEWUSER)` and `setns(CLONE_NEWNET)` for this user (a container seccomp profile often blocks `setns`; Kubernetes: a Localhost seccomp profile that allows it, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | the holder stand-in cannot be started, or the join fails for another reason (report only) | allow unprivileged user and network namespaces and `setns` for this user, or do not use `run --keep-alive`; plain `sbx run` does not need them |
 | `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |

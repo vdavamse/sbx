@@ -309,6 +309,7 @@ pub(crate) mod test_support {
                     status: StepStatus::Ok,
                     errno: None,
                     reason: None,
+                    phase: None,
                 })
                 .collect(),
         }

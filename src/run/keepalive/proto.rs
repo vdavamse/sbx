@@ -243,10 +243,11 @@ impl SessionLandlock {
     }
 
     /// Encodes the settings: mode code (1 byte), port count (2 bytes), ports (2
-    /// bytes each). The count is checked, never wrapped: a list longer than the
-    /// cap is a caller bug (debug builds assert), and in a release build the
-    /// count saturates, so the peer sees a count that no port list matches and
-    /// refuses the frame.
+    /// bytes each). The count is never wrapped. A list longer than the cap is a
+    /// caller bug (debug builds assert). In a release build a count above
+    /// `u16::MAX` saturates to 65535, which no port list of this size matches, so
+    /// the peer refuses the frame. A count from `MAX_BIND_TCP + 1` to 65535 is
+    /// sent exactly, and the peer refuses it because it exceeds `MAX_BIND_TCP`.
     fn encode_into(&self, out: &mut Vec<u8>) {
         debug_assert!(
             self.bind_tcp.len() <= MAX_BIND_TCP,
