@@ -13,7 +13,8 @@
 //! * PR2 state: every offline check is `ok` (or `warn`); the E checks are
 //!   `opt-in` without `SBX_CONFORMANCE_NETWORK=1` and `ok` with it (E05 may be
 //!   an opt-in skip when `npm` is absent); no capability or not-implemented
-//!   skip exists on a host that can run sandboxes;
+//!   skip exists on a host that can run sandboxes, except I04 (foreign uid),
+//!   which is an opt-in skip on every host by design (it needs a second uid);
 //! * when the host cannot run sandboxes at all, the suite prints
 //!   `SKIP conformance: host cannot run sandboxes` and exits 0.
 //!
@@ -320,6 +321,8 @@ fn full_report_scenario() -> Result<Option<String>, String> {
                     c["status"], kind
                 ));
             }
+        } else if id == "I04" && c["status"] == "skip" && kind == Some("opt-in") {
+            // Group I's foreign-uid check: never run unprivileged, so an opt-in skip.
         } else if c["status"] != "ok" && c["status"] != "warn" {
             return Err(format!(
                 "{id}: expected ok, got {} ({})",
