@@ -29,7 +29,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use super::ctl;
-use super::proto::{CallEnd, Reply, Request};
+use super::proto::{CallEnd, Reply, Request, SessionLandlock};
 use crate::bwrap::seccomp;
 use crate::bwrap::version::{BwrapStatus, find_bwrap};
 use crate::bwrap::{Build, Launch, build};
@@ -43,8 +43,8 @@ use crate::run::serve::FaultLatch;
 use crate::run::stdio::{OutputBudget, PumpEnd, Pumps};
 use crate::run::sys;
 use crate::run::{
-    EXIT_FAILURE, Early, Outcome, RunError, check_bwrap_version, deadline_from, stdin_mode,
-    write_diagnostics,
+    EXIT_FAILURE, Early, LandlockSetup, Outcome, RunError, check_bwrap_version, deadline_from,
+    stdin_mode, write_diagnostics,
 };
 
 /// The parsed `sbx attach` invocation.
@@ -162,8 +162,10 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
         .map_err(|err| RunError::new(format!("cannot send the attach request: {err:?}")))?;
     let (frame, fds) = ctl::recv_frame(&stream)
         .map_err(|err| RunError::new(format!("the session did not answer: {err:?}")))?;
-    let (id, mut fds) = match Reply::decode(frame) {
-        Ok(Reply::Accepted(id)) if fds.len() == 3 => (id, fds),
+    let (id, landlock, mut fds) = match Reply::decode(frame) {
+        // The session's Landlock settings come with the admission: the call applies
+        // them, and the attach has no Landlock flags of its own to weaken them.
+        Ok(Reply::Accepted(id, landlock)) if fds.len() == 3 => (id, landlock, fds),
         Ok(Reply::Refused(reason)) => {
             return Err(RunError::new(format!("session refused the call: {reason}")).into());
         }
@@ -184,6 +186,7 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
         holder_pidfd,
         user_ns,
         net_ns,
+        &landlock,
     ) {
         Ok(done) => done,
         Err(early) => (early_outcome(early), PumpEnd::default(), false),
@@ -212,6 +215,7 @@ fn run_call(
     holder_pidfd: OwnedFd,
     user_ns: OwnedFd,
     net_ns: OwnedFd,
+    landlock: &SessionLandlock,
 ) -> Result<(Outcome, PumpEnd, bool), Early> {
     let signals = sys::Signals::install()
         .map_err(|err| RunError::new(format!("cannot block signals: {err}")))?;
@@ -224,6 +228,18 @@ fn run_call(
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
+    // The session's Landlock layer (issue #56 with #18): the same setup, the same
+    // layer and the same refusal as the resident's `run`, so every call is confined
+    // exactly as the resident is. `require` on a kernel below ABI 6 is refused
+    // before anything is spawned.
+    if landlock.mode == crate::landlock::Mode::Require {
+        if let Some(reason) = crate::landlock::require_refusal(crate::landlock::kernel_abi()) {
+            return Err(RunError::new(reason).into());
+        }
+    }
+    let setup = crate::run::landlock_setup(landlock.mode)?;
+    let layer =
+        crate::run::landlock_layer(&setup.exe, &setup.status, landlock.mode, &landlock.bind_tcp);
     let launch: Launch = build(&Build {
         policy,
         session_dir: session,
@@ -233,7 +249,7 @@ fn run_call(
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
-        landlock: None, // TEMPORARY during the rebase: the session's Landlock is wired next.
+        landlock: layer,
     })
     .map_err(|err| RunError::new(err.to_string()))?;
     // S8a (#39/#40, N19) on every call: a payload may have planted a link under a
@@ -248,12 +264,32 @@ fn run_call(
         .map_err(|err| RunError::new(format!("cannot prepare the namespace fds: {err}")))?;
     let net_fd = sys::clear_cloexec(net_ns.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the namespace fds: {err}")))?;
+    let exe_fd = match &setup.exe {
+        Some(file) => Some(
+            sys::clear_cloexec(file.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim: {err}")))?,
+        ),
+        None => None,
+    };
+    let status_fd = match &setup.status {
+        Some((_, write)) => Some(
+            sys::clear_cloexec(write.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim status: {err}")))?,
+        ),
+        None => None,
+    };
     let (stdin, stdin_piped) = stdin_mode();
     let child = join_command(
-        user_fd,
-        net_fd,
-        info_fd,
-        seccomp_fd,
+        JoinFds {
+            user: user_fd,
+            net: net_fd,
+            info: info_fd,
+            seccomp: seccomp_fd,
+            shim: JoinShim {
+                exe: exe_fd,
+                status: status_fd,
+            },
+        },
         std::process::id(),
         &launch,
         stdin,
@@ -264,6 +300,16 @@ fn run_call(
     drop(seccomp_memfd);
     drop(user_ns);
     drop(net_ns);
+    let LandlockSetup {
+        exe: exe_file,
+        status: status_pipe,
+    } = setup;
+    drop(exe_file);
+    let (status_read, status_write) = match status_pipe {
+        Some((read, write)) => (Some(read), Some(write)),
+        None => (None, None),
+    };
+    drop(status_write);
 
     let child_pidfd = sys::pidfd_open(child.id() as libc::pid_t)
         .map_err(|err| RunError::new(format!("cannot watch sbx __init: {err}")))?;
@@ -290,20 +336,39 @@ fn run_call(
         pidfd: holder_pidfd,
     };
     let cause = supervise(&mut sb, &signals, &latch, deadline, timeout, &mut watch);
-    Ok(teardown(sb, cause, Some(pumps)))
+    let (outcome, end, stragglers) = teardown(sb, cause, Some(pumps));
+    // The shim's status pipe, read as `run` reads it (issue #19 M1).
+    let outcome = crate::run::landlock_status_outcome(outcome, status_read.as_ref());
+    Ok((outcome, end, stragglers))
 }
 
-/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, and
-/// the call's bwrap argv after `--`.
-fn join_command(
+/// The descriptors one join hands `__init --join`: the session's namespace fds,
+/// the kept bwrap fds, and the shim's fds when the session has a Landlock layer.
+struct JoinFds {
     user: RawFd,
     net: RawFd,
     info: RawFd,
     seccomp: RawFd,
-    parent_pid: u32,
-    launch: &Launch,
-    stdin: Stdio,
-) -> Command {
+    shim: JoinShim,
+}
+
+/// The shim's descriptors of one join (`--exe-fd` and `--status-fd`).
+#[derive(Clone, Copy)]
+struct JoinShim {
+    exe: Option<RawFd>,
+    status: Option<RawFd>,
+}
+
+/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, and
+/// the call's bwrap argv after `--`.
+fn join_command(fds: JoinFds, parent_pid: u32, launch: &Launch, stdin: Stdio) -> Command {
+    let JoinFds {
+        user,
+        net,
+        info,
+        seccomp,
+        shim,
+    } = fds;
     let mut argv: Vec<OsString> = vec![
         "__init".into(),
         "--join-user".into(),
@@ -316,8 +381,16 @@ fn join_command(
         seccomp.to_string().into(),
         "--parent-pid".into(),
         parent_pid.to_string().into(),
-        "--".into(),
     ];
+    if let Some(exe) = shim.exe {
+        argv.push("--exe-fd".into());
+        argv.push(exe.to_string().into());
+    }
+    if let Some(status) = shim.status {
+        argv.push("--status-fd".into());
+        argv.push(status.to_string().into());
+    }
+    argv.push("--".into());
     argv.extend(launch.argv().iter().cloned());
     let mut cmd = Command::new("/proc/self/exe");
     cmd.args(argv)
@@ -400,7 +473,7 @@ pub(crate) fn stop(session_dir: PathBuf) -> ExitCode {
             eprintln!("sbx stop: {reason}");
             ExitCode::from(EXIT_FAILURE as u8)
         }
-        Ok(Reply::Accepted(_)) | Err(_) => {
+        Ok(Reply::Accepted(_, _)) | Err(_) => {
             eprintln!("sbx stop: the session did not confirm the stop");
             ExitCode::from(EXIT_FAILURE as u8)
         }

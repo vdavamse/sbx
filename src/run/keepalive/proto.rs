@@ -113,8 +113,10 @@ pub(crate) enum Request {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Reply {
     /// An attach was admitted under this call id (resident = 0 is never issued
-    /// to an attach).
-    Accepted(u32),
+    /// to an attach), with the session's Landlock settings: the attach applies
+    /// exactly these, so it takes no Landlock flags of its own (see
+    /// [`SessionLandlock`]).
+    Accepted(u32, SessionLandlock),
     /// The request was applied.
     Done,
     /// The request was refused; the text is the reason.
@@ -207,12 +209,88 @@ impl Request {
     }
 }
 
+/// The Landlock settings a session was started with (`run --keep-alive
+/// --landlock … --landlock-bind-tcp …`). The holder pins them at start and sends
+/// them with every accepted attach, so the resident and every call run under
+/// one layer and an attach cannot weaken it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionLandlock {
+    pub(crate) mode: crate::landlock::Mode,
+    /// `--landlock-bind-tcp` ports, in command-line order (0 = ephemeral).
+    pub(crate) bind_tcp: Vec<u16>,
+}
+
+/// The most bind ports a session may name on the wire.
+pub(crate) const MAX_BIND_TCP: usize = 256;
+
+impl SessionLandlock {
+    /// No layer (the default; a plain session).
+    #[cfg(test)]
+    pub(crate) fn off() -> Self {
+        Self {
+            mode: crate::landlock::Mode::Off,
+            bind_tcp: Vec::new(),
+        }
+    }
+
+    /// The wire code of the mode: `off` 0, `best-effort` 1, `require` 2.
+    fn mode_code(&self) -> u8 {
+        match self.mode {
+            crate::landlock::Mode::Off => 0,
+            crate::landlock::Mode::BestEffort => 1,
+            crate::landlock::Mode::Require => 2,
+        }
+    }
+
+    /// Encodes the settings: mode code (1 byte), port count (2 bytes), ports (2
+    /// bytes each).
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(self.mode_code());
+        out.extend_from_slice(&(self.bind_tcp.len() as u16).to_be_bytes());
+        for port in &self.bind_tcp {
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+
+    /// Decodes the settings from the start of `bytes`; returns the rest.
+    fn decode_from(bytes: &[u8]) -> Result<(Self, &[u8]), ProtoError> {
+        let malformed = || ProtoError::Malformed("landlock settings are truncated");
+        let (&code, rest) = bytes.split_first().ok_or_else(malformed)?;
+        let mode = match code {
+            0 => crate::landlock::Mode::Off,
+            1 => crate::landlock::Mode::BestEffort,
+            2 => crate::landlock::Mode::Require,
+            _ => return Err(ProtoError::Malformed("unknown landlock mode code")),
+        };
+        if rest.len() < 2 {
+            return Err(malformed());
+        }
+        let count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        if count > MAX_BIND_TCP {
+            return Err(ProtoError::Malformed("too many landlock bind ports"));
+        }
+        let ports_bytes = &rest[2..];
+        if ports_bytes.len() < 2 * count {
+            return Err(malformed());
+        }
+        let bind_tcp = ports_bytes[..2 * count]
+            .chunks_exact(2)
+            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+            .collect();
+        Ok((Self { mode, bind_tcp }, &ports_bytes[2 * count..]))
+    }
+}
+
 impl Reply {
     /// The opcode and payload of this reply. A refusal reason is cut to
     /// [`MAX_REASON`] at a character boundary.
     pub(crate) fn encode(&self) -> (u8, Vec<u8>) {
         match self {
-            Reply::Accepted(call_id) => (OP_ACCEPTED, call_id.to_be_bytes().to_vec()),
+            Reply::Accepted(call_id, landlock) => {
+                let mut payload = call_id.to_be_bytes().to_vec();
+                landlock.encode_into(&mut payload);
+                (OP_ACCEPTED, payload)
+            }
             Reply::Done => (OP_DONE, Vec::new()),
             Reply::Refused(reason) => {
                 let mut end = reason.len().min(MAX_REASON);
@@ -228,12 +306,16 @@ impl Reply {
     pub(crate) fn decode(frame: Frame) -> Result<Self, ProtoError> {
         match frame.op {
             OP_ACCEPTED => {
-                let bytes: [u8; 4] = frame
-                    .payload
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ProtoError::Malformed("accepted reply is not 4 bytes"))?;
-                Ok(Reply::Accepted(u32::from_be_bytes(bytes)))
+                let payload = frame.payload.as_slice();
+                if payload.len() < 4 {
+                    return Err(ProtoError::Malformed("accepted reply has no call id"));
+                }
+                let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let (landlock, rest) = SessionLandlock::decode_from(&payload[4..])?;
+                if !rest.is_empty() {
+                    return Err(ProtoError::Malformed("accepted reply has trailing bytes"));
+                }
+                Ok(Reply::Accepted(id, landlock))
             }
             OP_DONE => {
                 if !frame.payload.is_empty() {
@@ -317,7 +399,14 @@ mod tests {
     #[test]
     fn replies_round_trip() {
         for reply in [
-            Reply::Accepted(42),
+            Reply::Accepted(42, SessionLandlock::off()),
+            Reply::Accepted(
+                7,
+                SessionLandlock {
+                    mode: crate::landlock::Mode::Require,
+                    bind_tcp: vec![8080, 0],
+                },
+            ),
             Reply::Done,
             Reply::Refused("policy differs from the session's policy".into()),
         ] {
@@ -490,5 +579,46 @@ mod tests {
         let (_, payload) = Reply::Refused(reason).encode();
         assert_eq!(payload.len(), 511);
         assert!(std::str::from_utf8(&payload).is_ok());
+    }
+
+    #[test]
+    fn accepted_reply_carries_the_session_landlock_settings() {
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: vec![443, 0, 8080],
+        };
+        let (op, payload) = Reply::Accepted(9, settings.clone()).encode();
+        // call id, mode code, port count, the three ports (big-endian).
+        assert_eq!(payload, [0, 0, 0, 9, 1, 0, 3, 1, 187, 0, 0, 31, 144]);
+        let frame = Frame { op, payload };
+        assert_eq!(Reply::decode(frame).unwrap(), Reply::Accepted(9, settings));
+    }
+
+    #[test]
+    fn accepted_reply_rejects_bad_landlock_settings() {
+        let frame = |payload: Vec<u8>| Frame { op: b'K', payload };
+        // An unknown mode code.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 9, 0, 0])),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A port count longer than the payload.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 0, 0, 2, 0, 80])),
+            Err(ProtoError::Malformed(_))
+        ));
+        // More ports than the cap.
+        let mut many = vec![0, 0, 0, 1, 0];
+        many.extend_from_slice(&((MAX_BIND_TCP as u16) + 1).to_be_bytes());
+        many.extend(std::iter::repeat_n(0u8, 2 * (MAX_BIND_TCP + 1)));
+        assert!(matches!(
+            Reply::decode(frame(many)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // Trailing bytes after the settings.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 0, 0, 0, 7])),
+            Err(ProtoError::Malformed(_))
+        ));
     }
 }

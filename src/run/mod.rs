@@ -685,27 +685,16 @@ fn execute(
     // here (O_CLOEXEC, like every std open) and becomes the shim's program, and a
     // status pipe carries the shim's failure reason back (M1). The read end is
     // non-blocking; the write end is handed over in the spawn window.
-    let (exe_file, status_pipe) = match args.landlock {
-        crate::landlock::Mode::Off => (None, None),
-        _ => {
-            let exe = File::open("/proc/self/exe")
-                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
-            let pipe = sys::pipe_cloexec().map_err(|err| {
-                RunError::new(format!("cannot create the shim status pipe: {err}"))
-            })?;
-            (Some(exe), Some(pipe))
-        }
-    };
-    let landlock_layer = match (&exe_file, &status_pipe) {
-        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
-            mode: args.landlock,
-            bind_tcp: args.landlock_bind_tcp.clone(),
-            exe_fd: file.as_raw_fd(),
-            status_fd: status_write.as_raw_fd(),
-            host_abi: crate::landlock::host_abi(),
-        }),
-        _ => None,
-    };
+    let LandlockSetup {
+        exe: exe_file,
+        status: status_pipe,
+    } = landlock_setup(args.landlock)?;
+    let landlock_layer = landlock_layer(
+        &exe_file,
+        &status_pipe,
+        args.landlock,
+        &args.landlock_bind_tcp,
+    );
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -843,7 +832,8 @@ fn execute(
                     )));
                 }
                 // Issue #18: bind sbx.ctl and capture the session namespaces
-                // while __init is parked, before the go byte.
+                // while __init is parked, before the go byte. The Landlock settings
+                // are the session's: an attach applies exactly these.
                 if let Some(h) = hold.as_ref() {
                     holder = Some(
                         keepalive::holder::prepare(
@@ -856,6 +846,10 @@ fn execute(
                                 net_mode: mode.label(),
                                 audit: audit.clone(),
                                 map: map.clone(),
+                                landlock: keepalive::proto::SessionLandlock {
+                                    mode: args.landlock,
+                                    bind_tcp: args.landlock_bind_tcp.clone(),
+                                },
                             },
                         )
                         .map_err(Cause::Setup)?,
@@ -959,26 +953,7 @@ fn execute(
         h.end_calls(keepalive::holder::CALL_GRACE);
     }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
-    // M1 and round 3 item 2: the status pipe says whether the shim started and
-    // whether it failed (module docs point 11). It ends the run as `failed` only
-    // when the payload's own outcome is not already a failure.
-    if let Some(bytes) = status_read.as_ref().and_then(read_status) {
-        match crate::landlock::decode_status(&bytes) {
-            crate::landlock::StatusReport::Started => {}
-            crate::landlock::StatusReport::Failed(reason) => {
-                if !matches!(outcome, Outcome::Failed(_)) {
-                    outcome = Outcome::Failed(format!("landlock: {reason}"));
-                }
-            }
-            crate::landlock::StatusReport::NotStarted => {
-                if !matches!(outcome, Outcome::Failed(_)) {
-                    let rc = exit_code(&outcome);
-                    outcome =
-                        Outcome::Failed(format!("landlock: the shim did not start (rc {rc})"));
-                }
-            }
-        }
-    }
+    outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`
     // is answered (issue #18, review 2): a stop that returns has left the audit
@@ -1005,6 +980,80 @@ fn execute(
         stops.answer();
     }
     std::process::exit(code)
+}
+
+/// The Landlock descriptors of one launch (issue #19): sbx's own executable, for
+/// the shim, and the shim's status pipe. Both are opened only under a layer.
+pub(crate) struct LandlockSetup {
+    pub(crate) exe: Option<File>,
+    /// The status pipe: (read end, write end).
+    pub(crate) status: Option<(OwnedFd, OwnedFd)>,
+}
+
+/// Opens the descriptors a launch with `mode` needs (none when `mode` is off).
+/// `run` and every persistent-session attach call go through this one function
+/// (issue #18 with #56: the layer is the session's in both).
+pub(crate) fn landlock_setup(mode: crate::landlock::Mode) -> Result<LandlockSetup, RunError> {
+    match mode {
+        crate::landlock::Mode::Off => Ok(LandlockSetup {
+            exe: None,
+            status: None,
+        }),
+        _ => {
+            let exe = File::open("/proc/self/exe")
+                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
+            let pipe = sys::pipe_cloexec().map_err(|err| {
+                RunError::new(format!("cannot create the shim status pipe: {err}"))
+            })?;
+            Ok(LandlockSetup {
+                exe: Some(exe),
+                status: Some(pipe),
+            })
+        }
+    }
+}
+
+/// The [`crate::landlock::Layer`] for a launch, or `None` when there is none.
+pub(crate) fn landlock_layer(
+    exe: &Option<File>,
+    status: &Option<(OwnedFd, OwnedFd)>,
+    mode: crate::landlock::Mode,
+    bind_tcp: &[u16],
+) -> Option<crate::landlock::Layer> {
+    match (exe, status) {
+        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
+            mode,
+            bind_tcp: bind_tcp.to_vec(),
+            exe_fd: file.as_raw_fd(),
+            status_fd: status_write.as_raw_fd(),
+            host_abi: crate::landlock::host_abi(),
+        }),
+        _ => None,
+    }
+}
+
+/// The outcome after the shim's status pipe is read (issue #19 M1 and round 3
+/// item 2): the pipe says whether the shim started and whether it failed. It ends
+/// the run as `failed` only when the payload's own outcome is not already one.
+pub(crate) fn landlock_status_outcome(mut outcome: Outcome, status: Option<&OwnedFd>) -> Outcome {
+    if let Some(bytes) = status.and_then(read_status) {
+        match crate::landlock::decode_status(&bytes) {
+            crate::landlock::StatusReport::Started => {}
+            crate::landlock::StatusReport::Failed(reason) => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    outcome = Outcome::Failed(format!("landlock: {reason}"));
+                }
+            }
+            crate::landlock::StatusReport::NotStarted => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    let rc = exit_code(&outcome);
+                    outcome =
+                        Outcome::Failed(format!("landlock: the shim did not start (rc {rc})"));
+                }
+            }
+        }
+    }
+    outcome
 }
 
 /// Reads the shim's status pipe without blocking (issue #19 M1): the bytes there

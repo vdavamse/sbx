@@ -73,7 +73,7 @@ use super::ctl;
 use super::join::capture_namespaces;
 use super::limits::{Clock, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME, EndReason};
 use super::pin::{MISMATCH, PolicyPin};
-use super::proto::{Reply, Request};
+use super::proto::{Reply, Request, SessionLandlock};
 use crate::dns::FakeIpMap;
 use crate::run::audit::{AuditLog, CallExit, call_exit_row, ts};
 use crate::run::lifecycle::{Cause, Extra};
@@ -342,6 +342,8 @@ pub(crate) struct Holder {
     /// The session's fake-IP map, shared with the proxies (its poison flag is
     /// the call rows' `dns_poisoned`).
     map: Arc<FakeIpMap>,
+    /// The Landlock settings pinned at start, sent with every accepted attach.
+    landlock: SessionLandlock,
     calls: Vec<Call>,
     next_id: u32,
     stopping: bool,
@@ -364,6 +366,9 @@ pub(crate) struct HolderInputs {
     pub(crate) audit: Arc<AuditLog>,
     /// The session's fake-IP map, shared with the proxies.
     pub(crate) map: Arc<FakeIpMap>,
+    /// The session's Landlock settings, pinned at start (issue #56 with #18): an
+    /// attach applies exactly these, and sends none of its own.
+    pub(crate) landlock: SessionLandlock,
 }
 
 /// Builds the holder after the resident is up and before the go byte (rule 4 and
@@ -381,6 +386,7 @@ pub(crate) fn prepare(
         net_mode,
         audit,
         map,
+        landlock,
     } = inputs;
     let dir = ctl::open_session_dir(session)
         .map_err(|err| RunError::new(format!("cannot open the session directory: {err}")))?;
@@ -405,6 +411,7 @@ pub(crate) fn prepare(
         net_mode,
         audit,
         map,
+        landlock,
         calls: Vec::new(),
         next_id: 1,
         stopping: false,
@@ -624,7 +631,7 @@ impl Holder {
             self.user_ns.as_raw_fd(),
             self.net_ns.as_raw_fd(),
         ];
-        let (op, payload) = Reply::Accepted(id).encode();
+        let (op, payload) = Reply::Accepted(id, self.landlock.clone()).encode();
         if ctl::send_frame_until(stream, op, &payload, &raw, self.conn_deadline).is_err() {
             // The attach never got the call: take it back.
             self.calls.retain(|c| c.id != id);
@@ -1016,6 +1023,7 @@ mod tests {
             net_mode: "transparent",
             audit: AuditLog::new(None, crate::run::serve::FaultLatch::new().expect("latch")),
             map: Arc::new(FakeIpMap::new(&crate::dns::DnsLimits::default())),
+            landlock: SessionLandlock::off(),
             calls: Vec::new(),
             next_id: 1,
             stopping: true,

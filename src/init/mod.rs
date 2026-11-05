@@ -491,6 +491,28 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
             ));
         }
     }
+    // The Landlock shim's descriptors (issue #56), validated as the plain pipeline
+    // validates them: a call under the session's layer needs them as the resident
+    // does.
+    if let Some(exe) = args.exe_fd {
+        validate_exe_fd(exe, user, args.keep_fd, args.seccomp_fd)?;
+        if exe == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--exe-fd must differ from --join-net",
+            ));
+        }
+    }
+    if let Some(status) = args.status_fd {
+        validate_status_fd(status, user, args.keep_fd, args.seccomp_fd, args.exe_fd)?;
+        if status == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--status-fd must differ from --join-net",
+            ));
+        }
+    }
+    validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?;
     crate::run::keepalive::join::join_namespaces(user, net).map_err(|err| {
         InitError::new(Stage::Netns, format!("join the session namespaces: {err}"))
             .with_errno(err.raw_os_error())

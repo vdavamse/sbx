@@ -716,3 +716,231 @@ fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn attached_call_runs_under_the_session_landlock_layer() {
+    // The session's Landlock layer (issue #56 with #18) applies to every call,
+    // not only to the resident. Its signal scope lets a sandboxed process signal
+    // only processes in its own domain, so a call cannot signal the resident
+    // (another domain). The control is the same session without the layer, where
+    // the same signal goes through. Needs Landlock ABI 6 (Linux 6.12+); skips
+    // elsewhere.
+    if !landlock_abi_six() {
+        eprintln!("SKIP attach-landlock-signal-scope: the kernel lacks Landlock ABI 6");
+        return;
+    }
+    let dir = scratch("landlock");
+    let Some(shim) = skip_or(&dir, "attach-landlock-signal-scope") else {
+        return;
+    };
+    let kill_probe = |pid: &Path, session: &Path, landlock: &[&str]| -> Option<i32> {
+        let mut cmd = sbx(&shim);
+        cmd.args(["run", "--keep-alive", "--idle-timeout", "60s"]);
+        cmd.args(landlock);
+        cmd.args(["--policy"])
+            .arg(policy_path())
+            .arg("--session-dir")
+            .arg(session)
+            .args(["--", "sh", "-c"])
+            .arg(format!("echo $$ > {}; exec sleep 300", pid.display()));
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "launch: {}", text(&out.stderr));
+        assert!(wait_until(Duration::from_secs(5), || pid.exists()));
+        let resident = read_pid(pid).expect("resident pid");
+        let probe = attach(
+            &shim,
+            session,
+            &[],
+            &[
+                "sh",
+                "-c",
+                &format!("kill -0 {resident} 2>/dev/null; echo $?"),
+            ],
+        );
+        assert_eq!(
+            probe.status.code(),
+            Some(0),
+            "the probe ran: {}",
+            text(&probe.stderr)
+        );
+        let rc = text(&probe.stdout).trim().parse::<i32>().ok();
+        assert!(stop(&shim, session).status.success());
+        rc
+    };
+    let plain = kill_probe(&dir.join("plain-pid"), &dir.join("plain"), &[]);
+    assert_eq!(
+        plain,
+        Some(0),
+        "control: without the layer the call signals the resident"
+    );
+    let scoped = kill_probe(
+        &dir.join("scoped-pid"),
+        &dir.join("scoped"),
+        &["--landlock", "require"],
+    );
+    assert_ne!(
+        scoped,
+        Some(0),
+        "under the session's signal scope the call cannot signal the resident"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn attach_has_no_landlock_flags_of_its_own() {
+    // A call takes the session's Landlock settings; it cannot ask for its own, so
+    // attach refuses the flag (a usage error, rc 2) rather than weakening anything.
+    let dir = scratch("attach-flag");
+    let Some(shim) = skip_or(&dir, "attach-rejects-landlock-flags") else {
+        return;
+    };
+    let out = sbx(&shim)
+        .args(["attach", "--landlock", "off", "--policy"])
+        .arg(policy_path())
+        .arg("--session-dir")
+        .arg(dir.join("s"))
+        .args(["--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Whether the running kernel reports Landlock ABI 6 or later (`sbx check`'s own probe).
+fn landlock_abi_six() -> bool {
+    let out = Command::new(SBX).args(["check", "--json"]).output();
+    let Ok(out) = out else {
+        return false;
+    };
+    let v: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    v["checks"].as_array().into_iter().flatten().any(|c| {
+        c["id"] == "landlock"
+            && c["status"] == "ok"
+            && c["detail"].as_str().is_some_and(|d| d.contains("ABI"))
+    }) && landlock_ge_6(&v)
+}
+
+fn landlock_ge_6(v: &serde_json::Value) -> bool {
+    v["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["id"] == "landlock")
+        .filter_map(|c| c["detail"].as_str())
+        .filter_map(|d| {
+            d.split("ABI ")
+                .nth(1)?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+        .any(|abi| abi >= 6)
+}
+
+#[test]
+fn holder_kill_paths_work_under_the_session_landlock_layer() {
+    // Review item of #18 with #56: the signal scope confines the sandboxed
+    // processes, not the holder or the attach (which sit outside every domain). So
+    // the holder still ends an attached call on stop (SIGTERM through the attach's
+    // pidfd) and a holder SIGKILL still ends the resident and the call. Needs ABI 6.
+    if !landlock_abi_six() {
+        eprintln!("SKIP holder-kill-under-landlock: the kernel lacks Landlock ABI 6");
+        return;
+    }
+    let dir = scratch("landlock-kill");
+    let Some(shim) = skip_or(&dir, "holder-kill-under-landlock") else {
+        return;
+    };
+    // Stop with a call in flight: the call ends by the holder's teardown (143).
+    let session = dir.join("stop");
+    let mut cmd = sbx(&shim);
+    cmd.args([
+        "run",
+        "--keep-alive",
+        "--idle-timeout",
+        "60s",
+        "--landlock",
+        "require",
+        "--policy",
+    ])
+    .arg(policy_path())
+    .arg("--session-dir")
+    .arg(&session)
+    .args(["--", "sleep", "300"]);
+    assert!(cmd.output().unwrap().status.success());
+    let mut call = sbx(&shim)
+        .args(["attach", "--policy"])
+        .arg(policy_path())
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "sleep", "300"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(stop(&shim, &session).status.success());
+    let rc = call.wait().unwrap().code();
+    assert_eq!(
+        rc,
+        Some(143),
+        "the holder's stop ended the call under the layer"
+    );
+
+    // Holder SIGKILL: the resident and the call both die.
+    let session = dir.join("kill");
+    let resident = dir.join("kill-resident-pid");
+    let holder = dir.join("kill-holder-pid");
+    let mut cmd = sbx(&shim);
+    cmd.args([
+        "run",
+        "--keep-alive",
+        "--idle-timeout",
+        "60s",
+        "--landlock",
+        "require",
+        "--policy",
+    ])
+    .arg(policy_path())
+    .arg("--session-dir")
+    .arg(&session)
+    .args(["--", "sh", "-c"])
+    .arg(format!(
+        "echo $$ > {}; echo $PPID > {}; exec sleep 300",
+        resident.display(),
+        holder.display()
+    ));
+    assert!(cmd.output().unwrap().status.success());
+    assert!(wait_until(Duration::from_secs(5), || holder.exists()));
+    let mut call = sbx(&shim)
+        .args(["attach", "--policy"])
+        .arg(policy_path())
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "sleep", "300"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let res = read_pid(&resident).expect("resident pid");
+    let hold = read_pid(&holder).expect("holder pid");
+    unsafe {
+        libc::kill(hold, libc::SIGKILL);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || !alive(res)),
+        "the resident died with the holder"
+    );
+    let call_rc = call.wait().unwrap().code();
+    assert_eq!(
+        call_rc,
+        Some(125),
+        "the attach reports the holder's death under the layer"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
