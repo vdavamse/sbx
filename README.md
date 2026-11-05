@@ -235,7 +235,8 @@ cannot run on this host. `2`: a usage error. The full report is always on stdout
 and the reasons on stderr.
 
 **Fix hints.** Each failing item carries one fix. Where the fix depends on the
-platform, the Kubernetes and Docker forms are given:
+platform, the Kubernetes and Docker forms are given (for Kubernetes, the full
+setup is in [docs/kubernetes.md](docs/kubernetes.md)):
 
 | item | the condition | fix |
 |---|---|---|
@@ -667,6 +668,16 @@ deletes sessions, so it is conservative by design.
   - A process running as your user that writes into a session while gc empties
     it can make gc fail (`could not empty the directory after N passes`); the
     tombstone is left for the next gc.
+
+## Kubernetes
+
+[docs/kubernetes.md](docs/kubernetes.md) shows how to run sbx in a pod with its own user namespace
+(`hostUsers: false`), without privileged mode or added capabilities: the pod settings sbx needs
+(`procMount: Unmasked`, a Localhost seccomp profile, the AppArmor setting), which `sbx check` item
+fails without each one, node requirements, Pod Security Admission, and what changes in the threat
+model. The example manifests, image and kind config are in
+[`examples/kubernetes/`](examples/kubernetes/), and the `kubernetes` CI job runs `sbx check` and the
+offline conformance tiers in that pod.
 
 ## Build
 

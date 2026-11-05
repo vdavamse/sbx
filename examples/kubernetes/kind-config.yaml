@@ -1,0 +1,17 @@
+# kind cluster for the sbx Kubernetes example (issue #15, docs/kubernetes.md).
+# Create it from the repository root (the hostPath below is relative to it):
+#   kind create cluster --name sbx --config examples/kubernetes/kind-config.yaml
+# Tested with kind v0.33.0 and the node image pinned below (Kubernetes v1.37.0).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # From the kind v0.33.0 release notes; kind requires the digest.
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraMounts:
+      # The kubelet resolves seccompProfile.localhostProfile relative to
+      # /var/lib/kubelet/seccomp on the node. On a real cluster, put the file
+      # there on every node that may run the pod.
+      - hostPath: examples/kubernetes/seccomp
+        containerPath: /var/lib/kubelet/seccomp/profiles/sbx
+        readOnly: true

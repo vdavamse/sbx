@@ -1,0 +1,70 @@
+# sbx in a user-namespaced pod (issue #15). docs/kubernetes.md explains every
+# setting; the comments name the `sbx check` item that failed without it in the
+# kind test cluster. No privileged mode, no added capabilities.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sbx-example
+  labels:
+    app.kubernetes.io/name: sbx-example
+spec:
+  # The pod gets its own user namespace: its uids 0-65535 map to an unprivileged
+  # host range. Kubernetes accepts procMount: Unmasked only together with it.
+  hostUsers: false
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  # `sleep` as PID 1 ignores SIGTERM; do not wait 30 s for it on delete.
+  terminationGracePeriodSeconds: 5
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    # Containers without their own profile keep the runtime default.
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: sbx
+      image: sbx-k8s-example:dev
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: false
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+        # Without it: netns-ipv6 FAIL (EROFS) and bwrap-run FAIL.
+        procMount: Unmasked
+        # Without it (RuntimeDefault): userns FAIL (unshare blocked by seccomp).
+        # Docker's default profile resolved for no capabilities, plus clone,
+        # mount, pivot_root, sethostname, umount2 and unshare
+        # (examples/kubernetes/README.md). Install it on every node.
+        seccompProfile:
+          type: Localhost
+          localhostProfile: profiles/sbx/sbx-userns.json
+        # Unconfined works on nodes with and without AppArmor. Removing it was
+        # not testable here (AppArmor was off): docs/kubernetes.md, "AppArmor".
+        appArmorProfile:
+          type: Unconfined
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+          ephemeral-storage: 256Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+          ephemeral-storage: 1Gi
+      volumeMounts:
+        # readOnlyRootFilesystem: sbx needs a writable TMPDIR (session and
+        # conformance files) and HOME.
+        - name: tmp
+          mountPath: /tmp
+        - name: home
+          mountPath: /home/sbx
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 512Mi
+    - name: home
+      emptyDir:
+        sizeLimit: 64Mi
