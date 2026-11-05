@@ -322,6 +322,7 @@ pub(crate) struct Holder {
 /// namespace descriptors of the parked `__init` (`init_pid`), and pins the policy.
 pub(crate) fn prepare(
     hold: &Hold,
+    t0: Instant,
     session: &Path,
     init_pid: libc::pid_t,
     pin_bytes: Vec<u8>,
@@ -343,7 +344,8 @@ pub(crate) fn prepare(
         listener,
         dir,
         pin: PolicyPin::new(pin_bytes),
-        clock: Clock::new(Instant::now(), hold.idle, hold.max),
+        // The lifetime runs from the start of the run, setup included (review 6).
+        clock: Clock::new(t0, hold.idle, hold.max),
         self_pidfd,
         user_ns,
         net_ns,

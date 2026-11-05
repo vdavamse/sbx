@@ -594,8 +594,6 @@ fn execute(
         .iter()
         .map(|p| p.as_path().to_path_buf())
         .collect();
-    // A holder's `timeout` is its max lifetime (the setup bound); the resident
-    // itself has no run timeout (issue #18).
     // A session that attach can join needs the nftables redirect (issue #18):
     // refuse before anything is spawned when the policy is not transparent.
     if hold.is_some() && policy.network.mode != crate::policy::NetworkMode::Transparent {
@@ -604,8 +602,11 @@ fn execute(
         )
         .into());
     }
+    // A holder's setup is bounded like any run's (SETUP_TIMEOUT). Its lifetime is
+    // not: the session clock (`--max-lifetime`) starts at t0 and bounds it, and the
+    // resident is never bound by the policy's limits.timeout (issue #18, review 6).
     let timeout = match hold.as_ref() {
-        Some(h) => h.max,
+        Some(_) => SETUP_TIMEOUT,
         None => effective_timeout(args.timeout, policy.limits.timeout),
     };
     let deadline = deadline_from(t0, timeout);
@@ -855,6 +856,7 @@ fn execute(
                     holder = Some(
                         keepalive::holder::prepare(
                             h,
+                            t0,
                             &session,
                             sb.bwrap_pid,
                             pinned.clone().unwrap_or_default(),
