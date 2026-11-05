@@ -267,13 +267,13 @@ jobs:
           python3 - check.json <<'PY' || FAIL=1
           import json, sys
           r = json.load(open(sys.argv[1]))
-          # landlock is report-only and exempt (warn/skip allowed). keep-alive is
-          # report-only for users but deliberately gated here: the runner must
-          # support persistent sessions (conformance group I needs it), so a
-          # runner that blocks setns or pidfd_open fails this smoke on purpose.
-          # Every other item must be ok.
+          # landlock and conntrack (#43) are report-only and exempt (warn/skip
+          # allowed). keep-alive is report-only for users but deliberately gated
+          # here: the runner must support persistent sessions (conformance group
+          # I needs it), so a runner that blocks setns or pidfd_open fails this
+          # smoke on purpose. Every other item must be ok.
           bad = [c["id"] + "=" + c["status"] for c in r["capabilities"]
-                 if c["id"] != "landlock" and c["status"] != "ok"]
+                 if c["id"] not in ("landlock", "conntrack") and c["status"] != "ok"]
           if r["network_mode"] != "transparent" or bad:
               print("FAIL: sbx check is not all-ok:", r["network_mode"], bad)
               print(json.dumps(r, indent=2))

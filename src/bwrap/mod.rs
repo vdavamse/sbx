@@ -230,6 +230,28 @@ pub struct Build<'a> {
     /// rows 17–23. `None`, or a layer whose mode is `off`, leaves the argv
     /// byte-identical to a run without the layer.
     pub landlock: Option<crate::landlock::Layer>,
+    /// Size cap in bytes for each deny `--tmpfs` mask (issue #43): `Some(n)`
+    /// emits `--size n` before every deny `--tmpfs` (bwrap >= 0.10, see
+    /// [`deny_tmpfs_size_for`]); `None` leaves them unsized (bwrap's default
+    /// is half of RAM).
+    pub deny_tmpfs_size: Option<u64>,
+}
+
+/// Size of each deny `--tmpfs` mask (issue #43): a mask only hides a path,
+/// so 1 MiB bounds the file DATA a payload can store there (an unsized tmpfs
+/// holds up to half of RAM). It does not bound the inode count (`nr_inodes`
+/// keeps its default; bwrap has no flag for it), so many empty files still
+/// cost kernel memory.
+pub const DENY_TMPFS_BYTES: u64 = 1 << 20;
+
+/// The first bwrap version with `--size` (0.10.0).
+pub const BWRAP_SIZE_MIN: (u32, u32, u32) = (0, 10, 0);
+
+/// [`Build::deny_tmpfs_size`] for a bwrap of `version`: [`DENY_TMPFS_BYTES`]
+/// from [`BWRAP_SIZE_MIN`], else `None` (older bwrap rejects `--size`; it is
+/// not a reason to refuse the run, `sbx check` warns instead).
+pub fn deny_tmpfs_size_for(version: (u32, u32, u32)) -> Option<u64> {
+    (version >= BWRAP_SIZE_MIN).then_some(DENY_TMPFS_BYTES)
 }
 
 /// A complete, validated bwrap invocation.
@@ -656,6 +678,23 @@ pub fn shadowed_dests() -> [&'static str; 5] {
 }
 
 #[cfg(test)]
+mod tmpfs_size_tests {
+    use super::*;
+
+    /// Issue #43: `--size` exists from bwrap 0.10.0; older bwrap gets
+    /// unsized masks (no refusal; `sbx check` warns).
+    #[test]
+    fn deny_tmpfs_size_gated_on_bwrap_0_10() {
+        assert_eq!(deny_tmpfs_size_for((0, 8, 0)), None);
+        assert_eq!(deny_tmpfs_size_for((0, 9, 9)), None);
+        assert_eq!(deny_tmpfs_size_for((0, 10, 0)), Some(DENY_TMPFS_BYTES));
+        assert_eq!(deny_tmpfs_size_for((0, 11, 1)), Some(DENY_TMPFS_BYTES));
+        assert_eq!(deny_tmpfs_size_for((1, 0, 0)), Some(DENY_TMPFS_BYTES));
+        assert_eq!(DENY_TMPFS_BYTES, 1_048_576);
+    }
+}
+
+#[cfg(test)]
 mod probe_argv_tests {
     use super::*;
 
@@ -841,6 +880,7 @@ mod tests {
             info_fd: None,
             seccomp_fd: BASE_SECCOMP_FD,
             landlock: None,
+            deny_tmpfs_size: None,
         }
     }
 

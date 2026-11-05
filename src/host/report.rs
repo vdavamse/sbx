@@ -173,6 +173,7 @@ mod tests {
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
   ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
   ok    keep-alive  pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)
+  ok    conntrack   conntrack table: 312 of 262144 entries in use in this network namespace (report-only; each sandbox namespace may grow to 262144, using host kernel memory)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 "#;
@@ -191,6 +192,7 @@ network mode: transparent (policies with network mode transparent, explicit or n
   skip  seccomp     not probed: user namespaces are unavailable
   ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
   skip  keep-alive  not probed: user namespaces are unavailable
+  ok    conntrack   conntrack table: 312 of 262144 entries in use in this network namespace (report-only; each sandbox namespace may grow to 262144, using host kernel memory)
 
 network mode: unavailable (no policy can run until the failed items are fixed)
 "#;
@@ -306,6 +308,15 @@ network mode: unavailable (no policy can run until the failed items are fixed)
       "id": "keep-alive",
       "status": "ok",
       "detail": "pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)",
+      "evidence": null,
+      "errno": null,
+      "impact": null,
+      "fix": null
+    },
+    {
+      "id": "conntrack",
+      "status": "ok",
+      "detail": "conntrack table: 312 of 262144 entries in use in this network namespace (report-only; each sandbox namespace may grow to 262144, using host kernel memory)",
       "evidence": null,
       "errno": null,
       "impact": null,

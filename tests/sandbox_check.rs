@@ -572,7 +572,9 @@ fn nested_no_userns() -> Result<(), String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|c| c["status"] == "skip")
+        // conntrack (#43) is report-only and reads /proc/sys/net/netfilter,
+        // which depends on the namespace sbx check runs in: not counted.
+        .filter(|c| c["status"] == "skip" && c["id"] != "conntrack")
         .count();
     // Seven since #34: the `seccomp` item is skipped too (its probe step
     // needs bwrap-run, which cannot start without user namespaces). Eight since

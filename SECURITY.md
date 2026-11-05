@@ -66,8 +66,9 @@ Please **do not** file a public issue for a security report.
   misbehaving *within* the sandbox: writing inside its writable mounts, or
   talking to allow-listed destinations. Note: v1 enforces a wall-clock
   timeout and optional per-process `RLIMIT_*` limits (`limits.processes`,
-  `open_files`, `file_bytes`, `address_space_bytes`), but no cgroup
-  CPU/memory/disk quotas; resource exhaustion affecting the host is a known
+  `open_files`, `file_bytes`, `address_space_bytes`) and run-level caps
+  (deny-mask tmpfs size, concurrent proxy connections, fake-IP names), but
+  no cgroup CPU/memory quotas and no disk quotas; resource exhaustion affecting the host is a known
   limitation (threat model R14), not a reportable vulnerability. The sandbox
   contains the command; it does not make the command benign.
 
