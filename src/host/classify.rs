@@ -991,10 +991,12 @@ fn bind_sockets_item(scan: &SocketScan, roots: usize) -> PolicyItem {
                 scan.found.len() - BIND_SOCKETS_SHOWN
             ));
         }
-        let partial = if scan.truncated {
-            " (the scan hit its bound; the list may be incomplete)"
-        } else {
-            ""
+        let partial = match (scan.truncated, scan.unlisted.len()) {
+            (true, _) => " (the scan hit its bound; the list may be incomplete)".to_owned(),
+            (false, 0) => String::new(),
+            (false, n) => {
+                format!(" ({n} directories could not be listed; the list may be incomplete)")
+            }
         };
         return PolicyItem {
             id: "bind-sockets",
@@ -1015,6 +1017,34 @@ fn bind_sockets_item(scan: &SocketScan, roots: usize) -> PolicyItem {
             status: Status::Warn,
             detail: "the socket scan of filesystem.ro/rw hit its bound; no unix socket file found so far (not exhaustive)".to_owned(),
             fix: Some("narrow filesystem.ro/rw".to_owned()),
+        };
+    }
+    if !scan.unlisted.is_empty() {
+        // connect() needs only search permission: a socket inside a
+        // directory that cannot be listed (0711) is still reachable by name.
+        let mut shown: Vec<String> = scan
+            .unlisted
+            .iter()
+            .take(BIND_SOCKETS_SHOWN)
+            .map(|p| p.display().to_string())
+            .collect();
+        if scan.unlisted.len() > BIND_SOCKETS_SHOWN {
+            shown.push(format!(
+                "and {} more",
+                scan.unlisted.len() - BIND_SOCKETS_SHOWN
+            ));
+        }
+        return PolicyItem {
+            id: "bind-sockets",
+            status: Status::Warn,
+            detail: format!(
+                "no unix socket file found, but the scan is not exhaustive: these directories under filesystem.ro/rw cannot be listed, and a socket inside one is still reachable by name: {}",
+                shown.join(", ")
+            ),
+            fix: Some(
+                "check those directories for sockets as their owner, or add them to filesystem.deny"
+                    .to_owned(),
+            ),
         };
     }
     PolicyItem {
@@ -2063,6 +2093,7 @@ mod tests {
                     .map(|i| PathBuf::from(format!("/run/s{i:02}.sock")))
                     .collect(),
                 truncated: false,
+                unlisted: vec![],
             }
         };
         let r = sockets_check(&policy, &found);
@@ -2082,6 +2113,7 @@ mod tests {
         let truncated = |_: &[&Path], _: &[&Path]| SocketScan {
             found: vec![],
             truncated: true,
+            unlisted: vec![],
         };
         let r = sockets_check(&policy, &truncated);
         assert!(r.runnable);
@@ -2095,12 +2127,46 @@ mod tests {
         let both = |_: &[&Path], _: &[&Path]| SocketScan {
             found: vec![PathBuf::from("/run/docker.sock")],
             truncated: true,
+            unlisted: vec![],
         };
         let r = sockets_check(&policy, &both);
         assert_eq!(r.checks[4].status, Status::Warn);
         assert!(
             r.checks[4].detail.ends_with(
                 ": /run/docker.sock (the scan hit its bound; the list may be incomplete)"
+            ),
+            "{}",
+            r.checks[4].detail
+        );
+
+        // Review of #48: an unlistable directory makes the scan
+        // non-exhaustive (connect needs only search permission).
+        let unlisted = |_: &[&Path], _: &[&Path]| SocketScan {
+            found: vec![],
+            truncated: false,
+            unlisted: vec![PathBuf::from("/run/user/1000")],
+        };
+        let r = sockets_check(&policy, &unlisted);
+        assert!(r.runnable);
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(
+            r.checks[4]
+                .detail
+                .starts_with("no unix socket file found, but the scan is not exhaustive")
+                && r.checks[4].detail.ends_with(": /run/user/1000"),
+            "{}",
+            r.checks[4].detail
+        );
+        let found_and_unlisted = |_: &[&Path], _: &[&Path]| SocketScan {
+            found: vec![PathBuf::from("/run/docker.sock")],
+            truncated: false,
+            unlisted: vec![PathBuf::from("/run/a"), PathBuf::from("/run/b")],
+        };
+        let r = sockets_check(&policy, &found_and_unlisted);
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(
+            r.checks[4].detail.ends_with(
+                ": /run/docker.sock (2 directories could not be listed; the list may be incomplete)"
             ),
             "{}",
             r.checks[4].detail

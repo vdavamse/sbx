@@ -388,6 +388,7 @@ network mode: unavailable (no policy can run until the failed items are fixed)
             &|_, _| crate::host::facts::SocketScan {
                 found: vec!["/run/docker.sock".into()],
                 truncated: false,
+                unlisted: vec![],
             },
         ));
         let text = render_human(&r);

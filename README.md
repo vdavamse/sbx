@@ -513,13 +513,17 @@ the D-Bus buses, an ssh-agent, or nscd and systemd-resolved (a resolver that
 bypasses the fake-IP DNS). Keep socket directories out of `filesystem.ro` and
 `filesystem.rw`, or mask them with `filesystem.deny`. A bind at exactly `/tmp`,
 `/root`, `/work`, `/proc` or `/dev` is covered by sbx's own mount there, so the
-host sockets under it are not reachable. `sbx check --policy P --host` warns
-about each reachable socket file under a bind (`bind-sockets`), and the
+host sockets under it are not reachable; under `/proc` and `/dev` this holds for
+deeper binds too, since those mounts come after every bind. `sbx check --policy
+P --host` warns about each reachable socket file under a bind (`bind-sockets`),
+and also warns when a directory under a bind cannot be listed, since `connect`
+needs only search permission and a socket inside it stays reachable by name. The
 conformance check `D05` warns about any socket file visible inside the sandbox.
 
 **`/etc/hosts` (issue #35).** The sandbox's `/etc/hosts` is generated, like
 `resolv.conf`, `passwd` and `group`: it holds only `127.0.0.1 localhost` and
-`::1 localhost`. The host's file is never bound, so a host entry cannot pin an
+`127.0.1.1 sandbox` (the sandbox hostname). There is no `::1` entry, because
+IPv6 is disabled inside the sandbox. The host's file is never bound, so a host entry cannot pin an
 allowed name to a real address past the fake-IP resolver, and host entries are
 not disclosed. A policy that lists `/etc/hosts` in `filesystem.ro` gets the
 generated file (it mounts last). Names that a host's `/etc/hosts` or Kubernetes
