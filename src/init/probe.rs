@@ -320,15 +320,14 @@ impl Reaper {
         self.0.unwrap_or(-1)
     }
 
-    /// Reaps a child that has already exited (EOF on its pipe).
-    fn wait(&mut self) {
-        if let Some(pid) = self.0.take() {
-            let mut status: libc::c_int = 0;
-            // SAFETY: waitpid on a child this process forked and has not reaped.
-            unsafe {
-                libc::waitpid(pid, &mut status, 0);
-            }
-        }
+    /// Reaps a child that has already exited (EOF on its pipe) and returns its
+    /// raw wait status; `None` when it was already reaped or the wait failed.
+    fn wait(&mut self) -> Option<libc::c_int> {
+        let pid = self.0.take()?;
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid on a child this process forked and has not reaped.
+        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+        (rc == pid).then_some(status)
     }
 }
 
@@ -390,9 +389,28 @@ fn pipe_cloexec() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd
     })
 }
 
+/// How a keep-alive child ended, from its raw wait status, in words. `None`
+/// means the status could not be collected.
+fn how_it_ended(what: &str, status: Option<libc::c_int>) -> String {
+    match status {
+        Some(s) if libc::WIFSIGNALED(s) => {
+            format!("{what} was killed by signal {}", libc::WTERMSIG(s))
+        }
+        Some(s) if libc::WIFEXITED(s) => {
+            format!("{what} exited with status {}", libc::WEXITSTATUS(s))
+        }
+        _ => format!("{what} ended in a way that cannot be classified"),
+    }
+}
+
 /// The holder stand-in's answer: `K` once it is parked in its fresh namespaces,
-/// or `E` and the errno (five bytes, one write).
-pub(crate) fn decode_holder_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
+/// or `E` and the errno (five bytes, one write). Anything else is a holder that
+/// died before answering; `status` is its wait status, and the reason says how
+/// it ended (a seccomp KILL before `unshare` is a signal death, not "not ready").
+pub(crate) fn decode_holder_answer(
+    bytes: &[u8],
+    status: Option<libc::c_int>,
+) -> Result<(), KeepAliveFault> {
     match bytes {
         [b'K', ..] => Ok(()),
         [b'E', e0, e1, e2, e3] => {
@@ -407,16 +425,30 @@ pub(crate) fn decode_holder_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
         }
         _ => Err(KeepAliveFault {
             errno: None,
-            reason: "the holder stand-in exited before it was ready".to_owned(),
+            reason: format!(
+                "{} before it was ready",
+                how_it_ended("the holder stand-in", status)
+            ),
         }),
     }
 }
 
-/// The joiner's answer: nothing on success (EOF after its exit), or the errno of
-/// its failed `setns` (four bytes).
-pub(crate) fn decode_joiner_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
+/// The joiner's outcome. Success needs both halves: no answer bytes, and a
+/// wait status that is a normal exit with status 0. Four bytes are the errno of
+/// its failed `setns`; a signal death or a nonzero exit without an answer is a
+/// fault in its own right (an outer seccomp KILL of `setns` is a signal).
+pub(crate) fn decode_joiner_outcome(
+    bytes: &[u8],
+    status: Option<libc::c_int>,
+) -> Result<(), KeepAliveFault> {
     match bytes {
-        [] => Ok(()),
+        [] => match status {
+            Some(s) if libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 0 => Ok(()),
+            _ => Err(KeepAliveFault {
+                errno: None,
+                reason: format!("{} before it answered", how_it_ended("the joiner", status)),
+            }),
+        },
         [e0, e1, e2, e3] => {
             let errno = i32::from_ne_bytes([*e0, *e1, *e2, *e3]);
             Err(KeepAliveFault {
@@ -434,11 +466,30 @@ pub(crate) fn decode_joiner_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
     }
 }
 
+/// Test-only fault injection into the keep-alive children. Production always
+/// passes [`Inject::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Inject {
+    None,
+    /// The joiner raises this signal before it joins, as an outer seccomp KILL
+    /// of `setns` would. The signal must be fatal; a survivor exits 3.
+    JoinerSignal(libc::c_int),
+}
+
 /// The keep-alive join (module docs): a holder stand-in in a fresh user and
 /// network namespace, its namespace descriptors captured as `run --keep-alive`
 /// captures the session's, and a forked joiner that runs the attach's `setns`
 /// pair on them. The probe's own namespaces are untouched.
 fn keep_alive_join() -> Result<(), KeepAliveFault> {
+    keep_alive_join_with(Inject::None, &mut Vec::new())
+}
+
+/// [`keep_alive_join`] with a fault injection, and every child pid it forks
+/// pushed onto `forked` (so a test can check that each one was reaped).
+pub(crate) fn keep_alive_join_with(
+    inject: Inject,
+    forked: &mut Vec<libc::pid_t>,
+) -> Result<(), KeepAliveFault> {
     let deadline = Instant::now() + KEEP_ALIVE_PROBE_TIMEOUT;
     let timeout_reason = |what: &str| KeepAliveFault {
         errno: None,
@@ -463,11 +514,20 @@ fn keep_alive_join() -> Result<(), KeepAliveFault> {
         holder_child(answer_write.as_raw_fd());
     }
     drop(answer_write);
-    let holder = Reaper(Some(pid));
+    // Every path below ends with both children reaped: each Reaper kills and
+    // waits in its Drop, which unwinding runs too.
+    forked.push(pid);
+    let mut holder = Reaper(Some(pid));
     let bytes = read_bounded(answer_read.as_raw_fd(), deadline)
         .map_err(|e| fault_of(&e, "cannot read the holder stand-in's answer"))?
         .ok_or_else(|| timeout_reason("the holder stand-in"))?;
-    decode_holder_answer(&bytes)?;
+    // EOF means the holder is gone: reap it for its status.
+    let status = if bytes.is_empty() {
+        holder.wait()
+    } else {
+        None
+    };
+    decode_holder_answer(&bytes, status)?;
 
     let (user, net) = crate::run::keepalive::join::capture_namespaces(holder.pid())
         .map_err(|e| fault_of(&e, "cannot open the holder stand-in's namespaces"))?;
@@ -482,17 +542,26 @@ fn keep_alive_join() -> Result<(), KeepAliveFault> {
         ));
     }
     if pid == 0 {
-        joiner_child(user.as_raw_fd(), net.as_raw_fd(), join_write.as_raw_fd());
+        joiner_child(
+            user.as_raw_fd(),
+            net.as_raw_fd(),
+            join_write.as_raw_fd(),
+            inject,
+        );
     }
     drop(join_write);
+    forked.push(pid);
     let mut joiner = Reaper(Some(pid));
     let bytes = read_bounded(join_read.as_raw_fd(), deadline)
         .map_err(|e| fault_of(&e, "cannot read the joiner's answer"))?
         .ok_or_else(|| timeout_reason("the joiner"))?;
-    decode_joiner_answer(&bytes)?;
-    // EOF: the joiner has exited, so this wait does not block for long.
-    joiner.wait();
-    Ok(())
+    // EOF means the joiner has exited, so this wait does not block for long.
+    let status = if bytes.is_empty() {
+        joiner.wait()
+    } else {
+        None
+    };
+    decode_joiner_outcome(&bytes, status)
 }
 
 /// The holder stand-in (the child that never returns): arms its death signal,
@@ -527,7 +596,7 @@ fn holder_child(report: RawFd) -> ! {
 /// The joiner (the child that never returns): arms its death signal, joins the
 /// holder's namespaces as the attach does, and exits 0, or reports the errno of
 /// the failed `setns` (four bytes) and exits 1.
-fn joiner_child(user: RawFd, net: RawFd, report: RawFd) -> ! {
+fn joiner_child(user: RawFd, net: RawFd, report: RawFd, inject: Inject) -> ! {
     // SAFETY: as for `holder_child`; the joiner exits through `_exit`.
     unsafe {
         libc::prctl(
@@ -537,6 +606,11 @@ fn joiner_child(user: RawFd, net: RawFd, report: RawFd) -> ! {
             0,
             0,
         );
+        if let Inject::JoinerSignal(sig) = inject {
+            libc::raise(sig);
+            // The signal was not fatal: fail visibly, not as a success.
+            libc::_exit(3);
+        }
     }
     match crate::run::keepalive::join::join_namespaces(user, net) {
         Ok(()) => unsafe { libc::_exit(0) },
@@ -840,13 +914,23 @@ mod tests {
         assert_eq!(report.steps[12].step, "keep-alive");
     }
 
+    /// A raw wait status for a normal exit with `code`.
+    fn exited(code: libc::c_int) -> Option<libc::c_int> {
+        Some(code << 8)
+    }
+
+    /// A raw wait status for death by `sig` (no core dump).
+    fn signaled(sig: libc::c_int) -> Option<libc::c_int> {
+        Some(sig)
+    }
+
     #[test]
     fn keep_alive_answers_decode_strictly() {
         // K: parked in the fresh namespaces.
-        assert_eq!(decode_holder_answer(b"K\0\0\0\0"), Ok(()));
+        assert_eq!(decode_holder_answer(b"K\0\0\0\0", None), Ok(()));
         // E + errno: the unshare failed, with the errno kept.
         let eperm = libc::EPERM.to_ne_bytes();
-        let fault = decode_holder_answer(&[b'E', eperm[0], eperm[1], eperm[2], eperm[3]])
+        let fault = decode_holder_answer(&[b'E', eperm[0], eperm[1], eperm[2], eperm[3]], None)
             .expect_err("E is a failure");
         assert_eq!(fault.errno, Some(libc::EPERM));
         assert!(
@@ -854,24 +938,132 @@ mod tests {
                 .reason
                 .starts_with("unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed:")
         );
-        // EOF, a short or unknown message: the stand-in is not ready.
-        for bytes in [&b""[..], b"E", b"X\0\0\0\0"] {
-            let fault = decode_holder_answer(bytes).expect_err("not ready");
+        // A short or unknown message: the stand-in is not ready, and says how
+        // it ended.
+        for bytes in [b"E".as_slice(), b"X\0\0\0\0"] {
+            let fault = decode_holder_answer(bytes, exited(0)).expect_err("not ready");
             assert_eq!(fault.errno, None, "{bytes:?}");
+            assert_eq!(
+                fault.reason,
+                "the holder stand-in exited with status 0 before it was ready"
+            );
         }
     }
 
     #[test]
+    fn holder_death_before_answering_names_the_signal() {
+        // EOF with a SIGSYS death (an outer seccomp KILL of unshare): a signal,
+        // not a bare "not ready".
+        let fault = decode_holder_answer(b"", signaled(libc::SIGSYS)).expect_err("died");
+        assert_eq!(fault.errno, None);
+        assert_eq!(
+            fault.reason,
+            "the holder stand-in was killed by signal 31 before it was ready"
+        );
+        let fault = decode_holder_answer(b"", None).expect_err("unknown status");
+        assert!(
+            fault
+                .reason
+                .ends_with("cannot be classified before it was ready")
+        );
+    }
+
+    #[test]
     fn joiner_answers_decode_strictly() {
-        assert_eq!(decode_joiner_answer(b""), Ok(()));
+        // Success is the empty answer AND a normal exit with status 0.
+        assert_eq!(decode_joiner_outcome(b"", exited(0)), Ok(()));
         let enospc = libc::ENOSPC.to_ne_bytes();
-        let fault = decode_joiner_answer(&enospc).expect_err("four bytes are an errno");
+        let fault = decode_joiner_outcome(&enospc, exited(1)).expect_err("four bytes are an errno");
         assert_eq!(fault.errno, Some(libc::ENOSPC));
         assert!(
             fault.reason.starts_with(
                 "setns into the holder stand-in's user and network namespaces failed:"
             )
         );
-        assert_eq!(decode_joiner_answer(b"abc").expect_err("short").errno, None);
+        assert_eq!(
+            decode_joiner_outcome(b"abc", exited(0))
+                .expect_err("short")
+                .errno,
+            None
+        );
+    }
+
+    #[test]
+    fn joiner_exit_status_is_part_of_success() {
+        // Empty answer, but not a clean exit: never ok (the item-1 bug).
+        let killed = decode_joiner_outcome(b"", signaled(libc::SIGSYS)).expect_err("signal");
+        assert_eq!(killed.errno, None);
+        assert_eq!(
+            killed.reason,
+            "the joiner was killed by signal 31 before it answered"
+        );
+        let nonzero = decode_joiner_outcome(b"", exited(1)).expect_err("nonzero exit");
+        assert_eq!(
+            nonzero.reason,
+            "the joiner exited with status 1 before it answered"
+        );
+        assert!(
+            decode_joiner_outcome(b"", None).is_err(),
+            "unknown status is not ok"
+        );
+        assert_eq!(decode_joiner_outcome(b"", exited(0)), Ok(()));
+    }
+
+    /// True when the holder could not even unshare (no unprivileged user and
+    /// network namespaces here): the real-process tests then skip, as the
+    /// userns-gated scenarios of `tests/sandbox_check.rs` do.
+    fn holder_unavailable(fault: &KeepAliveFault) -> bool {
+        fault
+            .reason
+            .starts_with("unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed")
+    }
+
+    /// Asserts that no forked child is left: `kill(pid, 0)` on a reaped child
+    /// fails with ESRCH.
+    fn assert_all_reaped(forked: &[libc::pid_t]) {
+        assert!(!forked.is_empty(), "the keep-alive join forked children");
+        for pid in forked {
+            // SAFETY: signal 0 only probes the pid.
+            let rc = unsafe { libc::kill(*pid, 0) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(
+                rc == -1 && errno == Some(libc::ESRCH),
+                "child {pid} is still there"
+            );
+        }
+    }
+
+    #[test]
+    fn real_join_succeeds_and_reaps_both_children() {
+        let mut forked = Vec::new();
+        match keep_alive_join_with(Inject::None, &mut forked) {
+            Ok(()) => assert_all_reaped(&forked),
+            Err(fault) if holder_unavailable(&fault) => {
+                eprintln!("skipped: {}", fault.reason);
+            }
+            Err(fault) => panic!("the keep-alive join must succeed: {fault:?}"),
+        }
+    }
+
+    #[test]
+    fn joiner_killed_by_a_signal_is_a_fault_and_leaves_no_child() {
+        // The item-1 case: the joiner dies before answering (an outer seccomp
+        // KILL of setns). The step must fail, never report ok, and the holder
+        // parked in its namespaces must be gone too.
+        let mut forked = Vec::new();
+        match keep_alive_join_with(Inject::JoinerSignal(libc::SIGKILL), &mut forked) {
+            Err(fault) if holder_unavailable(&fault) => {
+                eprintln!("skipped: {}", fault.reason);
+            }
+            Err(fault) => {
+                assert_eq!(
+                    fault.reason,
+                    "the joiner was killed by signal 9 before it answered"
+                );
+                assert_eq!(fault.errno, None);
+                assert_all_reaped(&forked);
+            }
+            Ok(()) => panic!("a joiner killed by a signal must not report ok"),
+        }
     }
 }
