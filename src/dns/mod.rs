@@ -716,6 +716,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: allow.iter().map(|s| rule(s)).collect(),
             ports: vec![443],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let server = DnsServer::new(&network, Arc::clone(&map), sink.clone());
         (server, map, sink)
@@ -1412,6 +1414,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
             ports: vec![443],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let server = DnsServer::new(
             &network,

@@ -80,6 +80,9 @@
 //!    any non-terminating proxy; #14's threat model). A full per-request
 //!    relay scanner (this module's [`crate::proxy::relay::RelayScanner`]
 //!    analogue) remains the shape for lifting the no-keep-alive cost.
+//!    The TLS-terminated path (crate::tls, proxy module docs point 14)
+//!    applies the same rewrite to the one request it forwards, after its
+//!    own Host and path checks.
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -168,7 +171,7 @@ fn find_terminator(buf: &[u8], scanned: &mut usize) -> Option<usize> {
 /// `\r\n\r\n` — always ≥ the 4-byte terminator — so the insertion point is
 /// `head_end - 2`; everything else (request line, client headers,
 /// pipelined body bytes) stays byte-identical.
-fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
+pub(crate) fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
     let at = head_end - 2;
     buf.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
 }

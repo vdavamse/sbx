@@ -68,11 +68,12 @@
 //!    decision. No relay idle timeout in v1 (#29).
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
-//!    must not pass (Q1). TLS is PASSED THROUGH, never terminated (no CA in
-//!    the sandbox): `Accepted::into_connection` is NEVER called — which is
-//!    why rustls ships with NO crypto provider (the Acceptor parse path
-//!    needs none, and the aarch64 static-musl leg requires a pure-Rust
-//!    tree). ECH is denied outright, GREASE-ECH false positives accepted
+//!    must not pass (Q1). TLS is PASSED THROUGH in the default build, never
+//!    terminated: `Accepted::into_connection` is NEVER called there — which
+//!    is why the default rustls ships with NO crypto provider (the Acceptor
+//!    parse path needs none, and the aarch64 static-musl leg requires a
+//!    pure-Rust tree). The one exception is the opt-in termination of
+//!    `network.mitm_hosts` (point 14). ECH is denied outright, GREASE-ECH false positives accepted
 //!    (Q4 — sandbox clients are CLI tools; user docs land with #10).
 //!    IPv4-only by construction (#5: IPv6 disabled, 127.0.0.1 listeners,
 //!    AF_INET nft — an AF_INET6 `SO_ORIGINAL_DST` answer is denied). The
@@ -96,7 +97,8 @@
 //!    twice, and the acceptor is dropped after inspection. Post-ClientHello
 //!    pipelined bytes the acceptor internally buffers therefore survive in
 //!    the replay buffer (`inspect_tls_replays_pipelined_bytes` pins it),
-//!    and the upstream sees the client's byte stream verbatim — with ONE
+//!    and the upstream sees the client's byte stream verbatim (terminated
+//!    hosts, point 14, send their own rewritten request instead) — with ONE
 //!    documented deviation (round-2 review fix): on port 80 the validated
 //!    head is replayed with an inserted `Connection: close` (http.rs module
 //!    docs point 6 — the name binding's connection-lifetime enforcement;
@@ -172,7 +174,8 @@
 //!     and the 443 twin no rewrite can reach: h2 `:authority` vhost
 //!     confusion after an SNI-checked handshake (ALPN rides through
 //!     uninspected — inherent to any non-terminating proxy; #14's threat
-//!     model).
+//!     model). Terminated hosts (point 14) never reach this relay: their
+//!     client bytes are parsed, not relayed raw.
 //! 13. **Explicit proxy (issue #8)** — the same pipeline reached by an
 //!     explicit request, served by [`serve_explicit`] on the explicit
 //!     listener (see the `explicit` module for the full design). Name comes from the
@@ -190,6 +193,23 @@
 //!     silent close; body framing beyond the strict table is deferred (F3);
 //!     pipelined second requests on one connection are not inspected (the
 //!     vhost-confusion class, #14; see the `explicit` module docs point 10).
+//!     A CONNECT to a terminated host (point 14) is handed to the terminator
+//!     after the `200`, with the same SNI check first.
+//! 14. **TLS termination for URL-path rules (issue #17, opt-in)** — with the
+//!     `tls-termination` build feature, a 443 connection whose verified SNI
+//!     names a `network.mitm_hosts` entry is handed to the terminator in
+//!     `crate::tls` (module docs there). The handoff happens AFTER the SNI
+//!     check and BEFORE any dial. The terminator completes the sandbox's TLS
+//!     handshake with a leaf from the run's CA, checks the one request's `Host`
+//!     (equal to the SNI) and its `network.paths` rule, then dials under the
+//!     same guard and verifies the upstream certificate: never disabled, never
+//!     plaintext. It records exactly ONE Decision before any relay byte, and
+//!     answers denials and errors over TLS. Two refusals keep the rule
+//!     unbypassable: plain HTTP on port 80 to a terminated host is denied
+//!     (`Rejected::MitmPlainHttp`), and a terminated host without a terminator
+//!     is refused before its hello is read (`Rejected::TerminationUnavailable`,
+//!     which is every terminated host in the default build). Every other host
+//!     keeps points 1–13 unchanged.
 
 pub(crate) mod explicit;
 pub mod hello;
@@ -215,7 +235,7 @@ use crate::policy::{self, Domain, DomainRule};
 /// The ports with a v1 protocol inspector (module docs point 7): 443 is
 /// inspected as TLS ([`hello`]), 80 as HTTP/1 ([`http`]). Any other
 /// policy-listed port denies with [`Rejected::NoInspector`] (Q1).
-const TLS_PORT: u16 = 443;
+pub(crate) const TLS_PORT: u16 = 443;
 const HTTP_PORT: u16 = 80;
 
 /// The initial accept-backoff delay (doubles to
@@ -431,6 +451,24 @@ pub enum Rejected {
     Eof,
     /// No complete preamble within [`Limits::decision_timeout`].
     DecisionTimeout { secs: u64 },
+    /// A terminated host (`network.mitm_hosts`, issue #17) was requested
+    /// with a path that no `network.paths` rule of that host permits. The
+    /// path text is NEVER in the reason (the host is the only client text).
+    PathNotAllowed { host: Domain },
+    /// A request on a TLS-terminated connection that v1 does not carry:
+    /// CONNECT, an upgrade, h2 preface, chunked/any Transfer-Encoding, or an
+    /// absolute-form / non-origin-form target. `detail` is a pinned fragment.
+    UnsupportedRequest { detail: &'static str },
+    /// A terminated host was requested over plain HTTP on port 80. Its
+    /// URL-path rules are enforceable only over TLS, so the request is denied.
+    MitmPlainHttp { name: Domain },
+    /// The host needs TLS termination but this build (or run) has none. Fail
+    /// closed: the feature-off binary refuses such policies at load time, and
+    /// this is the proxy-side backstop.
+    TerminationUnavailable { name: Domain },
+    /// The TLS handshake with the sandbox client failed (no ALPN overlap,
+    /// a malformed hello, a client abort, or an internal leaf-minting error).
+    TlsClientHandshake { detail: String },
 }
 
 impl Rejected {
@@ -537,6 +575,24 @@ impl Rejected {
             Rejected::DecisionTimeout { secs } => {
                 format!("decision-phase timeout: no complete protocol preamble within {secs}s")
             }
+            Rejected::PathNotAllowed { host } => format!(
+                "request path is not allowed for {} by the policy URL-path rules",
+                host.as_str()
+            ),
+            Rejected::UnsupportedRequest { detail } => {
+                format!("unsupported request on a TLS-terminated connection: {detail}")
+            }
+            Rejected::MitmPlainHttp { name } => format!(
+                "{} has URL-path rules and is reachable only over TLS: plain HTTP on port 80 is denied",
+                name.as_str()
+            ),
+            Rejected::TerminationUnavailable { name } => format!(
+                "{} requires TLS termination, which this sbx build does not provide (build with the tls-termination feature)",
+                name.as_str()
+            ),
+            Rejected::TlsClientHandshake { detail } => {
+                format!("TLS handshake with the sandbox client failed: {detail}")
+            }
         }
     }
 }
@@ -557,6 +613,10 @@ pub enum Failed {
     /// is that limit, reported verbatim by [`decide`]'s single mapping
     /// site.
     ConnectTimeout { name: Domain, secs: u64 },
+    /// The upstream TLS handshake failed for a terminated host: certificate
+    /// verification (webpki roots + hostname), protocol, or the handshake
+    /// timeout. Upstream verification is never disabled.
+    UpstreamTls { name: Domain, detail: String },
 }
 
 impl Failed {
@@ -575,6 +635,12 @@ impl Failed {
             Failed::ConnectTimeout { name, secs } => {
                 format!("connect to {} timed out after {secs}s", name.as_str())
             }
+            Failed::UpstreamTls { name, detail } => {
+                format!(
+                    "TLS handshake with upstream {} failed: {detail}",
+                    name.as_str()
+                )
+            }
         }
     }
 }
@@ -591,6 +657,9 @@ pub enum NameSource {
     ConnectTarget,
     /// The name is the absolute-form request-target's host.
     RequestTarget,
+    /// The name is the TLS SNI of a terminated connection (issue #17). The
+    /// client's `Host` is compared against it; the wording names the TLS port.
+    Sni,
 }
 
 impl NameSource {
@@ -600,6 +669,7 @@ impl NameSource {
             NameSource::DnsMap => "the DNS-map name",
             NameSource::ConnectTarget => "the CONNECT target name",
             NameSource::RequestTarget => "the request-target name",
+            NameSource::Sni => "the SNI name",
         }
     }
 
@@ -609,6 +679,7 @@ impl NameSource {
             NameSource::DnsMap => "the original destination port",
             NameSource::ConnectTarget => "the CONNECT target port",
             NameSource::RequestTarget => "the request-target port",
+            NameSource::Sni => "the TLS port",
         }
     }
 }
@@ -1069,6 +1140,8 @@ pub struct Proxy {
     pub limits: Limits,
     /// Connections currently held, against [`Limits::max_connections`].
     active: Arc<std::sync::atomic::AtomicUsize>,
+    /// TLS-termination rules and state (issue #17; module docs point 14).
+    pub mitm: Mitm,
 }
 
 /// One held connection slot; dropping it frees the slot (issue #43).
@@ -1106,6 +1179,66 @@ impl Proxy {
     }
 }
 
+/// The TLS-termination inputs of a [`Proxy`] (issue #17): the terminated host
+/// names and URL-path rules from the policy, plus the run's [`Terminator`]
+/// (`None` = no termination available — a terminated host is then denied).
+pub struct Mitm {
+    /// Cloned from `policy.network.mitm_hosts`.
+    pub hosts: Vec<Domain>,
+    /// Cloned from `policy.network.paths`.
+    pub paths: Vec<policy::UrlPrefix>,
+    /// The per-run CA and upstream verifier; `None` in every test fixture
+    /// that does not terminate, and always `None` in the default build.
+    pub terminator: Option<Arc<Terminator>>,
+}
+
+impl Mitm {
+    fn from_network(network: &policy::Network, terminator: Option<Arc<Terminator>>) -> Self {
+        Self {
+            hosts: network.mitm_hosts.clone(),
+            paths: network.paths.clone(),
+            terminator,
+        }
+    }
+}
+
+/// The TLS termination state a run hands the proxy (issue #17, D3). With the
+/// `tls-termination` feature this is [`crate::tls::Terminator`] (per-run CA,
+/// upstream verifier, leaf cache). Without the feature it is uninhabited:
+/// no value can exist, and the policy validation refuses mitm hosts anyway.
+#[cfg(feature = "tls-termination")]
+pub use crate::tls::Terminator;
+
+/// Uninhabited without the `tls-termination` feature (see [`Terminator`]).
+#[cfg(not(feature = "tls-termination"))]
+pub enum Terminator {}
+
+#[cfg(not(feature = "tls-termination"))]
+impl Terminator {
+    /// Unreachable: no [`Terminator`] value exists in this build.
+    pub(crate) async fn terminate<S>(
+        &self,
+        client: S,
+        handoff: Handoff,
+        _proxy: &Proxy,
+        _decision_for: impl Fn(Verdict) -> Decision,
+    ) {
+        // Unreachable: `self` cannot exist. Consuming the arguments keeps
+        // the stub's signature identical to the feature build's.
+        let Handoff { replay, name } = handoff;
+        drop((client, replay, name));
+        match *self {}
+    }
+}
+
+/// A 443 connection to a terminated host, past the SNI check (issue #17): the
+/// inspected ClientHello plus any pipelined bytes (the replay), and the
+/// verified name. The terminator consumes it.
+pub(crate) struct Handoff {
+    pub(crate) replay: Vec<u8>,
+    pub(crate) name: Domain,
+}
+
 impl Proxy {
     /// Production shape for #10: [`GuardedConnector::system`] with default
     /// limits, built from a validated policy's network section, denying
@@ -1133,6 +1266,19 @@ impl Proxy {
         connector: Arc<dyn Connector>,
         limits: Limits,
     ) -> Arc<Self> {
+        Self::with_terminator(network, dns_map, sink, connector, limits, None)
+    }
+
+    /// [`Self::new`] with the run's [`Terminator`] (issue #17); `None` = no
+    /// termination available, so a terminated host is denied.
+    pub(crate) fn with_terminator(
+        network: &policy::Network,
+        dns_map: Arc<dyn DnsMap>,
+        sink: Arc<dyn DecisionSink>,
+        connector: Arc<dyn Connector>,
+        limits: Limits,
+        terminator: Option<Arc<Terminator>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             allow: network.allow.clone(),
             ports: network.ports.clone(),
@@ -1141,7 +1287,26 @@ impl Proxy {
             connector,
             limits,
             active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            mitm: Mitm::from_network(network, terminator),
         })
+    }
+
+    /// The production shape of a TERMINATING run (issue #17): like
+    /// [`Self::system`], with the run's [`Terminator`] attached.
+    pub fn system_terminating(
+        network: &policy::Network,
+        dns_map: Arc<dyn DnsMap>,
+        sink: Arc<dyn DecisionSink>,
+        terminator: Arc<Terminator>,
+        host_addrs: egress::HostAddrs,
+        max_connections: usize,
+    ) -> Arc<Self> {
+        let limits = Limits {
+            max_connections,
+            ..Limits::default()
+        };
+        let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
+        Self::with_terminator(network, dns_map, sink, connector, limits, Some(terminator))
     }
 }
 
@@ -1273,9 +1438,9 @@ pub(crate) async fn handle_connection(
 ) {
     // Proxy-standard; failure ignored (same policy as the upstream flip).
     let _ = client.set_nodelay(true);
-    let (decision, relay) = match original_dst(client.as_raw_fd()) {
+    let step = match original_dst(client.as_raw_fd()) {
         Ok(orig_dst) => {
-            decide(
+            decide_step(
                 &mut client,
                 ConnCtx {
                     client_addr,
@@ -1287,7 +1452,7 @@ pub(crate) async fn handle_connection(
         }
         // Fail-closed: no verifiable destination ⇒ no traffic. `client` is
         // dropped at scope end (FIN/RST), after `record`, as on every arm.
-        Err(err) => (
+        Err(err) => Step::Decided(
             Decision {
                 client: client_addr,
                 via: Via::Transparent { orig_dst: None },
@@ -1298,6 +1463,24 @@ pub(crate) async fn handle_connection(
             },
             None,
         ),
+    };
+    let (decision, relay) = match step {
+        Step::Decided(decision, relay) => (decision, relay),
+        // A terminated host (issue #17): the terminator records the
+        // connection's ONE decision itself, before any relay byte.
+        Step::Terminate {
+            handoff,
+            ctx,
+            terminator,
+        } => {
+            let name = handoff.name.clone();
+            terminator
+                .terminate(client, handoff, &proxy, move |verdict| {
+                    decision(&ctx, Some(name.clone()), verdict)
+                })
+                .await;
+            return;
+        }
     };
     // EXACTLY ONE record per connection, before any relay byte
     // (`exactly_one_decision_per_connection` pins it).
@@ -1322,6 +1505,22 @@ pub(crate) async fn handle_connection(
         )
         .await;
     }
+}
+
+/// What the transparent pipeline hands back: a recorded-once decision with
+/// its relay state, or (issue #17) a terminated-host handoff. The client
+/// stream stays with the caller either way; on a handoff the caller gives
+/// it to the terminator.
+pub(crate) enum Step {
+    /// The decision (not yet recorded) and, on the allowed passthrough
+    /// path only, the relay state.
+    Decided(Decision, Option<RelayStart>),
+    /// 443 to a terminated host, SNI verified: the terminator owns the rest.
+    Terminate {
+        handoff: Handoff,
+        ctx: ConnCtx,
+        terminator: Arc<Terminator>,
+    },
 }
 
 /// How the relay phase runs (issue #8 seam): the 443 second-hello scanner
@@ -1433,16 +1632,17 @@ pub(crate) fn original_dst(fd: RawFd) -> io::Result<SocketAddrV4> {
 /// terminal [`Decision`] plus, on the allowed path only, the [`RelayStart`]
 /// hand-off state. Generic over the client stream so unit tests drive it
 /// over `tokio::io::duplex` without sockets. The client is BORROWED: the
-/// caller records the decision before it drops (closes) the stream.
-pub(crate) async fn decide<S: AsyncRead + Unpin>(
+/// caller records the decision before it drops (closes) the stream, and on
+/// a [`Step::Terminate`] hands its owned stream to the terminator.
+pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
     client: &mut S,
     ctx: ConnCtx,
     proxy: &Proxy,
-) -> (Decision, Option<RelayStart>) {
+) -> Step {
     // 1. Port policy — the original destination port must be listed.
     let port = ctx.orig_dst.port();
     if !proxy.ports.contains(&port) {
-        return (
+        return Step::Decided(
             decision(
                 &ctx,
                 None,
@@ -1455,7 +1655,7 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     //    2): 198.18/15 + TEST-NET-3 are guard-denied BY DESIGN.
     let ip = *ctx.orig_dst.ip();
     let Some(name) = proxy.dns_map.name_for(ip) else {
-        return (
+        return Step::Decided(
             decision(&ctx, None, Verdict::Denied(Rejected::UnknownFakeIp { ip })),
             None,
         );
@@ -1463,11 +1663,35 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     // 3. Allow list. The RuleMatch borrows the allow slice; it is used
     //    synchronously and dropped before any await (egress.rs borrow note).
     if egress::allowed(name.as_str(), &proxy.allow).is_none() {
-        return (
+        return Step::Decided(
             decision(
                 &ctx,
                 Some(name.clone()),
                 Verdict::Denied(Rejected::NotAllowed { name }),
+            ),
+            None,
+        );
+    }
+    // 3b. Terminated hosts (issue #17, module docs point 14): plain HTTP is
+    //     denied (the path rules are TLS-only), and a terminated host without
+    //     a terminator is refused before anything is read.
+    let terminated = proxy.mitm.hosts.contains(&name);
+    if terminated && port == HTTP_PORT {
+        return Step::Decided(
+            decision(
+                &ctx,
+                Some(name.clone()),
+                Verdict::Denied(Rejected::MitmPlainHttp { name }),
+            ),
+            None,
+        );
+    }
+    if terminated && proxy.mitm.terminator.is_none() {
+        return Step::Decided(
+            decision(
+                &ctx,
+                Some(name.clone()),
+                Verdict::Denied(Rejected::TerminationUnavailable { name }),
             ),
             None,
         );
@@ -1493,7 +1717,7 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
         // Q1: policy-listed but uninspectable ⇒ deny, immediate (no
         // timeout needed — nothing is read).
         other => {
-            return (
+            return Step::Decided(
                 decision(
                     &ctx,
                     Some(name),
@@ -1506,10 +1730,10 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     let replay = match inspected {
         Ok(Ok(replay)) => replay,
         Ok(Err(rejected)) => {
-            return (decision(&ctx, Some(name), Verdict::Denied(rejected)), None);
+            return Step::Decided(decision(&ctx, Some(name), Verdict::Denied(rejected)), None);
         }
         Err(_elapsed) => {
-            return (
+            return Step::Decided(
                 decision(
                     &ctx,
                     Some(name),
@@ -1521,11 +1745,31 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             );
         }
     };
+    // 4b. SNI verified on a terminated host: hand the connection to the
+    //     terminator (module docs point 14). No dial happens here.
+    if terminated {
+        return match proxy.mitm.terminator.clone() {
+            Some(terminator) => Step::Terminate {
+                handoff: Handoff { replay, name },
+                ctx,
+                terminator,
+            },
+            // Unreachable (checked at 3b); fail closed anyway.
+            None => Step::Decided(
+                decision(
+                    &ctx,
+                    Some(name.clone()),
+                    Verdict::Denied(Rejected::TerminationUnavailable { name }),
+                ),
+                None,
+            ),
+        };
+    }
     // 5. Connect (GuardedConnector owns the connect timeout internally —
     //    the scopes never nest).
     let connected = match connect_upstream(proxy, &name, port).await {
         Ok(connected) => connected,
-        Err(verdict) => return (decision(&ctx, Some(name), verdict), None),
+        Err(verdict) => return Step::Decided(decision(&ctx, Some(name), verdict), None),
     };
     // 6. Allowed — the decision carries the guarded peer actually
     //    connected; the relay state carries the FULL replay buffer and,
@@ -1535,7 +1779,7 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
         // walker requires it fully present); fail closed anyway (house
         // rule: no panics).
         let Some(hello_end) = hello::first_record_end(&replay) else {
-            return (
+            return Step::Decided(
                 decision(
                     &ctx,
                     Some(name),
@@ -1550,7 +1794,7 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     } else {
         None
     };
-    (
+    Step::Decided(
         decision(
             &ctx,
             Some(name.clone()),
@@ -1565,6 +1809,22 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             scan_from,
         }),
     )
+}
+
+/// The test-facing transparent pipeline: [`decide_step`] for every input
+/// that does not terminate. A terminated host panics here, because its
+/// outcome is owned by the terminator (tests drive that through
+/// [`decide_step`] and the terminator directly).
+#[cfg(test)]
+pub(crate) async fn decide<S: AsyncRead + Unpin>(
+    client: &mut S,
+    ctx: ConnCtx,
+    proxy: &Proxy,
+) -> (Decision, Option<RelayStart>) {
+    match decide_step(client, ctx, proxy).await {
+        Step::Decided(decision, relay) => (decision, relay),
+        Step::Terminate { .. } => panic!("terminated host reached the passthrough test seam"),
+    }
 }
 
 /// Step 5 of the pipeline, shared by the transparent and explicit paths:
@@ -1782,6 +2042,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
             ports: vec![TLS_PORT, HTTP_PORT],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
         Proxy::new(
@@ -1931,6 +2193,8 @@ mod tests {
                 mode: policy::NetworkMode::Transparent,
                 allow: vec![rule("allowed.test")],
                 ports: vec![TLS_PORT],
+                mitm_hosts: Vec::new(),
+                paths: Vec::new(),
             };
             let proxy = Proxy::new(
                 &network,
@@ -2195,6 +2459,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: allow.iter().map(|s| rule(s)).collect(),
             ports: ports.to_vec(),
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let proxy = Proxy::new(&network, Arc::new(map), sink.clone(), connector, limits);
         (proxy, sink)
@@ -2242,6 +2508,154 @@ mod tests {
 
     fn tls_hello(name: &str) -> Vec<u8> {
         hello::build_client_hello(Some(name), &[])
+    }
+
+    /// A proxy whose policy names `hosts` as terminated (issue #17). No
+    /// terminator is attached: this exercises the refusals every build shares.
+    fn mitm_proxy(hosts: &[&str], connector: Arc<dyn Connector>) -> Arc<Proxy> {
+        let network = policy::Network {
+            mode: policy::NetworkMode::Transparent,
+            allow: vec![crate::policy::DomainRule::parse("allowed.test").expect("rule")],
+            ports: vec![TLS_PORT, HTTP_PORT],
+            mitm_hosts: hosts.iter().map(|host| dom(host)).collect(),
+            paths: vec![policy::UrlPrefix::parse("https://allowed.test/v1/").expect("rule")],
+        };
+        let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
+        Proxy::new(
+            &network,
+            Arc::new(map),
+            Arc::new(RecordingSink::default()),
+            connector,
+            Limits::default(),
+        )
+    }
+
+    #[test]
+    fn terminated_host_on_plain_http_is_denied_before_any_read() {
+        // Issue #17: URL-path rules are enforceable over TLS only, so a
+        // terminated host reached on port 80 is denied at once (nothing read).
+        let (connector, calls) = never_connector();
+        let proxy = mitm_proxy(&["allowed.test"], connector);
+        let (decision, relay) = run_decide(
+            &proxy,
+            &format!("{FAKE_IP}:80"),
+            b"GET /admin HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+        );
+        assert!(relay.is_none());
+        assert_eq!(decision.verdict.label(), "denied");
+        assert!(matches!(
+            decision.verdict,
+            Verdict::Denied(Rejected::MitmPlainHttp { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no dial");
+    }
+
+    #[test]
+    fn terminated_host_without_a_terminator_is_refused_before_the_hello_is_read() {
+        // Fail closed: a terminated host with no terminator (the default
+        // build's only possible state) never reaches the passthrough relay.
+        let (connector, calls) = never_connector();
+        let proxy = mitm_proxy(&["allowed.test"], connector);
+        let (decision, relay) = run_decide(
+            &proxy,
+            &format!("{FAKE_IP}:443"),
+            &tls_hello("allowed.test"),
+        );
+        assert!(relay.is_none());
+        assert!(matches!(
+            decision.verdict,
+            Verdict::Denied(Rejected::TerminationUnavailable { .. })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no dial");
+    }
+
+    #[test]
+    fn non_terminated_hosts_keep_the_passthrough_pipeline() {
+        // The terminated set is exact: an allowed host NOT in mitm_hosts is
+        // still an ordinary SNI-checked passthrough (its relay state exists).
+        let (connector, _calls) = never_connector();
+        let proxy = mitm_proxy(&["other.allowed.test"], connector);
+        let (decision, _relay) = run_decide(
+            &proxy,
+            &format!("{FAKE_IP}:443"),
+            &tls_hello("allowed.test"),
+        );
+        // Dial is refused by the never-connector's canary, so the verdict is
+        // the connector's: the point is that it was NOT Terminate/unavailable.
+        assert!(!matches!(
+            decision.verdict,
+            Verdict::Denied(
+                Rejected::TerminationUnavailable { .. } | Rejected::MitmPlainHttp { .. }
+            )
+        ));
+    }
+
+    #[cfg(feature = "tls-termination")]
+    fn run_step(proxy: &Proxy, orig_dst: &str, client_bytes: &[u8]) -> Step {
+        let (mut client, mut peer) = duplex(64 * 1024);
+        block_on(async {
+            peer.write_all(client_bytes)
+                .await
+                .expect("fixture write fits the duplex buffer");
+            let step = decide_step(&mut client, ctx(orig_dst), proxy).await;
+            drop(peer);
+            step
+        })
+    }
+
+    #[cfg(feature = "tls-termination")]
+    #[test]
+    fn terminated_host_hands_off_only_after_its_sni_is_verified() {
+        // Issue #17: a verified SNI on a terminated host returns the handoff
+        // with the inspected ClientHello as its replay, and no dial happens.
+        let term = Arc::new(
+            crate::tls::Terminator::new(
+                crate::tls::RunCa::generate(&[dom("allowed.test")], Duration::from_secs(60))
+                    .expect("CA"),
+            )
+            .expect("terminator"),
+        );
+        let (connector, calls) = never_connector();
+        let network = policy::Network {
+            mode: policy::NetworkMode::Transparent,
+            allow: vec![crate::policy::DomainRule::parse("allowed.test").expect("rule")],
+            ports: vec![TLS_PORT],
+            mitm_hosts: vec![dom("allowed.test")],
+            paths: vec![policy::UrlPrefix::parse("https://allowed.test/").expect("rule")],
+        };
+        let mut proxy = Proxy::new(
+            &network,
+            Arc::new(StaticMap::new(&[(FAKE_IP, "allowed.test")])),
+            Arc::new(RecordingSink::default()),
+            connector,
+            Limits::default(),
+        );
+        Arc::get_mut(&mut proxy)
+            .expect("sole owner")
+            .mitm
+            .terminator = Some(term);
+        let hello = tls_hello("allowed.test");
+        match run_step(&proxy, &format!("{FAKE_IP}:443"), &hello) {
+            Step::Terminate { handoff, .. } => {
+                assert_eq!(handoff.name.as_str(), "allowed.test");
+                assert_eq!(handoff.replay, hello);
+            }
+            Step::Decided(decision, _) => panic!("expected a handoff, got {decision:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no dial before the request check"
+        );
+
+        // A wrong SNI is still denied before any handoff.
+        match run_step(&proxy, &format!("{FAKE_IP}:443"), &tls_hello("evil.test")) {
+            Step::Decided(decision, _) => assert!(matches!(
+                decision.verdict,
+                Verdict::Denied(Rejected::SniMismatch { .. })
+            )),
+            Step::Terminate { .. } => panic!("a mismatched SNI must not hand off"),
+        }
     }
 
     // ---- the pinned vocabularies (the #10 contract) ----------------------
