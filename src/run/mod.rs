@@ -177,6 +177,8 @@ pub struct RunArgs {
     pub idle_timeout: Option<Duration>,
     /// `--max-lifetime` (keep-alive only); None = the 8h default.
     pub max_lifetime: Option<Duration>,
+    /// `--max-connections` (issue #43): the proxies' concurrent-connection cap.
+    pub max_connections: usize,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -905,7 +907,13 @@ fn execute(
             )))
         })?;
         let host_addrs = crate::egress::HostAddrs::new(host_addrs);
-        let proxy = Proxy::system(&net, map.clone(), audit.clone(), host_addrs);
+        let proxy = Proxy::system(
+            &net,
+            map.clone(),
+            audit.clone(),
+            host_addrs,
+            args.max_connections,
+        );
         let dns = DnsServer::new(&net, map.clone(), audit.clone());
         // S16: start the runtime; go only after every task was first-polled.
         let ready = start_net(serve_tasks(fds, proxy, dns), latch.clone()).map_err(|err| {
