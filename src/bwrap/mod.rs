@@ -543,6 +543,20 @@ pub fn generated_etc_paths() -> [&'static str; 4] {
     ]
 }
 
+/// Sandbox destinations sbx mounts over AFTER every policy bind (argv
+/// elements 6–7): the session leaves (`/root`, `/tmp`, `/work`, prio 2) and
+/// `--proc /proc --dev /dev`. A policy bind at one of these is not visible
+/// there (`sbx check --host` `bind-sockets`, issue #35).
+pub fn shadowed_dests() -> [&'static str; 5] {
+    [
+        "/dev",
+        "/proc",
+        etc::DEST_HOME,
+        etc::DEST_TMP,
+        etc::DEST_WORK,
+    ]
+}
+
 #[cfg(test)]
 mod probe_argv_tests {
     use super::*;
@@ -628,6 +642,10 @@ mod probe_argv_tests {
         );
         assert_eq!(infra_etc_paths().len(), 6);
         assert!(!infra_etc_paths().contains(&"/etc/hosts"));
+        assert_eq!(
+            shadowed_dests(),
+            ["/dev", "/proc", "/root", "/tmp", "/work"]
+        );
     }
 }
 

@@ -736,11 +736,16 @@ fn bind_sockets_item(scan: &SocketScan, roots: usize) -> PolicyItem {
                 scan.found.len() - BIND_SOCKETS_SHOWN
             ));
         }
+        let partial = if scan.truncated {
+            " (the scan hit its bound; the list may be incomplete)"
+        } else {
+            ""
+        };
         return PolicyItem {
             id: "bind-sockets",
             status: Status::Warn,
             detail: format!(
-                "unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): {}",
+                "unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): {}{partial}",
                 shown.join(", ")
             ),
             fix: Some(
@@ -1646,6 +1651,27 @@ mod tests {
         assert_eq!(r.checks[4].status, Status::Warn);
         assert!(
             r.checks[4].detail.ends_with("(not exhaustive)"),
+            "{}",
+            r.checks[4].detail
+        );
+
+        let both = |_: &[&Path], _: &[&Path]| SocketScan {
+            found: vec![PathBuf::from("/run/docker.sock")],
+            truncated: true,
+        };
+        let r = policy_check(
+            "p.json",
+            &policy,
+            EffectiveMode::Explicit,
+            &|_| true,
+            &|_| false,
+            &both,
+        );
+        assert_eq!(r.checks[4].status, Status::Warn);
+        assert!(
+            r.checks[4].detail.ends_with(
+                ": /run/docker.sock (the scan hit its bound; the list may be incomplete)"
+            ),
             "{}",
             r.checks[4].detail
         );
