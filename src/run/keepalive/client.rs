@@ -423,22 +423,41 @@ fn report_call_end(dir: &OwnedFd, id: u32, outcome: &Outcome, truncated: bool, t
     }
 }
 
+/// How long `sbx stop` waits for the holder's answer (rule 4). The holder answers
+/// only after its teardown, which can take a few seconds (the call grace period is
+/// [`super::holder::CALL_GRACE`], 5 s), so the wait is generous: 120 s.
+pub(crate) const STOP_ANSWER_WAIT: Duration = Duration::from_secs(120);
+
 /// `sbx stop --session-dir DIR` (rule 4).
 pub(crate) fn stop(session_dir: PathBuf) -> ExitCode {
+    stop_with_wait(session_dir, STOP_ANSWER_WAIT)
+}
+
+/// `sbx stop` with the answer wait as a parameter, so a test can prove the
+/// give-up path without sleeping for the real budget. Prints the reason on stderr
+/// and returns rc 125 when the stop is not confirmed.
+fn stop_with_wait(session_dir: PathBuf, answer_wait: Duration) -> ExitCode {
+    match stop_session(session_dir, answer_wait) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("sbx stop: {reason}");
+            ExitCode::from(EXIT_FAILURE as u8)
+        }
+    }
+}
+
+/// The stop itself. `Ok` when the session is stopped or was not running; `Err` with
+/// the reason otherwise (the caller prints it and exits 125). The holder's answer is
+/// awaited for at most `answer_wait` from the moment the request is sent.
+fn stop_session(session_dir: PathBuf, answer_wait: Duration) -> Result<(), String> {
     let session = match absolutize(&session_dir) {
         Ok(path) => lexical_normalize(&path),
-        Err(err) => {
-            eprintln!("sbx stop: {}", err.reason());
-            return ExitCode::from(EXIT_FAILURE as u8);
-        }
+        Err(err) => return Err(err.reason().to_owned()),
     };
     let dir = match ctl::open_session_dir(&session) {
         Ok(fd) => fd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("sbx stop: cannot open the session directory: {err}");
-            return ExitCode::from(EXIT_FAILURE as u8);
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("cannot open the session directory: {err}")),
     };
     let stream: UnixStream = match ctl::connect_ctl(dir.as_fd()) {
         Ok(stream) => stream,
@@ -446,12 +465,9 @@ pub(crate) fn stop(session_dir: PathBuf) -> ExitCode {
             if err.kind() == std::io::ErrorKind::NotFound
                 || err.kind() == std::io::ErrorKind::ConnectionRefused =>
         {
-            return ExitCode::SUCCESS;
+            return Ok(());
         }
-        Err(err) => {
-            eprintln!("sbx stop: cannot reach the session: {err}");
-            return ExitCode::from(EXIT_FAILURE as u8);
-        }
+        Err(err) => return Err(format!("cannot reach the session: {err}")),
     };
     let (op, payload) = Request::Stop.encode();
     if let Err(err) = ctl::send_frame_until(
@@ -461,21 +477,104 @@ pub(crate) fn stop(session_dir: PathBuf) -> ExitCode {
         &[],
         Instant::now() + Duration::from_secs(5),
     ) {
-        eprintln!("sbx stop: cannot send the stop request: {err:?}");
-        return ExitCode::from(EXIT_FAILURE as u8);
+        return Err(format!("cannot send the stop request: {err:?}"));
     }
     // The holder answers after its teardown, which can take a few seconds: the
-    // whole wait has a 120 s deadline (the client's own budget is 30 s).
-    let answer = ctl::recv_frame_until(&stream, Instant::now() + Duration::from_secs(120));
+    // whole wait has the `answer_wait` deadline (STOP_ANSWER_WAIT in production).
+    let answer = ctl::recv_frame_until(&stream, Instant::now() + answer_wait);
     match answer.and_then(|(frame, _)| Reply::decode(frame)) {
-        Ok(Reply::Done) => ExitCode::SUCCESS,
-        Ok(Reply::Refused(reason)) => {
-            eprintln!("sbx stop: {reason}");
-            ExitCode::from(EXIT_FAILURE as u8)
-        }
+        Ok(Reply::Done) => Ok(()),
+        Ok(Reply::Refused(reason)) => Err(reason),
         Ok(Reply::Accepted(_, _)) | Err(_) => {
-            eprintln!("sbx stop: the session did not confirm the stop");
-            ExitCode::from(EXIT_FAILURE as u8)
+            Err("the session did not confirm the stop".to_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch session directory with no `sbx.ctl` yet (mode 0700, like a real one).
+    fn scratch_session(tag: &str) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("sbx-stop-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("session dir");
+        dir
+    }
+
+    #[test]
+    fn stop_answer_wait_is_pinned_at_120_seconds() {
+        assert_eq!(STOP_ANSWER_WAIT, Duration::from_secs(120));
+    }
+
+    /// A holder that accepts the stop and never answers: `sbx stop` gives up when
+    /// its wait runs out, with the pinned reason and rc 125. The wait is 300 ms, so
+    /// the test does not sleep for the real budget.
+    #[test]
+    fn a_holder_that_never_answers_makes_stop_give_up_at_the_deadline() {
+        let dir = scratch_session("silent");
+        let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("the stop connects");
+            // Keep the connection open and silent until the test is done.
+            let _ = held.recv();
+            drop(conn);
+        });
+
+        let wait = Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = stop_session(dir.clone(), wait);
+        let elapsed = started.elapsed();
+        let code = stop_with_wait(dir.clone(), wait);
+        let _ = release.send(());
+        holder.join().expect("the fake holder ends");
+
+        assert_eq!(
+            outcome,
+            Err("the session did not confirm the stop".to_owned())
+        );
+        assert!(elapsed >= wait, "gave up before the deadline: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "waited far beyond the deadline: {elapsed:?}"
+        );
+        assert_eq!(code, ExitCode::from(EXIT_FAILURE as u8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A holder that answers with a refusal: the reason is carried to the caller.
+    #[test]
+    fn a_refused_stop_carries_the_holders_reason() {
+        let dir = scratch_session("refused");
+        let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
+        let holder = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("the stop connects");
+            let (op, payload) = Reply::Refused("session is stopping".into()).encode();
+            ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
+        });
+        let outcome = stop_session(dir.clone(), Duration::from_secs(10));
+        holder.join().expect("the fake holder ends");
+        assert_eq!(outcome, Err("session is stopping".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No socket at all is a session that is not running: rc 0.
+    #[test]
+    fn stop_of_a_session_that_is_not_running_is_ok() {
+        let dir = scratch_session("absent");
+        assert_eq!(stop_session(dir.clone(), STOP_ANSWER_WAIT), Ok(()));
+        assert_eq!(
+            stop_with_wait(dir.clone(), STOP_ANSWER_WAIT),
+            ExitCode::SUCCESS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

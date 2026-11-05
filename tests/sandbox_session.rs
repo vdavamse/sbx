@@ -455,6 +455,39 @@ fn max_lifetime_above_24h_is_a_usage_error() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// More than 256 `--landlock-bind-tcp` ports with `--keep-alive` is refused at
+/// argument validation: rc 2, the limit named, and no session directory made.
+/// Nothing runs, so this needs no user namespace and no shim.
+#[test]
+fn keep_alive_refuses_more_than_256_bind_ports_rc2() {
+    let dir = scratch("bind-cap");
+    let mut cmd = Command::new(SBX);
+    cmd.args([
+        "run",
+        "--keep-alive",
+        "--landlock",
+        "best-effort",
+        "--policy",
+    ])
+    .arg(policy_path())
+    .arg("--session-dir")
+    .arg(dir.join("s"));
+    for port in 1..=257u32 {
+        cmd.arg("--landlock-bind-tcp").arg(port.to_string());
+    }
+    let out = cmd.args(["--", "true"]).output().expect("run sbx");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "--keep-alive takes at most 256 --landlock-bind-tcp ports (this run names 257)"
+        ),
+        "{stderr}"
+    );
+    assert!(!dir.join("s").exists(), "no session directory is made");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn audit_rows_carry_call_ids() {
     let dir = scratch("audit");

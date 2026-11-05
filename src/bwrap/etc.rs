@@ -13,7 +13,8 @@
 //!    — so HOME is `/root`, Q7), `tmp` → [`DEST_TMP`].
 //! 3. **Pinned contents** — `resolv.conf` points DNS at the netns-local
 //!    resolver (`127.0.0.1:53` — the nft rules redirect udp/53 there, #9);
-//!    `hosts` carries ONLY the loopback `localhost` entries (issue #35) —
+//!    `hosts` carries ONLY `localhost` and the sandbox hostname, on IPv4
+//!    loopback (issue #35; no `::1`: the netns has IPv6 off) —
 //!    binding the host's `/etc/hosts` would let a pinned allowed name
 //!    resolve to its real IP, bypassing fake-IP DNS (the transparent
 //!    proxy then denies it: "unknown fake IP" — fail-closed, but it
@@ -80,10 +81,14 @@ pub const RESOLV_CONF_CONTENT: &str = "nameserver 127.0.0.1\n";
 /// identity the sandbox uid 0 resolves against. Exactly one trailing `\n`.
 pub const PASSWD_CONTENT: &str = "root:x:0:0:root:/root:/bin/bash\n";
 
-/// Pinned content of the generated `/etc/hosts` (issue #35): loopback
-/// `localhost` only, so every other name goes through the fake-IP resolver
-/// (#9) and no host entry is disclosed. Exactly one trailing `\n`.
-pub const HOSTS_CONTENT: &str = "127.0.0.1 localhost\n::1 localhost\n";
+/// Pinned content of the generated `/etc/hosts` (issue #35): `localhost`
+/// and the sandbox's own hostname (`--hostname sandbox`), both on IPv4
+/// loopback, so every other name goes through the fake-IP resolver (#9) and
+/// no host entry is disclosed. No `::1` entry: the sandbox netns disables
+/// IPv6 (`init/netns.rs`, C09), so a client that takes the first
+/// `getaddrinfo` result for `localhost` must not get an unusable address.
+/// Exactly one trailing `\n`.
+pub const HOSTS_CONTENT: &str = "127.0.0.1 localhost\n127.0.1.1 sandbox\n";
 
 /// Pinned content of the generated `/etc/group` (Q7). Exactly one trailing
 /// `\n`.
@@ -365,7 +370,7 @@ mod tests {
         assert_eq!(DEST_HOME, "/root");
         assert_eq!(DEST_TMP, "/tmp");
         assert_eq!(RESOLV_CONF_CONTENT, "nameserver 127.0.0.1\n");
-        assert_eq!(HOSTS_CONTENT, "127.0.0.1 localhost\n::1 localhost\n");
+        assert_eq!(HOSTS_CONTENT, "127.0.0.1 localhost\n127.0.1.1 sandbox\n");
         assert_eq!(PASSWD_CONTENT, "root:x:0:0:root:/root:/bin/bash\n");
         assert_eq!(GROUP_CONTENT, "root:x:0:\n");
     }

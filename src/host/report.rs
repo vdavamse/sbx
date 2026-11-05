@@ -172,6 +172,7 @@ mod tests {
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
   ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
+  ok    keep-alive  pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 "#;
@@ -189,6 +190,7 @@ network mode: transparent (policies with network mode transparent, explicit or n
   skip  bwrap-proc  not probed: user namespaces are unavailable
   skip  seccomp     not probed: user namespaces are unavailable
   ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
+  skip  keep-alive  not probed: user namespaces are unavailable
 
 network mode: unavailable (no policy can run until the failed items are fixed)
 "#;
@@ -299,6 +301,15 @@ network mode: unavailable (no policy can run until the failed items are fixed)
       "errno": null,
       "impact": null,
       "fix": null
+    },
+    {
+      "id": "keep-alive",
+      "status": "ok",
+      "detail": "pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)",
+      "evidence": null,
+      "errno": null,
+      "impact": null,
+      "fix": null
     }
   ],
   "policy": null
@@ -388,6 +399,7 @@ network mode: unavailable (no policy can run until the failed items are fixed)
             &|_, _| crate::host::facts::SocketScan {
                 found: vec!["/run/docker.sock".into()],
                 truncated: false,
+                unlisted: vec![],
             },
         ));
         let text = render_human(&r);

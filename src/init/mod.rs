@@ -378,6 +378,32 @@ pub struct InitArgs {
     pub cmd: Vec<OsString>,
 }
 
+/// The descriptor a control-stage validator must differ from, and the flag that
+/// named it in this pipeline. The plain pipeline's control fd is `--fd`; the join
+/// pipeline's first namespace descriptor (`--join-user`) takes that role, so a
+/// join-mode message must name `--join-user`, not a flag `__init --join` never
+/// received (issue #18, review of the join pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlFd {
+    fd: RawFd,
+    flag: &'static str,
+}
+
+impl ControlFd {
+    /// The plain pipeline's control socket (`--fd`).
+    pub(crate) const fn plain(fd: RawFd) -> Self {
+        Self { fd, flag: "--fd" }
+    }
+
+    /// The join pipeline's user namespace descriptor (`--join-user`).
+    pub(crate) const fn join_user(fd: RawFd) -> Self {
+        Self {
+            fd,
+            flag: "--join-user",
+        }
+    }
+}
+
 /// Whether a policy whose mode is `min_mode` accepts the explicit fallback
 /// (issue #11, Q1): explicit and none do, transparent does not.
 pub(crate) fn fallback_allowed(min_mode: NetworkMode) -> bool {
@@ -396,16 +422,22 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     arm_parent_death(args.parent_pid)?; // m6: first, so a dying parent takes us with it
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
     if let Some(keep) = args.keep_fd {
-        validate_keep_fd(keep, fd)?; // Stage::Control too (issue #10, Q13)
+        validate_keep_fd(keep, ControlFd::plain(fd))?; // Stage::Control too (issue #10, Q13)
     }
     if let Some(seccomp) = args.seccomp_fd {
-        validate_seccomp_fd(seccomp, fd, args.keep_fd)?; // Stage::Control (issue #34)
+        validate_seccomp_fd(seccomp, ControlFd::plain(fd), args.keep_fd)?; // Stage::Control (issue #34)
     }
     if let Some(exe) = args.exe_fd {
-        validate_exe_fd(exe, fd, args.keep_fd, args.seccomp_fd)?; // Stage::Control (issue #19)
+        validate_exe_fd(exe, ControlFd::plain(fd), args.keep_fd, args.seccomp_fd)?; // Stage::Control (issue #19)
     }
     if let Some(status) = args.status_fd {
-        validate_status_fd(status, fd, args.keep_fd, args.seccomp_fd, args.exe_fd)?; // Stage::Control (issue #19 M1)
+        validate_status_fd(
+            status,
+            ControlFd::plain(fd),
+            args.keep_fd,
+            args.seccomp_fd,
+            args.exe_fd,
+        )?; // Stage::Control (issue #19 M1)
     }
     // m4: the exe and status fds are only meaningful inside the shim's own argv.
     validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?; // Stage::Control
@@ -474,7 +506,7 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
         ));
     }
     if let Some(keep) = args.keep_fd {
-        validate_keep_fd(keep, user)?;
+        validate_keep_fd(keep, ControlFd::join_user(user))?;
         if keep == net {
             return Err(InitError::new(
                 Stage::Control,
@@ -483,7 +515,7 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
         }
     }
     if let Some(seccomp) = args.seccomp_fd {
-        validate_seccomp_fd(seccomp, user, args.keep_fd)?;
+        validate_seccomp_fd(seccomp, ControlFd::join_user(user), args.keep_fd)?;
         if seccomp == net {
             return Err(InitError::new(
                 Stage::Control,
@@ -495,7 +527,12 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
     // validates them: a call under the session's layer needs them as the resident
     // does.
     if let Some(exe) = args.exe_fd {
-        validate_exe_fd(exe, user, args.keep_fd, args.seccomp_fd)?;
+        validate_exe_fd(
+            exe,
+            ControlFd::join_user(user),
+            args.keep_fd,
+            args.seccomp_fd,
+        )?;
         if exe == net {
             return Err(InitError::new(
                 Stage::Control,
@@ -504,7 +541,13 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
         }
     }
     if let Some(status) = args.status_fd {
-        validate_status_fd(status, user, args.keep_fd, args.seccomp_fd, args.exe_fd)?;
+        validate_status_fd(
+            status,
+            ControlFd::join_user(user),
+            args.keep_fd,
+            args.seccomp_fd,
+            args.exe_fd,
+        )?;
         if status == net {
             return Err(InitError::new(
                 Stage::Control,
@@ -708,7 +751,7 @@ fn fd_hygiene(control: RawFd, keep: &[RawFd]) {
 /// offset.
 fn validate_seccomp_fd(
     seccomp: RawFd,
-    control: RawFd,
+    control: ControlFd,
     keep: Option<RawFd>,
 ) -> Result<(), InitError> {
     let fail = |reason: String| InitError::new(Stage::Control, reason);
@@ -717,9 +760,10 @@ fn validate_seccomp_fd(
             "--seccomp-fd {seccomp} must be greater than 2"
         )));
     }
-    if seccomp == control {
+    if seccomp == control.fd {
         return Err(fail(format!(
-            "--seccomp-fd {seccomp} must differ from --fd"
+            "--seccomp-fd {seccomp} must differ from {}",
+            control.flag
         )));
     }
     if keep == Some(seccomp) {
@@ -773,7 +817,7 @@ fn validate_seccomp_fd(
 /// `/proc/self/exe` in this process, so a substituted file cannot be the shim.
 fn validate_exe_fd(
     exe: RawFd,
-    control: RawFd,
+    control: ControlFd,
     keep: Option<RawFd>,
     seccomp: Option<RawFd>,
 ) -> Result<(), InitError> {
@@ -781,8 +825,11 @@ fn validate_exe_fd(
     if exe <= 2 {
         return Err(fail(format!("--exe-fd {exe} must be greater than 2")));
     }
-    if exe == control {
-        return Err(fail(format!("--exe-fd {exe} must differ from --fd")));
+    if exe == control.fd {
+        return Err(fail(format!(
+            "--exe-fd {exe} must differ from {}",
+            control.flag
+        )));
     }
     if keep == Some(exe) {
         return Err(fail(format!("--exe-fd {exe} must differ from --keep-fd")));
@@ -823,7 +870,7 @@ fn validate_exe_fd(
 /// a shim failure reason can only reach the run that created the pipe.
 fn validate_status_fd(
     status: RawFd,
-    control: RawFd,
+    control: ControlFd,
     keep: Option<RawFd>,
     seccomp: Option<RawFd>,
     exe: Option<RawFd>,
@@ -832,8 +879,11 @@ fn validate_status_fd(
     if status <= 2 {
         return Err(fail(format!("--status-fd {status} must be greater than 2")));
     }
-    if status == control {
-        return Err(fail(format!("--status-fd {status} must differ from --fd")));
+    if status == control.fd {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from {}",
+            control.flag
+        )));
     }
     if keep == Some(status) {
         return Err(fail(format!(
@@ -955,13 +1005,16 @@ pub(crate) fn validate_shim_command(
 /// `child-pid` JSON there); a forged pid cannot be produced by the payload
 /// because bwrap closes the info fd before the payload exists (E3) and `run`
 /// verifies PPid/NSpid anyway.
-fn validate_keep_fd(keep: RawFd, control: RawFd) -> Result<(), InitError> {
+fn validate_keep_fd(keep: RawFd, control: ControlFd) -> Result<(), InitError> {
     let fail = |reason: String| InitError::new(Stage::Control, reason);
     if keep <= 2 {
         return Err(fail(format!("--keep-fd {keep} must be greater than 2")));
     }
-    if keep == control {
-        return Err(fail(format!("--keep-fd {keep} must differ from --fd")));
+    if keep == control.fd {
+        return Err(fail(format!(
+            "--keep-fd {keep} must differ from {}",
+            control.flag
+        )));
     }
     // SAFETY: fstat/fcntl on a number we were handed; the result is only read.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1362,7 +1415,11 @@ mod tests {
     #[test]
     fn validate_keep_fd_table() {
         // Pinned reasons (issue #10 §4.2); each rejection is staged Control.
-        let msg = |k: RawFd, c: RawFd| validate_keep_fd(k, c).expect_err("must reject").to_string();
+        let msg = |k: RawFd, c: RawFd| {
+            validate_keep_fd(k, ControlFd::plain(c))
+                .expect_err("must reject")
+                .to_string()
+        };
         let c = 999; // control fd: never equal to the keep fds under test
         assert_eq!(
             msg(2, c),
@@ -1392,7 +1449,7 @@ mod tests {
             msg(rd, c),
             format!("sbx __init: control: --keep-fd {rd} is not open for writing")
         );
-        assert!(validate_keep_fd(wr, c).is_ok());
+        assert!(validate_keep_fd(wr, ControlFd::plain(c)).is_ok());
         unsafe {
             libc::close(rd);
             libc::close(wr);
@@ -1443,7 +1500,7 @@ mod tests {
             return;
         };
         let msg = |s: RawFd, c: RawFd, k: Option<RawFd>| {
-            validate_seccomp_fd(s, c, k)
+            validate_seccomp_fd(s, ControlFd::plain(c), k)
                 .expect_err("must reject")
                 .to_string()
         };
@@ -1466,7 +1523,7 @@ mod tests {
 
         let sealed_good = memfd_with(&good, true);
         let raw = sealed_good.as_raw_fd();
-        assert!(validate_seccomp_fd(raw, 999, None).is_ok());
+        assert!(validate_seccomp_fd(raw, ControlFd::plain(999), None).is_ok());
         // Rewound after validation: the offset is 0 for bwrap.
         // SAFETY: lseek SEEK_CUR reads the offset without moving it.
         assert_eq!(unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) }, 0);
@@ -1506,7 +1563,7 @@ mod tests {
 
         // A prefix of the right program is not the right program.
         let short = memfd_with(&good[..good.len() - 8], true);
-        assert!(validate_seccomp_fd(short.as_raw_fd(), 999, None).is_err());
+        assert!(validate_seccomp_fd(short.as_raw_fd(), ControlFd::plain(999), None).is_err());
     }
 
     #[test]
@@ -1521,7 +1578,7 @@ mod tests {
     fn validate_exe_fd_table() {
         // Issue #19: the shim's executable fd. Stage Control, pinned reasons.
         let msg = |e: RawFd, c: RawFd, k: Option<RawFd>, s: Option<RawFd>| {
-            validate_exe_fd(e, c, k, s)
+            validate_exe_fd(e, ControlFd::plain(c), k, s)
                 .expect_err("must reject")
                 .to_string()
         };
@@ -1572,7 +1629,7 @@ mod tests {
             )
         );
         let me = std::fs::File::open("/proc/self/exe").expect("open self");
-        assert!(validate_exe_fd(me.as_raw_fd(), 999, None, None).is_ok());
+        assert!(validate_exe_fd(me.as_raw_fd(), ControlFd::plain(999), None, None).is_ok());
     }
 
     #[test]
@@ -1711,7 +1768,7 @@ mod tests {
     fn validate_status_fd_table() {
         // M1: a pipe open for writing, distinct from every other inherited fd.
         let msg = |st: RawFd| {
-            validate_status_fd(st, 999, None, None, None)
+            validate_status_fd(st, ControlFd::plain(999), None, None, None)
                 .expect_err("must reject")
                 .to_string()
         };
@@ -1728,18 +1785,18 @@ mod tests {
         assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         let (rd, wr) = (p[0], p[1]);
         assert_eq!(
-            validate_status_fd(wr, 999, Some(wr), None, None)
+            validate_status_fd(wr, ControlFd::plain(999), Some(wr), None, None)
                 .expect_err("keep")
                 .to_string(),
             format!("sbx __init: control: --status-fd {wr} must differ from --keep-fd")
         );
         assert_eq!(
-            validate_status_fd(rd, 999, None, None, None)
+            validate_status_fd(rd, ControlFd::plain(999), None, None, None)
                 .expect_err("read end")
                 .to_string(),
             format!("sbx __init: control: --status-fd {rd} is not open for writing")
         );
-        assert!(validate_status_fd(wr, 999, None, None, None).is_ok());
+        assert!(validate_status_fd(wr, ControlFd::plain(999), None, None, None).is_ok());
         // SAFETY: closing the pipe ends created above.
         unsafe {
             libc::close(rd);
@@ -1747,7 +1804,7 @@ mod tests {
         }
         let file = std::fs::File::open("/dev/null").expect("open");
         assert_eq!(
-            validate_status_fd(file.as_raw_fd(), 999, None, None, None)
+            validate_status_fd(file.as_raw_fd(), ControlFd::plain(999), None, None, None)
                 .expect_err("not a pipe")
                 .to_string(),
             format!(
@@ -1812,5 +1869,56 @@ mod tests {
         // and the staged-prefix shape is pinned by the integration suite's
         // fail-* scenarios and the CI smoke's `sbx __init: control:` grep.
         let _code = run_init(args(999, None, None));
+    }
+
+    /// Issue #18 review: a join-mode validator names `--join-user`, the flag the
+    /// caller passed, and never the plain pipeline's `--fd`.
+    #[test]
+    fn join_mode_validators_name_join_user() {
+        let user = ControlFd::join_user(999);
+        let err = validate_keep_fd(999, user).expect_err("keep equals the join user fd");
+        assert_eq!(
+            err.to_string(),
+            "sbx __init: control: --keep-fd 999 must differ from --join-user"
+        );
+        let err = validate_seccomp_fd(999, user, None).expect_err("seccomp equals it");
+        assert_eq!(
+            err.to_string(),
+            "sbx __init: control: --seccomp-fd 999 must differ from --join-user"
+        );
+        let err = validate_exe_fd(999, user, None, None).expect_err("exe equals it");
+        assert_eq!(
+            err.to_string(),
+            "sbx __init: control: --exe-fd 999 must differ from --join-user"
+        );
+        let err = validate_status_fd(999, user, None, None, None).expect_err("status equals it");
+        assert_eq!(
+            err.to_string(),
+            "sbx __init: control: --status-fd 999 must differ from --join-user"
+        );
+        // The plain pipeline's messages are unchanged (pinned by the tests above).
+        let plain = validate_keep_fd(999, ControlFd::plain(999)).expect_err("keep equals --fd");
+        assert_eq!(
+            plain.to_string(),
+            "sbx __init: control: --keep-fd 999 must differ from --fd"
+        );
+    }
+
+    /// The same, through the join pipeline itself: a `--keep-fd` equal to the
+    /// `--join-user` descriptor is refused with the join flag's name. Both
+    /// descriptors are real namespace links, so the earlier checks pass.
+    #[test]
+    fn join_pipeline_refuses_keep_fd_naming_join_user() {
+        let user = std::fs::File::open("/proc/self/ns/user").expect("open the user namespace");
+        let net = std::fs::File::open("/proc/self/ns/net").expect("open the network namespace");
+        let (user_fd, net_fd) = (user.as_raw_fd(), net.as_raw_fd());
+        let mut join_args = args(-1, Some(user_fd), None);
+        join_args.join = Some((user_fd, net_fd));
+        let err = pipeline(&join_args).expect_err("keep-fd equal to --join-user is refused");
+        assert_eq!(
+            err.to_string(),
+            format!("sbx __init: control: --keep-fd {user_fd} must differ from --join-user")
+        );
+        assert_eq!(err.stage(), Stage::Control);
     }
 }

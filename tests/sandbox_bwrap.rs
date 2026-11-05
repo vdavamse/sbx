@@ -514,7 +514,7 @@ echo "SBX-BW-MARKER hosts=$(tr '\n' '|' < /etc/hosts)"
         out.stdout
     );
     assert!(
-        has_marker(&out, "hosts=127.0.0.1 localhost|::1 localhost|"),
+        has_marker(&out, "hosts=127.0.0.1 localhost|127.0.1.1 sandbox|"),
         "/etc/hosts must be the synthetic loopback-only one (issue #35):\n{}",
         out.stdout
     );

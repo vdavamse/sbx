@@ -480,6 +480,7 @@ pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
     if let Cmd::Run {
         landlock,
         landlock_bind_tcp,
+        keep_alive,
         ..
     } = &cli.command
     {
@@ -487,6 +488,19 @@ pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
             return Err(Cli::command().error(
                 clap::error::ErrorKind::ArgumentConflict,
                 "--landlock-bind-tcp needs --landlock best-effort or require",
+            ));
+        }
+        // Issue #18 with #56: a session pins its Landlock settings in one wire
+        // frame, which holds at most MAX_BIND_TCP ports. Refused here, before
+        // anything runs, so the holder never starts with ports it cannot send.
+        let max = crate::run::keepalive::proto::MAX_BIND_TCP;
+        if *keep_alive && landlock_bind_tcp.len() > max {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ValueValidation,
+                format!(
+                    "--keep-alive takes at most {max} --landlock-bind-tcp ports (this run names {}); the session's settings travel in one control frame",
+                    landlock_bind_tcp.len()
+                ),
             ));
         }
     }
@@ -1822,6 +1836,47 @@ mod tests {
                 .contains("--landlock-bind-tcp needs --landlock best-effort or require"),
             "{err}"
         );
+    }
+
+    /// `run` argv with `ports` `--landlock-bind-tcp` flags and the given extras.
+    fn run_with_ports(ports: usize, extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv: Vec<String> = [
+            "sbx",
+            "run",
+            "--policy",
+            "p.json",
+            "--session-dir",
+            "/tmp/s",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        argv.extend(extra.iter().map(|x| (*x).to_owned()));
+        argv.extend(["--landlock".to_owned(), "best-effort".to_owned()]);
+        for port in 0..ports {
+            argv.push("--landlock-bind-tcp".to_owned());
+            argv.push((port + 1).to_string());
+        }
+        argv.extend(["--", "/bin/true"].map(str::to_owned));
+        Cli::try_parse_from(argv).and_then(|cli| validate(&cli).map(|()| cli))
+    }
+
+    #[test]
+    fn keep_alive_caps_the_bind_ports_at_the_wire_limit() {
+        use crate::run::keepalive::proto::MAX_BIND_TCP;
+        // The limit itself is accepted with --keep-alive.
+        run_with_ports(MAX_BIND_TCP, &["--keep-alive"]).expect("256 ports are within the cap");
+        // One more is a usage error that names the limit (rc 2 through clap).
+        let err = run_with_ports(MAX_BIND_TCP + 1, &["--keep-alive"])
+            .expect_err("257 ports with --keep-alive are refused");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(
+            err.to_string().contains(
+                "--keep-alive takes at most 256 --landlock-bind-tcp ports (this run names 257)"
+            ),
+            "{err}"
+        );
+        // A plain run keeps the old behaviour: no port cap.
+        run_with_ports(MAX_BIND_TCP + 1, &[]).expect("plain run is unchanged");
     }
 
     #[test]

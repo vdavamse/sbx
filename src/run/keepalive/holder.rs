@@ -1010,6 +1010,12 @@ mod tests {
     /// A holder over a real listener, with dummy descriptors and an audit log
     /// that writes nothing: enough to exercise the control handlers in-process.
     fn test_holder(listener: UnixListener, dir: OwnedFd) -> Holder {
+        let audit = AuditLog::new(None, crate::run::serve::FaultLatch::new().expect("latch"));
+        test_holder_with(listener, dir, audit)
+    }
+
+    /// [`test_holder`] with the audit sink the test reads back.
+    fn test_holder_with(listener: UnixListener, dir: OwnedFd, audit: Arc<AuditLog>) -> Holder {
         let dev_null = || OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null"));
         listener.set_nonblocking(true).expect("nonblocking");
         Holder {
@@ -1021,7 +1027,7 @@ mod tests {
             user_ns: dev_null(),
             net_ns: dev_null(),
             net_mode: "transparent",
-            audit: AuditLog::new(None, crate::run::serve::FaultLatch::new().expect("latch")),
+            audit,
             map: Arc::new(FakeIpMap::new(&crate::dns::DnsLimits::default())),
             landlock: SessionLandlock::off(),
             calls: Vec::new(),
@@ -1073,6 +1079,73 @@ mod tests {
             !dir.join(ctl::CTL_NAME).exists(),
             "the control socket is removed"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #18 with #9: the call exit row's `dns_poisoned` follows the session's
+    /// fake-IP map. The map is poisoned the way a panic inside its lock poisons it
+    /// (`poison_for_test` panics while holding the lock on another thread); the
+    /// call end recorded before that is `false`, the one after is `true`. Both rows
+    /// are read back from the audit file the holder writes.
+    #[test]
+    fn a_poisoned_session_map_marks_the_call_exit_row() {
+        use crate::run::keepalive::proto::CallEnd;
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("sbx-holder-dns-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("session dir");
+        let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind");
+        let audit_path = dir.join("audit.jsonl");
+        let file = crate::run::audit::open_audit(&audit_path).expect("open the audit file");
+        let audit = AuditLog::new(
+            Some(file),
+            crate::run::serve::FaultLatch::new().expect("latch"),
+        );
+        let mut holder = test_holder_with(listener, dirfd, audit);
+
+        // Two admitted calls, both owned by this process (the call end must match).
+        let me = std::process::id() as libc::pid_t;
+        for id in [1, 2] {
+            holder.calls.push(Call {
+                id,
+                pid: me,
+                pidfd: sys::pidfd_open(me).expect("pidfd of this process"),
+                started: Instant::now(),
+            });
+        }
+        let end = |call_id: u32| CallEnd {
+            call_id,
+            rc: 0,
+            duration_ms: 1,
+            outcome: "exited",
+            truncated: false,
+            reason: "command exited with status 0".into(),
+        };
+        let (peer, _other_end) = UnixStream::pair().expect("socket pair");
+
+        holder.call_end(&peer, me, end(1), Instant::now());
+        assert!(!holder.map.poisoned(), "the map starts healthy");
+        holder.map.poison_for_test();
+        assert!(holder.map.poisoned(), "the map is poisoned");
+        holder.call_end(&peer, me, end(2), Instant::now());
+
+        let text = std::fs::read_to_string(&audit_path).expect("read the audit file");
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each audit row is JSON"))
+            .collect();
+        let exit_of = |call_id: u64| {
+            rows.iter()
+                .find(|r| r["event"] == "exit" && r["call_id"] == call_id)
+                .unwrap_or_else(|| panic!("an exit row for call {call_id}: {text}"))
+                .clone()
+        };
+        assert_eq!(exit_of(1)["dns_poisoned"], false, "before poisoning");
+        assert_eq!(exit_of(2)["dns_poisoned"], true, "after poisoning");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

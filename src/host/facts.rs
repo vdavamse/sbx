@@ -312,12 +312,32 @@ pub const SOCKET_SCAN_MAX_ENTRIES: usize = 500_000;
 /// Depth bound of [`socket_scan`] below each root.
 pub const SOCKET_SCAN_MAX_DEPTH: usize = 32;
 
-/// What [`socket_scan`] saw: the socket files (sorted, deduped) and whether a
-/// bound cut the walk short (then `found` is not exhaustive).
+/// What [`socket_scan`] saw: the socket files (sorted, deduped), whether a
+/// bound cut the walk short, and the directories that could not be listed
+/// (sorted, deduped). With `truncated` or a non-empty `unlisted`, `found` is
+/// not exhaustive.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SocketScan {
     pub found: Vec<PathBuf>,
     pub truncated: bool,
+    pub unlisted: Vec<PathBuf>,
+}
+
+/// Shadowed destinations that hide EVERY policy path at or under them:
+/// `--proc /proc --dev /dev` are argv element 7, emitted after all binds
+/// (bwrap/mod.rs module docs point 4), so no bind under them escapes. The
+/// other shadows (the session leaves, element 6) are escaped by a deeper
+/// policy bind, which sorts and mounts after them.
+const ABSOLUTE_SHADOWS: [&str; 2] = ["/dev", "/proc"];
+
+/// Split `shadows` into (absolute, escapable) per [`ABSOLUTE_SHADOWS`].
+fn split_shadows<'a>(shadows: &[&'a str]) -> (Vec<&'a Path>, Vec<&'a Path>) {
+    let (abs, esc): (Vec<&str>, Vec<&str>) =
+        shadows.iter().partition(|s| ABSOLUTE_SHADOWS.contains(s));
+    (
+        abs.into_iter().map(Path::new).collect(),
+        esc.into_iter().map(Path::new).collect(),
+    )
 }
 
 /// Walk `roots` (the policy `ro`/`rw` binds) for unix socket files the payload
@@ -326,31 +346,49 @@ pub struct SocketScan {
 /// shadowed destinations ([`crate::bwrap::shadowed_dests`]) and the
 /// [`SOCKET_SCAN_MAX_ENTRIES`]/[`SOCKET_SCAN_MAX_DEPTH`] bounds.
 pub fn socket_scan(roots: &[&Path], skip: &[&Path]) -> SocketScan {
-    let shadows = crate::bwrap::shadowed_dests();
-    let shadows: Vec<&Path> = shadows.iter().map(Path::new).collect();
+    let all = crate::bwrap::shadowed_dests();
+    let (absolute, escapable) = split_shadows(&all);
+    // An absolute shadow hides like a deny mask: roots included.
+    let mut masks: Vec<&Path> = skip.to_vec();
+    masks.extend(absolute);
     socket_scan_bounded(
         roots,
-        skip,
-        &shadows,
+        &masks,
+        &escapable,
         SOCKET_SCAN_MAX_ENTRIES,
         SOCKET_SCAN_MAX_DEPTH,
     )
+}
+
+/// Whether the caller may search (`x`) `dir`, by its effective ids
+/// (`faccessat(AT_EACCESS)`).
+fn searchable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the
+    // call; faccessat reads it and touches no other memory.
+    unsafe { libc::faccessat(libc::AT_FDCWD, c.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
 }
 
 /// The bounded walk behind [`socket_scan`].
 ///
 /// - `skip` (the deny masks) hides every path at or under it, roots
 ///   included: bwrap's deny `--tmpfs` mounts come after every bind.
-/// - `shadow` (destinations sbx mounts over AFTER the policy binds: the
-///   session leaves and `/proc`, `/dev`) hides what is at or under it in a
-///   root's walk, unless the root lies strictly below that shadow. Such a
-///   root is its own bind, which sorts and mounts after the shadow.
+/// - `shadow` (escapable shadows: the session leaves, which sbx mounts after
+///   the policy binds) hides what is at or under it in a root's walk, unless
+///   the root lies strictly below that shadow. Such a root is its own bind,
+///   which sorts and mounts after the shadow. `/proc` and `/dev` are not
+///   escapable; [`socket_scan`] passes them in `skip`.
 /// - Roots follow symlinks (bwrap's bind does). Entries below them are
 ///   `lstat`ed and not followed: inside the sandbox a link resolves against
 ///   the sandbox view, which only holds other binds, walked as their own
 ///   roots.
-/// - Unreadable directories are skipped. They are unreadable to the payload
-///   too (same uid).
+/// - A directory that cannot be listed is recorded in `unlisted`: `connect`
+///   needs only search permission, so a payload that knows a socket's name
+///   can still reach it (a 0711 directory). A root that an earlier root
+///   covers but that sits under an unlisted directory is walked on its own.
 /// - `truncated` is set when `max_entries` stops the walk (`found` is then
 ///   partial) or a directory sits at `max_depth`.
 pub fn socket_scan_bounded(
@@ -392,31 +430,42 @@ pub fn socket_scan_bounded(
 
     let mut scan = SocketScan::default();
     let mut visited = 0usize;
-    'roots: for root in kept {
+    // Walks one root; false when max_entries stopped the scan.
+    let mut walk = |root: &Path, scan: &mut SocketScan| -> bool {
         let shadows = shadows_for(root);
         if hidden(root, &shadows) {
-            continue;
+            return true;
         }
         let Ok(meta) = fs::metadata(root) else {
-            continue;
+            return true;
         };
         if meta.file_type().is_socket() {
             scan.found.push(root.to_path_buf());
-            continue;
+            return true;
         }
         if !meta.is_dir() {
-            continue;
+            return true;
         }
         let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
         while let Some((dir, depth)) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    // Only a directory the caller can still SEARCH hides a
+                    // reachable socket (0711); one it cannot search (0700,
+                    // 0750, e.g. /etc/ssl/private) is unreachable to the
+                    // payload too, same uid (review of #61).
+                    if e.kind() == std::io::ErrorKind::PermissionDenied && searchable(&dir) {
+                        scan.unlisted.push(dir);
+                    }
+                    continue;
+                }
             };
             for entry in entries.flatten() {
                 visited += 1;
                 if visited > max_entries {
                     scan.truncated = true;
-                    break 'roots;
+                    return false;
                 }
                 let path = entry.path();
                 if hidden(&path, &shadows) {
@@ -436,7 +485,45 @@ pub fn socket_scan_bounded(
                 }
             }
         }
+        true
+    };
+    let mut done = Vec::new();
+    let mut complete = true;
+    for root in &kept {
+        done.push(*root);
+        if !walk(root, &mut scan) {
+            complete = false;
+            break;
+        }
     }
+    // A covered root whose nearest walked ancestor root stopped at an
+    // unlisted directory above it was never reached: walk it as its own root
+    // (bwrap binds it regardless). One at a time, to a fixpoint, so a root
+    // nested in another extra root is not walked twice and directories
+    // found unlisted by the extra walks are honoured too.
+    let mut pending: Vec<&Path> = roots.to_vec();
+    pending.sort();
+    pending.dedup();
+    while complete {
+        let next = pending.iter().copied().find(|r| {
+            if done.contains(r) {
+                return false;
+            }
+            let cover = done
+                .iter()
+                .copied()
+                .filter(|d| r.starts_with(d))
+                .max_by_key(|d| d.as_os_str().len());
+            scan.unlisted.iter().any(|u| {
+                r.starts_with(u) && *r != u.as_path() && cover.is_none_or(|d| u.starts_with(d))
+            })
+        });
+        let Some(root) = next else { break };
+        done.push(root);
+        complete = walk(root, &mut scan);
+    }
+    scan.unlisted.sort();
+    scan.unlisted.dedup();
     scan.found.sort();
     scan.found.dedup();
     scan
@@ -515,6 +602,150 @@ mod tests {
         let scan = socket_scan_bounded(&[base.as_path()], &[], &shadow, 1000, 8);
         assert_eq!(scan.found, vec![outside.clone()]);
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Review of #48: `/proc` and `/dev` are absolute (mounted after every
+    /// bind), the session leaves are escapable by a deeper root.
+    #[test]
+    fn shadows_split_into_absolute_and_escapable() {
+        let all = crate::bwrap::shadowed_dests();
+        let (abs, esc) = split_shadows(&all);
+        assert_eq!(abs, vec![Path::new("/dev"), Path::new("/proc")]);
+        assert_eq!(
+            esc,
+            vec![Path::new("/root"), Path::new("/tmp"), Path::new("/work")]
+        );
+        // As a mask (what socket_scan does with the absolute ones), a root
+        // strictly below it is hidden too: `rw: ["/dev/shm"]` cannot expose
+        // a socket, because `--dev /dev` mounts over it.
+        let base = scratch("socket-scan-absolute");
+        let dev = base.join("dev");
+        let shm = dev.join("shm");
+        fs::create_dir_all(&shm).expect("mkdir");
+        let sock = shm.join("s.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let scan = socket_scan_bounded(
+            &[dev.as_path(), shm.as_path()],
+            &[dev.as_path()],
+            &[],
+            1000,
+            8,
+        );
+        assert!(scan.found.is_empty(), "{scan:?}");
+        // The same layout as an escapable shadow: the deeper root escapes.
+        let scan = socket_scan_bounded(
+            &[dev.as_path(), shm.as_path()],
+            &[],
+            &[dev.as_path()],
+            1000,
+            8,
+        );
+        assert_eq!(scan.found, vec![sock.clone()]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Review of #48: a directory that cannot be listed is recorded, and a
+    /// root covered by an earlier root but sitting under that directory is
+    /// still walked (connect needs only search permission).
+    #[test]
+    fn socket_scan_records_unlisted_dirs_and_walks_roots_under_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("socket-scan-unlisted");
+        let locked = base.join("alice");
+        let proj = locked.join("proj");
+        fs::create_dir_all(&proj).expect("mkdir");
+        let sock = proj.join("agent.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).expect("chmod");
+        // Root (uid 0) lists any directory: the case cannot be built there.
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+            let _ = fs::remove_dir_all(&base);
+            eprintln!("skip: running as root, 0311 is listable");
+            return;
+        }
+        let only_outer = socket_scan_bounded(&[base.as_path()], &[], &[], 1000, 8);
+        assert!(only_outer.found.is_empty());
+        assert_eq!(only_outer.unlisted, vec![locked.clone()]);
+        let both = socket_scan_bounded(&[base.as_path(), proj.as_path()], &[], &[], 1000, 8);
+        assert_eq!(both.found, vec![sock.clone()], "{both:?}");
+        assert_eq!(both.unlisted, vec![locked.clone()]);
+        // A directory the caller can neither list nor search (0700 owned by
+        // another user, modelled by 0000) is unreachable to the payload too:
+        // not recorded, no warning (review of #61).
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
+        let closed = socket_scan_bounded(&[base.as_path()], &[], &[], 1000, 8);
+        assert!(closed.unlisted.is_empty(), "{closed:?}");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).expect("chmod");
+        // Nested extra roots: proj and proj/sub are both covered by base and
+        // both under the unlisted dir; proj/sub is reached by proj's walk,
+        // so it is walked once (the visited budget proves it).
+        let sub = proj.join("sub");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+        fs::create_dir_all(&sub).expect("mkdir");
+        fs::write(sub.join("f"), b"").expect("write");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).expect("chmod");
+        let nested = socket_scan_bounded(
+            &[base.as_path(), proj.as_path(), sub.as_path()],
+            &[],
+            &[],
+            1000,
+            8,
+        );
+        assert_eq!(nested.found, vec![sock.clone()], "{nested:?}");
+        // Visits: base lists alice (1); proj lists agent.sock and sub (2);
+        // sub lists f (1) = 4. A second walk of sub would visit f again (5),
+        // so a budget of exactly 4 truncates if and only if sub is re-walked.
+        let tight = socket_scan_bounded(
+            &[base.as_path(), proj.as_path(), sub.as_path()],
+            &[],
+            &[],
+            4,
+            8,
+        );
+        assert!(!tight.truncated, "sub walked twice: {tight:?}");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Review of #61: a directory found unlisted only during an extra root's
+    /// walk is honoured too (fixpoint): base ⊃ A(0311) ⊃ p1 ⊃ B(0311) ⊃ p2.
+    #[test]
+    fn socket_scan_follows_unlisted_dirs_found_by_extra_walks() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("socket-scan-unlisted-chain");
+        let a = base.join("A");
+        let p1 = a.join("p1");
+        let b = p1.join("B");
+        let p2 = b.join("p2");
+        fs::create_dir_all(&p2).expect("mkdir");
+        let sock = p2.join("s.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        for d in [&a, &b] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o311)).expect("chmod");
+        }
+        let restore = || {
+            for d in [&b, &a] {
+                let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
+            }
+        };
+        if fs::read_dir(&a).is_ok() {
+            restore();
+            let _ = fs::remove_dir_all(&base);
+            eprintln!("skip: running as root, 0311 is listable");
+            return;
+        }
+        let scan = socket_scan_bounded(
+            &[base.as_path(), p1.as_path(), p2.as_path()],
+            &[],
+            &[],
+            1000,
+            8,
+        );
+        assert_eq!(scan.found, vec![sock.clone()], "{scan:?}");
+        assert_eq!(scan.unlisted, vec![a.clone(), b.clone()]);
+        restore();
         let _ = fs::remove_dir_all(&base);
     }
 
