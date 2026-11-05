@@ -1,6 +1,6 @@
-//! The host tier's 46 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H);
-//! group I (the persistent-session checks of issue #18) is evaluated by
-//! [`super::session_tier`] and also counts in the host tier.
+//! The host tier's 52 checks: 46 scenario checks (issue #13, §4 groups A, B, C,
+//! D, F05/F06, G, H) and group I's six persistent-session checks (issue #18),
+//! which [`super::session_tier`] evaluates.
 //! the scenario plan and the pure evaluators over scenario evidence.
 //!
 //! Evaluation rules (review fixes):
