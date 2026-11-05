@@ -492,6 +492,14 @@ fn audit_rows_carry_call_ids() {
         .expect("call 1 row");
     assert_eq!(call["code"], 7);
     assert_eq!(call["outcome"], "exited");
+    assert_eq!(
+        call["output_truncated"], false,
+        "the call's truncation flag reaches the row"
+    );
+    assert!(
+        call["reason"].is_string(),
+        "the call's reason reaches the row: {call}"
+    );
     let resident = exits
         .iter()
         .find(|r| r["call_id"] == 0)

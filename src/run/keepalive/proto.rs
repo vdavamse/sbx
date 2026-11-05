@@ -28,6 +28,9 @@ pub(crate) const MAX_REASON: usize = 512;
 /// The call outcomes a `CallEnd` may carry (the audit exit-row vocabulary).
 pub(crate) const OUTCOMES: [&str; 5] = ["exited", "signaled", "timeout", "terminated", "failed"];
 
+/// The fixed part of a call end: call id, rc, duration, flags, outcome length.
+const CALL_END_FIXED: usize = 4 + 4 + 8 + 1 + 1;
+
 const OP_ATTACH: u8 = b'A';
 const OP_CALL_END: u8 = b'E';
 const OP_STOP: u8 = b'S';
@@ -74,6 +77,13 @@ pub(crate) struct Frame {
     pub(crate) payload: Vec<u8>,
 }
 
+/// The longest reason a call end carries (review 5): the rest is cut at a
+/// character boundary, like a refusal reason.
+pub(crate) const MAX_CALL_REASON: usize = 256;
+
+/// The flag bit of a call end whose output was cut at `limits.output_bytes`.
+const FLAG_TRUNCATED: u8 = 0b0000_0001;
+
 /// The end of one attached call, as the attach process reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallEnd {
@@ -82,6 +92,10 @@ pub(crate) struct CallEnd {
     pub(crate) duration_ms: u64,
     /// One of [`OUTCOMES`].
     pub(crate) outcome: &'static str,
+    /// The call's output hit `limits.output_bytes` (the exit row's flag).
+    pub(crate) truncated: bool,
+    /// The exit row's reason text, at most [`MAX_CALL_REASON`] bytes.
+    pub(crate) reason: String,
 }
 
 /// A request from an attach process or `sbx stop`.
@@ -113,11 +127,19 @@ impl Request {
         match self {
             Request::Attach(policy) => (OP_ATTACH, policy.clone()),
             Request::CallEnd(end) => {
-                let mut p = Vec::with_capacity(4 + 4 + 8 + end.outcome.len());
+                let mut reason_end = end.reason.len().min(MAX_CALL_REASON);
+                while !end.reason.is_char_boundary(reason_end) {
+                    reason_end -= 1;
+                }
+                let flags = if end.truncated { FLAG_TRUNCATED } else { 0 };
+                let mut p = Vec::with_capacity(CALL_END_FIXED + end.outcome.len() + reason_end);
                 p.extend_from_slice(&end.call_id.to_be_bytes());
                 p.extend_from_slice(&end.rc.to_be_bytes());
                 p.extend_from_slice(&end.duration_ms.to_be_bytes());
+                p.push(flags);
+                p.push(end.outcome.len() as u8);
                 p.extend_from_slice(end.outcome.as_bytes());
+                p.extend_from_slice(&end.reason.as_bytes()[..reason_end]);
                 (OP_CALL_END, p)
             }
             Request::Stop => (OP_STOP, Vec::new()),
@@ -130,7 +152,7 @@ impl Request {
             OP_ATTACH => Ok(Request::Attach(frame.payload)),
             OP_CALL_END => {
                 let p = &frame.payload;
-                if p.len() < 16 {
+                if p.len() < CALL_END_FIXED {
                     return Err(ProtoError::Malformed(
                         "call end is shorter than its fixed fields",
                     ));
@@ -138,7 +160,19 @@ impl Request {
                 let call_id = u32::from_be_bytes(p[0..4].try_into().expect("4 bytes"));
                 let rc = i32::from_be_bytes(p[4..8].try_into().expect("4 bytes"));
                 let duration_ms = u64::from_be_bytes(p[8..16].try_into().expect("8 bytes"));
-                let text = std::str::from_utf8(&p[16..])
+                let flags = p[16];
+                if flags & !FLAG_TRUNCATED != 0 {
+                    return Err(ProtoError::Malformed("call end sets an unknown flag"));
+                }
+                let outcome_len = p[17] as usize;
+                let rest = &p[CALL_END_FIXED..];
+                if rest.len() < outcome_len {
+                    return Err(ProtoError::Malformed(
+                        "call outcome is longer than the frame",
+                    ));
+                }
+                let (outcome_bytes, reason_bytes) = rest.split_at(outcome_len);
+                let text = std::str::from_utf8(outcome_bytes)
                     .map_err(|_| ProtoError::Malformed("call outcome is not UTF-8"))?;
                 let outcome = OUTCOMES
                     .iter()
@@ -147,11 +181,19 @@ impl Request {
                     .ok_or(ProtoError::Malformed(
                         "call outcome is not in the vocabulary",
                     ))?;
+                if reason_bytes.len() > MAX_CALL_REASON {
+                    return Err(ProtoError::Malformed("call reason is longer than the cap"));
+                }
+                let reason = std::str::from_utf8(reason_bytes)
+                    .map_err(|_| ProtoError::Malformed("call reason is not UTF-8"))?
+                    .to_owned();
                 Ok(Request::CallEnd(CallEnd {
                     call_id,
                     rc,
                     duration_ms,
                     outcome,
+                    truncated: flags & FLAG_TRUNCATED != 0,
+                    reason,
                 }))
             }
             OP_STOP => {
@@ -237,6 +279,8 @@ mod tests {
             rc: -1,
             duration_ms: 1234,
             outcome: "timeout",
+            truncated: true,
+            reason: "timed out after 2s".into(),
         });
         assert_eq!(round_trip_request(end.clone()), end);
     }
@@ -248,12 +292,26 @@ mod tests {
             rc: 2,
             duration_ms: 3,
             outcome: "exited",
+            truncated: true,
+            reason: "ok".into(),
         });
         let (op, payload) = end.encode();
         assert_eq!(op, b'E');
-        let mut want = vec![0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3];
+        // call id, rc, duration, flags (truncated), outcome length, outcome, reason.
+        let mut want = vec![0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 1, 6];
         want.extend_from_slice(b"exited");
+        want.extend_from_slice(b"ok");
         assert_eq!(payload, want);
+
+        let bare = Request::CallEnd(CallEnd {
+            call_id: 0,
+            rc: 0,
+            duration_ms: 0,
+            outcome: "failed",
+            truncated: false,
+            reason: String::new(),
+        });
+        assert_eq!(bare.encode().1.len(), CALL_END_FIXED + "failed".len());
     }
 
     #[test]
@@ -351,6 +409,66 @@ mod tests {
     }
 
     #[test]
+    fn call_end_rejects_bad_flags_reasons_and_lengths() {
+        let frame = |bytes: Vec<u8>| Frame {
+            op: b'E',
+            payload: bytes,
+        };
+        let head = |flags: u8, olen: u8| {
+            let mut v = vec![0u8; 16];
+            v.push(flags);
+            v.push(olen);
+            v
+        };
+        // An unknown flag bit.
+        let mut bad_flag = head(0b10, 6);
+        bad_flag.extend_from_slice(b"exited");
+        assert!(matches!(
+            Request::decode(frame(bad_flag)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // An outcome length longer than the frame.
+        assert!(matches!(
+            Request::decode(frame(head(0, 9))),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A reason longer than the cap.
+        let mut long = head(0, 6);
+        long.extend_from_slice(b"exited");
+        long.extend(std::iter::repeat_n(b'x', MAX_CALL_REASON + 1));
+        assert!(matches!(
+            Request::decode(frame(long)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A reason that is not UTF-8.
+        let mut bad_utf8 = head(0, 6);
+        bad_utf8.extend_from_slice(b"exited");
+        bad_utf8.push(0xff);
+        assert!(matches!(
+            Request::decode(frame(bad_utf8)),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn call_end_reason_is_cut_to_the_cap_at_a_char_boundary() {
+        let reason = format!("{}é", "a".repeat(MAX_CALL_REASON - 1));
+        let end = Request::CallEnd(CallEnd {
+            call_id: 1,
+            rc: 0,
+            duration_ms: 0,
+            outcome: "exited",
+            truncated: false,
+            reason,
+        });
+        let back = round_trip_request(end);
+        match back {
+            Request::CallEnd(e) => assert_eq!(e.reason.len(), MAX_CALL_REASON - 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn every_vocabulary_outcome_is_accepted() {
         for outcome in OUTCOMES {
             let end = Request::CallEnd(CallEnd {
@@ -358,6 +476,8 @@ mod tests {
                 rc: 0,
                 duration_ms: 0,
                 outcome,
+                truncated: false,
+                reason: String::new(),
             });
             assert_eq!(round_trip_request(end.clone()), end);
         }

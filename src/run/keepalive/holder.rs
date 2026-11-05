@@ -74,7 +74,7 @@ use super::join::capture_namespaces;
 use super::limits::{Clock, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME, EndReason};
 use super::pin::{MISMATCH, PolicyPin};
 use super::proto::{Reply, Request};
-use crate::run::audit::{AuditLog, call_exit_row, ts};
+use crate::run::audit::{AuditLog, CallExit, call_exit_row, ts};
 use crate::run::lifecycle::{Cause, Extra};
 use crate::run::sys;
 use crate::run::{RunArgs, RunError};
@@ -604,11 +604,15 @@ impl Holder {
         self.calls.remove(pos);
         self.audit.append_row(&call_exit_row(
             ts(SystemTime::now()),
-            end.call_id,
-            end.rc,
-            end.outcome,
-            end.duration_ms,
-            Some(self.net_mode),
+            &CallExit {
+                call_id: end.call_id,
+                code: end.rc,
+                outcome: end.outcome,
+                duration_ms: end.duration_ms,
+                net_mode: Some(self.net_mode),
+                truncated: end.truncated,
+                reason: &end.reason,
+            },
         ));
         self.clock.call_ended(now);
         reply(stream, &Reply::Done, &[], self.conn_deadline);
@@ -631,11 +635,15 @@ impl Holder {
                 .unwrap_or(u64::MAX);
             self.audit.append_row(&call_exit_row(
                 ts(SystemTime::now()),
-                call.id,
-                crate::run::EXIT_FAILURE,
-                "failed",
-                ms,
-                Some(self.net_mode),
+                &CallExit {
+                    call_id: call.id,
+                    code: crate::run::EXIT_FAILURE,
+                    outcome: "failed",
+                    duration_ms: ms,
+                    net_mode: Some(self.net_mode),
+                    truncated: false,
+                    reason: "the attach process exited without reporting the call end",
+                },
             ));
             self.clock.call_ended(now);
         }
@@ -671,14 +679,15 @@ impl Holder {
             let _ = sys::pidfd_kill(call.pidfd.as_fd());
             let ms = u64::try_from(now.saturating_duration_since(call.started).as_millis())
                 .unwrap_or(u64::MAX);
-            self.audit.append_row(&call_exit_row(
-                ts(SystemTime::now()),
-                call.id,
-                143,
-                "terminated",
-                ms,
-                Some(self.net_mode),
-            ));
+            self.audit.append_row(&call_exit_row(ts(SystemTime::now()), &CallExit {
+call_id: call.id,
+code: 143,
+outcome: "terminated",
+duration_ms: ms,
+net_mode: Some(self.net_mode),
+truncated: false,
+reason: "the session stopped while the call was running; it was killed after the grace period",
+}));
         }
     }
 

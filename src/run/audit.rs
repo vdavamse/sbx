@@ -206,27 +206,32 @@ pub(crate) fn exit_row_for(
     row
 }
 
+/// The fields of an attached call's exit row (issue #18).
+pub(crate) struct CallExit<'a> {
+    pub(crate) call_id: u32,
+    pub(crate) code: i32,
+    /// One of the pinned call outcomes (`protocol::OUTCOMES`).
+    pub(crate) outcome: &'static str,
+    pub(crate) duration_ms: u64,
+    pub(crate) net_mode: Option<&'static str>,
+    pub(crate) truncated: bool,
+    pub(crate) reason: &'a str,
+}
+
 /// The exit row of an attached call, built from the call end its attach
-/// process reported (issue #18). `code` is sbx's rc for the call and `outcome`
-/// one of the pinned call outcomes (`protocol::OUTCOMES`).
-pub(crate) fn call_exit_row(
-    ts: String,
-    call_id: u32,
-    code: i32,
-    outcome: &'static str,
-    duration_ms: u64,
-    net_mode: Option<&'static str>,
-) -> Row {
+/// process reported (issue #18). Written like [`exit_row_for`].
+pub(crate) fn call_exit_row(ts: String, call: &CallExit<'_>) -> Row {
     let mut row = Row::blank(ts, "exit");
+    row.reason = Some(call.reason.to_owned());
     row.exit = Some(ExitFields {
-        code,
-        outcome,
-        signal: (outcome == "signaled").then(|| code - 128),
-        duration_ms,
-        output_truncated: false,
+        code: call.code,
+        outcome: call.outcome,
+        signal: (call.outcome == "signaled").then(|| call.code - 128),
+        duration_ms: call.duration_ms,
+        output_truncated: call.truncated,
         dns_poisoned: false,
-        net_mode,
-        call_id: Some(call_id),
+        net_mode: call.net_mode,
+        call_id: Some(call.call_id),
     });
     row
 }

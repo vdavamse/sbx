@@ -36,8 +36,8 @@ use crate::bwrap::{Build, Launch, build};
 use crate::policy::Policy;
 use crate::run::lifecycle::{Cause, Extra, Pid1, Sandbox, supervise, teardown};
 use crate::run::plan::{
-    absolutize, effective_timeout, exit_code, lexical_normalize, outcome_label, passed_env,
-    sbx_diagnostic,
+    absolutize, effective_timeout, exit_code, exit_reason, lexical_normalize, outcome_label,
+    passed_env, sbx_diagnostic,
 };
 use crate::run::serve::FaultLatch;
 use crate::run::stdio::{OutputBudget, PumpEnd, Pumps};
@@ -190,7 +190,7 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
         Ok(done) => done,
         Err(early) => (early_outcome(early), PumpEnd::default(), false),
     };
-    report_call_end(&dir, id, &outcome, t0);
+    report_call_end(&dir, id, &outcome, end.truncated, t0);
     conclude_attach(outcome, end, stragglers, cap)
 }
 
@@ -330,7 +330,7 @@ fn join_command(
 
 /// Rule 6 of design point 4: tells the holder how the call ended. Best effort;
 /// the holder may already be gone, and the call's rc is unaffected either way.
-fn report_call_end(dir: &OwnedFd, id: u32, outcome: &Outcome, t0: Instant) {
+fn report_call_end(dir: &OwnedFd, id: u32, outcome: &Outcome, truncated: bool, t0: Instant) {
     let Ok(stream) = ctl::connect_ctl(dir.as_fd()) else {
         return;
     };
@@ -339,6 +339,9 @@ fn report_call_end(dir: &OwnedFd, id: u32, outcome: &Outcome, t0: Instant) {
         rc: exit_code(outcome),
         duration_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
         outcome: outcome_label(outcome),
+        truncated,
+        // The same reason `sbx run` writes on its exit row (bounded by the codec).
+        reason: exit_reason(outcome),
     };
     let (op, payload) = Request::CallEnd(end).encode();
     if ctl::send_frame(&stream, op, &payload, &[]).is_ok() {
