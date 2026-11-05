@@ -569,6 +569,14 @@ pub fn assemble(facts: &HostFacts) -> Report {
             let userns_failed = slots[index(CapId::Userns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
+            // Keep-alive needs unprivileged user namespaces. When userns failed
+            // at ANY stage (an early netns or listeners EPERM routed to userns by
+            // the AppArmor row included), its own step result is not evidence:
+            // the row is the userns skip, whatever the step reported.
+            if userns_failed {
+                slots[index(CapId::KeepAlive)] =
+                    Some(report_only(skip_row(CapId::KeepAlive, SKIP_USERNS)));
+            }
             let netns_failed = slots[index(CapId::Netns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
@@ -2341,6 +2349,79 @@ mod tests {
             EffectiveMode::Unavailable,
             "the probe failure, not keep-alive"
         );
+    }
+
+    /// `ok_steps()` with one step failed (keeping every other step as it is, so
+    /// the keep-alive steps can report ok on their own).
+    fn with_failed_step(name: &str, errno: i32) -> ProbeReport {
+        let mut probe = ok_steps();
+        for step in &mut probe.steps {
+            if step.step == name {
+                step.status = StepStatus::Fail;
+                step.errno = Some(errno);
+                step.reason = Some(format!("{name} failed"));
+            }
+        }
+        probe
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_a_later_stage() {
+        // AppArmor restricts unprivileged userns, and the netns EPERM is routed
+        // to the userns row (row 1). The keep-alive steps ran and reported ok,
+        // but the item must be the userns skip, not "ok" beside "userns FAIL".
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("netns", libc::EPERM)),
+            bwrap_ok(),
+            sysctls(Some(1), None, None),
+        ));
+        let userns = report
+            .capabilities
+            .iter()
+            .find(|c| c.id == CapId::Userns)
+            .expect("the userns item");
+        assert_eq!(userns.status, Status::Fail, "the routing is unchanged");
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None, "report-only: never limits the mode");
+        assert_eq!(ka.fix, None);
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_unshare() {
+        // The plain userns failure: keep-alive is the userns skip even when its
+        // own step failed too (the cascade's pidfd refusal, say).
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("unshare", libc::ENOSPC)),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None);
+
+        let mut probe = with_failed_step("unshare", libc::ENOSPC);
+        for step in &mut probe.steps {
+            if step.step == "pidfd-open" {
+                step.status = StepStatus::Fail;
+                step.errno = Some(libc::ENOSYS);
+                step.reason = Some("pidfd_open failed".to_owned());
+            }
+        }
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(
+            ka.status,
+            Status::Skip,
+            "a keep-alive warn is overridden too"
+        );
+        assert_eq!(ka.detail, SKIP_USERNS);
     }
 
     #[test]
