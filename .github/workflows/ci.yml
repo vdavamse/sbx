@@ -741,6 +741,34 @@ jobs:
           sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
             nft_meta nft_immediate nf_nat nft_counter || true
 
+      # Report-only: the runner's AppArmor state before the relaxation below
+      # (evidence for docs/kubernetes.md, "AppArmor"; never fails the job). The
+      # relaxation must come before the cluster: under the runner's defaults
+      # (kernel.apparmor_restrict_unprivileged_userns = 1) runc cannot mount
+      # sysfs for a hostUsers: false pod sandbox (EPERM), so the pod never
+      # starts (observed on the first CI run of this job).
+      - name: "Report: the runner's AppArmor state"
+        continue-on-error: true
+        run: |
+          set +e
+          {
+            echo "### Runner AppArmor state before relaxing it (report-only)"
+            echo '```'
+            echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>&1)"
+            echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1)"
+            sudo aa-status 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "no bwrap/unpriv AppArmor profiles listed"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Runner-only, the same relaxation the test job applies before its suites.
+      - name: Relax the runner's AppArmor userns restriction
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict \
+              || echo "::warning::could not unload AppArmor bwrap-userns-restrict"
+          fi
+
       - name: Create the kind cluster and start the example pod
         run: |
           kind create cluster --name "$CLUSTER" --config examples/kubernetes/kind-config.yaml --wait 180s
@@ -758,33 +786,6 @@ jobs:
           read -r INSIDE OUTSIDE COUNT <<< "$MAP"
           [ "$INSIDE" = 0 ] && [ "$OUTSIDE" != 0 ] && [ "$COUNT" = 65536 ] \
             || { echo "FAIL: the pod is not in its own user namespace"; exit 1; }
-
-      # Report-only: the runner's AppArmor defaults, before the gating steps relax
-      # them (evidence for docs/kubernetes.md, "AppArmor"; never fails the job).
-      - name: "Report: sbx check under the runner's AppArmor defaults"
-        continue-on-error: true
-        run: |
-          set +e
-          {
-            echo "### sbx check in the pod under the runner's AppArmor defaults (report-only)"
-            echo '```'
-            echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>&1)"
-            echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1)"
-            sudo aa-status 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "no bwrap/unpriv AppArmor profiles listed"
-            echo "pod LSM label: $(kubectl exec sbx-example -- cat /proc/self/attr/current 2>&1)"
-            kubectl exec sbx-example -- sbx check 2>&1
-            echo "rc=$?"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # Runner-only, the same relaxation the test job applies before its suites.
-      - name: Relax the runner's AppArmor userns restriction
-        run: |
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
-            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict \
-              || echo "::warning::could not unload AppArmor bwrap-userns-restrict"
-          fi
 
       - name: "sbx check in the pod (gating)"
         run: |
