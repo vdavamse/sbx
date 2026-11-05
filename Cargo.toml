@@ -23,6 +23,14 @@ httparse = "=1.10.1"
 humantime = "2.4"
 idna = "1.1"
 libc = { version = "0.2", default-features = false }
+# Optional Landlock layer (issue #19, `--landlock`): the exec shim inside the
+# sandbox (src/landlock) applies the filesystem, TCP-bind and signal-scope
+# rules. Pure Rust (static-musl OK); rust-version 1.71 <= MSRV 1.85; MIT OR
+# Apache-2.0. Its transitive crates are enumflags2 and thiserror (both pure
+# Rust, both already allowed by deny.toml's license list). Used only in the
+# `sbx` binary's shim path and in the forked unit tests; no `default-features`
+# knob exists, so the default feature set is taken as-is.
+landlock = "0.4.7"
 # DNS wire codec for the fake-IP resolver (issue #9): protocol only — no
 # resolver, no runtime, NO features (default-features off drops "std" +
 # "tokio"; the DNSSEC/TLS/HTTPS/QUIC code stays uncompiled, which the

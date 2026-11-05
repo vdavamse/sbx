@@ -92,6 +92,9 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
         "sockets" => sockets_role(),
         // #34: this process's and pid 1's Seccomp mode, and its fd set.
         "seccomp-status" => seccomp_status_role(),
+        // #19: the Landlock probes (mkdir at /, a TCP bind on the port in arg 0,
+        // kill(1, 0), a write under /work); see `landlock_probe_role`.
+        "landlock-probe" => landlock_probe_role(&arg(0)),
         // #34: an x32-ABI syscall, which the filter kills (SIGSYS, rc 159).
         "x32-syscall" => x32_syscall_role(),
         // #34: an i386 compat syscall through `int 0x80`, which the arch gate kills.
@@ -986,7 +989,203 @@ fn scenarios() -> Vec<Scenario> {
             gate: Bwrap,
             run: run_vs_gc_race,
         },
+        Scenario {
+            name: "landlock-fs-root-write",
+            gate: Bwrap,
+            run: landlock_fs_root_write,
+        },
+        Scenario {
+            name: "landlock-bind-tcp",
+            gate: Bwrap,
+            run: landlock_bind_tcp,
+        },
+        Scenario {
+            name: "landlock-signal-scope",
+            gate: Bwrap,
+            run: landlock_signal_scope,
+        },
+        Scenario {
+            name: "landlock-require",
+            gate: Always,
+            run: landlock_require,
+        },
+        Scenario {
+            name: "landlock-exe-fd-closed",
+            gate: Bwrap,
+            run: landlock_exe_fd_closed,
+        },
     ]
+}
+
+// ---- Landlock layer (issue #19) ---------------------------------------------
+
+/// #19: the Landlock probes of the payload, one `LL <label> <result>` line
+/// each. `mkdir` makes a directory at `/` (bwrap's root is a writable tmpfs, so
+/// only the layer denies it), `bind` listens on 127.0.0.1 at the port in
+/// `arg0`, `kill1` is `kill(1, 0)` (a permission probe; nothing is sent) and
+/// `work` writes under the session `/work` leaf. Results are `ok` or `errno=N`.
+fn landlock_probe_role(port: &str) -> u8 {
+    let result = |r: std::io::Result<()>| match r {
+        Ok(()) => "ok".to_owned(),
+        Err(err) => format!("errno={}", err.raw_os_error().unwrap_or(0)),
+    };
+    println!("LL mkdir {}", result(fs::create_dir("/sbx-landlock-probe")));
+    let port: u16 = port.parse().unwrap_or(8080);
+    println!(
+        "LL bind {}",
+        result(std::net::TcpListener::bind(("127.0.0.1", port)).map(|_| ()))
+    );
+    // SAFETY: kill(1, 0) only checks whether a signal could be sent; signal 0 is never delivered.
+    let rc = unsafe { libc::kill(1, 0) };
+    let kill1 = if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    };
+    println!("LL kill1 {}", result(kill1));
+    println!(
+        "LL work {}",
+        result(fs::write("/work/landlock-probe", b"probe"))
+    );
+    0
+}
+
+/// #19: one `landlock-probe` run under `extra` run flags: label → result.
+fn landlock_probes(
+    tag: &str,
+    extra: &[&str],
+    port: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let (done, dir) = run_role_case(tag, "landlock-probe", &[port], |_| {}, extra)?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)?;
+    let mut map = std::collections::BTreeMap::new();
+    for line in done.stdout.lines() {
+        if let Some(rest) = line.strip_prefix("LL ") {
+            let (label, value) = rest
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed LL line {line:?}"))?;
+            map.insert(label.to_owned(), value.to_owned());
+        }
+    }
+    Ok(map)
+}
+
+fn expect_ll(
+    map: &std::collections::BTreeMap<String, String>,
+    label: &str,
+    want: &str,
+) -> Result<(), String> {
+    match map.get(label) {
+        Some(got) if got == want => Ok(()),
+        other => Err(format!(
+            "landlock probe {label}: want {want}, got {other:?}"
+        )),
+    }
+}
+
+/// #19 AC: under `--landlock best-effort` the payload cannot create an entry at
+/// `/` (EACCES, errno 13), while the baseline without the layer can (bwrap's
+/// root is writable), and the session `/work` leaf stays writable.
+fn landlock_fs_root_write() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 1 {
+        println!("SKIP landlock-fs-root-write: the kernel has no Landlock");
+        return Ok(());
+    }
+    let base = landlock_probes("landlock-fs-base", &[], "8080")?;
+    expect_ll(&base, "mkdir", "ok")?;
+    let layered = landlock_probes("landlock-fs", &["--landlock", "best-effort"], "8080")?;
+    expect_ll(&layered, "mkdir", "errno=13")?;
+    expect_ll(&layered, "work", "ok")
+}
+
+/// #19 AC: a TCP bind is denied without a port rule (EACCES) and allowed with
+/// `--landlock-bind-tcp 8080` (ABI 4 and later).
+fn landlock_bind_tcp() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 4 {
+        println!(
+            "SKIP landlock-bind-tcp: TCP bind rules need Landlock ABI 4 (kernel {})",
+            sbx::landlock::kernel_abi()
+        );
+        return Ok(());
+    }
+    let base = landlock_probes("landlock-bind-base", &[], "8080")?;
+    expect_ll(&base, "bind", "ok")?;
+    let denied = landlock_probes("landlock-bind-deny", &["--landlock", "best-effort"], "8080")?;
+    expect_ll(&denied, "bind", "errno=13")?;
+    let allowed = landlock_probes(
+        "landlock-bind-allow",
+        &["--landlock", "best-effort", "--landlock-bind-tcp", "8080"],
+        "8080",
+    )?;
+    expect_ll(&allowed, "bind", "ok")
+}
+
+/// #19 AC: under signal scope (ABI 6) the payload cannot signal pid 1, which is
+/// outside its Landlock domain: `kill(1, 0)` is EPERM (errno 1).
+fn landlock_signal_scope() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 6 {
+        println!(
+            "SKIP landlock-signal-scope: signal scope needs Landlock ABI 6 (kernel {})",
+            sbx::landlock::kernel_abi()
+        );
+        return Ok(());
+    }
+    let layered = landlock_probes("landlock-signal", &["--landlock", "best-effort"], "8080")?;
+    expect_ll(&layered, "kill1", "errno=1")
+}
+
+/// #19 AC: `--landlock require` on a kernel below ABI 6 is refused with rc 125
+/// before anything is spawned, and the text names the ABI it needs. On ABI 6 or
+/// later the payload runs (when bwrap is available).
+fn landlock_require() -> Result<(), String> {
+    let dir = scratch("landlock-require");
+    let policy = Pol::new("exit").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--landlock", "require"],
+        &payload(&["0"]),
+    );
+    let abi = sbx::landlock::kernel_abi();
+    let result = if abi < 6 {
+        // Refused by the host-side pre-check: no bwrap is needed for this path.
+        expect_refusal(&args, "Linux 6.12 or later")
+    } else if !bwrap_available() {
+        println!("SKIP landlock-require: {SKIP_REASON}");
+        Ok(())
+    } else {
+        run_sbx(&args).and_then(|done| expect_rc(&done, 0))
+    };
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// #19 AC: the payload's fds are exactly 0–2 with the shim in front of it: the
+/// shim closes sbx's own executable fd before it execs the payload.
+fn landlock_exe_fd_closed() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 1 {
+        println!("SKIP landlock-exe-fd-closed: the kernel has no Landlock");
+        return Ok(());
+    }
+    let (done, dir) = run_role_case(
+        "landlock-fds",
+        "seccomp-status",
+        &[],
+        |_| {},
+        &["--landlock", "best-effort"],
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)?;
+    let fds: Vec<&str> = done
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("FD "))
+        .collect();
+    if fds != ["0", "1", "2"] {
+        return Err(format!("payload fds must be exactly 0-2, got {fds:?}"));
+    }
+    Ok(())
 }
 
 /// A private scratch area per scenario (unique, under the system temp dir).

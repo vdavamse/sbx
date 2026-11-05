@@ -56,6 +56,14 @@
 //!     chain with it. Teardown still kills pid 1 directly (the bwrap child's
 //!     pdeathsig is bound to bwrap's own parent thread). Requires Linux >= 5.3
 //!     (pidfd) and bubblewrap >= 0.8.
+//! 11. **Landlock layer (issue #19, `--landlock` and `--landlock-bind-tcp`).**
+//!     Off by default; the argv is then byte-identical to a run without the flag.
+//!     With it on, `run` refuses `require` on a kernel below ABI 6 before anything
+//!     is spawned (rc 125, [`crate::landlock::require_refusal`], S5b), opens sbx's
+//!     own executable (S8b) and passes it to `__init` as `--exe-fd` (S9–S11), and
+//!     bwrap runs the shim, which applies the rules and execs the payload. The
+//!     layer changes neither the audit log, the exit codes nor the teardown; see
+//!     [`crate::landlock`].
 
 mod audit;
 mod lifecycle;
@@ -99,7 +107,7 @@ use plan::{
 };
 use serve::{Fault, FaultLatch, serve_tasks, start_net};
 use session::SessionLock;
-use spawn::{SetupEnd, init_command, wait_for_fds};
+use spawn::{ChildFds, SetupEnd, init_command, wait_for_fds};
 use stdio::{OutputBudget, Pumps};
 
 /// Exit code for GNU-timeout-style timeouts.
@@ -134,6 +142,10 @@ pub struct RunArgs {
     pub cmd: Vec<OsString>,
     /// Hidden fail-only test driver, forwarded to `__init` (issue #11, Q6).
     pub test_break_rules: bool,
+    /// `--landlock` (issue #19); `Off` adds no layer.
+    pub landlock: crate::landlock::Mode,
+    /// `--landlock-bind-tcp` ports (issue #19), in command-line order.
+    pub landlock_bind_tcp: Vec<u16>,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -532,6 +544,14 @@ fn execute(
     let audit = AuditLog::new(audit_file, latch.clone());
     *audit_slot = Some(audit.clone());
 
+    // S5b (issue #19): `--landlock require` on a kernel below ABI 6 is refused here,
+    // before any spawn (the shim re-checks and fails closed too).
+    if args.landlock == crate::landlock::Mode::Require {
+        if let Some(reason) = crate::landlock::require_refusal(crate::landlock::kernel_abi()) {
+            return Err(RunError::new(reason).into());
+        }
+    }
+
     // S6: bwrap discovery and version gate.
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
@@ -550,6 +570,20 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
+    // S8b (issue #19): with the Landlock layer on, sbx's own executable is opened
+    // here (O_CLOEXEC, like every std open) and becomes the shim's program.
+    let exe_file = match args.landlock {
+        crate::landlock::Mode::Off => None,
+        _ => Some(
+            File::open("/proc/self/exe")
+                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?,
+        ),
+    };
+    let landlock_layer = exe_file.as_ref().map(|file| crate::landlock::Layer {
+        mode: args.landlock,
+        bind_tcp: args.landlock_bind_tcp.clone(),
+        exe_fd: file.as_raw_fd(),
+    });
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -559,6 +593,7 @@ fn execute(
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
+        landlock: landlock_layer,
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
@@ -571,11 +606,21 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
     let seccomp_fd = sys::clear_cloexec(seccomp_memfd.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
+    let exe_fd = match &exe_file {
+        Some(file) => Some(
+            sys::clear_cloexec(file.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim: {err}")))?,
+        ),
+        None => None,
+    };
     let (stdin, stdin_piped) = stdin_mode();
     let mut child = init_command(
-        child_fd,
-        info_fd,
-        seccomp_fd,
+        ChildFds {
+            control: child_fd,
+            info: info_fd,
+            seccomp: seccomp_fd,
+            exe: exe_fd,
+        },
         policy.network.mode,
         args.test_break_rules,
         &launch,
@@ -586,6 +631,7 @@ fn execute(
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);
+    drop(exe_file);
 
     // S12: a pidfd for the child (unreaped, so its pid cannot be recycled).
     let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {

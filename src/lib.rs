@@ -69,6 +69,9 @@
 //! guarantee as an executable check (69 checks, eight groups): the host, init,
 //! lab (a nested user/net/mount namespace with local fixtures) and opt-in
 //! network tiers.
+//! [`landlock`] (issue #19) is the optional Landlock layer behind `run --landlock`:
+//! filesystem, TCP-bind and signal-scope rules applied by an exec shim inside the
+//! sandbox, off by default.
 //! Tracking issue #20 describes the architecture; the
 //! issue #1 spike (`spikes/nft-load`) proved the unprivileged
 //! nftables-loading approach `sbx __init` ships.
@@ -81,6 +84,7 @@ pub mod egress;
 pub mod gc;
 pub mod host;
 pub mod init;
+pub mod landlock;
 pub mod policy;
 pub mod proxy;
 pub mod run;

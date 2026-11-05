@@ -103,7 +103,9 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
+        [--timeout DURATION] [--audit FILE]
+        [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
+        -- COMMAND [ARGS...]
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -147,7 +149,7 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 7 (report-only)
+  ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
@@ -160,8 +162,9 @@ sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
 (bwrap can start a sandbox here, and mount a fresh `/proc`), `seccomp` (bwrap
 installs sbx's socket-family filter, see [Running commands](#running-commands):
 a failure here makes the network mode `unavailable`, because the sandbox cannot
-start without the filter), and `landlock` (report only; sbx does not use Landlock
-yet). An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
+start without the filter), and `landlock` (report only: the Landlock ABI and which
+parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)).
+An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
 **Network modes.** The host provides one of three modes, from strongest to
@@ -447,6 +450,33 @@ x86_64 and aarch64 only). `sbx check` reports the `seccomp` item as FAIL in both
 cases. The integration
 suite (`tests/sandbox_run.rs`, scenarios `seccomp-*`) and the CI musl smoke pin
 these results.
+
+**Landlock layer (issue #19).** `--landlock` adds a Linux Landlock ruleset on top
+of the bwrap sandbox. It is off by default, and with `--landlock off` the bwrap
+command is the same as before. The mode is one of:
+
+- `best-effort`: apply the rules the kernel supports. A kernel without Landlock,
+  or with an older ABI, runs with the subset it has, silently.
+- `require`: apply the full set or refuse. The set needs Landlock ABI 6 (Linux
+  6.12 or later). On an older kernel `run` exits 125 before it starts anything,
+  with `sbx run: landlock require: …` on stderr.
+
+The rules follow the bwrap mount list. Read-only binds, the infra `/etc` set and
+the generated files can be read and executed. Read-write binds, the session
+`work`, `home` and `tmp` leaves, `/proc` and `/dev` can be written. The root
+directory can be listed, but nothing can be created in it. `--landlock-bind-tcp PORT`
+(repeatable; `0` is the kernel's ephemeral range) allows a TCP bind on that port.
+Without a port, binds are denied. The layer also stops the payload from signalling
+processes outside its domain, including bwrap's pid 1 (signal scope, ABI 6).
+
+The layer is a second check on top of the mounts and the network namespace. It
+does not restrict `connect(2)`: egress stays with the network namespace and the
+proxies. It also does not handle abstract-socket scope or `RESOLVE_UNIX`
+(see [threat model](docs/threat-model.md), R6). The shim is sbx's own executable,
+opened by `run` and exec'd inside the sandbox through `/proc/self/fd`. A
+dynamically linked sbx build needs its shared libraries visible inside the sandbox
+when `--landlock` is on. The static musl release does not. This is not checked
+before the run.
 
 **Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
 discovery), and unprivileged user namespaces. Run `sbx check` to see what this

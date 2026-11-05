@@ -58,8 +58,11 @@
 //!    `run` hands through) survives hygiene, and it is validated before any
 //!    namespace work. Issue #34 adds the hidden `--seccomp-fd N` (the sealed
 //!    socket-family program memfd bwrap reads as `--seccomp`), validated the
-//!    same way and content-checked against this binary's own program. The only
-//!    fds above 2 that survive hygiene are `--keep-fd` and `--seccomp-fd`. The signal mask is reset
+//!    same way and content-checked against this binary's own program. Issue #19
+//!    adds the hidden `--exe-fd N` (sbx's own executable, opened by `run` for the
+//!    Landlock shim; passed only under `--landlock`), validated as the same file
+//!    as `/proc/self/exe`. The only fds above 2 that survive hygiene are
+//!    `--keep-fd`, `--seccomp-fd` and `--exe-fd`. The signal mask is reset
 //!    first thing: std does not reset the blocked mask across spawn, and
 //!    `run` blocks TERM/INT/HUP/QUIT for its signalfd.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
@@ -351,6 +354,9 @@ pub struct InitArgs {
     /// The sealed seccomp-program memfd to keep for bwrap (`--seccomp-fd`,
     /// issue #34). Optional for direct `__init` callers; `run` always passes it.
     pub seccomp_fd: Option<RawFd>,
+    /// sbx's own executable, kept for the Landlock shim (`--exe-fd`, issue
+    /// #19). `Some` only when `run --landlock` is on.
+    pub exe_fd: Option<RawFd>,
     /// Expected parent pid (`--parent-pid`, m6).
     pub parent_pid: Option<i32>,
     /// The weakest network mode the caller accepts — the policy's own mode
@@ -382,6 +388,9 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     }
     if let Some(seccomp) = args.seccomp_fd {
         validate_seccomp_fd(seccomp, fd, args.keep_fd)?; // Stage::Control (issue #34)
+    }
+    if let Some(exe) = args.exe_fd {
+        validate_exe_fd(exe, fd, args.keep_fd, args.seccomp_fd)?; // Stage::Control (issue #19)
     }
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
     netns::write_id_maps(ids)?; // Stage::Idmap
@@ -428,11 +437,17 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
 }
 
-/// The fds that survive [`fd_hygiene`] on purpose (issue #10 and #34): the
-/// bwrap info pipe and the seccomp program memfd. Both are consumed by bwrap
-/// before the payload runs; both were validated in the control stage.
+/// The fds that survive [`fd_hygiene`] on purpose (issue #10, #34 and #19): the
+/// bwrap info pipe, the seccomp program memfd and, with `--landlock`, sbx's own
+/// executable for the shim. The first two are consumed by bwrap before the
+/// payload runs; the executable is closed by the shim itself. All were
+/// validated in the control stage.
 fn keep_set(args: &InitArgs) -> Vec<RawFd> {
-    args.keep_fd.into_iter().chain(args.seccomp_fd).collect()
+    args.keep_fd
+        .into_iter()
+        .chain(args.seccomp_fd)
+        .chain(args.exe_fd)
+        .collect()
 }
 
 /// Validate `--fd` before any namespace work: a bad control fd fails fast
@@ -629,6 +644,58 @@ fn validate_seccomp_fd(
     Ok(())
 }
 
+/// Issue #19: `--exe-fd` is sbx's own executable, opened by `run` so the
+/// Landlock shim can be exec'd through `/proc/self/fd/N` inside the sandbox.
+/// Validated before any namespace work: above stdio, distinct from the other
+/// inherited fds, a regular file, and the same file (`st_dev` and `st_ino`) as
+/// `/proc/self/exe` in this process, so a substituted file cannot be the shim.
+fn validate_exe_fd(
+    exe: RawFd,
+    control: RawFd,
+    keep: Option<RawFd>,
+    seccomp: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if exe <= 2 {
+        return Err(fail(format!("--exe-fd {exe} must be greater than 2")));
+    }
+    if exe == control {
+        return Err(fail(format!("--exe-fd {exe} must differ from --fd")));
+    }
+    if keep == Some(exe) {
+        return Err(fail(format!("--exe-fd {exe} must differ from --keep-fd")));
+    }
+    if seccomp == Some(exe) {
+        return Err(fail(format!(
+            "--exe-fd {exe} must differ from --seccomp-fd"
+        )));
+    }
+    // SAFETY: fstat on a number we were handed; the result is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(exe, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--exe-fd {exe} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(fail(format!("--exe-fd {exe} is not a regular file")));
+    }
+    // SAFETY: stat on the fixed path /proc/self/exe; the result is only read.
+    let mut me: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(c"/proc/self/exe".as_ptr(), &mut me) } != 0 {
+        return Err(fail(format!(
+            "cannot stat /proc/self/exe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if st.st_dev != me.st_dev || st.st_ino != me.st_ino {
+        return Err(fail(format!(
+            "--exe-fd {exe} is not this sbx executable (/proc/self/exe)"
+        )));
+    }
+    Ok(())
+}
+
 /// Issue #10 (Q13): `--keep-fd` is the bwrap info pipe `run` hands through.
 /// Validated in the control stage so a bad value fails before any namespace
 /// work. The write end must be a pipe open for writing (bwrap writes the
@@ -662,7 +729,7 @@ fn validate_keep_fd(keep: RawFd, control: RawFd) -> Result<(), InitError> {
 
 /// Pure core of [`fd_hygiene`]'s close set: the scanned fds minus `keep`
 /// (the one fd that survives the re-exec on purpose; issue #10).
-fn fds_to_close(scan: Vec<RawFd>, keep: &[RawFd]) -> Vec<RawFd> {
+pub(crate) fn fds_to_close(scan: Vec<RawFd>, keep: &[RawFd]) -> Vec<RawFd> {
     scan.into_iter().filter(|fd| !keep.contains(fd)).collect()
 }
 
@@ -722,7 +789,7 @@ fn arm_parent_death(expected_parent: Option<i32>) -> Result<(), InitError> {
 /// Pure collector for [`fd_hygiene`] (unit-testable without closing
 /// anything): the sorted, deduped open fds above stdio (> 2), or `None`
 /// when `/proc/self/fd` is unreadable (the documented degrade path).
-fn scan_fds_above_stdio() -> Option<Vec<RawFd>> {
+pub(crate) fn scan_fds_above_stdio() -> Option<Vec<RawFd>> {
     let dir = std::fs::read_dir("/proc/self/fd").ok()?;
     let mut fds: Vec<RawFd> = dir
         .filter_map(|entry| entry.ok())
@@ -833,6 +900,7 @@ mod tests {
             fd,
             keep_fd,
             seccomp_fd: None,
+            exe_fd: None,
             parent_pid,
             min_mode: NetworkMode::Transparent,
             test_break_rules: false,
@@ -1192,6 +1260,75 @@ mod tests {
         // everything else in the scan is closed.
         assert_eq!(fds_to_close(vec![3, 5, 9, 12], &[5, 9]), vec![3, 12]);
         assert_eq!(fds_to_close(vec![4, 5], &[5, 9]), vec![4]);
+    }
+
+    #[test]
+    fn validate_exe_fd_table() {
+        // Issue #19: the shim's executable fd. Stage Control, pinned reasons.
+        let msg = |e: RawFd, c: RawFd, k: Option<RawFd>, s: Option<RawFd>| {
+            validate_exe_fd(e, c, k, s)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2, 999, None, None),
+            "sbx __init: control: --exe-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(7, 7, None, None),
+            "sbx __init: control: --exe-fd 7 must differ from --fd"
+        );
+        assert_eq!(
+            msg(7, 999, Some(7), None),
+            "sbx __init: control: --exe-fd 7 must differ from --keep-fd"
+        );
+        assert_eq!(
+            msg(7, 999, None, Some(7)),
+            "sbx __init: control: --exe-fd 7 must differ from --seccomp-fd"
+        );
+        assert_eq!(
+            msg(998, 999, None, None),
+            "sbx __init: control: --exe-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        // A pipe is open but not a regular file.
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-element array; both ends are closed below.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            msg(p[1], 999, None, None),
+            format!(
+                "sbx __init: control: --exe-fd {} is not a regular file",
+                p[1]
+            )
+        );
+        // SAFETY: closing the pipe ends created above.
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+        // A regular file that is not this executable is refused; this
+        // process's own executable (the same inode as /proc/self/exe) is not.
+        let other = std::fs::File::open("/proc/self/status").expect("open");
+        let raw = other.as_raw_fd();
+        assert_eq!(
+            msg(raw, 999, None, None),
+            format!(
+                "sbx __init: control: --exe-fd {raw} is not this sbx executable (/proc/self/exe)"
+            )
+        );
+        let me = std::fs::File::open("/proc/self/exe").expect("open self");
+        assert!(validate_exe_fd(me.as_raw_fd(), 999, None, None).is_ok());
+    }
+
+    #[test]
+    fn keep_set_includes_exe_fd() {
+        let mut all = args(7, Some(5), None);
+        all.seccomp_fd = Some(9);
+        all.exe_fd = Some(11);
+        assert_eq!(keep_set(&all), vec![5, 9, 11]);
+        let mut exe_only = args(7, None, None);
+        exe_only.exe_fd = Some(11);
+        assert_eq!(keep_set(&exe_only), vec![11]);
     }
 
     #[test]

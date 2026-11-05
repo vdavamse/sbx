@@ -38,7 +38,10 @@
 //!    not explicitly kept before exec — hence on-disk synthetic files, Q6).
 //!    The only fds bwrap receives are the info pipe (`--info-fd`) and the
 //!    seccomp program memfd (`--seccomp`, issue #34), both consumed by
-//!    bwrap before the payload runs.
+//!    bwrap before the payload runs. With `--landlock` (issue #19) the
+//!    command is the Landlock shim, exec'd through sbx's own executable
+//!    fd; bwrap never reads that fd, and the shim closes it (argv.rs
+//!    element 14).
 //! 4. **Order is semantics** — bwrap applies filesystem ops in argv order.
 //!    All mounts sort by (dest ascending byte order, priority ascending):
 //!    byte order puts ancestors before descendants (ro parent before nested
@@ -201,6 +204,12 @@ pub struct Build<'a> {
     /// --seccomp-fd n` must carry it through fd hygiene. Must be > 2 and
     /// differ from `info_fd` (row 16).
     pub seccomp_fd: RawFd,
+    /// The Landlock layer (issue #19, `run --landlock`). `Some` with a mode
+    /// other than `off` makes the payload command the shim
+    /// (`/proc/self/fd/N __landlock … -- CMD`, argv.rs element 14) and adds
+    /// rows 17–19. `None`, or a layer whose mode is `off`, leaves the argv
+    /// byte-identical to a run without the layer.
+    pub landlock: Option<crate::landlock::Layer>,
 }
 
 /// A complete, validated bwrap invocation.
@@ -441,6 +450,33 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             "seccomp fd must differ from the info fd (got {})",
             input.seccomp_fd
         )));
+    }
+    // Rows 17–19 (issue #19): the Landlock shim's executable fd, checked only
+    // when a layer is on. It must be above the std streams and distinct from
+    // the info and seccomp fds (three distinct roles, three distinct numbers).
+    if let Some(layer) = input
+        .landlock
+        .as_ref()
+        .filter(|layer| layer.mode != crate::landlock::Mode::Off)
+    {
+        if layer.exe_fd <= 2 {
+            return Err(BwrapError(format!(
+                "exe fd must be greater than 2 (got {})",
+                layer.exe_fd
+            )));
+        }
+        if input.info_fd == Some(layer.exe_fd) {
+            return Err(BwrapError(format!(
+                "exe fd must differ from the info fd (got {})",
+                layer.exe_fd
+            )));
+        }
+        if layer.exe_fd == input.seccomp_fd {
+            return Err(BwrapError(format!(
+                "exe fd must differ from the seccomp fd (got {})",
+                layer.exe_fd
+            )));
+        }
     }
     // The argv layout itself has no failure modes (module docs point 1) —
     // but the assembly output gets one final sweep before it is trusted.
@@ -713,6 +749,7 @@ mod tests {
             passed_env,
             info_fd: None,
             seccomp_fd: BASE_SECCOMP_FD,
+            landlock: None,
         }
     }
 
@@ -967,6 +1004,44 @@ mod tests {
             None,
             "env_clear() must be applied"
         );
+    }
+
+    #[test]
+    fn landlock_error_pins() {
+        // Issue #19 rows 17–19: the shim's exe fd, checked only while a layer
+        // is on. Byte-exact reasons, in the order the rows run.
+        let policy = policy_of(POLICY);
+        let command = os(&["/bin/echo", "hi"]);
+        let no_env = BTreeMap::new();
+        let err = |input: &Build<'_>| build(input).expect_err("must be rejected").to_string();
+        let layer = |exe_fd: RawFd| {
+            Some(crate::landlock::Layer {
+                mode: crate::landlock::Mode::BestEffort,
+                bind_tcp: Vec::new(),
+                exe_fd,
+            })
+        };
+        let mut input = base_input(&policy, &command, &no_env);
+        input.landlock = layer(2);
+        assert_eq!(err(&input), "exe fd must be greater than 2 (got 2)");
+        // BASE_SECCOMP_FD is 10: the exe fd may not reuse it.
+        input.landlock = layer(10);
+        assert_eq!(
+            err(&input),
+            "exe fd must differ from the seccomp fd (got 10)"
+        );
+        input.info_fd = Some(11);
+        input.landlock = layer(11);
+        assert_eq!(err(&input), "exe fd must differ from the info fd (got 11)");
+        input.info_fd = None;
+        assert!(build(&input).is_ok(), "a distinct exe fd must build");
+        // `off` is not a layer: no row applies, whatever the fd number.
+        input.landlock = Some(crate::landlock::Layer {
+            mode: crate::landlock::Mode::Off,
+            bind_tcp: Vec::new(),
+            exe_fd: 2,
+        });
+        assert!(build(&input).is_ok(), "mode off must not check the exe fd");
     }
 
     #[test]

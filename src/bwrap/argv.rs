@@ -44,6 +44,9 @@
 //!     values from init::consts::{EXPLICIT_TCP_PORT, SANDBOX_ADDR}
 //! 13  --chdir {cwd | /work}
 //! 14  --
+//!     with `--landlock` on (issue #19, `Build::landlock`), the shim head
+//!     `/proc/self/fd/N __landlock --exe-fd N --mode M [--bind-tcp P]…
+//!     [--rule GRANT:PATH]…` and a second `--` (see `crate::landlock`)
 //! 15  the command elements verbatim (byte-preserving OsString copies)
 //! ```
 //!
@@ -62,6 +65,7 @@ use std::path::PathBuf;
 use super::Build;
 use super::etc::{DEST_HOME, DEST_TMP, DEST_WORK, SessionLayout, session_layout};
 use crate::init::consts::{EXPLICIT_TCP_PORT, SANDBOX_ADDR};
+use crate::landlock::{Grant, PathRule};
 use crate::policy::{AbsolutePath, NetworkMode};
 
 /// The infra `PATH` (Q3): the standard sbin/bin search path so payload
@@ -322,7 +326,17 @@ pub(super) fn assemble(input: &Build<'_>) -> Vec<OsString> {
 
     // 14–15. The command VERBATIM after `--` (Q12: no shell wrapping —
     //        that is #10's decision; byte-preserving OsString copies).
+    //        Issue #19: with a Landlock layer the command is the shim, and the
+    //        payload follows the shim's own `--` (layout element 14).
     argv.push(OsString::from("--"));
+    if let Some(layer) = input
+        .landlock
+        .as_ref()
+        .filter(|layer| layer.mode != crate::landlock::Mode::Off)
+    {
+        argv.extend(crate::landlock::shim_head(layer, &landlock_rules(&mounts)));
+        argv.push(OsString::from("--"));
+    }
     argv.extend(input.command.iter().cloned());
 
     argv
@@ -440,6 +454,29 @@ fn merged_mounts(input: &Build<'_>, layout: &SessionLayout) -> Vec<Mount> {
     deduped
 }
 
+/// The Landlock rules for this launch (issue #19; `crate::landlock` module
+/// docs point 4). Derived from the SAME merged mount list the binds are
+/// emitted from, at the destinations the payload sees, plus the fixed `/`,
+/// `/proc` and `/dev` entries. Sorted and deduplicated, so the shim argv is
+/// deterministic.
+fn landlock_rules(mounts: &[Mount]) -> Vec<PathRule> {
+    let mut rules = vec![
+        PathRule::new("/", Grant::ReadDir),
+        PathRule::new("/proc", Grant::All),
+        PathRule::new("/dev", Grant::All),
+    ];
+    for mount in mounts {
+        let grant = match mount.op {
+            BindOp::Ro => Grant::Read,
+            BindOp::Rw => Grant::All,
+        };
+        rules.push(PathRule::new(&mount.dest, grant));
+    }
+    rules.sort();
+    rules.dedup();
+    rules
+}
+
 fn policy_mount(op: BindOp, path: &AbsolutePath) -> Mount {
     Mount {
         op,
@@ -551,6 +588,7 @@ mod tests {
             passed_env,
             info_fd: None,
             seccomp_fd: SECCOMP_FD,
+            landlock: None,
         };
         build(&input)
             .expect("golden inputs must build")
@@ -691,6 +729,7 @@ mod tests {
             passed_env: &env,
             info_fd: Some(9),
             seccomp_fd: SECCOMP_FD,
+            landlock: None,
         };
         let with = build(&input)
             .expect("golden inputs must build")
@@ -724,6 +763,7 @@ mod tests {
                 passed_env: &env,
                 info_fd,
                 seccomp_fd,
+                landlock: None,
             };
             let argv = build(&input)
                 .expect("golden inputs must build")
@@ -1428,6 +1468,142 @@ mod tests {
         }
     }
 
+    #[test]
+    fn golden_landlock_shim_argv() {
+        // Issue #19: a layer turns the command into the shim (layout element
+        // 14). Everything before the payload's `--` is unchanged, the shim head
+        // and rules are pinned byte-exact (rules sorted by path, deduplicated),
+        // and mode `off` or no layer leaves the argv exactly as without one.
+        let policy = example("default.json");
+        let env = env_map(&[("LANG", "C.UTF-8")]);
+        let command = os(&["/bin/echo", "hi"]);
+        let plain = golden_argv(&policy, &env);
+        let build_with = |landlock: Option<crate::landlock::Layer>| {
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &env,
+                info_fd: None,
+                seccomp_fd: SECCOMP_FD,
+                landlock,
+            };
+            build(&input)
+                .expect("golden inputs must build")
+                .argv()
+                .to_vec()
+        };
+        assert_eq!(build_with(None), plain);
+        let off = crate::landlock::Layer {
+            mode: crate::landlock::Mode::Off,
+            bind_tcp: vec![8080],
+            exe_fd: 9,
+        };
+        assert_eq!(build_with(Some(off)), plain);
+
+        let layer = crate::landlock::Layer {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: vec![8080],
+            exe_fd: 9,
+        };
+        let argv = build_with(Some(layer));
+        let cut = plain.len() - command.len() - 1; // the `--` before the payload
+        assert_eq!(argv[..=cut], plain[..=cut]);
+        let rules = [
+            "readdir:/",
+            "all:/dev",
+            "read:/etc/alternatives",
+            "read:/etc/ca-certificates",
+            "read:/etc/group",
+            "read:/etc/hosts",
+            "read:/etc/ld.so.cache",
+            "read:/etc/localtime",
+            "read:/etc/nsswitch.conf",
+            "read:/etc/passwd",
+            "read:/etc/resolv.conf",
+            "read:/etc/ssl",
+            "all:/proc",
+            "all:/root",
+            "all:/tmp",
+            "read:/usr",
+            "all:/work",
+        ];
+        let mut want = os(&[
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--mode",
+            "best-effort",
+            "--bind-tcp",
+            "8080",
+        ]);
+        for rule in rules {
+            want.push(OsString::from("--rule"));
+            want.push(OsString::from(rule));
+        }
+        want.extend(os(&["--", "/bin/echo", "hi"]));
+        assert_eq!(argv[cut + 1..], want[..]);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_landlock_rules_mirror_the_mounts(
+            policy_json in prop_policy_json(),
+            command in prop_command(),
+        ) {
+            // Issue #19: every bind destination the payload sees has a rule
+            // (the rules come from the same merged list), the shim appears once,
+            // and the payload command is still the argv's tail.
+            let policy = prop_policy(&policy_json);
+            let input = Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &command,
+                cwd: None,
+                passed_env: &BTreeMap::new(),
+                info_fd: None,
+                seccomp_fd: SECCOMP_FD,
+                landlock: Some(crate::landlock::Layer {
+                    mode: crate::landlock::Mode::BestEffort,
+                    bind_tcp: Vec::new(),
+                    exe_fd: 9,
+                }),
+            };
+            let argv = build(&input).expect("generated inputs must build").argv().to_vec();
+            prop_assert!(argv.ends_with(&command), "the payload is the argv tail");
+            let shims = argv.iter().filter(|a| *a == "__landlock").count();
+            prop_assert_eq!(shims, 1);
+            let shim = argv.iter().position(|a| a == "/proc/self/fd/9").expect("shim present");
+            let rules: Vec<String> = argv[shim..]
+                .windows(2)
+                .filter(|w| w[0] == "--rule")
+                .map(|w| w[1].to_string_lossy().into_owned())
+                .collect();
+            for rule in &rules {
+                prop_assert!(
+                    crate::landlock::PathRule::parse(rule).is_ok(),
+                    "every emitted rule parses: {:?}",
+                    rule
+                );
+            }
+            let events = parse_flags(&argv[..shim - 1]);
+            for event in &events {
+                if let Event::Bind { dest, .. } = event {
+                    prop_assert!(
+                        rules.iter().any(|rule| rule.ends_with(&format!(":{dest}"))),
+                        "bind destination {:?} has no Landlock rule: {:?}",
+                        dest,
+                        rules
+                    );
+                }
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn prop_ancestors_first_and_deny_last(
@@ -1495,6 +1671,7 @@ mod tests {
                 passed_env: &empty,
                 info_fd,
                 seccomp_fd,
+                landlock: None,
             };
             let argv = build(&input)
                 .expect("generated inputs must build")
@@ -1537,6 +1714,7 @@ mod tests {
                 passed_env: &empty,
                 info_fd,
                 seccomp_fd: SECCOMP_FD,
+                landlock: None,
             };
             let argv = build(&input)
                 .expect("generated inputs must build")
@@ -1884,6 +2062,7 @@ mod tests {
                 passed_env: &empty,
                 info_fd: None,
                 seccomp_fd: SECCOMP_FD,
+                landlock: None,
             };
             let err = build(&input)
                 .expect_err("an injected NUL byte must be rejected")

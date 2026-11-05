@@ -125,6 +125,7 @@ fn smoke_launch(bwrap: &Path) -> Result<Outcome, String> {
         passed_env: &empty,
         info_fd: None,
         seccomp_fd,
+        landlock: None,
     };
     // The run_payload pipeline with `/bin/true` instead of a `/bin/sh`
     // script (the smoke needs no shell — only the loader + coreutils-free
@@ -364,6 +365,7 @@ fn run_payload(
         passed_env,
         info_fd: None,
         seccomp_fd,
+        landlock: None,
     };
     let launch = build(&input).map_err(|e| format!("build: {e}"))?;
     run_bounded(launch.command(), "bwrap payload")
