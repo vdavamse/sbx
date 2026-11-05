@@ -242,6 +242,20 @@ fn host_cannot(mode: EffectiveMode, d: &catalog::CheckDef) -> Option<String> {
     None
 }
 
+/// The host-tier gate, before any scenario runs (review 1 of #57). A host that
+/// cannot run sandboxes skips every host check as a capability skip, I04
+/// included. Where sandboxes work, I04 (the foreign-uid check, which needs a
+/// second uid) is an opt-in skip: it is never run here (see `session_tier`).
+pub(crate) fn host_gate(d: &catalog::CheckDef, mode: EffectiveMode) -> Option<CheckResult> {
+    if let Some(why) = host_cannot(mode, d) {
+        return Some(CheckResult::skip(d.id, SkipKind::Capability, why));
+    }
+    if d.id == "I04" {
+        return Some(session_tier::foreign_uid_skip());
+    }
+    None
+}
+
 fn run_one(
     d: &catalog::CheckDef,
     mode: EffectiveMode,
@@ -291,12 +305,8 @@ fn run_one(
             r
         }
         Tier::Host => {
-            if d.id == "I04" {
-                // Needs a second uid: never run here (see session_tier).
-                return session_tier::foreign_uid_skip();
-            }
-            if let Some(why) = host_cannot(mode, d) {
-                return CheckResult::skip(d.id, SkipKind::Capability, why);
+            if let Some(gated) = host_gate(d, mode) {
+                return gated;
             }
             let names: &'static [&'static str] = if session_tier::handles(d.id) {
                 session_tier::scenarios_of(d.id)
@@ -439,5 +449,43 @@ impl LabMemo {
                 detail: Some(why.clone()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn def(id: &str) -> &'static catalog::CheckDef {
+        catalog::CATALOG
+            .iter()
+            .find(|d| d.id == id)
+            .expect("catalog id")
+    }
+
+    #[test]
+    fn i04_is_a_capability_skip_where_no_sandbox_runs() {
+        // The release gate's negative tier: every host check skips as capability there.
+        let r = host_gate(def("I04"), EffectiveMode::Unavailable).expect("gated");
+        assert_eq!(r.skip_kind, Some(SkipKind::Capability));
+    }
+
+    #[test]
+    fn i04_is_opt_in_wherever_sandboxes_work() {
+        for mode in [EffectiveMode::Explicit, EffectiveMode::Transparent] {
+            let r = host_gate(def("I04"), mode).expect("gated");
+            assert_eq!(r.skip_kind, Some(SkipKind::OptIn), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn other_host_checks_are_capability_skips_without_sandboxes() {
+        let r = host_gate(def("A01"), EffectiveMode::Unavailable).expect("gated");
+        assert_eq!(r.skip_kind, Some(SkipKind::Capability));
+    }
+
+    #[test]
+    fn host_checks_pass_the_gate_where_sandboxes_work() {
+        assert!(host_gate(def("A01"), EffectiveMode::Transparent).is_none());
     }
 }

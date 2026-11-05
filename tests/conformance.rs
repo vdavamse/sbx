@@ -286,14 +286,12 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         .iter()
         .filter(|c| matches!(c["tier"].as_str(), Some("host" | "lab" | "init")))
         .collect();
-    // I04 (foreign uid) is an opt-in skip on every host by design, so a host
-    // that cannot run sandboxes skips every other offline check as capability.
+    // A host that cannot run sandboxes skips every offline check as a capability
+    // skip, I04 included (the gate in `run_one` orders capability before opt-in).
     let all_capability = !offline.is_empty()
-        && offline.iter().all(|c| {
-            c["status"] == "skip"
-                && (c["skip_kind"] == "capability"
-                    || (c["id"] == "I04" && c["skip_kind"] == "opt-in"))
-        });
+        && offline
+            .iter()
+            .all(|c| c["status"] == "skip" && c["skip_kind"] == "capability");
     if mode == "unavailable" && all_capability {
         return Ok(Some("host cannot run sandboxes".to_owned()));
     }
@@ -322,7 +320,7 @@ fn full_report_scenario() -> Result<Option<String>, String> {
                 ));
             }
         } else if id == "I04" && c["status"] == "skip" && kind == Some("opt-in") {
-            // Group I's foreign-uid check: never run unprivileged, so an opt-in skip.
+            // Group I's foreign-uid check: an opt-in skip where sandboxes work.
         } else if c["status"] != "ok" && c["status"] != "warn" {
             return Err(format!(
                 "{id}: expected ok, got {} ({})",

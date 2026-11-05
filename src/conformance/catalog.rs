@@ -632,7 +632,7 @@ pub const CATALOG: [CheckDef; 78] = [
         I,
         Hs,
         "foreign-uid connection to sbx.ctl is refused",
-        T,
+        S,
     ),
     c(
         "I05",
