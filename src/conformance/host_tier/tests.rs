@@ -646,7 +646,36 @@ pub fn good() -> Scns {
     m.insert("S13", s13());
     m.insert("S14", s14());
     m.insert("S15", s15());
+    m.insert("S16", s16());
     m
+}
+
+fn s16() -> Scn {
+    let mut s = scn(
+        "S16",
+        vec![
+            op("s16.hello", true, None, json!({})),
+            op("d13.ctl", true, None, json!({"kind": "file"})),
+            op("d13.0", false, Some(libc::ENOENT), json!({})),
+            op("d13.1", false, Some(libc::ENOENT), json!({})),
+            op("d14.read", true, None, json!({"len": 2, "matched": [0]})),
+            op("d14.trunc", false, Some(libc::EROFS), json!({})),
+            op("d14.create", false, Some(libc::EROFS), json!({})),
+            op("d14.ctl", true, None, json!({})),
+            op("d15.ro.vis", true, None, json!({"kind": "file"})),
+            op("d15.rw.vis", true, None, json!({"kind": "file"})),
+            op("d15.ro", false, Some(libc::ENOENT), json!({})),
+            op("d15.rw", false, Some(libc::ENOENT), json!({})),
+        ],
+        vec![],
+    );
+    s.notes
+        .insert("d13.paths", r#"["/var","/opt,with-comma"]"#.to_owned());
+    s.notes.insert("ro_file", "RO".to_owned());
+    s.notes.insert("ro_new", "absent: NotFound".to_owned());
+    s.notes.insert("rw_new", "X".to_owned());
+    s.notes.insert("tokens", "TOKEN,TOKEN".to_owned());
+    s
 }
 
 fn s14() -> Scn {
@@ -869,6 +898,38 @@ fn bad(id: &str, control: bool) -> Option<Scns> {
             r.ok = false;
             r.errno = Some(libc::EXDEV);
         }),
+        ("D13", false) => edit!(m.get_mut("S16").unwrap(), "d13.1", |r: &mut OpResult| {
+            r.ok = true;
+            r.errno = None;
+        }),
+        ("D13", true) => edit!(m.get_mut("S16").unwrap(), "d13.ctl", |r: &mut OpResult| {
+            r.ok = false;
+            r.errno = Some(libc::ENOENT);
+        }),
+        ("D14", false) => edit!(
+            m.get_mut("S16").unwrap(),
+            "d14.create",
+            |r: &mut OpResult| {
+                r.ok = true;
+                r.errno = None;
+            }
+        ),
+        ("D14", true) => edit!(m.get_mut("S16").unwrap(), "d14.ctl", |r: &mut OpResult| {
+            r.ok = false;
+            r.errno = Some(libc::EROFS);
+        }),
+        ("D15", false) => edit!(m.get_mut("S16").unwrap(), "d15.ro", |r: &mut OpResult| {
+            r.ok = true;
+            r.errno = None;
+        }),
+        ("D15", true) => edit!(
+            m.get_mut("S16").unwrap(),
+            "d15.rw.vis",
+            |r: &mut OpResult| {
+                r.ok = false;
+                r.errno = Some(libc::ENOENT);
+            }
+        ),
         ("D12", false) => {
             m.get_mut("S15").unwrap().fin.as_mut().unwrap().rc = Some(0);
         }
@@ -1033,8 +1094,8 @@ fn every_host_check_fails_on_its_assertion_mutation() {
 fn every_host_check_with_a_control_fails_as_control_when_the_control_breaks() {
     let with_control = [
         "A07", "A08", "A09", "A11", "A13", "B10", "C04", "C13", "D01", "D03", "D04", "D05", "D06",
-        "D07", "D08", "D09", "F01", "F06", "G01", "G02", "G03", "G04", "G05", "H01", "H02", "H03",
-        "H05", "H06",
+        "D07", "D08", "D09", "D13", "D14", "D15", "F01", "F06", "G01", "G02", "G03", "G04", "G05",
+        "H01", "H02", "H03", "H05", "H06",
     ];
     for id in with_control {
         let Some(m) = bad(id, true) else {
@@ -1277,4 +1338,129 @@ fn d02_reason() -> String {
         .into_iter()
         .next()
         .expect("localhost resolves to a loopback address on the test host")
+}
+
+#[test]
+fn d14_host_side_effects_fail_even_when_the_probe_reports_erofs() {
+    // The probe says EROFS, but the host file changed or a new file appeared:
+    // still a FAIL (the host re-read is the ground truth).
+    for (key, val) in [("ro_file", "X"), ("ro_new", "X")] {
+        let mut m = good();
+        m.get_mut("S16").unwrap().notes.insert(key, val.to_owned());
+        let (st, detail, control) = status_of("D14", &m);
+        assert_eq!(st, Status::Fail, "{key}: {detail}");
+        assert!(!control, "{key}: {detail}");
+    }
+}
+
+#[test]
+fn d15_changed_host_token_is_a_fail() {
+    let mut m = good();
+    m.get_mut("S16")
+        .unwrap()
+        .notes
+        .insert("tokens", "TOKEN,absent: NotFound".to_owned());
+    let (st, detail, _) = status_of("D15", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+}
+
+#[test]
+fn d13_with_no_probed_path_is_a_control_failure() {
+    let mut m = good();
+    m.get_mut("S16")
+        .unwrap()
+        .notes
+        .insert("d13.paths", "[]".to_owned());
+    let (st, detail, control) = status_of("D13", &m);
+    assert_ne!(st, Status::Ok, "{detail}");
+    assert!(control, "{detail}");
+}
+
+#[test]
+fn d13_paths_skip_candidates_that_hold_the_binary_or_the_base() {
+    use crate::conformance::scenarios::{D13_CANDIDATES, d13_paths};
+    // The candidates present on this host (at least /var or /home on any
+    // Linux runner), with nothing excluded.
+    let free = d13_paths("/nonexistent-exe/sbx", "/nonexistent-base");
+    assert!(!free.is_empty(), "no D13 candidate exists on this host");
+    for c in &free {
+        assert!(D13_CANDIDATES.contains(&c.as_str()), "{c}");
+        let exe_only = d13_paths(&format!("{c}/x/sbx"), "/nonexistent-base");
+        assert!(
+            !exe_only.contains(c),
+            "{c} probed although it holds the binary"
+        );
+        let base_only = d13_paths("/nonexistent-exe/sbx", &format!("{c}/tmp/base"));
+        assert!(
+            !base_only.contains(c),
+            "{c} probed although it holds the base"
+        );
+        let base_is = d13_paths("/nonexistent-exe/sbx", c);
+        assert!(!base_is.contains(c), "{c} probed although it is the base");
+        let prefix = d13_paths(&format!("{c}x/sbx"), &format!("{c}x/base"));
+        assert!(prefix.contains(c), "{c} skipped for a mere name prefix");
+    }
+}
+
+#[test]
+fn wrong_errnos_and_wrong_sides_are_assertion_failures() {
+    // Every mutation must FAIL as an assertion, not as a control.
+    type Mutation = (&'static str, &'static str, bool, Option<i32>);
+    let cases: [Mutation; 5] = [
+        ("D13", "d13.0", false, Some(libc::EACCES)),
+        ("D14", "d14.trunc", true, None),
+        ("D14", "d14.create", false, Some(libc::EACCES)),
+        ("D15", "d15.rw", true, None),
+        ("D15", "d15.ro", false, Some(libc::EACCES)),
+    ];
+    for (check, id, ok, err) in cases {
+        let mut m = good();
+        let r = m
+            .get_mut("S16")
+            .unwrap()
+            .probe
+            .as_mut()
+            .unwrap()
+            .results
+            .get_mut(id)
+            .unwrap();
+        r.ok = ok;
+        r.errno = err;
+        let (st, detail, control) = status_of(check, &m);
+        assert_eq!(st, Status::Fail, "{check} {id}: {detail}");
+        assert!(!control, "{check} {id}: {detail}");
+    }
+}
+
+#[test]
+fn d14_any_read_error_other_than_not_found_is_a_fail() {
+    let mut m = good();
+    m.get_mut("S16")
+        .unwrap()
+        .notes
+        .insert("ro_new", "absent: PermissionDenied".to_owned());
+    let (st, detail, _) = status_of("D14", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+}
+
+#[test]
+fn s16_host_read_of_a_missing_file_is_what_d14_requires() {
+    // Pins the runner/evaluator contract: CI once failed D14 because the
+    // runner wrote ErrorKind's Display ("entity not found") while the
+    // evaluator expects the Debug name.
+    use crate::conformance::scenarios::host_read;
+    let dir = std::env::temp_dir().join(format!("sbx-d14-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(host_read(&dir.join("missing")), "absent: NotFound");
+    std::fs::write(dir.join("f"), "RO").unwrap();
+    assert_eq!(host_read(&dir.join("f")), "RO");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut m = good();
+    m.get_mut("S16").unwrap().notes.insert(
+        "ro_new",
+        host_read(std::path::Path::new("/nonexistent/sbx-d14")),
+    );
+    let (st, detail, _) = status_of("D14", &m);
+    assert_eq!(st, Status::Ok, "{detail}");
 }
