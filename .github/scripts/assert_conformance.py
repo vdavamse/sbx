@@ -9,7 +9,8 @@ is kind "conformance" version 1; the network mode is not "unavailable"; no check
 FAILs; the only non-ok/warn checks are the six network checks E01-E06 and I04
 (foreign uid, issue #18), all skipped as opt-in; the offline tiers (host, lab,
 init) have exactly OFFLINE_CHECKS checks and every one is ok or warn (I04 aside);
-and the exit code is 0. With TITLE, a one-line summary is appended to $GITHUB_STEP_SUMMARY (when set). Exits 1 with every reason otherwise.
+and the exit code is 0. With TITLE, a one-line summary is appended to
+$GITHUB_STEP_SUMMARY (when set). Exits 1 with every reason otherwise.
 """
 
 import json

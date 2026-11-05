@@ -8,7 +8,8 @@ at the commit pinned below (the version Docker Engine docker-v29.9.1 vendors). I
 SHA-256 is checked before anything is written.
 
 The output is meant for a container that drops ALL capabilities and runs with
-hostUsers: false (the example pod does both; the guide's setns bound relies on it). Two steps:
+hostUsers: false (the example pod does both; the guide's setns bound relies on
+it). Two steps:
 
 1. Resolve the capability conditions for an empty capability set, the way Docker
    evaluates them: drop every rule that applies only when the container holds a
