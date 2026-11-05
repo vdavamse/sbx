@@ -678,8 +678,10 @@ sbx stop --session-dir S
   through the same code path as `run --landlock`. The settings are the session's:
   the holder pins them at start, and an attach applies exactly those. `sbx attach`
   takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
-  layer. Under its signal scope a call cannot signal the resident or another call.
-  The holder can still end a call (on stop, or when the holder dies), because the
+  layer. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
+  ABI 6), the signal scope adds a second barrier behind the per-call pid namespace
+  (S19): a call cannot signal the resident or another call. The holder can still
+  end a call (on stop, or when the holder dies), because the
   holder and the attach sit outside every call's Landlock domain (S24).
 - **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
   run for that long. `--max-lifetime` (default 8h) ends it after that long
