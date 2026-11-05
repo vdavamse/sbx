@@ -96,6 +96,8 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
         "x32-syscall" => x32_syscall_role(),
         // #34: an i386 compat syscall through `int 0x80`, which the arch gate kills.
         "int80-syscall" => int80_role(),
+        // #42: deny-listed syscalls and personality(2) personas.
+        "denylist" => denylist_role(),
         // #12: writes a marker into the session's work dir (/work).
         "mark" => match fs::write("/work/marker", b"marked") {
             Ok(()) => 0,
@@ -491,6 +493,92 @@ fn seccomp_status_role() -> u8 {
     0
 }
 
+/// #42: one `SYS <label> <ok|errno=N>` line per probe. The probes pass
+/// NULL or zero arguments: the filter answers before the kernel reads them.
+/// Unfiltered, several of them would also fail with EPERM (see
+/// `seccomp_denylist_eperm` for which ones discriminate).
+fn denylist_role() -> u8 {
+    use libc::c_long;
+    let report = |label: &str, ret: c_long| {
+        if ret < 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            println!("SYS {label} errno={errno}");
+        } else {
+            println!("SYS {label} ok");
+        }
+    };
+    const KEYCTL_GET_KEYRING_ID: c_long = 0;
+    const KEY_SPEC_SESSION_KEYRING: c_long = -3;
+    const ADDR_NO_RANDOMIZE: c_long = 0x0004_0000;
+    // SAFETY: syscalls with integer and NULL arguments; the denied ones never
+    // reach the kernel, and the personality query changes nothing.
+    unsafe {
+        report(
+            "keyctl",
+            libc::syscall(
+                libc::SYS_keyctl,
+                KEYCTL_GET_KEYRING_ID,
+                KEY_SPEC_SESSION_KEYRING,
+                0 as c_long,
+            ) as c_long,
+        );
+        report(
+            "bpf",
+            libc::syscall(libc::SYS_bpf, 0 as c_long, 0 as c_long, 0 as c_long) as c_long,
+        );
+        report(
+            "perf-event-open",
+            libc::syscall(
+                libc::SYS_perf_event_open,
+                0 as c_long,
+                0 as c_long,
+                -1 as c_long,
+                -1 as c_long,
+                0 as c_long,
+            ) as c_long,
+        );
+        report(
+            "userfaultfd",
+            libc::syscall(libc::SYS_userfaultfd, 0 as c_long) as c_long,
+        );
+        report(
+            "open-by-handle-at",
+            libc::syscall(
+                libc::SYS_open_by_handle_at,
+                -1 as c_long,
+                0 as c_long,
+                0 as c_long,
+            ) as c_long,
+        );
+        report(
+            "fsopen",
+            libc::syscall(libc::SYS_fsopen, 0 as c_long, 0 as c_long) as c_long,
+        );
+        // syslog(SYSLOG_ACTION_SIZE_BUFFER): succeeds unfiltered where
+        // kernel.dmesg_restrict is 0.
+        report(
+            "syslog",
+            libc::syscall(libc::SYS_syslog, 10 as c_long, 0 as c_long, 0 as c_long) as c_long,
+        );
+        // ioperm(0, 0, 0) (x86_64, the tail of the deny chain): turning ports
+        // off needs no capability, so it succeeds unfiltered.
+        #[cfg(target_arch = "x86_64")]
+        report(
+            "ioperm",
+            libc::syscall(libc::SYS_ioperm, 0 as c_long, 0 as c_long, 0 as c_long) as c_long,
+        );
+        report(
+            "personality-query",
+            libc::syscall(libc::SYS_personality, 0xffff_ffff as c_long) as c_long,
+        );
+        report(
+            "personality-no-randomize",
+            libc::syscall(libc::SYS_personality, ADDR_NO_RANDOMIZE) as c_long,
+        );
+    }
+    0
+}
+
 /// #34: an x32 syscall (bit 30 set). The filter kills the process.
 #[cfg(target_arch = "x86_64")]
 fn x32_syscall_role() -> u8 {
@@ -725,6 +813,11 @@ fn scenarios() -> Vec<Scenario> {
             name: "seccomp-int80-killed-159",
             gate: Bwrap,
             run: seccomp_int80_killed_159,
+        },
+        Scenario {
+            name: "seccomp-denylist-eperm",
+            gate: Bwrap,
+            run: seccomp_denylist_eperm,
         },
         Scenario {
             name: "exit-code-passthrough",
@@ -1580,6 +1673,70 @@ fn seccomp_int80_killed_159() -> Result<(), String> {
     let (done, dir) = run_role_case("seccomp-int80", "int80-syscall", &[], |_| {}, &[])?;
     let _ = fs::remove_dir_all(&dir);
     expect_rc(&done, 159)
+}
+
+/// The `SYS` lines of one `denylist` run (the role run directly when
+/// `sandboxed` is false), label → value.
+fn denylist_probes(sandboxed: bool) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let stdout = if sandboxed {
+        let (done, dir) = run_role_case("seccomp-denylist", "denylist", &[], |_| {}, &[])?;
+        let _ = fs::remove_dir_all(&dir);
+        expect_rc(&done, 0)?;
+        done.stdout
+    } else {
+        let out = Command::new(payload_exe())
+            .env(ROLE_ENV, "denylist")
+            .output()
+            .map_err(|e| format!("spawn denylist baseline: {e}"))?;
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("SYS ") {
+            let (label, value) = rest
+                .split_once(' ')
+                .ok_or_else(|| format!("malformed SYS line {line:?}"))?;
+            map.insert(label.to_owned(), value.to_owned());
+        }
+    }
+    Ok(map)
+}
+
+/// #42: deny-listed syscalls fail with EPERM (1) inside the sandbox, the
+/// personality query keeps working and `ADDR_NO_RANDOMIZE` is refused.
+/// Discriminating probes (they do not fail with EPERM without the filter,
+/// even after bwrap's capability drop): `keyctl`, `perf-event-open` (EFAULT
+/// on the NULL attr), `ioperm` (x86_64) and `personality-no-randomize`;
+/// `syslog` too where `dmesg_restrict` is 0. `bpf`, `userfaultfd`, `fsopen`
+/// and `open-by-handle-at` may already be EPERM from host sysctls or the
+/// capability drop. The host baseline (unfiltered, with capabilities of the
+/// test user) is printed for context only.
+fn seccomp_denylist_eperm() -> Result<(), String> {
+    let host = denylist_probes(false)?;
+    println!("host denylist baseline (unfiltered): {host:?}");
+    let map = denylist_probes(true)?;
+    for label in [
+        "keyctl",
+        "bpf",
+        "perf-event-open",
+        "userfaultfd",
+        "open-by-handle-at",
+        "fsopen",
+        "syslog",
+        "personality-no-randomize",
+    ]
+    .into_iter()
+    .chain(cfg!(target_arch = "x86_64").then_some("ioperm"))
+    {
+        match map.get(label) {
+            Some(got) if got == "errno=1" => {}
+            other => return Err(format!("probe {label}: want errno=1, got {other:?}")),
+        }
+    }
+    match map.get("personality-query") {
+        Some(got) if got == "ok" => Ok(()),
+        other => Err(format!("probe personality-query: want ok, got {other:?}")),
+    }
 }
 
 fn exit_code_passthrough() -> Result<(), String> {

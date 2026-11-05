@@ -37,9 +37,30 @@
 //!   comparison would deny harmless spellings such as `(1 << 32) | AF_UNIX`
 //!   and would not be a stricter check of the kernel's behaviour.
 //!
-//! Every other syscall is allowed (`SECCOMP_RET_ALLOW`): this is a family
-//! allow-list, not a syscall allow-list. A broader syscall deny-list is a
-//! separate follow-up.
+//! **Syscall deny-list (issue #42).** A conservative set of syscalls that
+//! widen the kernel attack surface and that ordinary tools do not need fails
+//! with `EPERM` (the answer Docker's default profile gives, so callers
+//! degrade the same way): see [`DENIED_SYSCALLS`]. It covers the kernel
+//! keyring (`keyctl`, `add_key`, `request_key`), `bpf`, `perf_event_open`,
+//! `userfaultfd`, `kexec_*`, kernel modules, `open_by_handle_at`, the old
+//! and new mount APIs (through `open_tree_attr`, Linux 6.15),
+//! `quotactl_fd`, `syslog`, swap, `reboot`, `acct` and (x86_64)
+//! `iopl`/`ioperm`. Many of these already fail without capabilities; the
+//! filter refuses them before the kernel looks at any argument.
+//! `personality(2)` is allowed only for Docker's set of personas
+//! ([`ALLOWED_PERSONAS`], low word of `args[0]`; the kernel takes an
+//! `unsigned int`), so `ADDR_NO_RANDOMIZE` and `READ_IMPLIES_EXEC` are
+//! refused with `EPERM`.
+//!
+//! Not filtered, by design: `ptrace` (cBPF cannot compare the target with
+//! the caller, and gdb/strace need it; the payload is in its own pid
+//! namespace and every process in it, pid 1 included, carries this filter),
+//! and namespace flags of `clone`/`unshare`/`setns` (bwrap's
+//! `--disable-userns` and `--cap-drop ALL` already refuse them, and
+//! `clone3`'s flags are behind a pointer cBPF cannot read).
+//!
+//! Every other syscall is allowed (`SECCOMP_RET_ALLOW`): this is a
+//! deny-list, not a syscall allow-list.
 //!
 //! **Encoding.** The program is a `struct sock_filter[]` in *native*
 //! endianness, 8 bytes per instruction; bwrap reads it verbatim
@@ -89,6 +110,7 @@ const OFF_ARCH: u32 = 4;
 /// offset 20 is never read).
 const OFF_ARG0_LO: u32 = 16;
 
+const EPERM: u32 = 1;
 const EAFNOSUPPORT: u32 = 97;
 const ENOSYS: u32 = 38;
 
@@ -101,8 +123,89 @@ pub const AF_NETLINK: u32 = 16;
 pub const ALLOWED_FAMILIES: [u32; 4] = [AF_UNIX, AF_INET, AF_INET6, AF_NETLINK];
 
 /// The seccomp ABI's errno values (asm-generic, identical on both arches).
+pub const ERRNO_EPERM: u32 = EPERM;
 pub const ERRNO_EAFNOSUPPORT: u32 = EAFNOSUPPORT;
 pub const ERRNO_ENOSYS: u32 = ENOSYS;
+
+/// One deny-listed syscall: its name and its number on x86_64 and on
+/// aarch64 (`None` where the syscall does not exist on that architecture).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeniedSyscall {
+    pub name: &'static str,
+    pub x86_64: Option<u32>,
+    pub aarch64: Option<u32>,
+}
+
+const fn both(name: &'static str, x86_64: u32, aarch64: u32) -> DeniedSyscall {
+    DeniedSyscall {
+        name,
+        x86_64: Some(x86_64),
+        aarch64: Some(aarch64),
+    }
+}
+
+/// Syscalls that fail with `EPERM` (issue #42), in listing order (the
+/// program's compare chain). x86_64 numbers are from
+/// `arch/x86/entry/syscalls/syscall_64.tbl`, aarch64 from
+/// `include/uapi/asm-generic/unistd.h`.
+pub const DENIED_SYSCALLS: [DeniedSyscall; 31] = [
+    // Kernel keyring: not namespaced per sandbox.
+    both("keyctl", 250, 219),
+    both("add_key", 248, 217),
+    both("request_key", 249, 218),
+    // Kernel attack surface with a long CVE history.
+    both("bpf", 321, 280),
+    both("perf_event_open", 298, 241),
+    both("userfaultfd", 323, 282),
+    // Kernel replacement and modules.
+    both("kexec_load", 246, 104),
+    both("kexec_file_load", 320, 294),
+    both("init_module", 175, 105),
+    both("finit_module", 313, 273),
+    both("delete_module", 176, 106),
+    // File handles bypass path-based confinement ("shocker").
+    both("open_by_handle_at", 304, 265),
+    // Mount APIs, old and new.
+    both("mount", 165, 40),
+    both("umount2", 166, 39),
+    both("pivot_root", 155, 41),
+    both("open_tree", 428, 428),
+    both("move_mount", 429, 429),
+    both("fsopen", 430, 430),
+    both("fsconfig", 431, 431),
+    both("fsmount", 432, 432),
+    both("fspick", 433, 433),
+    both("mount_setattr", 442, 442),
+    both("open_tree_attr", 467, 467),
+    both("quotactl_fd", 443, 443),
+    // Host-wide state.
+    both("syslog", 103, 116),
+    both("swapon", 167, 224),
+    both("swapoff", 168, 225),
+    both("reboot", 169, 142),
+    both("acct", 163, 89),
+    // x86 I/O port access.
+    DeniedSyscall {
+        name: "iopl",
+        x86_64: Some(172),
+        aarch64: None,
+    },
+    DeniedSyscall {
+        name: "ioperm",
+        x86_64: Some(173),
+        aarch64: None,
+    },
+];
+
+/// `personality(2)` values allowed (Docker's default profile). Anything else
+/// fails with `EPERM`.
+pub const ALLOWED_PERSONAS: [u32; 5] = [
+    0x0000_0000, // PER_LINUX
+    0x0000_0008, // PER_LINUX32
+    0x0002_0000, // UNAME26
+    0x0002_0008, // PER_LINUX32 | UNAME26
+    0xffff_ffff, // query only
+];
 
 /// Architectures with a filter program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,6 +241,7 @@ impl Arch {
                 socket: 41,
                 socketpair: 53,
                 io_uring: [425, 426, 427],
+                personality: 135,
             },
             Arch::Aarch64 => SyscallTable {
                 audit_arch: AUDIT_ARCH_AARCH64,
@@ -145,8 +249,17 @@ impl Arch {
                 socket: 198,
                 socketpair: 199,
                 io_uring: [425, 426, 427],
+                personality: 92,
             },
         }
+    }
+
+    /// This architecture's deny-listed syscall numbers, in listing order.
+    pub fn denied_numbers(self) -> impl Iterator<Item = u32> {
+        DENIED_SYSCALLS.iter().filter_map(move |s| match self {
+            Arch::X86_64 => s.x86_64,
+            Arch::Aarch64 => s.aarch64,
+        })
     }
 }
 
@@ -159,6 +272,7 @@ struct SyscallTable {
     socket: u32,
     socketpair: u32,
     io_uring: [u32; 3],
+    personality: u32,
 }
 
 /// One `struct sock_filter`: `{ u16 code; u8 jt; u8 jf; u32 k; }`.
@@ -177,9 +291,11 @@ enum Label {
     Enosys,
     Check,
     Allow,
+    Eperm,
+    Persona,
 }
 
-const LABELS: usize = 4;
+const LABELS: usize = 6;
 
 fn label_slot(label: Label) -> usize {
     match label {
@@ -187,6 +303,8 @@ fn label_slot(label: Label) -> usize {
         Label::Enosys => 1,
         Label::Check => 2,
         Label::Allow => 3,
+        Label::Eperm => 4,
+        Label::Persona => 5,
     }
 }
 
@@ -240,8 +358,9 @@ impl Asm {
 
 /// The filter program for `arch`. Pure: no I/O, deterministic.
 ///
-/// The listing (x86_64, 19 instructions; aarch64 is the same without the
-/// x32 check at index 3) is pinned by `golden_listing_*`.
+/// The listing (x86_64, 58 instructions; aarch64 is the same without the
+/// x32 check at index 3 and without `iopl`/`ioperm`, 55) is pinned by
+/// `golden_listing_*`.
 pub fn program(arch: Arch) -> Vec<Insn> {
     let t = arch.table();
     let mut a = Asm::default();
@@ -280,6 +399,15 @@ pub fn program(arch: Arch) -> Vec<Insn> {
     for nr in t.io_uring {
         a.push(BPF_JMP | BPF_JEQ | BPF_K, Some(Label::Enosys), None, nr);
     }
+    for nr in arch.denied_numbers() {
+        a.push(BPF_JMP | BPF_JEQ | BPF_K, Some(Label::Eperm), None, nr);
+    }
+    a.push(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        Some(Label::Persona),
+        None,
+        t.personality,
+    );
     a.push(BPF_RET | BPF_K, None, None, SECCOMP_RET_ALLOW);
 
     // Family check on the low word of args[0].
@@ -294,6 +422,16 @@ pub fn program(arch: Arch) -> Vec<Insn> {
         None,
         SECCOMP_RET_ERRNO | EAFNOSUPPORT,
     );
+
+    // personality(2): allowed personas on the low word of args[0], the rest
+    // falls through to EPERM.
+    a.place(Label::Persona);
+    a.push(BPF_LD | BPF_W | BPF_ABS, None, None, OFF_ARG0_LO);
+    for persona in ALLOWED_PERSONAS {
+        a.push(BPF_JMP | BPF_JEQ | BPF_K, Some(Label::Allow), None, persona);
+    }
+    a.place(Label::Eperm);
+    a.push(BPF_RET | BPF_K, None, None, SECCOMP_RET_ERRNO | EPERM);
 
     a.place(Label::Allow);
     a.push(BPF_RET | BPF_K, None, None, SECCOMP_RET_ALLOW);
@@ -511,7 +649,12 @@ mod tests {
         for arch in Arch::ALL {
             let t = arch.table();
             for nr in 0..1024u32 {
-                if nr == t.socket || nr == t.socketpair || t.io_uring.contains(&nr) {
+                if nr == t.socket
+                    || nr == t.socketpair
+                    || t.io_uring.contains(&nr)
+                    || nr == t.personality
+                    || arch.denied_numbers().any(|d| d == nr)
+                {
                     continue;
                 }
                 assert_eq!(run(arch, nr, 40), SECCOMP_RET_ALLOW, "{arch:?} nr {nr}");
@@ -520,6 +663,89 @@ mod tests {
         // getuid (102) on x86_64: pins that i386 socketcall's number is not
         // denied natively; the arch gate is what closes that path.
         assert_eq!(run(Arch::X86_64, 102, 0), SECCOMP_RET_ALLOW);
+    }
+
+    #[test]
+    fn denied_syscalls_are_eperm() {
+        // Issue #42: every deny-listed number, whatever its arguments.
+        for arch in Arch::ALL {
+            let mut count = 0;
+            for nr in arch.denied_numbers() {
+                for a0 in [0u64, 1, 40, u64::MAX] {
+                    assert_eq!(
+                        run(arch, nr, a0),
+                        SECCOMP_RET_ERRNO | EPERM,
+                        "{arch:?} nr {nr}"
+                    );
+                }
+                count += 1;
+            }
+            let want = match arch {
+                Arch::X86_64 => DENIED_SYSCALLS.len(),
+                Arch::Aarch64 => DENIED_SYSCALLS.len() - 2,
+            };
+            assert_eq!(count, want, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn denied_table_is_consistent() {
+        for arch in Arch::ALL {
+            let t = arch.table();
+            let nrs: Vec<u32> = arch.denied_numbers().collect();
+            let mut unique = nrs.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique.len(), nrs.len(), "{arch:?}: duplicate number");
+            for nr in nrs {
+                assert!(
+                    nr != t.socket
+                        && nr != t.socketpair
+                        && nr != t.personality
+                        && !t.io_uring.contains(&nr),
+                    "{arch:?}: {nr} overlaps a special-cased syscall"
+                );
+            }
+        }
+        let mut names: Vec<&str> = DENIED_SYSCALLS.iter().map(|s| s.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), DENIED_SYSCALLS.len(), "duplicate name");
+    }
+
+    #[test]
+    fn personality_allows_only_listed_personas() {
+        const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
+        const READ_IMPLIES_EXEC: u64 = 0x0040_0000;
+        for arch in Arch::ALL {
+            let nr = arch.table().personality;
+            for persona in ALLOWED_PERSONAS {
+                assert_eq!(
+                    run(arch, nr, u64::from(persona)),
+                    SECCOMP_RET_ALLOW,
+                    "{arch:?} {persona:#x}"
+                );
+                // High word ignored: the kernel takes an unsigned int.
+                assert_eq!(
+                    run(arch, nr, u64::from(persona) | (0xdead_beef << 32)),
+                    SECCOMP_RET_ALLOW
+                );
+            }
+            for persona in [
+                ADDR_NO_RANDOMIZE,
+                READ_IMPLIES_EXEC,
+                ADDR_NO_RANDOMIZE | 0x0002_0000,
+                1,
+                0xffff_fffe,
+                (1 << 32) | ADDR_NO_RANDOMIZE,
+            ] {
+                assert_eq!(
+                    run(arch, nr, persona),
+                    SECCOMP_RET_ERRNO | EPERM,
+                    "{arch:?} {persona:#x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -627,21 +853,60 @@ mod tests {
     fn golden_listing_x86_64() {
         let want: Vec<(u16, u8, u8, u32)> = vec![
             (0x0020, 0, 0, 4),
-            (0x0015, 0, 16, 0xC000_003E),
+            (0x0015, 0, 55, 0xC000_003E),
             (0x0020, 0, 0, 0),
-            (0x0045, 14, 0, 0x4000_0000),
-            (0x0015, 5, 0, 41),
-            (0x0015, 4, 0, 53),
-            (0x0015, 10, 0, 425),
-            (0x0015, 9, 0, 426),
-            (0x0015, 8, 0, 427),
+            (0x0045, 53, 0, 0x4000_0000),
+            (0x0015, 37, 0, 41),
+            (0x0015, 36, 0, 53),
+            (0x0015, 49, 0, 425),
+            (0x0015, 48, 0, 426),
+            (0x0015, 47, 0, 427),
+            (0x0015, 44, 0, 250),
+            (0x0015, 43, 0, 248),
+            (0x0015, 42, 0, 249),
+            (0x0015, 41, 0, 321),
+            (0x0015, 40, 0, 298),
+            (0x0015, 39, 0, 323),
+            (0x0015, 38, 0, 246),
+            (0x0015, 37, 0, 320),
+            (0x0015, 36, 0, 175),
+            (0x0015, 35, 0, 313),
+            (0x0015, 34, 0, 176),
+            (0x0015, 33, 0, 304),
+            (0x0015, 32, 0, 165),
+            (0x0015, 31, 0, 166),
+            (0x0015, 30, 0, 155),
+            (0x0015, 29, 0, 428),
+            (0x0015, 28, 0, 429),
+            (0x0015, 27, 0, 430),
+            (0x0015, 26, 0, 431),
+            (0x0015, 25, 0, 432),
+            (0x0015, 24, 0, 433),
+            (0x0015, 23, 0, 442),
+            (0x0015, 22, 0, 467),
+            (0x0015, 21, 0, 443),
+            (0x0015, 20, 0, 103),
+            (0x0015, 19, 0, 167),
+            (0x0015, 18, 0, 168),
+            (0x0015, 17, 0, 169),
+            (0x0015, 16, 0, 163),
+            (0x0015, 15, 0, 172),
+            (0x0015, 14, 0, 173),
+            (0x0015, 7, 0, 135),
             (0x0006, 0, 0, 0x7fff_0000),
             (0x0020, 0, 0, 16),
-            (0x0015, 4, 0, 1),
-            (0x0015, 3, 0, 2),
-            (0x0015, 2, 0, 10),
-            (0x0015, 1, 0, 16),
+            (0x0015, 11, 0, 1),
+            (0x0015, 10, 0, 2),
+            (0x0015, 9, 0, 10),
+            (0x0015, 8, 0, 16),
             (0x0006, 0, 0, 0x0005_0061),
+            (0x0020, 0, 0, 16),
+            (0x0015, 5, 0, 0),
+            (0x0015, 4, 0, 8),
+            (0x0015, 3, 0, 0x0002_0000),
+            (0x0015, 2, 0, 0x0002_0008),
+            (0x0015, 1, 0, 0xFFFF_FFFF),
+            (0x0006, 0, 0, 0x0005_0001),
             (0x0006, 0, 0, 0x7fff_0000),
             (0x0006, 0, 0, 0x0005_0026),
             (0x0006, 0, 0, 0x8000_0000),
@@ -653,20 +918,57 @@ mod tests {
     fn golden_listing_aarch64() {
         let want: Vec<(u16, u8, u8, u32)> = vec![
             (0x0020, 0, 0, 4),
-            (0x0015, 0, 15, 0xC000_00B7),
+            (0x0015, 0, 52, 0xC000_00B7),
             (0x0020, 0, 0, 0),
-            (0x0015, 5, 0, 198),
-            (0x0015, 4, 0, 199),
-            (0x0015, 10, 0, 425),
-            (0x0015, 9, 0, 426),
-            (0x0015, 8, 0, 427),
+            (0x0015, 35, 0, 198),
+            (0x0015, 34, 0, 199),
+            (0x0015, 47, 0, 425),
+            (0x0015, 46, 0, 426),
+            (0x0015, 45, 0, 427),
+            (0x0015, 42, 0, 219),
+            (0x0015, 41, 0, 217),
+            (0x0015, 40, 0, 218),
+            (0x0015, 39, 0, 280),
+            (0x0015, 38, 0, 241),
+            (0x0015, 37, 0, 282),
+            (0x0015, 36, 0, 104),
+            (0x0015, 35, 0, 294),
+            (0x0015, 34, 0, 105),
+            (0x0015, 33, 0, 273),
+            (0x0015, 32, 0, 106),
+            (0x0015, 31, 0, 265),
+            (0x0015, 30, 0, 40),
+            (0x0015, 29, 0, 39),
+            (0x0015, 28, 0, 41),
+            (0x0015, 27, 0, 428),
+            (0x0015, 26, 0, 429),
+            (0x0015, 25, 0, 430),
+            (0x0015, 24, 0, 431),
+            (0x0015, 23, 0, 432),
+            (0x0015, 22, 0, 433),
+            (0x0015, 21, 0, 442),
+            (0x0015, 20, 0, 467),
+            (0x0015, 19, 0, 443),
+            (0x0015, 18, 0, 116),
+            (0x0015, 17, 0, 224),
+            (0x0015, 16, 0, 225),
+            (0x0015, 15, 0, 142),
+            (0x0015, 14, 0, 89),
+            (0x0015, 7, 0, 92),
             (0x0006, 0, 0, 0x7fff_0000),
             (0x0020, 0, 0, 16),
-            (0x0015, 4, 0, 1),
-            (0x0015, 3, 0, 2),
-            (0x0015, 2, 0, 10),
-            (0x0015, 1, 0, 16),
+            (0x0015, 11, 0, 1),
+            (0x0015, 10, 0, 2),
+            (0x0015, 9, 0, 10),
+            (0x0015, 8, 0, 16),
             (0x0006, 0, 0, 0x0005_0061),
+            (0x0020, 0, 0, 16),
+            (0x0015, 5, 0, 0),
+            (0x0015, 4, 0, 8),
+            (0x0015, 3, 0, 0x0002_0000),
+            (0x0015, 2, 0, 0x0002_0008),
+            (0x0015, 1, 0, 0xFFFF_FFFF),
+            (0x0006, 0, 0, 0x0005_0001),
             (0x0006, 0, 0, 0x7fff_0000),
             (0x0006, 0, 0, 0x0005_0026),
             (0x0006, 0, 0, 0x8000_0000),
@@ -678,7 +980,7 @@ mod tests {
     fn golden_bytes_are_native_endian() {
         // First instruction: LD|W|ABS arch => code 0x0020, jt 0, jf 0, k 4.
         let bytes = encode(&program(Arch::X86_64));
-        assert_eq!(bytes.len(), 19 * 8);
+        assert_eq!(bytes.len(), 58 * 8);
         let mut first = Vec::new();
         first.extend_from_slice(&0x0020u16.to_ne_bytes());
         first.extend_from_slice(&[0, 0]);
@@ -691,49 +993,126 @@ mod tests {
         last.extend_from_slice(&SECCOMP_RET_KILL_PROCESS.to_ne_bytes());
         assert_eq!(&bytes[bytes.len() - 8..], &last[..]);
         // Length is a multiple of 8 (bwrap rejects anything else).
-        assert_eq!(encode(&program(Arch::Aarch64)).len(), 18 * 8);
+        assert_eq!(encode(&program(Arch::Aarch64)).len(), 55 * 8);
     }
 
-    /// The full byte encoding, pinned against the prototype's binaries
-    /// (`prog-*.bin`, verified with bwrap 0.9.0 on this kernel): one
-    /// 8-byte instruction (16 hex digits) per line.
+    /// The full byte encoding, one 8-byte instruction (16 hex digits) per
+    /// line. The #34 layout was validated against the prototype's binaries
+    /// (`prog-*.bin`, bwrap 0.9.0); the #42 additions shift its jump
+    /// offsets, and are exercised end to end by `seccomp-denylist-eperm`.
     const GOLDEN_X86_64_HEX: &[&str] = &[
         "2000000004000000",
-        "150000103e0000c0",
+        "150000373e0000c0",
         "2000000000000000",
-        "45000e0000000040",
-        "1500050029000000",
-        "1500040035000000",
-        "15000a00a9010000",
-        "15000900aa010000",
-        "15000800ab010000",
+        "4500350000000040",
+        "1500250029000000",
+        "1500240035000000",
+        "15003100a9010000",
+        "15003000aa010000",
+        "15002f00ab010000",
+        "15002c00fa000000",
+        "15002b00f8000000",
+        "15002a00f9000000",
+        "1500290041010000",
+        "150028002a010000",
+        "1500270043010000",
+        "15002600f6000000",
+        "1500250040010000",
+        "15002400af000000",
+        "1500230039010000",
+        "15002200b0000000",
+        "1500210030010000",
+        "15002000a5000000",
+        "15001f00a6000000",
+        "15001e009b000000",
+        "15001d00ac010000",
+        "15001c00ad010000",
+        "15001b00ae010000",
+        "15001a00af010000",
+        "15001900b0010000",
+        "15001800b1010000",
+        "15001700ba010000",
+        "15001600d3010000",
+        "15001500bb010000",
+        "1500140067000000",
+        "15001300a7000000",
+        "15001200a8000000",
+        "15001100a9000000",
+        "15001000a3000000",
+        "15000f00ac000000",
+        "15000e00ad000000",
+        "1500070087000000",
         "060000000000ff7f",
         "2000000010000000",
-        "1500040001000000",
-        "1500030002000000",
-        "150002000a000000",
-        "1500010010000000",
+        "15000b0001000000",
+        "15000a0002000000",
+        "150009000a000000",
+        "1500080010000000",
         "0600000061000500",
+        "2000000010000000",
+        "1500050000000000",
+        "1500040008000000",
+        "1500030000000200",
+        "1500020008000200",
+        "15000100ffffffff",
+        "0600000001000500",
         "060000000000ff7f",
         "0600000026000500",
         "0600000000000080",
     ];
     const GOLDEN_AARCH64_HEX: &[&str] = &[
         "2000000004000000",
-        "1500000fb70000c0",
+        "15000034b70000c0",
         "2000000000000000",
-        "15000500c6000000",
-        "15000400c7000000",
-        "15000a00a9010000",
-        "15000900aa010000",
-        "15000800ab010000",
+        "15002300c6000000",
+        "15002200c7000000",
+        "15002f00a9010000",
+        "15002e00aa010000",
+        "15002d00ab010000",
+        "15002a00db000000",
+        "15002900d9000000",
+        "15002800da000000",
+        "1500270018010000",
+        "15002600f1000000",
+        "150025001a010000",
+        "1500240068000000",
+        "1500230026010000",
+        "1500220069000000",
+        "1500210011010000",
+        "150020006a000000",
+        "15001f0009010000",
+        "15001e0028000000",
+        "15001d0027000000",
+        "15001c0029000000",
+        "15001b00ac010000",
+        "15001a00ad010000",
+        "15001900ae010000",
+        "15001800af010000",
+        "15001700b0010000",
+        "15001600b1010000",
+        "15001500ba010000",
+        "15001400d3010000",
+        "15001300bb010000",
+        "1500120074000000",
+        "15001100e0000000",
+        "15001000e1000000",
+        "15000f008e000000",
+        "15000e0059000000",
+        "150007005c000000",
         "060000000000ff7f",
         "2000000010000000",
-        "1500040001000000",
-        "1500030002000000",
-        "150002000a000000",
-        "1500010010000000",
+        "15000b0001000000",
+        "15000a0002000000",
+        "150009000a000000",
+        "1500080010000000",
         "0600000061000500",
+        "2000000010000000",
+        "1500050000000000",
+        "1500040008000000",
+        "1500030000000200",
+        "1500020008000200",
+        "15000100ffffffff",
+        "0600000001000500",
         "060000000000ff7f",
         "0600000026000500",
         "0600000000000080",
@@ -789,6 +1168,62 @@ mod tests {
         );
         assert_eq!(ERRNO_EAFNOSUPPORT as i32, libc::EAFNOSUPPORT);
         assert_eq!(ERRNO_ENOSYS as i32, libc::ENOSYS);
+        assert_eq!(ERRNO_EPERM as i32, libc::EPERM);
+        assert_eq!(t.personality, libc::SYS_personality as u32);
+        assert_eq!(
+            Arch::X86_64.denied_numbers().collect::<Vec<_>>(),
+            native_denied_from_libc()
+        );
+    }
+
+    /// The deny-list in listing order, from `libc::SYS_*` for this target
+    /// (`iopl`/`ioperm` on x86_64 only).
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn native_denied_from_libc() -> Vec<u32> {
+        // libc's musl aarch64 module has no `SYS_kexec_file_load`; 294 is
+        // the asm-generic number (glibc aarch64 libc agrees).
+        #[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
+        const KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
+        #[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+        const KEXEC_FILE_LOAD: libc::c_long = 294;
+        let mut nrs = vec![
+            libc::SYS_keyctl,
+            libc::SYS_add_key,
+            libc::SYS_request_key,
+            libc::SYS_bpf,
+            libc::SYS_perf_event_open,
+            libc::SYS_userfaultfd,
+            libc::SYS_kexec_load,
+            KEXEC_FILE_LOAD,
+            libc::SYS_init_module,
+            libc::SYS_finit_module,
+            libc::SYS_delete_module,
+            libc::SYS_open_by_handle_at,
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_pivot_root,
+            libc::SYS_open_tree,
+            libc::SYS_move_mount,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_fspick,
+            libc::SYS_mount_setattr,
+            // open_tree_attr (Linux 6.15) is not in libc yet; 467 on both.
+            467,
+            libc::SYS_quotactl_fd,
+            libc::SYS_syslog,
+            libc::SYS_swapon,
+            libc::SYS_swapoff,
+            libc::SYS_reboot,
+            libc::SYS_acct,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        nrs.extend([libc::SYS_iopl, libc::SYS_ioperm]);
+        nrs.into_iter().map(|n| n as u32).collect()
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -807,6 +1242,12 @@ mod tests {
         );
         assert_eq!(ERRNO_EAFNOSUPPORT as i32, libc::EAFNOSUPPORT);
         assert_eq!(ERRNO_ENOSYS as i32, libc::ENOSYS);
+        assert_eq!(ERRNO_EPERM as i32, libc::EPERM);
+        assert_eq!(t.personality, libc::SYS_personality as u32);
+        assert_eq!(
+            Arch::Aarch64.denied_numbers().collect::<Vec<_>>(),
+            native_denied_from_libc()
+        );
     }
 
     #[test]
