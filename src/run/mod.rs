@@ -449,7 +449,7 @@ fn check_bwrap_version(
     deadline: Instant,
     timeout: Duration,
     signals: &sys::Signals,
-) -> Result<(), Early> {
+) -> Result<(u32, u32, u32), Early> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let mut child = Command::new(bwrap)
@@ -522,9 +522,15 @@ fn check_bwrap_version(
         .map_err(|err| RunError::new(format!("cannot collect bwrap --version: {err}")))?;
     let text = String::from_utf8_lossy(&out).into_owned();
     // The shared gate (issue #11): the refusal text is BwrapStatus's, pinned.
-    match classify_version_output(bwrap, status.success(), status.code(), &text).run_reason() {
-        None => Ok(()),
-        Some(reason) => Err(RunError::new(reason).into()),
+    // The usable version is returned: the argv depends on it (issue #43,
+    // deny-mask `--size` from bwrap 0.10).
+    let classified = classify_version_output(bwrap, status.success(), status.code(), &text);
+    match (&classified, classified.run_reason()) {
+        (BwrapStatus::Ok { version, .. }, None) => Ok(*version),
+        (_, reason) => Err(RunError::new(
+            reason.unwrap_or_else(|| "unsupported bwrap version".to_owned()),
+        )
+        .into()),
     }
 }
 
@@ -667,7 +673,7 @@ fn execute(
     // S6: bwrap discovery and version gate.
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
-    check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
+    let bwrap_version = check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
 
     // S7: env pass-through and the session layout.
     let env = passed_env(&policy, |name| std::env::var_os(name));
@@ -706,6 +712,7 @@ fn execute(
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: landlock_layer,
+        deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 

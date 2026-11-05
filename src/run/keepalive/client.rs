@@ -226,7 +226,7 @@ fn run_call(
     sys::reset_sigchld();
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
-    check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
+    let bwrap_version = check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
     let env = passed_env(policy, |name| std::env::var_os(name));
     let (info_read, info_write) = sys::pipe_cloexec()
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
@@ -254,6 +254,7 @@ fn run_call(
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: layer,
+        deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
     // S8a (#39/#40, N19) on every call: a payload may have planted a link under a

@@ -1473,6 +1473,7 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
         info_fd: None,
         seccomp_fd,
         landlock: None,
+        deny_tmpfs_size: None,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 

@@ -263,7 +263,13 @@ pub(super) fn assemble(input: &Build<'_>) -> (Vec<OsString>, Plan) {
 
     // 8. Deny masks LAST among the filesystem ops — deny always wins
     //    (Q5). Sorted dest-ascending byte order, deduped.
+    //    Each mask is sized when the bwrap supports `--size` (issue #43):
+    //    `--size` applies to the next `--tmpfs` only.
     for deny in &denies {
+        if let Some(size) = input.deny_tmpfs_size {
+            argv.push(OsString::from("--size"));
+            argv.push(OsString::from(size.to_string()));
+        }
         argv.push(OsString::from("--tmpfs"));
         argv.push(OsString::from(deny));
     }
@@ -910,11 +916,69 @@ mod tests {
             info_fd: None,
             seccomp_fd: SECCOMP_FD,
             landlock: None,
+            deny_tmpfs_size: None,
         };
         build(&input)
             .expect("golden inputs must build")
             .argv()
             .to_vec()
+    }
+
+    /// Issue #43: with a size, every deny `--tmpfs` is preceded by its own
+    /// `--size` (bwrap applies `--size` to the next tmpfs only); without one
+    /// the argv is unchanged; nothing else gets a `--size`.
+    #[test]
+    fn deny_masks_sized_when_requested() {
+        let policy = policy_of(&base_with(&[(
+            r#""ro": [], "rw": [], "deny": []"#,
+            r#""ro": ["/usr"], "rw": [], "deny": ["/usr/share/doc", "/usr/share/man"]"#,
+        )]));
+        let env = BTreeMap::new();
+        let cmd = os(&["/bin/echo", "hi"]);
+        let argv_with = |size: Option<u64>| {
+            build(&Build {
+                policy: &policy,
+                session_dir: Path::new(SESSION_DIR),
+                bwrap_path: Path::new(BWRAP),
+                command: &cmd,
+                cwd: None,
+                passed_env: &env,
+                info_fd: None,
+                seccomp_fd: SECCOMP_FD,
+                landlock: None,
+                deny_tmpfs_size: size,
+            })
+            .expect("build")
+            .argv()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+        };
+        let plain = argv_with(None);
+        let sized = argv_with(Some(1 << 20));
+        assert!(!plain.iter().any(|a| a == "--size"));
+        let tmpfs: Vec<usize> = sized
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--tmpfs")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(tmpfs.len(), 2);
+        for i in &tmpfs {
+            assert_eq!(&sized[i - 2..*i], ["--size", "1048576"]);
+        }
+        assert_eq!(sized.iter().filter(|a| *a == "--size").count(), 2);
+        // Removing the --size pairs gives back the unsized argv exactly.
+        let mut stripped = Vec::new();
+        let mut it = sized.iter();
+        while let Some(a) = it.next() {
+            if a == "--size" {
+                it.next();
+            } else {
+                stripped.push(a.clone());
+            }
+        }
+        assert_eq!(stripped, plain);
     }
 
     // Shared expected-argv blocks. Deliberately spelled out (not computed
@@ -1051,6 +1115,7 @@ mod tests {
             info_fd: Some(9),
             seccomp_fd: SECCOMP_FD,
             landlock: None,
+            deny_tmpfs_size: None,
         };
         let with = build(&input)
             .expect("golden inputs must build")
@@ -1085,6 +1150,7 @@ mod tests {
                 info_fd,
                 seccomp_fd,
                 landlock: None,
+                deny_tmpfs_size: None,
             };
             let argv = build(&input)
                 .expect("golden inputs must build")
@@ -1913,6 +1979,7 @@ mod tests {
                 info_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock,
+                deny_tmpfs_size: None,
             };
             build(&input)
                 .expect("golden inputs must build")
@@ -2008,6 +2075,7 @@ mod tests {
                     status_fd: 8,
                     host_abi: 6,
                 }),
+                deny_tmpfs_size: None,
             };
             let argv = build(&input).expect("generated inputs must build").argv().to_vec();
             let verdict = crate::init::validate_shim_command(&argv, Some(9), Some(8));
@@ -2041,6 +2109,7 @@ mod tests {
                     status_fd: 8,
                     host_abi: 6,
                 }),
+                deny_tmpfs_size: None,
             };
             let argv = build(&input).expect("generated inputs must build").argv().to_vec();
             prop_assert!(argv.ends_with(&command), "the payload is the argv tail");
@@ -2299,6 +2368,7 @@ mod tests {
                 info_fd,
                 seccomp_fd,
                 landlock: None,
+                deny_tmpfs_size: None,
             };
             let argv = build(&input)
                 .expect("generated inputs must build")
@@ -2342,6 +2412,7 @@ mod tests {
                 info_fd,
                 seccomp_fd: SECCOMP_FD,
                 landlock: None,
+                deny_tmpfs_size: None,
             };
             let argv = build(&input)
                 .expect("generated inputs must build")
@@ -2697,6 +2768,7 @@ mod tests {
                 info_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: None,
+                deny_tmpfs_size: None,
             };
             let err = build(&input)
                 .expect_err("an injected NUL byte must be rejected")

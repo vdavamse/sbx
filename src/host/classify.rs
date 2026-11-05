@@ -749,7 +749,8 @@ pub struct Seams<'a> {
 /// [`policy_check`] with explicit seams. Items: `network-mode`, `infra-etc`,
 /// `policy-paths`, `deny-paths`, `bind-sockets` (#35, warns),
 /// `mount-chains` (#39/#40, fails), `pin-cost` (warns above 50 pins),
-/// `bwrap-cve` (warns below 0.12.0), `deny-links` (warns on hard links).
+/// `bwrap-cve` (warns below 0.12.0), `deny-links` (warns on hard links),
+/// `deny-tmpfs-size` (#43, warns below bwrap 0.10 when there are denies).
 /// Only a `Fail` makes the policy not runnable; `Warn` and `Skip` do not.
 pub fn policy_check_with(
     path: &str,
@@ -862,6 +863,7 @@ pub fn policy_check_with(
     checks.push(bwrap_item);
     checks.push(pin_cost_item(plan.pins));
     checks.push(deny_links_item(policy, seams.hard_links));
+    checks.push(deny_tmpfs_item(policy.filesystem.deny.len(), seams.bwrap));
 
     let runnable = checks.iter().all(|c| c.status != Status::Fail);
     PolicyCheck {
@@ -950,6 +952,51 @@ fn bwrap_cve_item(n: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
             "bubblewrap {shown} predates 0.12.0 (CVE-2026-87766) unless your distribution backported the fix; this policy has {n} mount paths under its binds. sbx verifies them before each run, but a concurrent writer can still race that check (0.12.0 closes the dest side only; see R26)"
         ),
         fix: Some("install bubblewrap 0.12.0 or later".to_owned()),
+    }
+}
+
+/// `deny-tmpfs-size` (issue #43, warns, never fails): from bwrap 0.10 sbx
+/// caps each deny `--tmpfs` mask at [`crate::bwrap::DENY_TMPFS_BYTES`];
+/// older bwrap has no `--size`, so a writable mask holds up to half of RAM.
+fn deny_tmpfs_item(denies: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
+    let Some(version) = bwrap else {
+        return PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Skip,
+            detail: "bubblewrap is not usable on this host, so deny-mask sizing was not checked"
+                .to_owned(),
+            fix: None,
+        };
+    };
+    let shown = format!("{}.{}.{}", version.0, version.1, version.2);
+    if denies == 0 {
+        return PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Ok,
+            detail: "the policy has no deny masks".to_owned(),
+            fix: None,
+        };
+    }
+    match crate::bwrap::deny_tmpfs_size_for(version) {
+        Some(bytes) => PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Ok,
+            detail: format!(
+                "bubblewrap {shown} sizes each of the {denies} deny masks at {} KiB",
+                bytes / 1024
+            ),
+            fix: None,
+        },
+        None => PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Warn,
+            detail: format!(
+                "bubblewrap {shown} predates 0.10 (no --size): the {denies} deny masks are unsized tmpfs, so a payload can fill one up to half of RAM"
+            ),
+            fix: Some(
+                "install bubblewrap 0.10 or later, or set a memory limit (cgroup)".to_owned(),
+            ),
+        },
     }
 }
 
@@ -2003,6 +2050,24 @@ mod tests {
     }
 
     #[test]
+    fn deny_tmpfs_size_warns_below_0_10_only_with_denies() {
+        assert_eq!(deny_tmpfs_item(2, Some((0, 9, 0))).status, Status::Warn);
+        assert!(
+            deny_tmpfs_item(2, Some((0, 9, 0)))
+                .detail
+                .contains("predates 0.10 (no --size)")
+        );
+        assert_eq!(deny_tmpfs_item(0, Some((0, 9, 0))).status, Status::Ok);
+        let ok = deny_tmpfs_item(2, Some((0, 10, 0)));
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(
+            ok.detail,
+            "bubblewrap 0.10.0 sizes each of the 2 deny masks at 1024 KiB"
+        );
+        assert_eq!(deny_tmpfs_item(2, None).status, Status::Skip);
+    }
+
+    #[test]
     fn bwrap_cve_warns_below_0_12_only_with_mount_paths() {
         let with_rw = r#"{"version":1,"filesystem":{"ro":["/usr","/tmp/x"],"rw":["/tmp"],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
         let no_rw = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
@@ -2143,7 +2208,7 @@ mod tests {
         let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/run"],"deny":["/run/secret"]},"network":{"mode":"explicit","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
         let policy = policy_of(json);
         let r = sockets_check(&policy, &no_sockets);
-        assert_eq!(r.checks.len(), 9);
+        assert_eq!(r.checks.len(), 10);
         assert_eq!(r.checks[4].id, "bind-sockets");
         assert_eq!(r.checks[4].status, Status::Ok);
         assert_eq!(

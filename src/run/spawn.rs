@@ -380,6 +380,7 @@ mod tests {
             info_fd: Some(9),
             seccomp_fd: 11,
             landlock: None,
+            deny_tmpfs_size: None,
         })
         .expect("builds");
         // Issue #34: `--seccomp-fd 11` follows `--keep-fd 9`.
@@ -489,6 +490,7 @@ mod tests {
             info_fd: Some(9),
             seccomp_fd: 11,
             landlock: None,
+            deny_tmpfs_size: None,
         })
         .expect("builds");
         let fds = ChildFds {
