@@ -24,6 +24,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// The control socket's file name inside the session directory.
 pub(crate) const CTL_NAME: &str = "sbx.ctl";
@@ -154,134 +155,223 @@ pub(crate) fn connect_ctl(dir: BorrowedFd<'_>) -> io::Result<UnixStream> {
 /// the attach reply sends three).
 pub(crate) const MAX_FDS: usize = 4;
 
-/// Sends one frame; `fds` travel with the header bytes (SCM_RIGHTS). The
-/// payload follows on the same stream. `MSG_NOSIGNAL`: a vanished peer is an
-/// error, never SIGPIPE.
-pub(crate) fn send_frame(
+/// The budget of one blocking client call (send or receive a whole frame).
+pub(crate) const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Waits until `fd` is ready for `events`, or `deadline` passes (a
+/// `TimedOut` error). Hang-up also counts as ready: the next syscall reports it.
+fn wait_fd(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control deadline passed",
+            ));
+        }
+        let ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: one pollfd, a live pointer to it, and a bounded timeout.
+        let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if rc < 0 {
+            let err = io_last();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc > 0 {
+            return Ok(());
+        }
+    }
+}
+
+/// Reads exactly `buf.len()` bytes before `deadline` (one budget for the whole
+/// read: a peer that trickles bytes cannot extend it).
+fn read_until(fd: RawFd, buf: &mut [u8], deadline: Instant) -> io::Result<()> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        wait_fd(fd, libc::POLLIN, deadline)?;
+        // SAFETY: the pointer and length name the unfilled tail of `buf`.
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf[pos..].as_mut_ptr().cast(),
+                buf.len() - pos,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            let err = io_last();
+            match err.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => continue,
+                _ => return Err(err),
+            }
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed mid-frame",
+            ));
+        }
+        pos += n as usize;
+    }
+    Ok(())
+}
+
+/// Sends one frame before `deadline`. `fds` travel with the first bytes of the
+/// header (SCM_RIGHTS). `MSG_NOSIGNAL`: a vanished peer is an error, never SIGPIPE.
+pub(crate) fn send_frame_until(
     stream: &UnixStream,
     op: u8,
     payload: &[u8],
     fds: &[RawFd],
+    deadline: Instant,
 ) -> Result<(), super::proto::ProtoError> {
     use super::proto::{MAX_FRAME, ProtoError};
-    use std::io::Write;
     if payload.len() > MAX_FRAME {
         return Err(ProtoError::TooLarge(payload.len()));
     }
     if fds.len() > MAX_FDS {
         return Err(ProtoError::Malformed("too many descriptors for one frame"));
     }
-    let len = payload.len() as u32;
-    let mut header = [0u8; 5];
-    header[0] = op;
-    header[1..].copy_from_slice(&len.to_be_bytes());
+    let fd = stream.as_raw_fd();
+    let mut total = Vec::with_capacity(5 + payload.len());
+    total.push(op);
+    total.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    total.extend_from_slice(payload);
     let fd_bytes = std::mem::size_of_val(fds);
     // u64 storage keeps the control block aligned for struct cmsghdr.
     let mut control = [0u64; 8];
-    let mut iov = libc::iovec {
-        iov_base: header.as_ptr() as *mut libc::c_void,
-        iov_len: header.len(),
-    };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    if !fds.is_empty() {
-        let space = unsafe { libc::CMSG_SPACE(fd_bytes as u32) } as usize;
-        msg.msg_control = control.as_mut_ptr().cast();
-        msg.msg_controllen = space as _;
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
-            std::ptr::copy_nonoverlapping(
-                fds.as_ptr().cast::<u8>(),
-                libc::CMSG_DATA(cmsg),
-                fd_bytes,
-            );
+    let mut sent = 0usize;
+    let mut fds_pending = !fds.is_empty();
+    while sent < total.len() {
+        wait_fd(fd, libc::POLLOUT, deadline)?;
+        let mut iov = libc::iovec {
+            iov_base: total[sent..].as_ptr() as *mut libc::c_void,
+            iov_len: total.len() - sent,
+        };
+        // SAFETY: zeroed msghdr is a valid starting state; fields are set below.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        if fds_pending {
+            let space = unsafe { libc::CMSG_SPACE(fd_bytes as u32) } as usize;
+            msg.msg_control = control.as_mut_ptr().cast();
+            msg.msg_controllen = space as _;
+            // SAFETY: the control block is large enough for one cmsghdr with `fds`.
+            unsafe {
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    fd_bytes,
+                );
+            }
         }
+        let rc = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) };
+        if rc < 0 {
+            let err = io_last();
+            match err.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => continue,
+                _ => return Err(ProtoError::Io(err)),
+            }
+        }
+        sent += rc as usize;
+        fds_pending = false;
     }
-    let sent = loop {
-        let rc = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        if rc >= 0 {
-            break rc as usize;
-        }
-        let err = io_last();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(ProtoError::Io(err));
-        }
-    };
-    let mut w = stream;
-    if sent < header.len() {
-        w.write_all(&header[sent..])?;
-    }
-    w.write_all(payload)?;
-    w.flush()?;
     Ok(())
 }
 
-/// Receives one frame and the descriptors that came with its header. The
-/// descriptors are close-on-exec (`MSG_CMSG_CLOEXEC`) and owned by the caller;
-/// a frame with `MSG_CTRUNC` fails closed.
-pub(crate) fn recv_frame(
+/// Sends one frame within the default client budget.
+pub(crate) fn send_frame(
     stream: &UnixStream,
+    op: u8,
+    payload: &[u8],
+    fds: &[RawFd],
+) -> Result<(), super::proto::ProtoError> {
+    send_frame_until(stream, op, payload, fds, Instant::now() + CLIENT_TIMEOUT)
+}
+
+/// Receives one frame and the descriptors that came with its header, all before
+/// `deadline`. The descriptors are close-on-exec (`MSG_CMSG_CLOEXEC`) and owned by
+/// the caller. A frame with `MSG_CTRUNC` fails closed.
+pub(crate) fn recv_frame_until(
+    stream: &UnixStream,
+    deadline: Instant,
 ) -> Result<(super::proto::Frame, Vec<std::os::fd::OwnedFd>), super::proto::ProtoError> {
     use super::proto::{Frame, MAX_FRAME, ProtoError};
-    use std::io::Read;
     use std::os::fd::FromRawFd;
+    let fd = stream.as_raw_fd();
     let mut header = [0u8; 5];
-    let mut control = [0u64; 8];
-    let mut iov = libc::iovec {
-        iov_base: header.as_mut_ptr().cast(),
-        iov_len: header.len(),
-    };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = std::mem::size_of_val(&control) as _;
-    let got = loop {
-        let rc = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if rc >= 0 {
-            break rc as usize;
-        }
-        let err = io_last();
-        if err.kind() != io::ErrorKind::Interrupted {
-            return Err(ProtoError::Io(err));
-        }
-    };
-    // Collect any descriptors first, so every error path below closes them.
+    let mut got = 0usize;
+    // Descriptors are collected from every header read, so they are owned (and
+    // closed on any error path) as soon as they arrive.
     let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                let count = data_len / std::mem::size_of::<RawFd>();
-                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                for i in 0..count {
-                    fds.push(std::os::fd::OwnedFd::from_raw_fd(*data.add(i)));
-                }
+    while got < header.len() {
+        wait_fd(fd, libc::POLLIN, deadline)?;
+        let mut control = [0u64; 8];
+        let mut iov = libc::iovec {
+            iov_base: header[got..].as_mut_ptr().cast(),
+            iov_len: header.len() - got,
+        };
+        // SAFETY: zeroed msghdr is a valid starting state; fields are set below.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&control) as _;
+        let rc =
+            unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT) };
+        if rc < 0 {
+            let err = io_last();
+            match err.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => continue,
+                _ => return Err(ProtoError::Io(err)),
             }
-            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
-    }
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(ProtoError::Malformed("control data truncated"));
-    }
-    if got == 0 {
-        return Err(ProtoError::Eof);
-    }
-    let mut r = stream;
-    if got < header.len() {
-        r.read_exact(&mut header[got..])?;
+        // SAFETY: walks the cmsgs the kernel just wrote into `control`.
+        unsafe {
+            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+            while !cmsg.is_null() {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                    let count = data_len / std::mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                    for i in 0..count {
+                        fds.push(std::os::fd::OwnedFd::from_raw_fd(*data.add(i)));
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+            }
+        }
+        if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(ProtoError::Malformed("control data truncated"));
+        }
+        if rc == 0 {
+            if got == 0 {
+                return Err(ProtoError::Eof);
+            }
+            return Err(ProtoError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "peer closed mid-header",
+            )));
+        }
+        got += rc as usize;
     }
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
     if len > MAX_FRAME {
         return Err(ProtoError::TooLarge(len));
     }
     let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
+    read_until(fd, &mut payload, deadline)?;
     Ok((
         Frame {
             op: header[0],
@@ -289,6 +379,13 @@ pub(crate) fn recv_frame(
         },
         fds,
     ))
+}
+
+/// Receives one frame within the default client budget.
+pub(crate) fn recv_frame(
+    stream: &UnixStream,
+) -> Result<(super::proto::Frame, Vec<std::os::fd::OwnedFd>), super::proto::ProtoError> {
+    recv_frame_until(stream, Instant::now() + CLIENT_TIMEOUT)
 }
 
 /// The pid and uid of the peer (`SO_PEERCRED`).
@@ -497,5 +594,46 @@ mod tests {
         let (pid, uid) = peer_creds(&a).unwrap();
         assert_eq!(pid, std::process::id() as libc::pid_t);
         assert_eq!(uid, euid());
+    }
+
+    #[test]
+    fn a_trickling_peer_is_cut_off_at_the_frame_deadline() {
+        // The header declares 1000 bytes; the peer sends one byte every 50 ms.
+        // A per-read timeout would never fire; the frame deadline must.
+        use super::super::proto::ProtoError;
+        use std::io::Write;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut header = vec![b'A'];
+            header.extend_from_slice(&1000u32.to_be_bytes());
+            let _ = a.write_all(&header);
+            for _ in 0..200 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if a.write_all(&[0]).is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let result = recv_frame_until(&b, started + Duration::from_millis(300));
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&result, Err(ProtoError::Io(e)) if e.kind() == io::ErrorKind::TimedOut),
+            "expected a deadline error, got {:?}",
+            result.as_ref().err()
+        );
+        assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+        drop(b);
+        let _ = writer.join();
+    }
+
+    #[test]
+    fn a_silent_peer_is_cut_off_at_the_deadline() {
+        use super::super::proto::ProtoError;
+        let (_a, b) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let result = recv_frame_until(&b, started + Duration::from_millis(100));
+        assert!(matches!(result, Err(ProtoError::Io(e)) if e.kind() == io::ErrorKind::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

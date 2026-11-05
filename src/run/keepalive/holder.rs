@@ -17,9 +17,15 @@
 //!    namespaces. Attaches to an explicit-mode session are refused (the join
 //!    re-verifies nftables, which only the transparent mode loads).
 //! 4. **Control socket.** `sbx.ctl` is bound before the go byte (see
-//!    [`super::ctl`]). Each connection has a 2 s I/O budget, its peer uid is
-//!    checked, and a frame that fails to decode is dropped without a reply. The
-//!    holder serves connections serially from the supervisor loop.
+//!    [`super::ctl`]). Each connection has one 2 s deadline, `REQUEST_TIMEOUT`,
+//!    covering its whole request and its reply: every read and write polls
+//!    against the time left, so a peer that trickles bytes is cut off at the
+//!    deadline and cannot extend it. Its peer uid is checked, and a frame that
+//!    fails to decode is dropped without a reply. Each supervisor wake accepts at
+//!    most `ACCEPT_BATCH` (8) connections and then returns to the loop, so
+//!    signals, the lifetime clock and the resident are checked between batches.
+//!    Connections are served serially, so a stalled peer costs at most its own
+//!    deadline.
 //! 5. **Attach handshake.** An `Attach` request carries the attach process's
 //!    pidfd (SCM_RIGHTS). The holder keeps it: the attach is the call's
 //!    process, and the holder's pidfd for the attach is how a stop reaches it.
@@ -77,8 +83,12 @@ use crate::run::{RunArgs, RunError};
 pub(crate) const LOG_FILE: &str = "holder.log";
 /// How long an attached call may take to end after SIGTERM (rule 8).
 pub(crate) const CALL_GRACE: Duration = Duration::from_secs(5);
-/// The I/O budget of one control connection (rule 4).
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// The budget of one control connection: the whole request and its reply share
+/// this single deadline (rule 4). A slow client cannot extend it byte by byte.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// The most connections one supervisor wake serves (rule 4): the loop runs its
+/// signal, child and clock checks between batches.
+pub(crate) const ACCEPT_BATCH: usize = 8;
 /// The longest refusal reason the launcher will print.
 const MAX_MESSAGE: usize = 1024;
 /// How long the listener is left out of the poll after a resource-exhaustion
@@ -303,6 +313,8 @@ pub(crate) struct Holder {
     backoff_until: Option<Instant>,
     /// Set by a fatal `accept` failure; the next wake ends the session.
     fatal: Option<String>,
+    /// The deadline of the connection being served (rule 4).
+    conn_deadline: Instant,
 }
 
 /// Builds the holder after the resident is up and before the go byte (rule 4 and
@@ -344,36 +356,85 @@ pub(crate) fn prepare(
         stop_requested: false,
         backoff_until: None,
         fatal: None,
+        conn_deadline: Instant::now(),
     })
 }
 
-/// Writes one reply with optional descriptors. Best effort: a vanished peer is
-/// the peer's problem.
-fn reply(stream: &UnixStream, msg: &Reply, fds: &[RawFd]) {
+/// Writes one reply with optional descriptors, before `deadline`. Best effort: a
+/// vanished or stalled peer loses its reply, and the caller undoes the work.
+fn reply(stream: &UnixStream, msg: &Reply, fds: &[RawFd], deadline: Instant) {
     let (op, payload) = msg.encode();
-    let _ = ctl::send_frame(stream, op, &payload, fds);
+    let _ = ctl::send_frame_until(stream, op, &payload, fds, deadline);
+}
+
+/// How one accept round ended (rule 10 and the batch cap).
+#[derive(Debug)]
+pub(crate) enum RoundEnd {
+    /// The backlog is empty for now.
+    Drained,
+    /// The batch cap was reached; more may be waiting.
+    Capped,
+    /// Descriptors or memory are exhausted: back off.
+    Backoff,
+    /// The socket is unusable: end the session.
+    Fatal(String),
+}
+
+/// The connections one accept round collected, and how the round ended.
+#[derive(Debug)]
+pub(crate) struct AcceptRound {
+    pub(crate) streams: Vec<UnixStream>,
+    pub(crate) end: RoundEnd,
+}
+
+/// Accepts up to `cap` connections (rule 4). `accept` is the listener's accept;
+/// a client that gave up is skipped, and skips count toward the cap so an endless
+/// stream of them cannot hold the loop either.
+pub(crate) fn accept_round(
+    mut accept: impl FnMut() -> std::io::Result<UnixStream>,
+    cap: usize,
+) -> AcceptRound {
+    let mut streams = Vec::new();
+    let mut skipped = 0usize;
+    loop {
+        if streams.len() >= cap || skipped >= cap {
+            return AcceptRound {
+                streams,
+                end: RoundEnd::Capped,
+            };
+        }
+        match accept() {
+            Ok(stream) => streams.push(stream),
+            Err(err) => {
+                let end = match classify_accept(err.raw_os_error()) {
+                    AcceptFault::Next => {
+                        skipped += 1;
+                        continue;
+                    }
+                    AcceptFault::Drained => RoundEnd::Drained,
+                    AcceptFault::Backoff => RoundEnd::Backoff,
+                    AcceptFault::Fatal => {
+                        RoundEnd::Fatal(format!("control socket failed: accept: {err}"))
+                    }
+                };
+                return AcceptRound { streams, end };
+            }
+        }
+    }
 }
 
 impl Holder {
-    /// Reads every pending connection (rule 4). Serial by design: each one has a
-    /// bounded I/O budget.
+    /// One supervisor wake's accept round (rule 4): at most [`ACCEPT_BATCH`]
+    /// connections, served serially, each under its own deadline.
     fn accept_all(&mut self, now: Instant) {
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => self.handle(stream, now),
-                Err(err) => match classify_accept(err.raw_os_error()) {
-                    AcceptFault::Next => continue,
-                    AcceptFault::Drained => break,
-                    AcceptFault::Backoff => {
-                        self.backoff_until = Some(now + ACCEPT_BACKOFF);
-                        break;
-                    }
-                    AcceptFault::Fatal => {
-                        self.fatal = Some(format!("control socket failed: accept: {err}"));
-                        break;
-                    }
-                },
-            }
+        let round = accept_round(|| self.listener.accept().map(|(s, _)| s), ACCEPT_BATCH);
+        for stream in round.streams {
+            self.handle(stream, now);
+        }
+        match round.end {
+            RoundEnd::Drained | RoundEnd::Capped => {}
+            RoundEnd::Backoff => self.backoff_until = Some(now + ACCEPT_BACKOFF),
+            RoundEnd::Fatal(text) => self.fatal = Some(text),
         }
     }
 
@@ -383,9 +444,9 @@ impl Holder {
 
     /// One connection: peer check, one frame, one reply (or a silent drop).
     fn handle(&mut self, stream: UnixStream, now: Instant) {
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.conn_deadline = deadline;
         let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
         let Ok((pid, uid)) = ctl::peer_creds(&stream) else {
             return;
         };
@@ -394,10 +455,11 @@ impl Holder {
                 &stream,
                 &Reply::Refused("not the session owner".into()),
                 &[],
+                deadline,
             );
             return;
         }
-        let Ok((frame, fds)) = ctl::recv_frame(&stream) else {
+        let Ok((frame, fds)) = ctl::recv_frame_until(&stream, deadline) else {
             return;
         };
         let Ok(request) = Request::decode(frame) else {
@@ -424,7 +486,12 @@ impl Holder {
         now: Instant,
     ) {
         if self.stopping {
-            reply(stream, &Reply::Refused("session is stopping".into()), &[]);
+            reply(
+                stream,
+                &Reply::Refused("session is stopping".into()),
+                &[],
+                self.conn_deadline,
+            );
             return;
         }
         if fds.len() != 1 {
@@ -432,6 +499,7 @@ impl Holder {
                 stream,
                 &Reply::Refused("attach must send exactly one descriptor".into()),
                 &[],
+                self.conn_deadline,
             );
             return;
         }
@@ -440,11 +508,17 @@ impl Holder {
                 stream,
                 &Reply::Refused("attach needs a transparent-mode session".into()),
                 &[],
+                self.conn_deadline,
             );
             return;
         }
         if !self.pin.matches(policy) {
-            reply(stream, &Reply::Refused(MISMATCH.into()), &[]);
+            reply(
+                stream,
+                &Reply::Refused(MISMATCH.into()),
+                &[],
+                self.conn_deadline,
+            );
             return;
         }
         let id = self.next_id;
@@ -453,6 +527,7 @@ impl Holder {
                 stream,
                 &Reply::Refused("session call ids are exhausted".into()),
                 &[],
+                self.conn_deadline,
             );
             return;
         };
@@ -471,7 +546,7 @@ impl Holder {
             self.net_ns.as_raw_fd(),
         ];
         let (op, payload) = Reply::Accepted(id).encode();
-        if ctl::send_frame(stream, op, &payload, &raw).is_err() {
+        if ctl::send_frame_until(stream, op, &payload, &raw, self.conn_deadline).is_err() {
             // The attach never got the call: take it back.
             self.calls.retain(|c| c.id != id);
             self.clock.call_ended(now);
@@ -486,7 +561,12 @@ impl Holder {
         now: Instant,
     ) {
         let Some(pos) = self.calls.iter().position(|c| c.id == end.call_id) else {
-            reply(stream, &Reply::Refused("unknown call".into()), &[]);
+            reply(
+                stream,
+                &Reply::Refused("unknown call".into()),
+                &[],
+                self.conn_deadline,
+            );
             return;
         };
         if self.calls[pos].pid != pid {
@@ -494,6 +574,7 @@ impl Holder {
                 stream,
                 &Reply::Refused("call belongs to another process".into()),
                 &[],
+                self.conn_deadline,
             );
             return;
         }
@@ -507,7 +588,7 @@ impl Holder {
             Some(self.net_mode),
         ));
         self.clock.call_ended(now);
-        reply(stream, &Reply::Done, &[]);
+        reply(stream, &Reply::Done, &[], self.conn_deadline);
     }
 
     /// Records calls whose attach died without reporting (rule 6).
@@ -583,7 +664,7 @@ impl Holder {
         ctl::unlink_ctl(self.dir.as_fd());
         drop(self.listener);
         for waiter in self.stop_waiters.drain(..) {
-            reply(&waiter, &Reply::Done, &[]);
+            reply(&waiter, &Reply::Done, &[], Instant::now() + REQUEST_TIMEOUT);
         }
     }
 }
@@ -704,5 +785,66 @@ mod tests {
         // poll(2) ignores negative fds, so the exhausted listener cannot spin the loop.
         assert_eq!(listener_poll_fd(7, false), 7);
         assert_eq!(listener_poll_fd(7, true), -1);
+    }
+
+    #[test]
+    fn one_round_serves_at_most_the_batch_cap() {
+        // The listener always has a connection waiting: the round stops at the cap,
+        // so the supervisor runs between batches.
+        let mut calls = 0usize;
+        let round = accept_round(
+            || {
+                calls += 1;
+                UnixStream::pair().map(|(a, _b)| a)
+            },
+            ACCEPT_BATCH,
+        );
+        assert_eq!(round.streams.len(), ACCEPT_BATCH);
+        assert!(matches!(round.end, RoundEnd::Capped));
+        assert_eq!(calls, ACCEPT_BATCH);
+    }
+
+    #[test]
+    fn a_round_stops_when_the_backlog_is_empty() {
+        let mut served = 0usize;
+        let round = accept_round(
+            || {
+                served += 1;
+                if served <= 2 {
+                    UnixStream::pair().map(|(a, _b)| a)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                }
+            },
+            ACCEPT_BATCH,
+        );
+        assert_eq!(round.streams.len(), 2);
+        assert!(matches!(round.end, RoundEnd::Drained));
+    }
+
+    #[test]
+    fn a_round_reports_backoff_and_fatal_errors() {
+        let round = accept_round(
+            || Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            ACCEPT_BATCH,
+        );
+        assert!(matches!(round.end, RoundEnd::Backoff));
+        let round = accept_round(
+            || Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            ACCEPT_BATCH,
+        );
+        assert!(matches!(round.end, RoundEnd::Fatal(_)));
+    }
+
+    #[test]
+    fn endless_skips_do_not_hold_the_round() {
+        // A client that always gives up before accept is counted as a skip, so the
+        // round still ends at the cap.
+        let round = accept_round(
+            || Err(std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            ACCEPT_BATCH,
+        );
+        assert!(round.streams.is_empty());
+        assert!(matches!(round.end, RoundEnd::Capped));
     }
 }
