@@ -204,8 +204,8 @@ parts of the optional layer the kernel provides, see **Landlock layer** under [R
 and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
 into a fresh user and network namespace, the two things `run --keep-alive` and
 `attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
-failure is a `warn` and never limits the network mode, as `landlock` does, so a
-host that runs plain sandboxes still exits 0.
+failure is a `warn`. Like `landlock`, it is report only: it never limits the
+network mode, so a host that runs plain sandboxes still exits 0.
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
