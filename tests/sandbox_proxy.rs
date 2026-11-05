@@ -4138,7 +4138,7 @@ fn scenario_dns_then_connect_netns() -> Result<(), String> {
     Ok(())
 }
 
-/// AC4: the pool is full at two names. A NEW name is REFUSED with the pinned
+/// AC4 (#43: NXDOMAIN, was REFUSED): the cap is two names. A NEW name gets NXDOMAIN with the pinned
 /// reason, the existing names keep answering, and nothing wraps.
 fn scenario_dns_exhaustion_netns() -> Result<(), String> {
     let run = run_netns_full(
@@ -4163,7 +4163,7 @@ fn scenario_dns_exhaustion_netns() -> Result<(), String> {
         return Err(format!("second name: {b:?}"));
     }
     if refused.verdict != DnsVerdict::Error(sbx::dns::DnsFailed::PoolExhausted)
-        || refused.reason() != "fake-IP pool 198.18.0.0/15 exhausted"
+        || refused.reason() != "fake-IP name cap reached: no new names in this run"
     {
         return Err(format!("third name must be refused: {refused:?}"));
     }
@@ -4574,8 +4574,8 @@ fn role_dns_exhaustion() -> Result<(), String> {
     )?;
     expect_empty(
         &dns_lookup(server, 0x0403, b"c.allowed.test", 1)?,
-        5,
-        "c.allowed.test (pool full)",
+        3,
+        "c.allowed.test (name cap reached: NXDOMAIN)",
     )?;
     single_a(
         &dns_lookup(server, 0x0404, b"a.allowed.test", 1)?,
