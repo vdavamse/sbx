@@ -266,6 +266,9 @@ jobs:
           #    processes (no internal processes), so it cannot be reused.
           CGS=/sys/fs/cgroup/sbx-ci-$$
           sudo mkdir "$CGS"
+          # The per-run cgroups below are the delegated ones; their parent must
+          # offer them the controllers (as the delegating manager would).
+          echo "+memory +pids" | sudo tee "$CGS/cgroup.subtree_control" > /dev/null
           # Runs CMD with the calling subshell moved into the fresh cgroup $1
           # first, so sbx is the only process there once it execs. A failed
           # move stops the subshell (it must not run sbx elsewhere).
