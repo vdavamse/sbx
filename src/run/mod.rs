@@ -997,9 +997,12 @@ fn execute(
             net_mode,
         },
     );
+    // Review 6 of #57: the control socket is closed before the lock is released,
+    // and the stops are answered after both (exit row, socket and lock are done).
+    let stops = holder.take().map(|h| h.close_control());
     drop(lock);
-    if let Some(h) = holder.take() {
-        h.finish();
+    if let Some(stops) = stops {
+        stops.answer();
     }
     std::process::exit(code)
 }

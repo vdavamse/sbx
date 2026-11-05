@@ -719,13 +719,15 @@ reason: "the session stopped while the call was running; it was killed after the
     }
 
     /// Rule 8, last steps: remove `sbx.ctl` and answer every `sbx stop`.
-    pub(crate) fn finish(mut self) {
+    ///
+    /// Review 6 of #57: the socket is gone before the session lock is released,
+    /// so a holder that takes the lock next finds no stale `sbx.ctl` to unlink
+    /// over its own. The stops are answered later, by [`StopWaiters::answer`],
+    /// after the lock is released (the exit row is already written).
+    pub(crate) fn close_control(mut self) -> StopWaiters {
         self.drain_backlog();
         ctl::unlink_ctl(self.dir.as_fd());
-        drop(self.listener);
-        for waiter in self.stop_waiters.drain(..) {
-            reply(&waiter, &Reply::Done, &[], Instant::now() + REQUEST_TIMEOUT);
-        }
+        StopWaiters(std::mem::take(&mut self.stop_waiters))
     }
 
     /// Answers the connections already queued at the listener (review 4): a
@@ -745,6 +747,19 @@ reason: "the session stopped while the call was running; it was killed after the
             if !capped {
                 break;
             }
+        }
+    }
+}
+
+/// The `sbx stop` connections waiting for the session to be gone.
+pub(crate) struct StopWaiters(Vec<UnixStream>);
+
+impl StopWaiters {
+    /// Answers every waiting stop with `Done` (review 6: called only after the
+    /// exit row is written and the session lock is released).
+    pub(crate) fn answer(self) {
+        for waiter in self.0 {
+            reply(&waiter, &Reply::Done, &[], Instant::now() + REQUEST_TIMEOUT);
         }
     }
 }
@@ -1005,7 +1020,7 @@ mod tests {
         let (op, payload) = Request::Attach(b"policy".to_vec()).encode();
         send_frame(&attach_client, op, &payload, &[]).expect("send attach");
 
-        holder.finish();
+        holder.close_control().answer();
 
         let (frame, _) = recv_frame(&attach_client).expect("the attach gets an answer");
         assert_eq!(
