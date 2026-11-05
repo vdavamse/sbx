@@ -441,6 +441,12 @@ impl DecisionSink for AuditLog {
         self.write(&teardown_row(ts(SystemTime::now()), decision, detail));
     }
 
+    fn closed(&self, decision: &Decision, up: u64, down: u64) {
+        // Issue #29 review, round 5: a plain `closed` call is a natural end. The
+        // relay calls `closed_with_reason`, which this sink implements.
+        self.closed_with_reason(decision, up, down, CloseReason::Ended);
+    }
+
     fn closed_with_reason(&self, decision: &Decision, up: u64, down: u64, end: CloseReason) {
         self.write(&close_row(ts(SystemTime::now()), decision, up, down, end));
     }
@@ -940,6 +946,35 @@ mod tests {
             None,
         ));
         assert!(latch.take().is_none());
+    }
+
+    /// Issue #29 review, round 5: a plain `closed` call writes exactly one close
+    /// row, with a null reason (the natural end).
+    #[test]
+    fn plain_closed_writes_exactly_one_close_row() {
+        let dir = std::env::temp_dir().join(format!("sbx-run-audit-{}-c", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("closed.jsonl");
+        std::fs::remove_file(&path).ok();
+        let latch = FaultLatch::new().expect("latch");
+        let log = AuditLog::new(Some(open_audit(&path).expect("open")), latch);
+        let c = decision(
+            "10.0.0.1:1",
+            transparent("1.2.3.4:80"),
+            Some("a.example"),
+            allowed("a.example", "1.2.3.4:80"),
+        );
+        DecisionSink::closed(&*log, &c, 7, 9);
+        let text = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("\"event\":\"close\""), "{text}");
+        assert!(lines[0].contains("\"reason\":null"), "{text}");
+        assert!(
+            lines[0].contains("\"bytes\":{\"up\":7,\"down\":9}"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

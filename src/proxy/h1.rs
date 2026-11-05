@@ -17,9 +17,11 @@
 //! 2. **Content-Length** — [`BodyFramer::Length`] streams exactly `n` bytes.
 //!    `Length(0)` never enters a body.
 //! 3. **Chunked (RFC 9112 §7.1, strict profile)** — [`BodyFramer::Chunked`]:
-//!    - a chunk-size line is `HEXDIG{1,16}` followed by CRLF, or by `;` and one
-//!      or more bytes from HTAB, SP, 0x21–0x7E and 0x80–0xFF, then CRLF. No
-//!      whitespace before `;` (RFC 9110 §5.6.3: senders must not generate it).
+//!    - a chunk-size line is `HEXDIG{1,16}` followed by CRLF, or by the
+//!      RFC 9112 §7.1.1 extension grammar `*( BWS ";" BWS token [ BWS "=" BWS
+//!      ( token / quoted-string ) ] )` and then CRLF (`chunk_exts_valid`, issue
+//!      #29 review, round 5). A value that is not a token or a quoted-string, an
+//!      empty name, an unterminated quoted-string and a trailing BWS are denied.
 //!      A bare LF, a CR that is not followed by LF, NUL and every other control
 //!      byte are denied. The line is capped at [`MAX_CHUNK_LINE`] bytes including
 //!      CRLF. Leading zeros count toward the 16 digits, so `u64` cannot overflow.
@@ -129,10 +131,14 @@ impl HeadAccumulator {
         }
     }
 
-    /// Bytes of a head have arrived but its terminator has not (the per-head
-    /// deadline runs while this holds).
+    /// A head has started and its terminator has not arrived (the per-head
+    /// deadline runs while this holds). CR and LF alone do not start a head:
+    /// RFC 9112 §2.2 lets a recipient ignore empty lines before the request-line
+    /// (issue #29 review, round 5), so the deadline starts on the first other
+    /// byte. A lone LF stays in the head and is denied by the bare-LF rule once
+    /// the head completes.
     pub(crate) fn in_progress(&self) -> bool {
-        !self.buf.is_empty()
+        self.buf.iter().any(|b| *b != b'\r' && *b != b'\n')
     }
 
     /// Append `input`. `Ok(Some((head, used)))` when the terminator completed:
@@ -343,14 +349,10 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<u64, Rejected> {
     if digits == 0 || digits > 16 {
         return Err(chunk_err(FRAMING_CHUNK_SIZE));
     }
-    match line.get(digits..) {
-        None | Some([]) => {}
-        Some([b';', ext @ ..]) => {
-            if ext.is_empty() || !ext.iter().all(|b| is_chunk_ext_byte(*b)) {
-                return Err(chunk_err(FRAMING_CHUNK_SIZE));
-            }
-        }
-        Some(_) => return Err(chunk_err(FRAMING_CHUNK_SIZE)),
+    // Issue #29 review, round 5: the RFC 9112 §7.1.1 extension grammar, not a
+    // byte class (see `chunk_exts_valid`).
+    if !chunk_exts_valid(line.get(digits..).unwrap_or(&[])) {
+        return Err(chunk_err(FRAMING_CHUNK_SIZE));
     }
     let mut size = 0u64;
     for digit in &line[..digits] {
@@ -369,9 +371,82 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<u64, Rejected> {
     Ok(size)
 }
 
-/// Chunk-extension bytes: HTAB, SP, VCHAR and obs-text.
-fn is_chunk_ext_byte(byte: u8) -> bool {
-    byte == HTAB || byte == SP || (0x21..=0x7e).contains(&byte) || byte >= 0x80
+/// Skips optional whitespace (SP / HTAB) at the front.
+fn skip_bws(mut at: &[u8]) -> &[u8] {
+    while let Some((&(SP | HTAB), rest)) = at.split_first() {
+        at = rest;
+    }
+    at
+}
+
+/// The chunk-extension grammar of RFC 9112 §7.1.1 (issue #29 review, round 5):
+/// `*( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )`, with
+/// `chunk-ext-name` and a bare `chunk-ext-val` both `token`s and a quoted value a
+/// `quoted-string` (quoted-pairs allowed). Input is the bytes after the size
+/// digits, up to the CRLF. Empty input is "no extensions". Anything else is
+/// refused: an empty name (`3;;;`, `3;=`), an unterminated quoted value
+/// (`3;a="x`), a trailing BWS before the CRLF, or a stray byte.
+fn chunk_exts_valid(rest: &[u8]) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let mut at = rest;
+    loop {
+        let Some((&b';', after_semi)) = skip_bws(at).split_first() else {
+            return false;
+        };
+        at = skip_bws(after_semi);
+        let name_len = at.iter().take_while(|b| is_tchar(**b)).count();
+        if name_len == 0 {
+            return false;
+        }
+        at = &at[name_len..];
+        if let Some((&b'=', after_eq)) = skip_bws(at).split_first() {
+            let value = skip_bws(after_eq);
+            if let Some((&b'"', body)) = value.split_first() {
+                match quoted_string_len(body) {
+                    Some(len) => at = &body[len..],
+                    None => return false,
+                }
+            } else {
+                let value_len = value.iter().take_while(|b| is_tchar(**b)).count();
+                if value_len == 0 {
+                    return false;
+                }
+                at = &value[value_len..];
+            }
+        }
+        if at.is_empty() {
+            return true;
+        }
+    }
+}
+
+/// The length of a quoted-string body (the bytes after the opening DQUOTE) up
+/// to and including its closing DQUOTE, or `None`: an unterminated string, or a
+/// byte outside `qdtext` / `quoted-pair`.
+fn quoted_string_len(body: &[u8]) -> Option<usize> {
+    let mut at = 0usize;
+    while let Some(&byte) = body.get(at) {
+        match byte {
+            b'"' => return Some(at + 1),
+            b'\\' => {
+                let escaped = *body.get(at + 1)?;
+                let pair_ok = escaped == HTAB
+                    || escaped == SP
+                    || (0x21..=0x7e).contains(&escaped)
+                    || escaped >= 0x80;
+                if !pair_ok {
+                    return None;
+                }
+                at += 2;
+            }
+            HTAB | SP | 0x21 | 0x23..=0x5b | 0x5d..=0x7e => at += 1,
+            byte if byte >= 0x80 => at += 1,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// RFC 9110 `tchar`.
@@ -683,7 +758,7 @@ mod tests {
             b"3;a\r\nabc\r\n0\r\n\r\n",
             b"3;a=b\r\nabc\r\n0\r\n\r\n",
             b"3;a=\"q v\"\r\nabc\r\n0\r\n\r\n",
-            b"3;a\t=\x80\r\nabc\r\n0\r\n\r\n",
+            b"3;a\t=b\r\nabc\r\n0\r\n\r\n",
             b"3\r\nabc\r\n0;last=1\r\n\r\n",
             b"3\r\nabc\r\n0\r\nX-A: b\r\n\r\n",
             b"3\r\nabc\r\n0\r\nX-A:\tb \t\r\nX-B:c\r\n\r\n",
@@ -741,7 +816,7 @@ mod tests {
             (b"11111111111111111\r\nx\r\n", FRAMING_CHUNK_SIZE), // 17 hex digits
             (b"zz\r\n", FRAMING_CHUNK_SIZE),                     // non-hex size
             (b"\r\n", FRAMING_CHUNK_SIZE),                       // empty size
-            (b"3 ;a\r\nabc\r\n", FRAMING_CHUNK_SIZE),            // BWS before ';'
+            (b"3 \r\nabc\r\n", FRAMING_CHUNK_SIZE),              // trailing BWS, no extension
             (b"3\n", FRAMING_CHUNK_SIZE),                        // bare LF
             (b"3\rX", FRAMING_CHUNK_SIZE),                       // CR without LF
             (b"3;a\x00\r\n", FRAMING_CHUNK_SIZE),                // NUL in an extension
@@ -822,7 +897,7 @@ mod tests {
     #[test]
     fn nothing_invalid_is_forwarded() {
         let rows: &[(&[u8], &[u8])] = &[
-            (b"3 ;a\r\nabc\r\n", b""),
+            (b"3;;;\r\nabc\r\n", b""),
             (b"3\r\nabc\nXX", b"3\r\nabc"),
             (b"3\r\nabcXX", b"3\r\nabc"),
             (b"3\r\nabc\r\nzz\r\n", b"3\r\nabc\r\n"),
@@ -834,6 +909,53 @@ mod tests {
             assert!(result.is_err(), "{bytes:?} must be denied");
             assert_eq!(out, expected.to_vec(), "{bytes:?}");
             assert!(bytes.starts_with(&out), "{bytes:?}");
+        }
+    }
+
+    /// Issue #29 review, round 5, item 3: the chunk-extension grammar of RFC 9112
+    /// §7.1.1, row by row. Accepted: BWS around `;`, `=` and the value; token
+    /// values; quoted values with quoted-pairs. Denied, all with `FRAMING_CHUNK_SIZE`:
+    /// an unterminated quoted value, empty names, a bare `=`, a trailing BWS
+    /// before the CRLF, and a stray byte.
+    #[test]
+    fn chunk_ext_grammar_table() {
+        let accepted: &[&[u8]] = &[
+            b"3;a=b",
+            b"3;a=\"b\\\"c\"",
+            b"3 ; a = b",
+            b"3;a",
+            b"3;a=b;c=d",
+            b"3;a=\"q v\";b",
+            b"3\t;\ta\t=\tb",
+            b"3;a=\"\\\\\"",
+        ];
+        for ext in accepted {
+            let line = [b"3".as_slice(), ext].concat();
+            assert!(parse_chunk_size(&line).is_ok(), "{line:?} must be accepted");
+        }
+        let denied: &[&[u8]] = &[
+            b"3;a=\"x",
+            b"3;;;",
+            b"3;=",
+            b"3;=b",
+            b"3;a=",
+            b"3;a=\"b\" x",
+            b"3;a=b ",
+            b"3;a b",
+            b"3;a=b;",
+            b"3;a=\"b\\\x01\"",
+            b"3;a=b\x7f",
+            b"3 ",
+        ];
+        for ext in denied {
+            let line = [b"3".as_slice(), ext].concat();
+            assert_eq!(
+                parse_chunk_size(&line),
+                Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_CHUNK_SIZE,
+                }),
+                "{line:?}"
+            );
         }
     }
 
@@ -935,6 +1057,24 @@ mod tests {
             !acc.in_progress(),
             "the accumulator is reset for the next head"
         );
+    }
+
+    /// Issue #29 review, round 5, item 2: CR and LF alone do not start a head
+    /// (the per-head deadline runs only on a real byte); a lone LF is buffered and
+    /// will be denied by the bare-LF rule once the head completes.
+    #[test]
+    fn head_accumulator_leading_crlf_does_not_start_a_head() {
+        let mut acc = HeadAccumulator::new(1024);
+        assert!(acc.push(b"\r\n").expect("ok").is_none());
+        assert!(!acc.in_progress(), "CRLF alone is not a head");
+        assert!(acc.push(b"\r").expect("ok").is_none());
+        assert!(!acc.in_progress());
+        assert!(acc.push(b"G").expect("ok").is_none());
+        assert!(acc.in_progress(), "the first real byte starts the head");
+
+        let mut lone = HeadAccumulator::new(1024);
+        assert!(lone.push(b"\n").expect("ok").is_none());
+        assert!(!lone.in_progress());
     }
 
     #[test]

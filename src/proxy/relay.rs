@@ -184,9 +184,12 @@
 //!    [`crate::proxy::Limits::decision_timeout`]. Deadlines use checked arithmetic.
 //! 9. **Teardown vocabulary (issue #29)** — [`Teardown`] is the single build site of
 //!    the relay-phase denial details: `SecondHello` and `TlsFraming` (the two pinned
-//!    scanner strings), and `Request { index, rejected }`, rendered as
+//!    scanner strings), `Request { index, rejected }`, rendered as
 //!    `relay torn down: HTTP request N denied: <reason>`, where request 1 is the
-//!    decision phase's and N counts up from there. [`relay_http`] writes every
+//!    decision phase's and N counts up from there, and `AfterLast { index }`,
+//!    rendered with the reason `bytes after the last request` (issue #29 review,
+//!    round 5: the client wrote again after its last request, an upgrade or a
+//!    pipelined request, and the relay refuses to forward it). [`relay_http`] writes every
 //!    validated byte before a request's outcome is acted on, so a denied element
 //!    never reaches the upstream and the bytes before it do. Upstream EOF ends the
 //!    segment (client half-close, then linger). A client EOF half-closes the
@@ -695,6 +698,10 @@ pub(crate) enum Teardown {
     /// An HTTP request on the connection was denied; `index` is its 1-based
     /// number, `rejected` the check that failed (port 80 and CONNECT-80).
     Request { index: u32, rejected: Rejected },
+    /// The client sent bytes after its last request's framed end (issue #29
+    /// review, round 5): an upgrade or a pipelined request the proxy refuses to
+    /// forward. `index` is the request those bytes would have been.
+    AfterLast { index: u32 },
 }
 
 impl Teardown {
@@ -714,6 +721,9 @@ impl Teardown {
             Teardown::Request { index, rejected } => format!(
                 "relay torn down: HTTP request {index} denied: {}",
                 rejected.reason()
+            ),
+            Teardown::AfterLast { index } => format!(
+                "relay torn down: HTTP request {index} denied: bytes after the last request"
             ),
         }
     }
@@ -1001,6 +1011,31 @@ async fn forward_input<W: AsyncWrite + Unpin>(
     })
 }
 
+/// After a last request's framed end the client is watched, not ignored
+/// (issue #29 review, round 5). The first byte read from the client means it
+/// expects more on this connection: an upgrade (gorilla/websocket, Go h2c and
+/// Node ws accept one despite the inserted `Connection: close`) or a pipelined
+/// request. The relay tears down at once with `Teardown::AfterLast`, and nothing
+/// is forwarded. A client EOF is not a denial. Bytes that arrived in the SAME
+/// read as the last request are discarded silently, as before: tearing down
+/// there would cut the response to that request.
+async fn settle_after_last<R: AsyncRead + Unpin>(
+    client_r: &mut R,
+    stream: &RequestStream,
+    flow: Flow,
+) -> io::Result<Flow> {
+    if !matches!(flow, Flow::AfterLast) {
+        return Ok(flow);
+    }
+    let mut chunk = [0u8; READ_CHUNK];
+    if client_r.read(&mut chunk).await? == 0 {
+        return Ok(Flow::AfterLast);
+    }
+    Ok(Flow::Torn(Teardown::AfterLast {
+        index: stream.index().saturating_add(1),
+    }))
+}
+
 /// Inspect one later request head (module docs point 7). Forward never
 /// reaches here: its only request is LAST, so the stream never yields a
 /// second head (the arm is a fail-closed backstop).
@@ -1062,7 +1097,7 @@ where
     }
     let up = async {
         if !matches!(first, Flow::Continue) {
-            return Ok(first);
+            return settle_after_last(&mut client_r, &stream, first).await;
         }
         let mut chunk = [0u8; READ_CHUNK];
         // (request number, instant the head's first byte was seen): the
@@ -1117,7 +1152,7 @@ where
             )
             .await?;
             if !matches!(flow, Flow::Continue) {
-                return Ok(flow);
+                return settle_after_last(&mut client_r, &stream, flow).await;
             }
         }
     };
@@ -2709,6 +2744,63 @@ mod tests {
             assert!(answered, "the upstream saw EOF before its response");
             assert!(matches!(end, Ok(HttpEnd::Finished)), "{end:?}");
             assert!(got.starts_with(b"HTTP/1.1 200 OK"), "{got:?}");
+        });
+    }
+
+    /// Issue #29 review, round 5, item 1: a client that writes more after its
+    /// last request (an upgrade, or a pipelined request) is torn down promptly
+    /// with the pinned `AfterLast` detail, and nothing it sent is forwarded.
+    #[test]
+    fn after_last_client_bytes_tear_down_promptly() {
+        block_on(async {
+            let close_head = b"GET /ws HTTP/1.1\r\nHost: allowed.test\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n";
+            let close = RequestMeta {
+                close: true,
+                upgrade: true,
+                ..keep_alive()
+            };
+            let frame = b"\x81\x05hello";
+            let got = run_http(
+                close_head,
+                close,
+                b"",
+                vec![(50, frame.to_vec())],
+                false,
+                small_limits(),
+            )
+            .await;
+            assert_eq!(
+                got.upstream_received,
+                close_head.to_vec(),
+                "nothing after the last request is forwarded"
+            );
+            assert_eq!(
+                torn(&got.end).detail(),
+                "relay torn down: HTTP request 2 denied: bytes after the last request"
+            );
+        });
+    }
+
+    /// Issue #29 review, round 5, item 2: leading CRLF before a request-line is
+    /// ignored by the head deadline. A client that sends a CRLF and then waits
+    /// longer than the decision timeout before its request is not torn down.
+    #[test]
+    fn leading_crlf_does_not_start_the_head_deadline() {
+        block_on(async {
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, b"\r\n".to_vec()), (300, GET2.to_vec())],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(b"\r\n");
+            want.extend_from_slice(GET2);
+            assert_eq!(got.upstream_received, want);
+            assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
         });
     }
 

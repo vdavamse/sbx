@@ -1096,6 +1096,10 @@ fn b11(ev: &Ev<'_>) -> R {
         format!("b11: {on_connection} requests on the connection, expected 1"),
     )?;
     need(
+        on_conn[0].drained,
+        "b11: the drain after the close request has not finished (a partial count is not evidence)",
+    )?;
+    need(
         on_conn[0].post_close_bytes == 0,
         format!(
             "b11: {} bytes after the body were forwarded",
@@ -1135,6 +1139,10 @@ fn b12(ev: &Ev<'_>) -> R {
     )?;
     // Nothing after the first request's framed end reached the fixture: the
     // identical follow-up was never forwarded (review item 2).
+    need(
+        on_conn[0].drained,
+        "b12: the drain after the first request has not finished (a partial count is not evidence)",
+    )?;
     need(
         on_conn[0].post_close_bytes == 0,
         format!(

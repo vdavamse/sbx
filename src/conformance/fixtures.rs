@@ -74,6 +74,12 @@ pub struct HttpRec {
     /// #29, B11): drained after the response until EOF or 2 s, `0` otherwise.
     #[serde(default)]
     pub post_close_bytes: u64,
+    /// True once the post-close accounting is complete (issue #29 review, round
+    /// 5). A close request is `false` until its drain ends, so a snapshot taken
+    /// during the drain cannot read `post_close_bytes == 0` vacuously. A
+    /// keep-alive request has no drain and is `true` at once.
+    #[serde(default)]
+    pub drained: bool,
 }
 
 /// One query the lab DNS received (lowercase name, no root dot).
@@ -358,6 +364,7 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
                     connection_close: close,
                     host_headers,
                     post_close_bytes: 0,
+                    drained: !close,
                 });
                 let body = format!("FIXTURE-HTTP {}", host.as_deref().unwrap_or("none"));
                 let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len());
@@ -380,6 +387,7 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
                     let extra = post_close_bytes(&mut buf, body_len, &mut |c| s.read(c));
                     if let Some(rec) = lock(&logs.http).iter_mut().rev().find(|r| r.conn == conn) {
                         rec.post_close_bytes = extra;
+                        rec.drained = true;
                     }
                     return;
                 }

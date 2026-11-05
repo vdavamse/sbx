@@ -623,7 +623,7 @@ result: NOT conformant (1 FAIL)
     }
 
     #[test]
-    fn list_json_has_80_rows() {
+    fn list_json_has_83_rows() {
         let v: serde_json::Value = serde_json::from_str(&render_list_json()).unwrap();
         assert_eq!(v["checks"].as_array().unwrap().len(), 83);
         assert_eq!(v["kind"], "conformance-catalog");

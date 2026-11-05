@@ -79,7 +79,8 @@ and tears the connection down, so the body's earlier chunks may already have
 been forwarded. Bodyless HTTP/1.1 requests keep
 the connection alive, while a request with a body, `Connection: close`,
 `Upgrade` or HTTP/1.0 is the last one forwarded, and nothing after it reaches
-the server. Explicit forward is always one request per connection. On 443 a
+the server: a client that writes again after its last request (an upgrade
+included) is torn down with a `relay torn down` deny row. Explicit forward is always one request per connection. On 443 a
 relay-phase scanner
 tears the connection down on any second `ClientHello` (the post-HRR
 retry shape) — the library module docs record the accepted residuals;

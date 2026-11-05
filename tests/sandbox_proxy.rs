@@ -450,6 +450,11 @@ fn scenarios() -> Vec<Scenario> {
             run: scenario_relay_idle_timeout_closes,
         },
         Scenario {
+            name: "http-upgrade-torn-down-80",
+            gate: Gate::Userns,
+            run: scenario_http_upgrade_torn_down_80,
+        },
+        Scenario {
             name: "sni-mismatch-denied",
             gate: Gate::Userns,
             run: scenario_sni_mismatch_denied,
@@ -1230,6 +1235,20 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
                                     .write_all(&buf)
                                     .map_err(|e| format!("echo write_all: {e}"))?;
                             }
+                            EchoMode::SwitchProtocols => {
+                                read_one_request(&mut stream, &mut buf)?;
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                                );
+                                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                                let mut chunk = [0u8; 4096];
+                                loop {
+                                    match stream.read(&mut chunk) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                    }
+                                }
+                            }
                             EchoMode::AnswerUnlessEof => {
                                 read_one_request(&mut stream, &mut buf)?;
                                 // An EOF within 300 ms: the proxy half-closed
@@ -1344,6 +1363,9 @@ enum EchoSpec {
     /// Keep-alive HTTP responder: every connection and request is recorded
     /// (`EchoOutcome::Http`); the server stops once the payload is reaped.
     ExpectHttp,
+    /// One upgrade request answered `101`, then the connection stays open; the
+    /// bytes it receives are recorded (issue #29 review, round 5).
+    ExpectHitSwitch,
 }
 
 /// The echo server's write-back discipline.
@@ -1371,6 +1393,10 @@ enum EchoMode {
     /// makes it drop WITHOUT answering; otherwise it answers `200` and closes.
     /// The recorded bytes are what it received.
     AnswerUnlessEof,
+    /// Issue #29 review, round 5: reads one request, answers `101 Switching
+    /// Protocols`, and keeps the connection open, recording every byte it
+    /// receives until the proxy closes (a websocket-style upgrade upstream).
+    SwitchProtocols,
 }
 
 /// One serve thread on its own current-thread runtime; the result travels
@@ -1503,6 +1529,7 @@ fn run_netns_limits(
         EchoSpec::None => None,
         EchoSpec::ExpectHit | EchoSpec::ExpectMiss => Some(spawn_echo_server(EchoMode::OnEof)?),
         EchoSpec::ExpectHitRequest => Some(spawn_echo_server(EchoMode::OnRequest)?),
+        EchoSpec::ExpectHitSwitch => Some(spawn_echo_server(EchoMode::SwitchProtocols)?),
         EchoSpec::ExpectHitEchoing => Some(spawn_echo_server(EchoMode::Immediate)?),
         EchoSpec::ExpectHttp => Some(spawn_echo_server(EchoMode::Http)?),
     };
@@ -2683,6 +2710,61 @@ fn scenario_http_keepalive_foreign_host_torn_down_80() -> Result<(), String> {
     Ok(())
 }
 
+/// An upgrade request (issue #29 review, round 5): the client gets the `101`,
+/// then writes a websocket-style frame. The proxy must not forward it; the
+/// connection is torn down while the client is still writing.
+fn role_http_upgrade() -> Result<(), String> {
+    let mut stream = connect_http80()?;
+    stream
+        .write_all(b"GET /ws HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        .map_err(|e| format!("write the upgrade request: {e}"))?;
+    let switched = read_framed_response(&mut stream)?;
+    if !switched.starts_with(b"HTTP/1.1 101") {
+        return Err(format!(
+            "upgrade response: {:?}",
+            String::from_utf8_lossy(&switched)
+        ));
+    }
+    stream
+        .write_all(b"\x81\x05hello")
+        .map_err(|e| format!("write the frame: {e}"))?;
+    expect_no_more_bytes(&mut stream, "after the upgraded frame")?;
+    marker("relay ok upgrade torn down");
+    Ok(())
+}
+
+/// Issue #29 review, round 5, item 1 end to end: an upgrade on :80 does not
+/// work; the client's frame after the `101` is refused with the pinned
+/// `AfterLast` teardown, and the upstream saw the upgrade request only.
+fn scenario_http_upgrade_torn_down_80() -> Result<(), String> {
+    let run = run_netns(
+        "pt-http-upgrade",
+        &[(TEST3, ALLOWED)],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHitSwitch,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok upgrade torn down"])?;
+    let want: &[u8] = b"GET /ws HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nConnection: close\r\n\r\n";
+    match run.echo {
+        Some(EchoOutcome::Hit(ref bytes)) if bytes == want => {}
+        ref other => {
+            return Err(format!(
+                "the upstream must receive the upgrade request only, with close inserted: {other:?}"
+            ));
+        }
+    }
+    let detail = "relay torn down: HTTP request 2 denied: bytes after the last request";
+    if run.teardowns != [detail.to_owned()] {
+        return Err(format!("teardown hook: {:?}", run.teardowns));
+    }
+    if run.decisions.len() != 1 || !matches!(run.decisions[0].verdict, Verdict::Allowed { .. }) {
+        return Err(format!("decisions: {:?}", run.decisions));
+    }
+    Ok(())
+}
+
 /// Issue #29, C4 end to end: a keep-alive relay with no traffic after its
 /// first response is closed by the idle timeout (1 s here, the in-process
 /// equivalent of `sbx run --relay-idle-timeout 1s`), and the `closed` hook
@@ -2983,6 +3065,7 @@ fn child_main(role: &str) -> ExitCode {
         "pt-http-keepalive-body" => role_http_keepalive_body(),
         "pt-http-foreign-host" => role_http_foreign_host(),
         "pt-http-idle" => role_http_idle(),
+        "pt-http-upgrade" => role_http_upgrade(),
         "pt-tls-sni-mismatch" => {
             let hello = build_client_hello(Some(EVIL), &[]);
             role_expect_close(TEST3, 443, Some(&hello))
