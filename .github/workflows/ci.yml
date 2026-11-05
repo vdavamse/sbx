@@ -773,6 +773,20 @@ jobs:
       - name: Create the kind cluster and start the example pod
         run: |
           kind create cluster --name "$CLUSTER" --config examples/kubernetes/kind-config.yaml --wait 180s
+          # kind bind-mounts files over /sys/devices/virtual/dmi/id/product_{name,uuid}
+          # in the node when the host has DMI (GitHub runners do; WSL does not). The
+          # kernel lets a user namespace mount a fresh sysfs only when an existing
+          # sysfs mount is fully visible, with child mounts only on empty
+          # directories, so runc's sysfs mount for a hostUsers: false sandbox fails
+          # with EPERM (observed here). Drop those file overmounts in this
+          # single-node CI cluster; the unique product_uuid only matters with
+          # several nodes.
+          NODE="$CLUSTER-control-plane"
+          for _ in 1 2 3 4; do
+            docker exec "$NODE" sh -c 'for m in $(awk "\$5 ~ \"^/sys/devices/virtual/dmi/id/\" {print \$5}" /proc/self/mountinfo); do umount "$m" || true; done'
+          done
+          docker exec "$NODE" sh -c 'awk "\$5 ~ \"^/sys/devices/virtual/dmi/\"" /proc/self/mountinfo' | tee dmi-left.txt
+          [ ! -s dmi-left.txt ] || { echo "FAIL: DMI overmounts are still present in the kind node"; exit 1; }
           kubectl get --raw /metrics | grep -E 'kubernetes_feature_enabled\{name="(UserNamespacesSupport|ProcMountType)"' || true
           kind load docker-image "$IMAGE" --name "$CLUSTER"
           kubectl apply -f examples/kubernetes/pod.yaml
