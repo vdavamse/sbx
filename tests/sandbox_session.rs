@@ -650,3 +650,69 @@ fn attach_refuses_a_call_after_a_symlink_is_planted_under_a_writable_bind() {
     assert!(stop(&shim, &session).status.success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_holder_does_not_keep_descriptors_inherited_from_its_caller() {
+    // Review 9: the caller's descriptors above stdio are not the session's to keep.
+    // A descriptor planted at 900 is not in the holder's table after the launch.
+    let dir = scratch("inherit");
+    let Some(shim) = skip_or(&dir, "holder-closes-inherited-fds") else {
+        return;
+    };
+    use std::os::unix::process::CommandExt;
+    let session = dir.join("s");
+    let null = std::fs::File::open("/dev/null").unwrap();
+    let src = std::os::fd::AsRawFd::as_raw_fd(&null);
+    let mut cmd = sbx(&shim);
+    cmd.args(["run", "--keep-alive", "--idle-timeout", "60s", "--policy"])
+        .arg(policy_path())
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "sleep", "300"]);
+    // SAFETY: dup2 is async-signal-safe; it runs in the child before exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::dup2(src, 900);
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "launch: {}", text(&out.stderr));
+    let want = session.to_string_lossy().into_owned();
+    let holder =
+        wait_for(Duration::from_secs(5), || holder_of(&want)).expect("the holder is running");
+    assert!(
+        !Path::new(&format!("/proc/{holder}/fd/900")).exists(),
+        "the holder kept the caller's descriptor 900"
+    );
+    assert!(stop(&shim, &session).status.success());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The `run --keep-alive` process that names `session` (the holder, not the launcher).
+fn holder_of(session: &str) -> Option<i32> {
+    fs::read_dir("/proc")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .find(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                let args: Vec<&[u8]> = c.split(|b| *b == 0).collect();
+                args.iter().any(|a| *a == b"--keep-alive") && args.contains(&session.as_bytes())
+            })
+        })
+}
+
+/// Polls `f` until it yields a value or `limit` passes.
+fn wait_for<T>(limit: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+    let until = Instant::now() + limit;
+    loop {
+        if let Some(v) = f() {
+            return Some(v);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -207,6 +207,10 @@ pub(crate) fn launch(args: RunArgs) -> ExitCode {
                 }
             }
         }
+        // Review 9 of #57: the holder lives for hours, so it must not keep the
+        // caller's inherited descriptors (a jobserver pipe, say). Everything above
+        // stdio goes, except the readiness pipe's write end.
+        close_inherited_fds(write_end.as_raw_fd());
         let hold = Hold::new(write_end, idle, max);
         return crate::run::run_session(args, Some(hold));
     }
@@ -235,6 +239,34 @@ pub(crate) fn launch(args: RunArgs) -> ExitCode {
         _ => reap_holder_reason(pid),
     };
     launch_failed(&reason)
+}
+
+/// The descriptors to close in the holder: every open one above stdio except
+/// `keep` (review 9; pure, unit-tested).
+pub(crate) fn fds_to_close(open: Vec<RawFd>, keep: RawFd) -> Vec<RawFd> {
+    open.into_iter()
+        .filter(|fd| *fd > 2 && *fd != keep)
+        .collect()
+}
+
+/// Closes the inherited descriptors of the forked holder (review 9). Scans
+/// `/proc/self/fd` first, so the scan's own directory descriptor is never closed
+/// under the iterator.
+fn close_inherited_fds(keep: RawFd) {
+    let open: Vec<RawFd> = std::fs::read_dir("/proc/self/fd")
+        .map(|dir| {
+            dir.flatten()
+                .filter_map(|e| e.file_name().to_str()?.parse::<RawFd>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    for fd in fds_to_close(open, keep) {
+        // SAFETY: a descriptor number this process holds; EBADF (already closed,
+        // e.g. the scan's own) is ignored.
+        unsafe {
+            libc::close(fd);
+        }
+    }
 }
 
 /// Clears `O_NONBLOCK` on a descriptor.
@@ -1034,5 +1066,14 @@ mod tests {
             "the control socket is removed"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_holder_closes_everything_above_stdio_but_the_readiness_pipe() {
+        assert_eq!(
+            fds_to_close(vec![0, 1, 2, 3, 5, 9, 900], 5),
+            vec![3, 9, 900]
+        );
+        assert!(fds_to_close(vec![0, 1, 2], 1).is_empty());
     }
 }
