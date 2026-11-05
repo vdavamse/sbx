@@ -1123,6 +1123,37 @@ mod tests {
         );
     }
 
+    /// Issue #29 review, item 5 on the explicit paths: a Connection token that
+    /// names a framing header or Host is denied for CONNECT and for absolute-form
+    /// forward (both go through `check_framing`).
+    #[test]
+    fn explicit_connection_tokens_naming_framing_are_denied() {
+        let check = |raw: &str| {
+            let bytes = raw.as_bytes().to_vec();
+            let end = bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("terminated")
+                + 4;
+            let req = parse_proxy_request(&bytes, end, 64).expect("parses");
+            check_proxy_head(&bytes[..end], &req, 64)
+        };
+        let want = Err(Rejected::AmbiguousFraming {
+            detail: http::FRAMING_CONNECTION_NAMES,
+        });
+        assert_eq!(
+            check("CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nConnection: Transfer-Encoding\r\n\r\n")
+                .map(|_| ()),
+            want.clone().map(|_: ()| ())
+        );
+        assert_eq!(
+            check("GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nProxy-Connection: content_length\r\n\r\n")
+                .map(|_| ()),
+            want.map(|_: ()| ())
+        );
+        assert!(check("GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n").is_ok());
+    }
+
     #[test]
     fn rewrite_forward_head_pinned() {
         let raw = b"GET http://allowed.test/p?q#f HTTP/1.1\r\nHost: allowed.test\r\nProxy-Authorization: Basic eA==\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Foo\r\nX-A: 1\r\n\r\n";

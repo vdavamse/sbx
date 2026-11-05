@@ -43,11 +43,13 @@
 //!    the next head or, after a last request, are discarded (`AfterLast`).
 //! 7. **Last request (FLAG-3)** — [`RequestMeta::is_last`] is true for HTTP/1.0,
 //!    `close`, `Upgrade`, and every request with a body. A request with a body
-//!    is always the last request on its upstream connection: a server that
-//!    disagrees with the proxy about where the body ends (CL.0, the chunk
-//!    differentials) cannot turn body bytes into an uninspected request, because
-//!    nothing after the body is forwarded. Bodyless HTTP/1.1 requests keep the
-//!    connection alive.
+//!    is always the last request on its upstream connection, so nothing after
+//!    its body is forwarded by the proxy. That is the proxy's half of the
+//!    defence. A server that disagrees with the proxy about where the body ends
+//!    (CL.0, the chunk differentials) still reads a smuggled request INSIDE the
+//!    forwarded body. What stops it is the server honouring the inserted
+//!    `Connection: close` (threat model R8(a)); the proxy cannot enforce that.
+//!    Bodyless HTTP/1.1 requests keep the connection alive.
 //! 8. **Request numbering** — [`RequestStream::index`] is the 1-based number of
 //!    the request whose head is being inspected, or whose body is being framed.
 //!    Teardown reasons quote it (`relay torn down: HTTP request 2 denied: …`).
@@ -56,7 +58,8 @@ use super::Limits;
 use super::Rejected;
 use super::http::{
     FRAMING_CHUNK_DATA_CRLF, FRAMING_CHUNK_LINE_TOO_LONG, FRAMING_CHUNK_SIZE,
-    FRAMING_TRAILER_FORBIDDEN, FRAMING_TRAILER_INVALID, FRAMING_TRAILER_TOO_LARGE, Framing,
+    FRAMING_CHUNK_SIZE_OVERFLOW, FRAMING_TRAILER_FORBIDDEN, FRAMING_TRAILER_INVALID,
+    FRAMING_TRAILER_TOO_LARGE, Framing,
 };
 
 /// The head terminator — the accumulator stops after its first occurrence.
@@ -358,6 +361,11 @@ pub(crate) fn parse_chunk_size(line: &[u8]) -> Result<u64, Rejected> {
         };
         size = (size << 4) | u64::from(value);
     }
+    // Issue #29 review, item 6: a size above i64::MAX is refused, never
+    // truncated (7fffffffffffffff is the largest accepted).
+    if size > i64::MAX as u64 {
+        return Err(chunk_err(FRAMING_CHUNK_SIZE_OVERFLOW));
+    }
     Ok(size)
 }
 
@@ -389,9 +397,15 @@ fn validate_trailer_field(
     if name.is_empty() || !name.iter().all(|b| is_tchar(*b)) {
         return Err(chunk_err(FRAMING_TRAILER_INVALID));
     }
+    // Issue #29 review, item 7: `_` is folded to `-` before the forbidden-name
+    // comparison, so `Content_Length` cannot slip past it.
+    let folded: Vec<u8> = name
+        .iter()
+        .map(|b| if *b == b'_' { b'-' } else { *b })
+        .collect();
     if ["host", "content-length", "transfer-encoding"]
         .iter()
-        .any(|forbidden| name.eq_ignore_ascii_case(forbidden.as_bytes()))
+        .any(|forbidden| folded.eq_ignore_ascii_case(forbidden.as_bytes()))
     {
         return Err(chunk_err(FRAMING_TRAILER_FORBIDDEN));
     }
@@ -820,6 +834,53 @@ mod tests {
             assert!(result.is_err(), "{bytes:?} must be denied");
             assert_eq!(out, expected.to_vec(), "{bytes:?}");
             assert!(bytes.starts_with(&out), "{bytes:?}");
+        }
+    }
+
+    /// Issue #29 review, item 6: a chunk size above i64::MAX is refused. The
+    /// largest accepted is 7fffffffffffffff; the first refused is 8000000000000000.
+    #[test]
+    fn chunk_size_i64_limit_table() {
+        assert_eq!(parse_chunk_size(b"7fffffffffffffff"), Ok(i64::MAX as u64));
+        assert_eq!(parse_chunk_size(b"0000000000000003"), Ok(3));
+        for line in [&b"8000000000000000"[..], b"ffffffffffffffff"] {
+            assert_eq!(
+                parse_chunk_size(line),
+                Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_CHUNK_SIZE_OVERFLOW,
+                }),
+                "{line:?}"
+            );
+        }
+        // The stream accepts the largest size line and waits for its data.
+        let line: &[u8] = b"7fffffffffffffff\r\n";
+        assert_eq!(
+            feed_pieces(Framing::Chunked, &[line]),
+            Ok((line.to_vec(), line.len(), false))
+        );
+    }
+
+    /// Issue #29 review, item 7: a trailer name is folded (`_` to `-`) before the
+    /// forbidden-name comparison.
+    #[test]
+    fn trailer_names_fold_underscores_before_the_forbidden_check() {
+        let rows: &[&[u8]] = &[
+            b"0\r\nContent_Length: 0\r\n\r\n",
+            b"0\r\ncontent_length: 0\r\n\r\n",
+            b"0\r\nTransfer_Encoding: chunked\r\n\r\n",
+            b"0\r\nHost_: a.test\r\n\r\n",
+        ];
+        for (index, bytes) in rows.iter().enumerate() {
+            let want = if index == 3 {
+                // `Host_` folds to `host-`, which is not Host: a plain field.
+                None
+            } else {
+                Some(FRAMING_TRAILER_FORBIDDEN)
+            };
+            match want {
+                Some(detail) => assert_chunked_denied(bytes, detail),
+                None => assert!(one_shot(Framing::Chunked, bytes).is_ok(), "{bytes:?}"),
+            }
         }
     }
 

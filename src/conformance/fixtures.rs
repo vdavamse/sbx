@@ -340,7 +340,15 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
     loop {
         match parse_head(&buf) {
             Some((n, rec_fields)) => {
-                let (method, target, host, close, host_headers) = rec_fields;
+                let (method, target, host, close, host_headers, body_len, chunked) = rec_fields;
+                if chunked {
+                    // No lab request uses chunked bodies; a refusal is a visible
+                    // failure of the check that sent one, never a silent count.
+                    let _ = s.write_all(
+                        b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    return;
+                }
                 lock(&logs.http).push(HttpRec {
                     conn,
                     accept_ms,
@@ -363,23 +371,21 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
                 }
                 buf.drain(..n);
                 if close {
-                    // Issue #29 (B11): half-close, then drain whatever the client
-                    // still sends (bytes already buffered count too) until EOF or
-                    // 2 s, and record it on this connection's request. Without the
-                    // drain an early return would make "nothing was forwarded"
-                    // vacuous.
+                    // Issue #29 (B11): half-close, then count whatever the client
+                    // still sends after THIS request's own body, and record it on
+                    // the connection's request. The body is consumed first; an
+                    // early return would make "nothing was forwarded" vacuous.
                     let _ = s.shutdown(std::net::Shutdown::Write);
-                    let mut extra = buf.len() as u64;
                     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-                    loop {
-                        match s.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(k) => extra += k as u64,
-                        }
-                    }
+                    let extra = post_close_bytes(&mut buf, body_len, &mut |c| s.read(c));
                     if let Some(rec) = lock(&logs.http).iter_mut().rev().find(|r| r.conn == conn) {
                         rec.post_close_bytes = extra;
                     }
+                    return;
+                }
+                // Keep-alive: consume this request's body so the next head starts
+                // at the next request, not inside the body.
+                if !consume_body(&mut buf, body_len, &mut |c| s.read(c)) {
                     return;
                 }
             }
@@ -396,8 +402,61 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
     }
 }
 
-/// One complete request head: its length and (method, target, Host, close, Host lines).
-type Head = (usize, (String, String, Option<String>, bool, usize));
+/// Consumes `body_len` body bytes of a keep-alive request: from `buf` first,
+/// then from `read`. `false` when the client ended before the body did.
+fn consume_body(
+    buf: &mut Vec<u8>,
+    body_len: usize,
+    read: &mut dyn FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> bool {
+    // Read until the body is buffered; bytes after it stay in `buf` (the next
+    // request's head), so nothing is dropped.
+    let mut chunk = [0u8; 4096];
+    while buf.len() < body_len {
+        match read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(k) => buf.extend_from_slice(&chunk[..k]),
+        }
+    }
+    buf.drain(..body_len);
+    true
+}
+
+/// The bytes a `close` request leaves AFTER its own Content-Length body (issue
+/// #29 review, B11 accounting). The body is consumed first, from `buf` and then
+/// from `read`; everything else that arrives until EOF or the read timeout is
+/// counted. A POST with nothing after it counts 0; a POST followed by a request
+/// counts exactly that request's length.
+fn post_close_bytes(
+    buf: &mut Vec<u8>,
+    body_len: usize,
+    read: &mut dyn FnMut(&mut [u8]) -> std::io::Result<usize>,
+) -> u64 {
+    let from_buf = body_len.min(buf.len());
+    buf.drain(..from_buf);
+    let mut owed = body_len - from_buf;
+    let mut extra = buf.len() as u64;
+    buf.clear();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(k) => {
+                let used = owed.min(k);
+                owed -= used;
+                extra += (k - used) as u64;
+            }
+        }
+    }
+    extra
+}
+
+/// One complete request head: its length and (method, target, Host, close,
+/// Host lines, Content-Length body length, chunked).
+type Head = (
+    usize,
+    (String, String, Option<String>, bool, usize, usize, bool),
+);
 
 /// Parse the first complete request head in `buf`, if there is one.
 fn parse_head(buf: &[u8]) -> Option<Head> {
@@ -425,7 +484,24 @@ fn parse_head(buf: &[u8]) -> Option<Head> {
                 .iter()
                 .filter(|h| h.name.eq_ignore_ascii_case("host"))
                 .count();
-            Some((n, (method, target, host, close, host_headers)))
+            // The request's own Content-Length body and whether the body is
+            // chunked (issue #29 review, B11 accounting): the fixture consumes
+            // the first and refuses the second.
+            let body_len = req
+                .headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-length"))
+                .and_then(|h| std::str::from_utf8(h.value).ok())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let chunked = req
+                .headers
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case("transfer-encoding"));
+            Some((
+                n,
+                (method, target, host, close, host_headers, body_len, chunked),
+            ))
         }
         _ => None,
     }
@@ -527,7 +603,7 @@ mod tests {
     #[test]
     fn head_parser_reports_close_and_host() {
         let keep = b"GET /a HTTP/1.1\r\nHost: x.allowed.conformance.test\r\n\r\n";
-        let (n, (m, t, h, c, hosts)) = parse_head(keep).expect("complete head");
+        let (n, (m, t, h, c, hosts, _, _)) = parse_head(keep).expect("complete head");
         assert_eq!(hosts, 1);
         assert_eq!(n, keep.len());
         assert_eq!((m.as_str(), t.as_str()), ("GET", "/a"));
@@ -558,5 +634,62 @@ mod tests {
         assert!(parse_head(b"GET / HTTP/1.1\r\nHost: y\r\n").is_none());
         let none = b"GET / HTTP/1.0\r\n\r\n";
         assert_eq!(parse_head(none).expect("complete").1.2, None);
+    }
+
+    /// A scripted client: `chunks` are the reads it returns, then EOF.
+    fn scripted(chunks: &[&[u8]]) -> impl FnMut(&mut [u8]) -> std::io::Result<usize> {
+        let mut queue: std::collections::VecDeque<Vec<u8>> =
+            chunks.iter().map(|c| c.to_vec()).collect();
+        move |out: &mut [u8]| match queue.pop_front() {
+            Some(next) => {
+                out[..next.len()].copy_from_slice(&next);
+                Ok(next.len())
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Issue #29 review, B11 accounting: a POST's own body is never counted.
+    #[test]
+    fn post_close_bytes_accounting() {
+        // The body is still in the socket: nothing after it, so 0.
+        let mut buf = Vec::new();
+        assert_eq!(post_close_bytes(&mut buf, 4, &mut scripted(&[b"body"])), 0);
+        // The body already sits in the buffer, nothing after it: 0.
+        let mut buf = b"body".to_vec();
+        assert_eq!(post_close_bytes(&mut buf, 4, &mut scripted(&[])), 0);
+        // A pipelined follow-up after the body counts exactly its length.
+        let follow = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut buf = Vec::new();
+        assert_eq!(
+            post_close_bytes(&mut buf, 4, &mut scripted(&[b"body", follow])),
+            follow.len() as u64
+        );
+        // The follow-up arrived in the same read as the body's tail.
+        let mut buf = b"bo".to_vec();
+        assert_eq!(
+            post_close_bytes(&mut buf, 4, &mut scripted(&[b"dy", follow])),
+            follow.len() as u64
+        );
+        // A request with no body: everything buffered counts.
+        let mut buf = follow.to_vec();
+        assert_eq!(
+            post_close_bytes(&mut buf, 0, &mut scripted(&[])),
+            follow.len() as u64
+        );
+    }
+
+    /// The keep-alive body consumption leaves the next head aligned.
+    #[test]
+    fn consume_body_aligns_the_next_head() {
+        let mut buf = b"ab".to_vec();
+        // The body's tail and the next head arrive in one read: the head survives.
+        assert!(consume_body(&mut buf, 4, &mut scripted(&[b"cdGET"])));
+        assert_eq!(buf, b"GET".to_vec());
+        let mut buf = Vec::new();
+        assert!(
+            !consume_body(&mut buf, 4, &mut scripted(&[b"cd"])),
+            "EOF in the body"
+        );
     }
 }

@@ -336,7 +336,7 @@ fn l2(env: &Env) -> Scn {
             ],
         ),
         // Issue #29, B12: two absolute-form requests in ONE write. The first is
-        // answered; the pipelined follow-up (another Host) is never forwarded.
+        // answered; the identical pipelined follow-up is never forwarded.
         tcp_env(
             "b12",
             vec![
@@ -727,9 +727,12 @@ fn a03(ev: &Ev<'_>) -> R {
         !reqs.is_empty(),
         format!("a03: fixture saw no request with Host {n}"),
     )?;
+    // Issue #29 F3: a bodyless HTTP/1.1 request is forwarded verbatim and may
+    // be kept alive, so the proxy inserts no `Connection: close` (the probe
+    // sends none). B06 and B11 cover the requests that are made last.
     need(
-        reqs.iter().any(|h| h.connection_close),
-        "a03: fixture request lacks Connection: close",
+        reqs.iter().all(|h| !h.connection_close),
+        "a03: a bodyless HTTP/1.1 request got an inserted Connection: close",
     )?;
     need(
         connect_row(s, &n, "transparent"),
@@ -1103,7 +1106,7 @@ fn b11(ev: &Ev<'_>) -> R {
 }
 
 /// B12 (issue #29, C2): explicit forward is one request per connection. The
-/// pipelined follow-up (another Host) is never forwarded, and the first
+/// pipelined follow-up (the same authority) is never forwarded, and the first
 /// request reaches the fixture with `Connection: close`.
 fn b12(ev: &Ev<'_>) -> R {
     let s = l2_scn(ev)?;
@@ -1130,9 +1133,14 @@ fn b12(ev: &Ev<'_>) -> R {
             on_conn.len()
         ),
     )?;
+    // Nothing after the first request's framed end reached the fixture: the
+    // identical follow-up was never forwarded (review item 2).
     need(
-        on_conn.len() == 1,
-        "b12: the fixture saw the pipelined follow-up",
+        on_conn[0].post_close_bytes == 0,
+        format!(
+            "b12: {} bytes after the first request reached the fixture",
+            on_conn[0].post_close_bytes
+        ),
     )?;
     Ok("explicit: a pipelined follow-up request is not forwarded".to_owned())
 }

@@ -534,6 +534,16 @@ pub(crate) const FRAMING_BARE_LF: &str = "bare LF line ending in the request hea
 /// servers normalise `_` to `-` and read the body the proxy never saw (R8).
 pub(crate) const FRAMING_UNDERSCORE_NAME: &str =
     "a framing header name uses an underscore (Content_Length or Transfer_Encoding)";
+/// A `Connection` or `Proxy-Connection` token naming a framing header or Host
+/// (issue #29 review, item 5): a hop-by-hop list must not remove the framing
+/// headers the proxy reads, nor the Host it binds.
+pub(crate) const FRAMING_CONNECTION_NAMES: &str =
+    "a Connection token names Content-Length, Transfer-Encoding or Host";
+/// A chunk-size above `i64::MAX` (issue #29 review, item 6).
+pub(crate) const FRAMING_CHUNK_SIZE_OVERFLOW: &str = "chunk size exceeds i64::MAX";
+/// A Content-Length above `i64::MAX` (issue #29 review, item 6): a count the
+/// stream cannot represent on every platform is refused, not truncated.
+pub(crate) const FRAMING_LENGTH_OVERFLOW: &str = "Content-Length exceeds i64::MAX";
 pub(crate) const FRAMING_CHUNK_SIZE: &str = "invalid chunk-size line";
 pub(crate) const FRAMING_CHUNK_LINE_TOO_LONG: &str = "chunk-size line exceeds the 4096-byte cap";
 pub(crate) const FRAMING_CHUNK_DATA_CRLF: &str = "chunk data is not followed by CRLF";
@@ -548,6 +558,30 @@ pub(crate) fn check_framing(
     headers: &[httparse::Header<'_>],
     minor_version: u8,
 ) -> Result<Framing, Rejected> {
+    // Issue #29 review, item 5: a Connection / Proxy-Connection token naming a
+    // framing header or Host is denied, on every path (check_framing is the
+    // single framing gate for transparent, CONNECT-80 and explicit forward).
+    for header in headers {
+        let hop = header.name.eq_ignore_ascii_case("connection")
+            || header.name.eq_ignore_ascii_case("proxy-connection");
+        if !hop {
+            continue;
+        }
+        for token in header.value.split(|b| *b == b',') {
+            let normalised: Vec<u8> = trim_ows(token)
+                .iter()
+                .map(|b| if *b == b'_' { b'-' } else { *b })
+                .collect();
+            let names_framing = normalised.eq_ignore_ascii_case(b"content-length")
+                || normalised.eq_ignore_ascii_case(b"transfer-encoding")
+                || normalised.eq_ignore_ascii_case(b"host");
+            if names_framing {
+                return Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_CONNECTION_NAMES,
+                });
+            }
+        }
+    }
     // Issue #29 review, item 7: a framing name with `_` is denied. It is not
     // the framing header the table below reads, but a server that normalises
     // `_` to `-` would read a body the proxy never saw.
@@ -578,23 +612,23 @@ pub(crate) fn check_framing(
     if cl_count > 1 {
         return Err(ambiguous(FRAMING_DUPLICATE_CL));
     }
-    // (2) the one Content-Length must be 1–20 ASCII digits (OWS-trimmed)
-    //     and fit a u64 — rejects "5, 5", "+5", "-5", overflow.
+    // (2) the one Content-Length must be ASCII digits (OWS-trimmed) and at most
+    //     i64::MAX — rejects "5, 5", "+5", "-5", and values past the limit.
     let length = match cl_first {
         Some(header) => {
             let raw = trim_ows(header.value);
-            let well_formed =
-                !raw.is_empty() && raw.len() <= 20 && raw.iter().all(|b| b.is_ascii_digit());
-            let parsed = if well_formed {
-                std::str::from_utf8(raw)
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            } else {
-                None
-            };
+            // Digits only; a valid digit string that does not fit the limit is
+            // an overflow (issue #29 review, item 6), not a malformed value.
+            if raw.is_empty() || !raw.iter().all(|b| b.is_ascii_digit()) {
+                return Err(ambiguous(FRAMING_INVALID_CL));
+            }
+            let parsed = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .filter(|n| *n <= i64::MAX as u64);
             match parsed {
                 Some(n) => Some(n),
-                None => return Err(ambiguous(FRAMING_INVALID_CL)),
+                None => return Err(ambiguous(FRAMING_LENGTH_OVERFLOW)),
             }
         }
         None => None,
@@ -1589,6 +1623,84 @@ mod tests {
             FRAMING_UNDERSCORE_NAME,
             "a framing header name uses an underscore (Content_Length or Transfer_Encoding)"
         );
+    }
+
+    /// Issue #29 review, item 6: a Content-Length above i64::MAX is refused
+    /// with `FRAMING_LENGTH_OVERFLOW`; i64::MAX itself is accepted. A non-digit
+    /// value stays `FRAMING_INVALID_CL`.
+    #[test]
+    fn content_length_limit_table() {
+        let head = |value: &str| {
+            format!("POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: {value}\r\n\r\n")
+                .into_bytes()
+        };
+        let ok = head("9223372036854775807");
+        assert_eq!(parse(&ok), Ok(ok.len()));
+        for value in [
+            "9223372036854775808",
+            "99999999999999999999",
+            "18446744073709551615",
+        ] {
+            assert_eq!(
+                parse(&head(value)),
+                Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_LENGTH_OVERFLOW,
+                }),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse(&head("12a")),
+            Err(Rejected::AmbiguousFraming {
+                detail: FRAMING_INVALID_CL,
+            })
+        );
+    }
+
+    /// Issue #29 review, item 5: a Connection or Proxy-Connection token that
+    /// names a framing header or Host is denied on the transparent path (request
+    /// 1 and request 2+). Case and `_`→`-` are folded; neighbouring tokens are
+    /// not affected.
+    #[test]
+    fn connection_tokens_naming_framing_are_denied() {
+        let denied: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: content-length\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: keep-alive, Transfer_Encoding\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nProxy-Connection: HOST\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nconnection: Content_Length, close\r\n\r\n",
+        ];
+        let expected = Rejected::AmbiguousFraming {
+            detail: FRAMING_CONNECTION_NAMES,
+        };
+        let expected_name = dom("allowed.test");
+        let check = check_allowed(&expected_name);
+        for head in denied {
+            assert_eq!(parse(head), Err(expected.clone()), "parse {head:?}");
+            assert_eq!(
+                inspect_head(head, &check, 64),
+                Err(expected.clone()),
+                "{head:?}"
+            );
+        }
+        let fine: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: x-content-length\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nKeep-Alive: content-length\r\n\r\n",
+        ];
+        for head in fine {
+            assert!(parse(head).is_ok(), "{head:?}");
+        }
+    }
+
+    /// The pinned texts of the review-round framing reasons.
+    #[test]
+    fn review_round_framing_details_pinned() {
+        assert_eq!(
+            FRAMING_CONNECTION_NAMES,
+            "a Connection token names Content-Length, Transfer-Encoding or Host"
+        );
+        assert_eq!(FRAMING_LENGTH_OVERFLOW, "Content-Length exceeds i64::MAX");
+        assert_eq!(FRAMING_CHUNK_SIZE_OVERFLOW, "chunk size exceeds i64::MAX");
     }
 
     // ---- the pure-parser table ----------------------------------------------

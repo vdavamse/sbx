@@ -72,8 +72,11 @@ name under the resolved-address guard — every resolved address, plus a
 connected-peer re-check as the DNS-rebinding backstop — then the
 buffered bytes are replayed and the connection is relayed, with the
 validated name binding enforced for every request on a connection: each
-HTTP/1 request is inspected before its bytes are forwarded (`Host`, target
-and framing; bodies are framed and streamed). Bodyless HTTP/1.1 requests keep
+HTTP/1 request head is inspected before any of that request's bytes are
+forwarded (`Host`, target, framing and `Connection` tokens). Bodies are framed
+and streamed as they are validated: a framing error inside a body truncates it
+and tears the connection down, so the body's earlier chunks may already have
+been forwarded. Bodyless HTTP/1.1 requests keep
 the connection alive, while a request with a body, `Connection: close`,
 `Upgrade` or HTTP/1.0 is the last one forwarded, and nothing after it reaches
 the server. Explicit forward is always one request per connection. On 443 a
