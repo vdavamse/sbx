@@ -24,6 +24,7 @@ spec:
       type: RuntimeDefault
   containers:
     - name: sbx
+      # In production, pin the image by registry digest (image@sha256:...).
       image: sbx-k8s-example:dev
       imagePullPolicy: IfNotPresent
       securityContext:
@@ -41,8 +42,11 @@ spec:
         seccompProfile:
           type: Localhost
           localhostProfile: profiles/sbx/sbx-userns.json
-        # Unconfined works on nodes with and without AppArmor. Removing it was
-        # not testable here (AppArmor was off): docs/kubernetes.md, "AppArmor".
+        # Expected to be required on AppArmor nodes: containerd's default profile
+        # denies mount and most /proc/sys writes (its source, v2.3.4). Not tested
+        # by sbx: AppArmor was off on the test host, where this is a no-op. Not enough on Ubuntu nodes with
+        # the userns restriction or bwrap-userns-restrict: docs/kubernetes.md,
+        # "AppArmor". PSA baseline rejects Unconfined.
         appArmorProfile:
           type: Unconfined
       resources:

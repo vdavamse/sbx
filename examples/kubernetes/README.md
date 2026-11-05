@@ -26,13 +26,15 @@ for, what was tested, and what breaks without it. The `kubernetes` CI job runs t
 - Use it only for containers that drop ALL capabilities: with capabilities, Docker's own file would
   allow more, and this one does not reflect that.
 
-Regenerate and compare:
+Regenerate and compare. `.gitattributes` keeps the profile LF on every checkout, and the
+comparison is against the committed blob (`git show`), so it also works in a checkout that converts
+other files to CRLF:
 
 ```sh
 curl -fsSL -o /tmp/default.json \
   https://raw.githubusercontent.com/moby/profiles/245180c51918481c0525424b3ee025d2b435d46c/seccomp/default.json
 python3 -I examples/kubernetes/seccomp/derive.py /tmp/default.json /tmp/sbx-userns.json
-diff -u examples/kubernetes/seccomp/sbx-userns.json /tmp/sbx-userns.json
+git show HEAD:examples/kubernetes/seccomp/sbx-userns.json | diff -u - /tmp/sbx-userns.json
 ```
 
 ## Other pins
@@ -46,6 +48,10 @@ diff -u examples/kubernetes/seccomp/sbx-userns.json /tmp/sbx-userns.json
 | JSON schemas | `yannh/kubernetes-json-schema` commit `102361970337d65537d40141dc29b991b8e95786` | git commit |
 | base image | `debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2` (pulled 2026-11-05) | registry digest |
 | bubblewrap | `0.12.0-1~deb13u1` (Debian package version) | Debian archive signatures (apt) |
+| ca-certificates, tzdata | **not pinned**: the versions in the Debian archive at build time | Debian archive signatures (apt) |
+
+The example's image tag (`sbx-k8s-example:dev`) is for kind only; in production, reference the
+image by registry digest (`image@sha256:...`) in `pod.yaml`.
 
 The exact bubblewrap version stops resolving when Debian replaces it in the archive. The image build
 then fails, and the pin must be updated on purpose.

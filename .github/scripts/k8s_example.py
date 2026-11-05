@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Helpers for the `kubernetes` CI job (issue #15, docs/kubernetes.md).
 
-Subcommands:
+The offline conformance assertions are shared with the test job in
+assert_conformance.py. Subcommands:
 
   variant NAME POD_YAML
       Print examples/kubernetes/pod.yaml with one required setting removed and the
@@ -17,11 +18,6 @@ Subcommands:
       `sbx check --json` from a variant pod: rc 1, network mode unavailable, and each
       ITEM is FAIL. ERRNO is a number, or `-` for an item whose errno is null (the
       bwrap items report bwrap's stderr instead).
-
-  assert-conformance CONF_JSON RC
-      `sbx check --conformance --json`: the same assertions as the test job's
-      conformance step (nothing FAILs, the 63 offline checks are ok or warn, the six
-      network checks are opt-in skips, rc 0).
 
   summary CHECK_JSON TITLE
       A Markdown block for $GITHUB_STEP_SUMMARY (never fails on content).
@@ -57,8 +53,11 @@ def variant(name, path):
 
 
 def load(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError) as err:
+        sys.exit(f"FAIL: cannot read {path}: {err}")
 
 
 def assert_ok(path, rc):
@@ -94,29 +93,6 @@ def assert_fail(path, rc, pairs):
         sys.exit("FAIL: " + "; ".join(problems))
 
 
-def assert_conformance(path, rc):
-    r = load(path)
-    assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
-    assert r["network_mode"] != "unavailable", r["network_mode"]
-    fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
-    assert not fails, f"FAIL checks: {fails}"
-    net = {"E01", "E02", "E03", "E04", "E05", "E06"}
-    non_ok = {
-        c["id"]: (c["status"], c.get("skip_kind"))
-        for c in r["checks"]
-        if c["status"] not in ("ok", "warn")
-    }
-    want = {i: ("skip", "opt-in") for i in net}
-    assert non_ok == want, f"unexpected non-ok set: {non_ok}"
-    offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-    assert len(offline) == 43 + 19 + 1 and all(
-        c["status"] in ("ok", "warn") for c in offline
-    ), "63 offline checks must pass"
-    assert rc == 0, f"rc {rc} (expected 0)"
-    s = r["summary"]
-    print(f"ok: {s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['opt_in_skips']} opt-in")
-
-
 def summary(path, title):
     print(f"### {title}")
     try:
@@ -142,8 +118,6 @@ def main(argv):
         assert_ok(args[0], int(args[1]))
     elif cmd == "assert-fail" and len(args) >= 4 and len(args) % 2 == 0:
         assert_fail(args[0], int(args[1]), args[2:])
-    elif cmd == "assert-conformance" and len(args) == 2:
-        assert_conformance(args[0], int(args[1]))
     elif cmd == "summary" and len(args) == 2:
         summary(args[0], args[1])
     else:

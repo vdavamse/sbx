@@ -274,28 +274,8 @@ jobs:
           FAIL=0
           "$BIN" check --conformance --json > conf.json
           RC=$?
-          python3 - conf.json "$RC" <<'PY' || FAIL=1
-          import json, sys
-          r = json.load(open(sys.argv[1]))
-          rc = int(sys.argv[2])
-          assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
-          assert r["network_mode"] != "unavailable", r["network_mode"]
-          fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
-          assert not fails, f"FAIL checks: {fails}"
-          net = {"E01", "E02", "E03", "E04", "E05", "E06"}
-          non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
-          want = {i: ("skip", "opt-in") for i in net}
-          assert non_ok == want, f"unexpected non-ok set: {non_ok}"
-          offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-          assert len(offline) == 46 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "66 offline checks must pass"
-          assert rc == 0, f"rc {rc} (PR2 expects 0)"
-          PY
-          python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, sys
-          s = json.load(open(sys.argv[1]))["summary"]
-          print("### sbx check --conformance (issue #13)")
-          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['capability_skips']} capability skip, {s['not_implemented']} not implemented, {s['opt_in_skips']} opt-in, {s['duration_ms']} ms")
-          PY
+          # Shared with the kubernetes job (issue #15): one copy of the expected numbers.
+          python3 -I .github/scripts/assert_conformance.py conf.json "$RC" "sbx check --conformance (issue #13)" || FAIL=1
           exit "$FAIL"
 
       # Issue #11 negative tier (gating): nested inside bwrap --disable-userns,
@@ -811,7 +791,7 @@ jobs:
           set +e
           FAIL=0
           kubectl exec sbx-example -- sbx check --json > k8s-check.json
-          python3 .github/scripts/k8s_example.py assert-ok k8s-check.json $? || FAIL=1
+          python3 -I .github/scripts/k8s_example.py assert-ok k8s-check.json $? || FAIL=1
           { echo '### sbx check in the example pod (issue #15)'; echo '```'; kubectl exec sbx-example -- sbx check; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
           kubectl exec sbx-example -- sbx check --policy /etc/sbx/default.json --host
           RC=$?
@@ -823,7 +803,7 @@ jobs:
           set +e
           kubectl exec sbx-example -- sbx check --conformance --json > k8s-conf.json
           RC=$?
-          python3 .github/scripts/k8s_example.py assert-conformance k8s-conf.json "$RC"
+          python3 -I .github/scripts/assert_conformance.py k8s-conf.json "$RC" "sbx check --conformance in the example pod (issue #15)"
 
       # The guide's "what breaks without it" table: each pod drops one setting.
       - name: "Without procMount or the seccomp profile (gating)"
@@ -831,26 +811,26 @@ jobs:
           set +e
           FAIL=0
           for V in no-procmount seccomp-runtimedefault; do
-            python3 .github/scripts/k8s_example.py variant "$V" examples/kubernetes/pod.yaml | kubectl apply -f -
+            python3 -I .github/scripts/k8s_example.py variant "$V" examples/kubernetes/pod.yaml | kubectl apply -f -
           done
           for V in no-procmount seccomp-runtimedefault; do
             kubectl wait --for=condition=Ready "pod/sbx-$V" --timeout=180s || { kubectl describe "pod/sbx-$V"; FAIL=1; }
           done
           kubectl exec sbx-no-procmount -- sbx check --json > no-procmount.json
-          python3 .github/scripts/k8s_example.py assert-fail no-procmount.json $? netns-ipv6 30 bwrap-run - || FAIL=1
+          python3 -I .github/scripts/k8s_example.py assert-fail no-procmount.json $? netns-ipv6 30 bwrap-run - || FAIL=1
           kubectl exec sbx-seccomp-runtimedefault -- sbx check --json > seccomp-runtimedefault.json
-          python3 .github/scripts/k8s_example.py assert-fail seccomp-runtimedefault.json $? userns 1 || FAIL=1
+          python3 -I .github/scripts/k8s_example.py assert-fail seccomp-runtimedefault.json $? userns 1 || FAIL=1
           exit "$FAIL"
 
       - name: "Report: without appArmorProfile (report-only)"
         continue-on-error: true
         run: |
           set +e
-          python3 .github/scripts/k8s_example.py variant no-apparmor examples/kubernetes/pod.yaml | kubectl apply -f -
+          python3 -I .github/scripts/k8s_example.py variant no-apparmor examples/kubernetes/pod.yaml | kubectl apply -f -
           kubectl wait --for=condition=Ready pod/sbx-no-apparmor --timeout=180s || kubectl describe pod/sbx-no-apparmor
           echo "pod LSM label: $(kubectl exec sbx-no-apparmor -- cat /proc/self/attr/current 2>&1)" | tee -a "$GITHUB_STEP_SUMMARY"
           kubectl exec sbx-no-apparmor -- sbx check --json > no-apparmor.json
-          python3 .github/scripts/k8s_example.py summary no-apparmor.json "sbx check without appArmorProfile (report-only, issue #15)" | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 -I .github/scripts/k8s_example.py summary no-apparmor.json "sbx check without appArmorProfile (report-only, issue #15)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Delete the kind cluster
         if: always()
