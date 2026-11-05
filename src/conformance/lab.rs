@@ -381,7 +381,10 @@ mod tests {
     #[test]
     fn lab_ip_passes_the_guard() {
         // The lab upstream must not be denied by the production guard: a
-        // future guard table that denies 9.9.9.9 fails here first.
+        // future guard table that denies 9.9.9.9 fails here first. In the
+        // lab netns 9.9.9.9 is also a host interface address (on `lo`); it
+        // passes guard_host only because run::sys::host_interface_addrs
+        // skips loopback interfaces (threat-model R12).
         assert!(crate::egress::guard(fixtures::LAB_IP.into()).is_ok());
         assert!(!fixtures::LAB_IP.is_private());
     }
