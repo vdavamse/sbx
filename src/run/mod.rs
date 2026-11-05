@@ -792,9 +792,10 @@ fn execute(
             return Err(RunError::new(err.to_string()).into());
         }
     }
-    // `limits_cgroup` lives to the end of this function: teardown (which
-    // takes the sandbox by value) has reaped the tree before it drops and
-    // removes the child cgroup. Every early return above removes it too.
+    // `limits_cgroup` is dropped (and the child cgroup removed) explicitly
+    // right after teardown has reaped the tree: this function ends in
+    // `process::exit`, which runs no destructors. Early returns before that
+    // point drop it normally.
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);
@@ -1002,6 +1003,9 @@ fn execute(
         h.end_calls(keepalive::holder::CALL_GRACE);
     }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
+    // Issue #43: the tree is reaped; remove the limited cgroup now (the
+    // process::exit below would skip its Drop).
+    drop(limits_cgroup);
     outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`

@@ -23,7 +23,10 @@
 //! 5. **Cleanup.** The child (`sbx-sandbox-<pid>`) is removed after the run
 //!    (best effort: it must be empty). The supervisor leaf stays until sbx
 //!    exits, and goes with the delegated cgroup (a systemd scope is removed
-//!    when its last process exits).
+//!    when its last process exits). A later sbx started from inside a
+//!    supervisor leaf treats that leaf as its group and nests a new
+//!    `sbx-supervisor` under it, one level per such run; the nesting is
+//!    harmless and goes away with the scope.
 
 use std::fs;
 use std::io;
@@ -164,6 +167,15 @@ impl Drop for SandboxCgroup {
     /// it must be empty, so it is retried briefly while the kernel finishes
     /// reaping; a leftover is reported on stderr).
     fn drop(&mut self) {
+        // sbx itself still inside (a failed move back): nothing can remove
+        // it, and the caller already reported why; no retry, no warning.
+        let inside = fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .and_then(|t| v2_path(&t).map(|p| self.dir.ends_with(p.trim_start_matches('/'))))
+            .unwrap_or(false);
+        if inside {
+            return;
+        }
         for _ in 0..50 {
             match fs::remove_dir(&self.dir) {
                 Ok(()) => return,
@@ -240,12 +252,18 @@ pub fn setup(
             }
         }
         for pid in pids.iter().filter(|p| **p != self_pid).chain([&self_pid]) {
-            fs::write(leaf.join("cgroup.procs"), pid.to_string()).map_err(|e| {
-                refuse(format!(
-                    "cannot move process {pid} into {}: {e}",
-                    leaf.display()
-                ))
-            })?;
+            match fs::write(leaf.join("cgroup.procs"), pid.to_string()) {
+                Ok(()) => {}
+                // An ancestor that exited meanwhile (the launcher, on
+                // Ctrl-C) is no longer in the way.
+                Err(e) if *pid != self_pid && e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(e) => {
+                    return Err(refuse(format!(
+                        "cannot move process {pid} into {}: {e}",
+                        leaf.display()
+                    )));
+                }
+            }
         }
         home = leaf;
         let line = to_enable
