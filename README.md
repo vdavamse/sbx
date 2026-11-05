@@ -104,7 +104,9 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
+        [--timeout DURATION] [--audit FILE]
+        [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
+        -- COMMAND [ARGS...]
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -177,7 +179,7 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 7 (report-only)
+  ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
@@ -190,8 +192,9 @@ sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
 (bwrap can start a sandbox here, and mount a fresh `/proc`), `seccomp` (bwrap
 installs sbx's socket-family filter, see [Running commands](#running-commands):
 a failure here makes the network mode `unavailable`, because the sandbox cannot
-start without the filter), and `landlock` (report only; sbx does not use Landlock
-yet). An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
+start without the filter), and `landlock` (report only: the Landlock ABI and which
+parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)).
+An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
 **Network modes.** The host provides one of three modes, from strongest to
@@ -372,6 +375,8 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 | an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
 | the host cannot provide the policy's network mode, or cannot run sandboxes (issue #11) | 125 | `failed` | `sbx run: policy requires network mode <mode> but this host provides only explicit: <reason>; fix: <fix>; run \`sbx check\` for a full host report` (or `… but this host cannot run sandboxes: …`); the staged line of `__init` comes first |
 | the explicit fallback ran (the nft redirect is unavailable, the policy is `explicit` or `none`) | the command's own | the command's | `sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (<reason>); run \`sbx check\` for details` |
+| a Landlock shim failure under `--landlock` (the shim could not apply the rules, could not check the host ABI, or could not exec the payload; issue #19) | 125 | `failed` | `sbx run: landlock: <reason>`. The shim starts with a marker on the status pipe and adds its reason after it, so a payload's own 125 (marker only) is never reported as this one, and a shim that never started is reported by the row above |
+| the Landlock shim did not start under `--landlock` (bwrap could not exec `/proc/self/fd/N`, or the dynamic loader failed before the shim's first act, so the status pipe holds no start marker) | 125 | `failed` | `sbx run: landlock: the shim did not start (rc N)`, where N is bwrap's own rc (1 for bwrap's exec failure, 127 for the loader) |
 | a usage error | 2 | — | clap's message |
 
 The audit row's `outcome` is one of: `exited` (the command ended by itself, or
@@ -565,6 +570,50 @@ x86_64 and aarch64 only). `sbx check` reports the `seccomp` item as FAIL in both
 cases. The integration
 suite (`tests/sandbox_run.rs`, scenarios `seccomp-*`) and the CI musl smoke pin
 these results.
+
+**Landlock layer (issue #19).** `--landlock` adds a Linux Landlock ruleset on top
+of the bwrap sandbox. It is off by default, and with `--landlock off` the bwrap
+command is the same as before. The mode is one of:
+
+- `best-effort`: apply the rules the kernel supports. A kernel without Landlock,
+  or with an older ABI, runs with the subset it has, silently.
+- `require`: apply the full set or refuse. The set needs Landlock ABI 6 (Linux
+  6.12 or later). On an older kernel `run` exits 125 before it starts anything,
+  with `sbx run: landlock require: …` on stderr.
+
+The rules follow the bwrap mount list. Read-only binds, the infra `/etc` set and
+the generated files can be read and executed. Read-write binds, the session
+`work`, `home` and `tmp` leaves, `/proc` and `/dev` can be written. The root
+directory can be listed, but nothing can be created in it. `--landlock-bind-tcp PORT`
+(repeatable; `0` is the kernel's ephemeral range) allows a TCP bind on that port.
+Without a port, binds are denied. The layer also stops the payload from signalling
+processes outside its domain, including bwrap's pid 1 (signal scope, ABI 6).
+
+The layer is a second check on top of the mounts and the network namespace. It
+does not restrict `connect(2)`: egress stays with the network namespace and the
+proxies. It also does not handle abstract-socket scope or `RESOLVE_UNIX`
+(see [threat model](docs/threat-model.md), R6). The shim is sbx's own executable,
+opened by `run` and exec'd inside the sandbox through `/proc/self/fd`. A
+dynamically linked sbx build needs its shared libraries visible inside the sandbox
+when `--landlock` is on. The static musl release does not. This is not checked
+before the run.
+
+Three limits of the layer that operators hit in practice:
+
+- **Deny masks and new directories.** A `deny` entry is a tmpfs over the path and
+  gets no Landlock rule of its own. Under a read-only mount, or outside every
+  mount, the masked directory is therefore not writable (`EACCES`). The same holds
+  for intermediate directories that bwrap creates on the root tmpfs: they are
+  reached only through the root's list-only rule, so they take no entries.
+- **ABI 1 (Linux 5.13 to 5.18).** `LANDLOCK_ACCESS_FS_REFER` is an ABI 2 right and
+  is not handled there, so with `best-effort` on an ABI 1 kernel a rename or hard
+  link across directories fails with `EXDEV`, even inside `/work`. The kernel does
+  this for any ruleset without REFER, and `sbx` does not work around it.
+- **Shim failures are not silent.** The shim writes its reason to a status pipe
+  before it exits 125, and `run` reports it as `failed` (exit-code table above).
+  `best-effort` fails closed when the kernel reports the ruleset as not enforced
+  while the host has Landlock (for example an outer seccomp profile refuses
+  `landlock_*`), instead of running the payload unrestricted.
 
 **Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
 discovery), and unprivileged user namespaces. Run `sbx check` to see what this

@@ -171,7 +171,7 @@ mod tests {
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 4 (report-only)
+  ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 "#;
@@ -188,7 +188,7 @@ network mode: transparent (policies with network mode transparent, explicit or n
   skip  bwrap-run   not probed: user namespaces are unavailable
   skip  bwrap-proc  not probed: user namespaces are unavailable
   skip  seccomp     not probed: user namespaces are unavailable
-  ok    landlock    Landlock ABI 4 (report-only)
+  ok    landlock    Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6
 
 network mode: unavailable (no policy can run until the failed items are fixed)
 "#;
@@ -294,7 +294,7 @@ network mode: unavailable (no policy can run until the failed items are fixed)
     {
       "id": "landlock",
       "status": "ok",
-      "detail": "Landlock ABI 4 (report-only)",
+      "detail": "Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6",
       "evidence": null,
       "errno": null,
       "impact": null,

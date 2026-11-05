@@ -131,6 +131,17 @@ pub enum Cmd {
         /// batch in the sandbox setup (forwarded to `__init`; issue #11, Q6).
         #[arg(long, hide = true)]
         test_break_rules: bool,
+
+        /// Landlock layer on top of the sandbox: `off` (the default), `best-effort`
+        /// (use what the kernel supports) or `require` (refuse unless the kernel has
+        /// Landlock ABI 6, Linux 6.12 or later). Filesystem, TCP-bind and signal-scope rules.
+        #[arg(long, value_name = "MODE", default_value = "off", value_parser = crate::landlock::parse_mode)]
+        landlock: crate::landlock::Mode,
+
+        /// With --landlock: allow TCP bind on this port (repeatable; 0 is the
+        /// ephemeral range). Without a port, binds are denied.
+        #[arg(long = "landlock-bind-tcp", value_name = "PORT", value_parser = clap::value_parser!(u16))]
+        landlock_bind_tcp: Vec<u16>,
     },
 
     /// Report what this host can run, or validate a policy file.
@@ -197,6 +208,46 @@ pub enum Cmd {
         #[command(subcommand)]
         role: ConformanceRole,
     },
+    /// Internal Landlock shim, exec'd inside the sandbox by `run --landlock`:
+    /// applies the ruleset, then execs the payload (hidden; issue #19).
+    #[command(name = "__landlock", hide = true)]
+    Landlock {
+        /// sbx's own executable fd (`run` passes it as `--exe-fd`); the shim closes it.
+        //
+        // `//` rationale, not `///`: clap renders doc comments as help text.
+        #[arg(long, value_name = "FD", required = true, value_parser = parse_control_fd)]
+        exe_fd: RawFd,
+
+        /// The status pipe's write end: the shim writes its failure reason there (issue #19 M1).
+        #[arg(long, value_name = "FD", required = true, value_parser = parse_control_fd)]
+        status_fd: RawFd,
+
+        /// The host's Landlock ABI as `run` saw it (0 = none; issue #19 m1).
+        #[arg(long, value_name = "N", required = true, value_parser = clap::value_parser!(u32))]
+        host_abi: u32,
+
+        /// The Landlock mode (`off`, `best-effort` or `require`).
+        #[arg(long, value_name = "MODE", required = true, value_parser = crate::landlock::parse_mode)]
+        mode: crate::landlock::Mode,
+
+        /// A TCP bind port (repeatable; 0 is the ephemeral range).
+        #[arg(long = "bind-tcp", value_name = "PORT", value_parser = clap::value_parser!(u16))]
+        bind_tcp: Vec<u16>,
+
+        /// A filesystem rule, `GRANT:PATH` with GRANT one of read, readdir or all (repeatable).
+        #[arg(long = "rule", value_name = "RULE", value_parser = crate::landlock::PathRule::parse)]
+        rule: Vec<crate::landlock::PathRule>,
+
+        /// Payload command, verbatim — everything after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            required = true
+        )]
+        cmd: Vec<OsString>,
+    },
+
     /// Internal namespace helper, re-exec'd by `run` (hidden; real since #5).
     #[command(name = "__init", hide = true)]
     Init {
@@ -228,6 +279,20 @@ pub enum Cmd {
         #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
         seccomp_fd: Option<RawFd>,
 
+        /// (hidden) sbx's own executable, kept for the Landlock shim (issue #19).
+        //
+        // Passed by `run` only under `--landlock`. Validated in the control stage
+        // (init::validate_exe_fd) as the same file as /proc/self/exe.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
+        exe_fd: Option<RawFd>,
+
+        /// (hidden) The Landlock shim's status pipe write end (issue #19 M1).
+        //
+        // Passed by `run` only under `--landlock`. Validated in the control stage
+        // (init::validate_status_fd) and checked against the command's shim argument.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
+        status_fd: Option<RawFd>,
+
         /// (hidden) The pid of the `run` process that spawned us (m6): __init sets
         /// PR_SET_PDEATHSIG and refuses to continue if its parent is not this pid.
         //
@@ -257,7 +322,7 @@ pub enum Cmd {
         /// and the nested bwrap launches, print one JSON line, exit 0.
         //
         // Issue #11 (T3/T4). Conflicts with every pipeline argument.
-        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "parent_pid", "min_mode", "cmd"])]
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "cmd"])]
         probe: bool,
 
         /// (hidden, with --probe) The bwrap binary the probe launches.
@@ -343,6 +408,19 @@ pub fn validate(cli: &Cli) -> Result<(), clap::Error> {
             }
         }
     }
+    if let Cmd::Run {
+        landlock,
+        landlock_bind_tcp,
+        ..
+    } = &cli.command
+    {
+        if !landlock_bind_tcp.is_empty() && *landlock == crate::landlock::Mode::Off {
+            return Err(Cli::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                "--landlock-bind-tcp needs --landlock best-effort or require",
+            ));
+        }
+    }
     if let Cmd::Check {
         policy: Some(_),
         host: false,
@@ -390,7 +468,26 @@ pub fn run() -> ExitCode {
     // debug, and release alike — at negligible cost (once per process).
     Cli::command().debug_assert();
 
-    let cli = Cli::parse();
+    // The shim (issue #19 m6) reports every parse error as its own failure: rc 125
+    // with `sbx __landlock:` on stderr, never clap's rc 2, because the payload's
+    // rc space and the status pipe belong to the shim's contract.
+    // Issue #19 round 3: the shim's start marker is the first thing it does, before
+    // any parsing, so `run` can tell a shim that never started from one that failed.
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    crate::landlock::announce_start(&argv);
+    let cli = if argv.get(1).is_some_and(|a| a == "__landlock") {
+        match Cli::try_parse_from(argv.clone()) {
+            Ok(cli) => cli,
+            Err(err) => {
+                if err.use_stderr() {
+                    return crate::landlock::parse_failure(&argv, err.to_string().trim_end());
+                }
+                err.exit();
+            }
+        }
+    } else {
+        Cli::parse()
+    };
     if let Err(err) = validate(&cli) {
         err.exit();
     }
@@ -422,6 +519,8 @@ pub fn run() -> ExitCode {
             audit,
             cmd,
             test_break_rules,
+            landlock,
+            landlock_bind_tcp,
         } => crate::run::run(crate::run::RunArgs {
             policy,
             session_dir,
@@ -430,6 +529,25 @@ pub fn run() -> ExitCode {
             audit,
             cmd,
             test_break_rules,
+            landlock,
+            landlock_bind_tcp,
+        }),
+        Cmd::Landlock {
+            exe_fd,
+            status_fd,
+            mode,
+            host_abi,
+            bind_tcp,
+            rule,
+            cmd,
+        } => crate::landlock::shim(crate::landlock::ShimArgs {
+            exe_fd,
+            status_fd,
+            mode,
+            host_abi,
+            bind_tcp,
+            rules: rule,
+            cmd,
         }),
         Cmd::Check {
             print_schema: true, ..
@@ -464,6 +582,8 @@ pub fn run() -> ExitCode {
             fd,
             keep_fd,
             seccomp_fd,
+            exe_fd,
+            status_fd,
             parent_pid,
             min_mode,
             test_break_rules,
@@ -481,6 +601,8 @@ pub fn run() -> ExitCode {
                 fd,
                 keep_fd,
                 seccomp_fd,
+                exe_fd,
+                status_fd,
                 parent_pid,
                 min_mode: min_mode.unwrap_or(NetworkMode::Transparent),
                 test_break_rules,
@@ -560,6 +682,7 @@ mod tests {
                 audit,
                 cmd,
                 test_break_rules,
+                ..
             } => {
                 assert!(!test_break_rules);
                 assert_eq!(policy, Path::new("p.json"));
@@ -1452,6 +1575,273 @@ mod tests {
             .render_help()
             .to_string();
         assert!(check.contains("--conformance"));
+    }
+
+    // ---- issue #19: the Landlock layer -----------------------------------
+
+    fn run_landlock_of(args: &[&str]) -> (crate::landlock::Mode, Vec<u16>) {
+        let cli = Cli::try_parse_from(
+            [
+                "sbx",
+                "run",
+                "--policy",
+                "p.json",
+                "--session-dir",
+                "/tmp/s",
+            ]
+            .into_iter()
+            .chain(args.iter().copied())
+            .chain(["--", "/bin/true"]),
+        )
+        .expect("landlock flags must parse");
+        validate(&cli).expect("valid landlock flags");
+        match cli.command {
+            Cmd::Run {
+                landlock,
+                landlock_bind_tcp,
+                ..
+            } => (landlock, landlock_bind_tcp),
+            other => panic!("expected Cmd::Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn landlock_defaults_off_and_parses_modes() {
+        use crate::landlock::Mode;
+        assert_eq!(run_landlock_of(&[]), (Mode::Off, vec![]));
+        assert_eq!(
+            run_landlock_of(&["--landlock", "best-effort"]),
+            (Mode::BestEffort, vec![])
+        );
+        assert_eq!(
+            run_landlock_of(&[
+                "--landlock",
+                "require",
+                "--landlock-bind-tcp",
+                "8080",
+                "--landlock-bind-tcp=0",
+            ]),
+            (Mode::Require, vec![8080, 0])
+        );
+    }
+
+    #[test]
+    fn landlock_rejects_bad_mode_and_port() {
+        for argv in [
+            &["--landlock", "strict"][..],
+            &["--landlock", "on"][..],
+            &["--landlock-bind-tcp", "65536"][..],
+            &["--landlock-bind-tcp", "port"][..],
+        ] {
+            let mut full = vec![
+                "sbx",
+                "run",
+                "--policy",
+                "p.json",
+                "--session-dir",
+                "/tmp/s",
+            ];
+            full.extend_from_slice(argv);
+            full.extend_from_slice(&["--", "/bin/true"]);
+            let err = Cli::try_parse_from(full).expect_err("must be rejected");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn landlock_bind_tcp_needs_a_landlock_mode() {
+        // Ports without a layer are a usage error (rc 2), never silently ignored.
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "run",
+            "--policy",
+            "p.json",
+            "--session-dir",
+            "/tmp/s",
+            "--landlock-bind-tcp",
+            "8080",
+            "--",
+            "/bin/true",
+        ])
+        .expect("parses; validate rejects");
+        let err = validate(&cli).expect_err("ports need a layer");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        assert!(
+            err.to_string()
+                .contains("--landlock-bind-tcp needs --landlock best-effort or require"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn landlock_flags_are_visible_in_run_help() {
+        let help = Cli::command()
+            .find_subcommand_mut("run")
+            .expect("run")
+            .render_help()
+            .to_string();
+        assert!(help.contains("--landlock"), "{help}");
+        assert!(help.contains("--landlock-bind-tcp"), "{help}");
+    }
+
+    #[test]
+    fn landlock_shim_parses_its_argv() {
+        use crate::landlock::{Grant, Mode, PathRule};
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--status-fd",
+            "8",
+            "--host-abi",
+            "6",
+            "--mode",
+            "require",
+            "--bind-tcp",
+            "8080",
+            "--rule",
+            "readdir:/",
+            "--rule",
+            "all:/work",
+            "--",
+            "/bin/echo",
+            "--help",
+        ])
+        .expect("shim argv must parse");
+        match cli.command {
+            Cmd::Landlock {
+                exe_fd,
+                status_fd,
+                mode,
+                host_abi,
+                bind_tcp,
+                rule,
+                cmd,
+            } => {
+                assert_eq!((exe_fd, status_fd, host_abi), (9, 8, 6));
+                assert_eq!(mode, Mode::Require);
+                assert_eq!(bind_tcp, [8080]);
+                assert_eq!(
+                    rule,
+                    [
+                        PathRule::new("/", Grant::ReadDir),
+                        PathRule::new("/work", Grant::All)
+                    ]
+                );
+                assert_eq!(cmd, ["/bin/echo", "--help"]);
+            }
+            other => panic!("expected Cmd::Landlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn landlock_shim_rejects_bad_rules_and_missing_fields() {
+        for argv in [
+            &["--rule", "write:/x"][..],
+            &["--rule", "read:relative"][..],
+        ] {
+            let mut full = vec![
+                "sbx",
+                "__landlock",
+                "--exe-fd",
+                "9",
+                "--status-fd",
+                "8",
+                "--host-abi",
+                "0",
+                "--mode",
+                "off",
+            ];
+            full.extend_from_slice(argv);
+            full.extend_from_slice(&["--", "/bin/true"]);
+            assert!(Cli::try_parse_from(full).is_err(), "{argv:?}");
+        }
+        // --exe-fd and --mode are required: the shim never guesses them.
+        assert!(
+            Cli::try_parse_from(["sbx", "__landlock", "--mode", "off", "--", "/bin/true"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["sbx", "__landlock", "--exe-fd", "9", "--", "/bin/true"]).is_err()
+        );
+        // --status-fd and --host-abi are required too (m6: the shim is strict).
+        assert!(
+            Cli::try_parse_from([
+                "sbx",
+                "__landlock",
+                "--exe-fd",
+                "9",
+                "--mode",
+                "off",
+                "--",
+                "/bin/true"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn landlock_shim_is_hidden_from_help() {
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("__landlock"), "{help}");
+    }
+
+    #[test]
+    fn init_parses_status_fd_and_hides_it() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--status-fd",
+            "13",
+            "--",
+            "/bin/true",
+        ])
+        .expect("--status-fd must parse");
+        match cli.command {
+            Cmd::Init { status_fd, .. } => assert_eq!(status_fd, Some(13)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand("__init")
+            .expect("__init subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--status-fd"), "{help}");
+    }
+
+    #[test]
+    fn init_parses_exe_fd_and_hides_it() {
+        let cli = Cli::try_parse_from([
+            "sbx",
+            "__init",
+            "--fd",
+            "7",
+            "--exe-fd",
+            "12",
+            "--",
+            "/bin/true",
+        ])
+        .expect("--exe-fd must parse");
+        match cli.command {
+            Cmd::Init { exe_fd, .. } => assert_eq!(exe_fd, Some(12)),
+            other => panic!("expected Cmd::Init, got {other:?}"),
+        }
+        let help = <Cli as clap::CommandFactory>::command()
+            .find_subcommand("__init")
+            .expect("__init subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(!help.contains("--exe-fd"), "{help}");
+        let err = Cli::try_parse_from(["sbx", "__init", "--probe", "--exe-fd", "11"])
+            .expect_err("--probe must conflict with --exe-fd");
+        assert!(
+            err.to_string().contains("--exe-fd") || err.to_string().contains("cannot be used"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -69,6 +69,24 @@
 //!     chain with it. Teardown still kills pid 1 directly (the bwrap child's
 //!     pdeathsig is bound to bwrap's own parent thread). Requires Linux >= 5.3
 //!     (pidfd) and bubblewrap >= 0.8.
+//! 11. **Landlock layer (issue #19, `--landlock` and `--landlock-bind-tcp`).**
+//!     Off by default; the argv is then byte-identical to a run without the flag.
+//!     With it on, `run` refuses `require` on a kernel below ABI 6 before anything
+//!     is spawned (rc 125, [`crate::landlock::require_refusal`], S5b), opens sbx's
+//!     own executable (S8b) and passes it to `__init` as `--exe-fd` (S9–S11), and
+//!     bwrap runs the shim, which applies the rules and execs the payload. A status
+//!     pipe (S8b, S9–S11) carries the shim's news back. The shim first writes a
+//!     start marker, before any argument parsing. A failure adds its reason after
+//!     the marker, then exits 125. After teardown, `run` reads the pipe:
+//!     - no marker: the shim never started (bwrap's exec of it failed, or the
+//!       dynamic loader did), so the outcome is `failed` with `sbx run: landlock:
+//!       the shim did not start (rc N)`, rc 125;
+//!     - marker and reason: `failed` with `sbx run: landlock: <reason>`, rc 125;
+//!     - marker only: the shim started and nothing failed, so the outcome is
+//!       unchanged, whatever the payload did (its own 125 included).
+//!
+//!     Outcomes that are already `failed` keep their own reason. See
+//!     [`crate::landlock`] module docs point 9.
 
 mod audit;
 mod lifecycle;
@@ -85,7 +103,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -112,7 +130,7 @@ use plan::{
 };
 use serve::{Fault, FaultLatch, serve_tasks, start_net};
 use session::SessionLock;
-use spawn::{SetupEnd, init_command, wait_for_fds};
+use spawn::{ChildFds, SetupEnd, init_command, wait_for_fds};
 use stdio::{OutputBudget, Pumps};
 
 /// Exit code for GNU-timeout-style timeouts.
@@ -147,6 +165,10 @@ pub struct RunArgs {
     pub cmd: Vec<OsString>,
     /// Hidden fail-only test driver, forwarded to `__init` (issue #11, Q6).
     pub test_break_rules: bool,
+    /// `--landlock` (issue #19); `Off` adds no layer.
+    pub landlock: crate::landlock::Mode,
+    /// `--landlock-bind-tcp` ports (issue #19), in command-line order.
+    pub landlock_bind_tcp: Vec<u16>,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -545,6 +567,14 @@ fn execute(
     let audit = AuditLog::new(audit_file, latch.clone());
     *audit_slot = Some(audit.clone());
 
+    // S5b (issue #19): `--landlock require` on a kernel below ABI 6 is refused here,
+    // before any spawn (the shim re-checks and fails closed too).
+    if args.landlock == crate::landlock::Mode::Require {
+        if let Some(reason) = crate::landlock::require_refusal(crate::landlock::kernel_abi()) {
+            return Err(RunError::new(reason).into());
+        }
+    }
+
     // S6: bwrap discovery and version gate.
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
@@ -563,6 +593,31 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
+    // S8b (issue #19): with the Landlock layer on, sbx's own executable is opened
+    // here (O_CLOEXEC, like every std open) and becomes the shim's program, and a
+    // status pipe carries the shim's failure reason back (M1). The read end is
+    // non-blocking; the write end is handed over in the spawn window.
+    let (exe_file, status_pipe) = match args.landlock {
+        crate::landlock::Mode::Off => (None, None),
+        _ => {
+            let exe = File::open("/proc/self/exe")
+                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
+            let pipe = sys::pipe_cloexec().map_err(|err| {
+                RunError::new(format!("cannot create the shim status pipe: {err}"))
+            })?;
+            (Some(exe), Some(pipe))
+        }
+    };
+    let landlock_layer = match (&exe_file, &status_pipe) {
+        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
+            mode: args.landlock,
+            bind_tcp: args.landlock_bind_tcp.clone(),
+            exe_fd: file.as_raw_fd(),
+            status_fd: status_write.as_raw_fd(),
+            host_abi: crate::landlock::host_abi(),
+        }),
+        _ => None,
+    };
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -572,6 +627,7 @@ fn execute(
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
+        landlock: landlock_layer,
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
@@ -597,11 +653,29 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
     let seccomp_fd = sys::clear_cloexec(seccomp_memfd.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
+    let exe_fd = match &exe_file {
+        Some(file) => Some(
+            sys::clear_cloexec(file.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim: {err}")))?,
+        ),
+        None => None,
+    };
+    let status_fd = match &status_pipe {
+        Some((_, write)) => Some(
+            sys::clear_cloexec(write.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim status: {err}")))?,
+        ),
+        None => None,
+    };
     let (stdin, stdin_piped) = stdin_mode();
     let mut child = init_command(
-        child_fd,
-        info_fd,
-        seccomp_fd,
+        ChildFds {
+            control: child_fd,
+            info: info_fd,
+            seccomp: seccomp_fd,
+            exe: exe_fd,
+            status: status_fd,
+        },
         policy.network.mode,
         args.test_break_rules,
         &launch,
@@ -612,6 +686,14 @@ fn execute(
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);
+    drop(exe_file);
+    // The write end lives on in __init, bwrap and the shim only; sbx keeps just the
+    // read end. Without this drop an empty pipe would never report EOF.
+    let (status_read, status_write) = match status_pipe {
+        Some((read, write)) => (Some(read), Some(write)),
+        None => (None, None),
+    };
+    drop(status_write);
 
     // S12: a pidfd for the child (unreaped, so its pid cannot be recycled).
     let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {
@@ -751,7 +833,27 @@ fn execute(
         Ok(()) => main_loop(&mut sb, &signals, &latch, deadline, timeout),
         Err(cause) => cause,
     };
-    let (outcome, end, stragglers) = teardown(sb, cause, pumps);
+    let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
+    // M1 and round 3 item 2: the status pipe says whether the shim started and
+    // whether it failed (module docs point 11). It ends the run as `failed` only
+    // when the payload's own outcome is not already a failure.
+    if let Some(bytes) = status_read.as_ref().and_then(read_status) {
+        match crate::landlock::decode_status(&bytes) {
+            crate::landlock::StatusReport::Started => {}
+            crate::landlock::StatusReport::Failed(reason) => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    outcome = Outcome::Failed(format!("landlock: {reason}"));
+                }
+            }
+            crate::landlock::StatusReport::NotStarted => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    let rc = exit_code(&outcome);
+                    outcome =
+                        Outcome::Failed(format!("landlock: the shim did not start (rc {rc})"));
+                }
+            }
+        }
+    }
     let _ = lock.touch();
     conclude(
         outcome,
@@ -766,6 +868,26 @@ fn execute(
             net_mode,
         },
     )
+}
+
+/// Reads the shim's status pipe without blocking (issue #19 M1): the bytes there
+/// (empty when nothing was written). The shim writes its marker first and any
+/// reason before exiting 125, so the data is in the pipe by the time the payload
+/// is gone. A pipe still held by a dying bwrap reads as EAGAIN, which ends the
+/// read with what is there. Decoding is `landlock::decode_status`.
+fn read_status(fd: &OwnedFd) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::from(fd.try_clone().ok()?);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    Some(bytes)
 }
 
 /// Which writable location an audit path collides with (for the pinned messages).

@@ -236,6 +236,23 @@ jobs:
           printf '%s\n' "$OUT" | grep -qx 'vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'packet errno 97' && printf '%s\n' "$OUT" | grep -qx 'hiword errno 97' && printf '%s\n' "$OUT" | grep -qx 'socketpair-vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'unix ok' && [ "$RC" -eq 0 ] || { echo "FAIL: socket-family filter rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
+      # Issue #19: the Landlock layer on the static musl release binary.
+      # The runner's Landlock ABI is printed so a skipped layer is visible in the
+      # log. The payload must see `mkdir` at `/` fail under the layer (EACCES),
+      # which bwrap's own tmpfs root would allow without it.
+      - name: "Smoke: sbx run --landlock best-effort (release musl)"
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/sbx
+          T=$(mktemp -d)
+          cat > "$T/landlock.json" <<'JSON'
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}
+          JSON
+          set +e
+          echo "runner Landlock: $("$BIN" check | grep landlock)"
+          OUT=$("$BIN" run --policy "$T/landlock.json" --session-dir "$T/s" --landlock best-effort -- /usr/bin/bash -c 'if mkdir /sbx-landlock-smoke 2>/dev/null; then echo made; exit 1; fi; echo denied')
+          RC=$?
+          [ "$RC" -eq 0 ] && [ "$OUT" = "denied" ] || { echo "FAIL: landlock smoke rc $RC out: $OUT"; exit 1; }
+
       # Issue #11: the real `sbx check` on the runner (gating). Every host item
       # must be ok and the network mode transparent — the environment the
       # integration suites assume. The human report goes to the job summary.
