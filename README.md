@@ -180,16 +180,19 @@ A policy with `network.mode: transparent` cannot run on an `explicit` host:
 and it is never silent: `sbx run` prints one notice line with the nft error, and
 the audit exit row records the mode the run got (see [Running commands](#running-commands)).
 
-**Policy comparison.** `sbx check --policy P --host` adds eight checks to the
+**Policy comparison.** `sbx check --policy P --host` adds nine checks to the
 host report: `network-mode` (the policy's mode against the host), `infra-etc`
 (the `/etc` files every sandbox binds), `policy-paths` (every `filesystem.ro` and
 `filesystem.rw` path exists), `deny-paths` (a deny entry that is a file cannot
 be masked, and one that sits under a bound path or an sbx-generated `/etc` file
-is flagged), `mount-chains` (the pre-launch verification of `run` below, which
-fails the policy when `run` would refuse), `bwrap-cve` (warns when bwrap is
-older than 0.12.0 and the policy has mount paths under its binds), `deny-links`
-(warns when a file under a deny path has a hard link outside it) and `pin-cost` (warns
-above 50 directory pins).
+is flagged), `bind-sockets` (a `warn` listing the unix socket files under
+`filesystem.ro` and `filesystem.rw`, outside `filesystem.deny`; see
+[Unix sockets under binds](#running-commands)), `mount-chains` (the pre-launch
+verification of `run` below, which fails the policy when `run` would refuse),
+`bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
+paths under its binds), `deny-links` (warns when a file under a deny path has a
+hard link outside it) and `pin-cost` (warns above 50 directory pins). A `warn`
+does not stop the policy from running.
 
 **JSON.** `sbx check --json` prints the same report as a JSON object with
 `"version": 1`: `network_mode`, `runnable_modes`, `probe_error` and one object per
@@ -296,7 +299,8 @@ temporary artifacts and prints their path on stderr. A full offline run takes a
 few seconds (the budget is 120 s).
 
 A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
-hazard, not a defect. It goes away when issue #35 lands.
+hazard, not a defect. Find the bind that holds it with
+`sbx check --policy P --host` (the `bind-sockets` item).
 
 **Lab tier.** The 19 lab checks (A02–A06, A12, B01–B09, C02, C07, F02, F04) run
 inside a child that unshares user, network and mount namespaces: no root, and
@@ -455,6 +459,30 @@ payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 `NO_PROXY` and their lowercase twins) pointing at the explicit listener. The
 explicit proxy's response table is in the `proxy::explicit` module docs (200 for
 an allowed CONNECT; 400, 403, 502 and 504 otherwise).
+
+**Unix sockets under binds (issue #35).** A read-only bind does not block
+`connect(2)` on a unix socket file: `ro` only stops writes to the file itself.
+A policy that binds `/run`, `/var/run`, a directory under `/tmp` (such as
+`/tmp/.X11-unix`) or a home directory therefore hands the payload every socket
+under it, for example `docker.sock` (host root),
+the D-Bus buses, an ssh-agent, or nscd and systemd-resolved (a resolver that
+bypasses the fake-IP DNS). Keep socket directories out of `filesystem.ro` and
+`filesystem.rw`, or mask them with `filesystem.deny`. A bind at exactly `/tmp`,
+`/root`, `/work`, `/proc` or `/dev` is covered by sbx's own mount there, so the
+host sockets under it are not reachable. `sbx check --policy P --host` warns
+about each reachable socket file under a bind (`bind-sockets`), and the
+conformance check `D05` warns about any socket file visible inside the sandbox.
+
+**`/etc/hosts` (issue #35).** The sandbox's `/etc/hosts` is generated, like
+`resolv.conf`, `passwd` and `group`: it holds only `127.0.0.1 localhost` and
+`::1 localhost`. The host's file is never bound, so a host entry cannot pin an
+allowed name to a real address past the fake-IP resolver, and host entries are
+not disclosed. A policy that lists `/etc/hosts` in `filesystem.ro` gets the
+generated file (it mounts last). Names that a host's `/etc/hosts` or Kubernetes
+`hostAliases` define are resolved by the proxy on the host side. They work for
+allowed names only when they map to a public address: the resolved-address guard
+still denies loopback, private, link-local and other special-purpose addresses,
+which is where `hostAliases` usually point.
 
 **Socket families and syscalls (issue #34).** Every `sbx run` installs a seccomp
 filter through bwrap (`--seccomp`), and the payload can create sockets only in

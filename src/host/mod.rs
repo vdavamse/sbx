@@ -193,7 +193,8 @@ pub struct PolicyCheck {
 }
 
 /// One policy check (`id` in the fixed order `network-mode`, `infra-etc`,
-/// `policy-paths`, `deny-paths`, `mount-chains`, `bwrap-cve`, `deny-links`).
+/// `policy-paths`, `deny-paths`, `bind-sockets`, `mount-chains`, `bwrap-cve`,
+/// `deny-links`, `pin-cost`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PolicyItem {
     pub id: &'static str,
@@ -257,6 +258,7 @@ pub fn check(args: CheckArgs) -> ExitCode {
                     },
                     bwrap,
                     hard_links: &crate::bwrap::guard::hard_links_under,
+                    sockets: &facts::socket_scan,
                 },
             ));
         }

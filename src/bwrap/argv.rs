@@ -23,6 +23,7 @@
 //!       prio 0 — policy filesystem.ro (list order) and .rw (list order)
 //!       prio 1 — infra /etc set (plain binds, src == dest, Q1/Q9)
 //!       prio 1 — generated files (src from SessionLayout):
+//!                <session>/etc/hosts       → /etc/hosts
 //!                <session>/etc/resolv.conf → /etc/resolv.conf
 //!                <session>/etc/passwd      → /etc/passwd
 //!                <session>/etc/group       → /etc/group
@@ -79,10 +80,13 @@ pub(crate) const INFRA_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/u
 /// [`super::build`]'s row 14 cross-checks the session dir against them —
 /// a session inside an infra bind would be an ancestor bind by placement
 /// alone, with no policy involvement.
-pub(super) const INFRA_ETC: [&str; 7] = [
+///
+/// `/etc/hosts` is deliberately NOT here (issue #35): it is generated
+/// (loopback-only, [`super::etc::HOSTS_CONTENT`]) so host-pinned names
+/// cannot bypass fake-IP DNS and host entries are not disclosed.
+pub(super) const INFRA_ETC: [&str; 6] = [
     "/etc/alternatives",
     "/etc/ca-certificates",
-    "/etc/hosts",
     "/etc/ld.so.cache",
     "/etc/localtime",
     "/etc/nsswitch.conf",
@@ -613,6 +617,7 @@ fn merged_mounts(fs: &crate::policy::Filesystem, layout: &SessionLayout) -> Vec<
     // from the session dir (no fd-passing — #5's fd_hygiene closes every
     // fd > 2 before exec, so --ro-bind-data is impossible).
     for (src, dest) in [
+        (&layout.hosts, "/etc/hosts"),
         (&layout.resolv_conf, "/etc/resolv.conf"),
         (&layout.passwd, "/etc/passwd"),
         (&layout.group, "/etc/group"),
@@ -916,7 +921,7 @@ mod tests {
     ];
 
     /// Element 6, infra half (no policy binds): the infra /etc set with
-    /// the three generated files interleaved in dest byte order.
+    /// the four generated files interleaved in dest byte order.
     const INFRA_BINDS_NO_POLICY: &[&str] = &[
         "--ro-bind",
         "/etc/alternatives",
@@ -928,7 +933,7 @@ mod tests {
         "/tmp/sbx-golden-session/etc/group",
         "/etc/group",
         "--ro-bind",
-        "/etc/hosts",
+        "/tmp/sbx-golden-session/etc/hosts",
         "/etc/hosts",
         "--ro-bind",
         "/etc/ld.so.cache",
@@ -1151,9 +1156,9 @@ mod tests {
     fn golden_collision_infra_wins() {
         // Golden 4 (Q13): same-dest collisions resolved by priority +
         // bwrap's last-mount-wins — no error class. The policy
-        // /etc/hosts collapses into the infra entry (exact duplicate);
-        // the policy /etc/passwd emits BEFORE the generated bind (prio
-        // 0 < 1 ⇒ generated wins); the policy ro /work before the session
+        // /etc/hosts and /etc/passwd each emit BEFORE their generated
+        // bind (prio 0 < 1 ⇒ generated wins — a policy cannot re-expose
+        // the host hosts file, issue #35); the policy ro /work before the session
         // rw /work (session wins). (The collision demo uses /work, not
         // /tmp: build() row 13 now rejects policy paths that are or
         // contain the session dir, and /tmp is an ancestor of SESSION_DIR
@@ -1180,6 +1185,9 @@ mod tests {
                     "/etc/group",
                     "--ro-bind",
                     "/etc/hosts",
+                    "/etc/hosts",
+                    "--ro-bind",
+                    "/tmp/sbx-golden-session/etc/hosts",
                     "/etc/hosts",
                     "--ro-bind",
                     "/etc/ld.so.cache",
@@ -2112,6 +2120,7 @@ mod tests {
                     layout.work,
                     layout.home,
                     layout.tmp,
+                    layout.hosts,
                     layout.resolv_conf,
                     layout.passwd,
                     layout.group,

@@ -31,9 +31,10 @@
 //!
 //! 8. No hooks: `run` and `__init` behave exactly as without `--conformance`.
 //!
-//! Known gaps (documented, not hidden): the `/etc/hosts` and socket-file
-//! findings are tracked in #35 (D05 warns, C06 notes); operator policies are
-//! out of v1 (built-in policies only).
+//! Known gaps (documented, not hidden): socket files under policy binds are
+//! reachable (D05 warns; `sbx check --policy P --host` warns as
+//! `bind-sockets`, #35); operator policies are out of v1 (built-in policies
+//! only).
 
 pub mod catalog;
 pub mod fixtures;
@@ -339,27 +340,9 @@ fn run_one(
                     .max()
                     .unwrap_or(0),
             );
-            if d.id == "C06" && hosts_has_foreign_entries() {
-                r.evidence
-                    .push("note: /etc/hosts has non-loopback entries; see #35".to_owned());
-            }
             r
         }
     }
-}
-
-/// Whether `/etc/hosts` pins a non-loopback address (Q7 note for C06).
-fn hosts_has_foreign_entries() -> bool {
-    std::fs::read_to_string("/etc/hosts").is_ok_and(|text| {
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .any(|l| {
-                let mut parts = l.split_whitespace();
-                let ip = parts.next().unwrap_or("");
-                !(ip.starts_with("127.") || ip == "::1") && parts.next().is_some()
-            })
-    })
 }
 
 /// The L checks the lab child must run: the selected ones (empty = none).
