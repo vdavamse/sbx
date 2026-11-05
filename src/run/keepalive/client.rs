@@ -524,6 +524,9 @@ fn early_refusal(stream: &UnixStream, err: &ProtoError) -> Option<String> {
     let ProtoError::Io(io) = err else {
         return None;
     };
+    // EPIPE is what Linux reports on the send. ECONNRESET is accepted too: it
+    // is the peer's unread-data reset, and AF_UNIX still delivers the queued
+    // frame before surfacing that error on a read.
     if !matches!(
         io.kind(),
         std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
@@ -618,53 +621,43 @@ mod tests {
 
     /// A holder that refuses and closes WITHOUT reading the request (as the
     /// real holder does for a foreign uid): the client's send hits EPIPE, and
-    /// the queued refusal is still reported, for stop and for the helper.
+    /// the queued refusal is still reported.
     #[test]
     fn a_refusal_before_the_request_is_read_survives_epipe() {
         let dir = scratch_session("early");
         let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
         let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             for _ in 0..2 {
                 let (conn, _) = listener.accept().expect("a client connects");
                 let (op, payload) = Reply::Refused("not the session owner".into()).encode();
                 ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
-                // Close without reading anything.
+                // Close without reading anything, then say so.
+                drop(conn);
+                let _ = closed_tx.send(());
             }
         });
 
-        // The helper, deterministically: wait until the holder has closed,
-        // then send — the send must fail, and the refusal must be recovered.
+        // The helper, deterministically: the send happens only after the
+        // holder has dropped its end, so it must fail (EPIPE), and the
+        // refusal queued before the close must be recovered.
         let client = ctl::connect_ctl(dirfd.as_fd()).expect("connect");
-        let mut peer_closed = false;
-        let mut probe = [0u8; 1];
-        for _ in 0..200 {
-            // MSG_PEEK reads the queued refusal without consuming it.
-            let n = unsafe {
-                libc::recv(
-                    client.as_raw_fd(),
-                    probe.as_mut_ptr().cast(),
-                    1,
-                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                )
-            };
-            if n > 0 {
-                peer_closed = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(peer_closed, "the refusal never arrived");
-        std::thread::sleep(Duration::from_millis(50));
-        let big = vec![0u8; 200 * 1024];
+        closed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the holder closes");
         let err =
-            ctl::send_frame(&client, b'A', &big, &[]).expect_err("a send to a closed peer fails");
+            ctl::send_frame(&client, b'S', &[], &[]).expect_err("a send to a closed peer fails");
         assert_eq!(
             early_refusal(&client, &err).as_deref(),
             Some("not the session owner")
         );
 
-        // And end to end through stop.
+        // End to end through stop. Not deterministic about WHICH path runs
+        // (the tiny Stop frame races the holder's close inside stop_session:
+        // either the send succeeds and the normal reply path reads the
+        // refusal, or it fails and early_refusal does), but both must report
+        // the holder's reason. The helper half above pins the EPIPE branch.
         assert_eq!(
             stop_session(dir.clone(), Duration::from_secs(10)),
             Err("not the session owner".to_owned())
