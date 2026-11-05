@@ -3,7 +3,7 @@
 //! info pipe; and the single teardown path that kills pid 1 and reaps bwrap.
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
@@ -152,6 +152,30 @@ fn resolve_pid1(buf: &[u8], bwrap_pid: libc::pid_t) -> Pid1 {
     }
 }
 
+/// Work the supervisor does on each wake-up beyond its own fds (issue #18). The
+/// holder adds its control socket and attached-call pidfds; an attach adds the
+/// holder's pidfd. Plain `run` passes [`NoExtra`], so its poll set is unchanged.
+pub(crate) trait Extra {
+    /// The fds to poll, in the order `wake` receives their revents.
+    fn fds(&self) -> Vec<RawFd> {
+        Vec::new()
+    }
+    /// Called after every wake-up with the extra fds' revents, in `fds` order.
+    /// A cause ends the run.
+    fn wake(&mut self, _revents: &[libc::c_short]) -> Option<Cause> {
+        None
+    }
+    /// An extra wake-up instant (the holder's idle or max-lifetime clock).
+    fn deadline(&self) -> Option<Instant> {
+        None
+    }
+}
+
+/// The no-op [`Extra`] of plain `run`.
+pub(crate) struct NoExtra;
+
+impl Extra for NoExtra {}
+
 /// The supervisor loop. The first cause observed wins (see [`pick_cause`]).
 pub(crate) fn main_loop(
     sb: &mut Sandbox,
@@ -159,6 +183,19 @@ pub(crate) fn main_loop(
     latch: &FaultLatch,
     deadline: Instant,
     timeout: Duration,
+) -> Cause {
+    supervise(sb, signals, latch, deadline, timeout, &mut NoExtra)
+}
+
+/// [`main_loop`] with an [`Extra`] hook. `deadline` is the run's own limit
+/// (timeout); the extra hook may add an earlier wake-up through `deadline()`.
+pub(crate) fn supervise(
+    sb: &mut Sandbox,
+    signals: &Signals,
+    latch: &FaultLatch,
+    deadline: Instant,
+    timeout: Duration,
+    extra: &mut dyn Extra,
 ) -> Cause {
     loop {
         let mut fds = vec![
@@ -173,7 +210,15 @@ pub(crate) fn main_loop(
             }
             _ => None,
         };
-        if let Err(err) = sys::poll_fds(&mut fds, Some(deadline)) {
+        let extra_start = fds.len();
+        for fd in extra.fds() {
+            fds.push(pollfd(fd, libc::POLLIN));
+        }
+        let wake_at = match extra.deadline() {
+            Some(at) => at.min(deadline),
+            None => deadline,
+        };
+        if let Err(err) = sys::poll_fds(&mut fds, Some(wake_at)) {
             return Cause::Setup(RunError::new(format!("internal error: poll failed: {err}")));
         }
         if let Some(index) = info_index {
@@ -202,6 +247,10 @@ pub(crate) fn main_loop(
             if let Some(cause) = kind_to_cause(kind, fault, signal, timeout) {
                 return cause;
             }
+        }
+        let revents: Vec<libc::c_short> = fds[extra_start..].iter().map(|p| p.revents).collect();
+        if let Some(cause) = extra.wake(&revents) {
+            return cause;
         }
     }
 }

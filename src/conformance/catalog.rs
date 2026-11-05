@@ -1,4 +1,5 @@
-//! The conformance catalog: all 72 checks, in report order (issue #13).
+//! The conformance catalog: all 81 checks, in report order (issue #13; group I,
+//! the persistent sessions of issue #18, adds six).
 //!
 //! Pure data plus the selector parser. The ids, group keys, titles and the
 //! `needs` lists are pinned by the `catalog_pinned` golden test; the
@@ -17,10 +18,11 @@ pub enum Group {
     F,
     G,
     H,
+    I,
 }
 
 /// Every group, in report order.
-pub const GROUPS: [Group; 8] = [
+pub const GROUPS: [Group; 9] = [
     Group::A,
     Group::B,
     Group::C,
@@ -29,6 +31,7 @@ pub const GROUPS: [Group; 8] = [
     Group::F,
     Group::G,
     Group::H,
+    Group::I,
 ];
 
 impl Group {
@@ -43,6 +46,7 @@ impl Group {
             Group::F => 'F',
             Group::G => 'G',
             Group::H => 'H',
+            Group::I => 'I',
         }
     }
 
@@ -57,6 +61,7 @@ impl Group {
             Group::F => "fail-closed",
             Group::G => "cleanup",
             Group::H => "secrets",
+            Group::I => "session",
         }
     }
 
@@ -71,6 +76,7 @@ impl Group {
             Group::F => "fail-closed",
             Group::G => "cleanup",
             Group::H => "secrets",
+            Group::I => "persistent sessions",
         }
     }
 }
@@ -157,11 +163,11 @@ const fn c(
     }
 }
 
-use Group::{A, B, C, D, E, F, G, H};
+use Group::{A, B, C, D, E, F, G, H, I};
 use Tier::{Host as Hs, Init as If, Lab as Lb, Network as Nw};
 
-/// The 72 checks, in report order (group, then id).
-pub const CATALOG: [CheckDef; 72] = [
+/// The 81 checks, in report order (group, then id).
+pub const CATALOG: [CheckDef; 81] = [
     c(
         "A01",
         A,
@@ -446,6 +452,21 @@ pub const CATALOG: [CheckDef; 72] = [
         S,
     ),
     c(
+        "D13",
+        D,
+        Hs,
+        "host paths outside the policy are invisible",
+        S,
+    ),
+    c("D14", D, Hs, "writes into an ro bind fail with EROFS", S),
+    c(
+        "D15",
+        D,
+        Hs,
+        "deny masks hide their targets under ro and rw covers",
+        S,
+    ),
+    c(
         "E01",
         E,
         Nw,
@@ -600,6 +621,48 @@ pub const CATALOG: [CheckDef; 72] = [
         "the caller's HOME and processes are invisible",
         S,
     ),
+    c(
+        "I01",
+        I,
+        Hs,
+        "attached call cannot see or signal the resident or another call",
+        T,
+    ),
+    c(
+        "I02",
+        I,
+        Hs,
+        "holder SIGKILL kills the resident and the attached calls",
+        T,
+    ),
+    c(
+        "I03",
+        I,
+        Hs,
+        "attach with a different policy is refused with rc 125",
+        T,
+    ),
+    c(
+        "I04",
+        I,
+        Hs,
+        "foreign-uid connection to sbx.ctl is refused",
+        S,
+    ),
+    c(
+        "I05",
+        I,
+        Hs,
+        "idle timeout ends the session; a running call holds it open",
+        T,
+    ),
+    c(
+        "I06",
+        I,
+        Hs,
+        "max lifetime ends the session and its running calls",
+        T,
+    ),
 ];
 
 /// Every catalog entry for `group`, in order.
@@ -641,10 +704,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_72_unique_ids_in_group_order() {
-        assert_eq!(CATALOG.len(), 72);
+    fn catalog_has_78_unique_ids_in_group_order() {
+        assert_eq!(CATALOG.len(), 81);
         let ids: BTreeSet<_> = CATALOG.iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 72);
+        assert_eq!(ids.len(), 81);
         let mut last = 0usize;
         for d in CATALOG.iter() {
             let g = GROUPS.iter().position(|g| *g == d.group).unwrap();
@@ -662,7 +725,7 @@ mod tests {
     #[test]
     fn tier_counts_match_the_design() {
         let count = |t: Tier| CATALOG.iter().filter(|d| d.tier == t).count();
-        assert_eq!(count(Tier::Host), 46);
+        assert_eq!(count(Tier::Host), 55);
         assert_eq!(count(Tier::Lab), 19);
         assert_eq!(count(Tier::Init), 1);
         assert_eq!(count(Tier::Network), 6);
@@ -696,16 +759,20 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(text.len(), 72);
+        assert_eq!(text.len(), 81);
         assert!(text[0].starts_with("A01|allow-list|host|allowed name gets an A record"));
         assert!(text[12].starts_with("A13|allow-list|host|exact-only =name"));
-        assert!(text[71].starts_with("H06|secrets|host|"));
+        assert!(text[74].starts_with("H06|secrets|host|"));
         let d11 = text
             .iter()
             .position(|t| t.starts_with("D11|"))
             .expect("D11");
         assert!(text[d11 + 1].starts_with("D12|"));
-        assert!(text[d11 + 2].starts_with("E01|"));
+        assert!(text[d11 + 2].starts_with("D13|isolation|host|"));
+        assert!(text[d11 + 3].starts_with("D14|isolation|host|"));
+        assert!(text[d11 + 4].starts_with("D15|isolation|host|"));
+        assert!(text[d11 + 5].starts_with("E01|"));
+        assert!(text[80].starts_with("I06|session|host|max lifetime"));
     }
 
     #[test]

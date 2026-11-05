@@ -21,15 +21,28 @@ use crate::bwrap::Launch;
 use crate::init::fdpass::{AchievedMode, ListenerFds, SetupMsg, StagedFailure, recv_setup};
 use crate::policy::NetworkMode;
 
+/// The descriptors `run` hands `__init`, each inherited across the one spawn:
+/// the control socket end, the bwrap info pipe, the seccomp program memfd and,
+/// with `--landlock` on, sbx's own executable for the Landlock shim (issue #19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildFds {
+    pub control: RawFd,
+    pub info: RawFd,
+    pub seccomp: RawFd,
+    pub exe: Option<RawFd>,
+    /// The shim's status pipe write end (issue #19 M1); with `exe`, only under `--landlock`.
+    pub status: Option<RawFd>,
+}
+
 /// The re-exec argv after the program:
-/// `__init --fd C --keep-fd I --seccomp-fd S --parent-pid P --min-mode M
-/// [--test-break-rules] -- <argv…>` (issue #11: `M` is the policy's mode — the
-/// weakest mode `__init` may fall back to; issue #34: `S` is the sealed
-/// seccomp-program memfd `__init` verifies and hands to bwrap).
+/// `__init --fd C --keep-fd I --seccomp-fd S [--exe-fd E] [--status-fd T]
+/// --parent-pid P --min-mode M [--test-break-rules] -- <argv…>` (issue #11: `M`
+/// is the policy's mode — the weakest mode `__init` may fall back to; issue #34:
+/// `S` is the sealed seccomp-program memfd `__init` verifies and hands to bwrap;
+/// issue #19: `E` is sbx's own executable, and round 3 adds `T`, the shim's
+/// status pipe write end; both are passed only under `--landlock`).
 pub(crate) fn init_argv(
-    control_fd: RawFd,
-    info_fd: RawFd,
-    seccomp_fd: RawFd,
+    fds: ChildFds,
     parent_pid: u32,
     min_mode: NetworkMode,
     test_break_rules: bool,
@@ -38,16 +51,24 @@ pub(crate) fn init_argv(
     let mut argv: Vec<OsString> = vec![
         "__init".into(),
         "--fd".into(),
-        control_fd.to_string().into(),
+        fds.control.to_string().into(),
         "--keep-fd".into(),
-        info_fd.to_string().into(),
+        fds.info.to_string().into(),
         "--seccomp-fd".into(),
-        seccomp_fd.to_string().into(),
-        "--parent-pid".into(),
-        parent_pid.to_string().into(),
-        "--min-mode".into(),
-        mode_word(min_mode).into(),
+        fds.seccomp.to_string().into(),
     ];
+    if let Some(exe) = fds.exe {
+        argv.push("--exe-fd".into());
+        argv.push(exe.to_string().into());
+    }
+    if let Some(status) = fds.status {
+        argv.push("--status-fd".into());
+        argv.push(status.to_string().into());
+    }
+    argv.push("--parent-pid".into());
+    argv.push(parent_pid.to_string().into());
+    argv.push("--min-mode".into());
+    argv.push(mode_word(min_mode).into());
     if test_break_rules {
         argv.push("--test-break-rules".into());
     }
@@ -69,9 +90,7 @@ fn mode_word(mode: NetworkMode) -> &'static str {
 /// mid-run), `env_clear()` (the second and last env-encoding site), stdout and
 /// stderr piped for the pumps, and its own process group.
 pub(crate) fn init_command(
-    control_fd: RawFd,
-    info_fd: RawFd,
-    seccomp_fd: RawFd,
+    fds: ChildFds,
     min_mode: NetworkMode,
     test_break_rules: bool,
     launch: &Launch,
@@ -80,9 +99,7 @@ pub(crate) fn init_command(
     let mut cmd = Command::new("/proc/self/exe");
     // m6: __init arms PDEATHSIG and verifies this pid as its parent.
     cmd.args(init_argv(
-        control_fd,
-        info_fd,
-        seccomp_fd,
+        fds,
         std::process::id(),
         min_mode,
         test_break_rules,
@@ -354,10 +371,18 @@ mod tests {
             passed_env: &Default::default(),
             info_fd: Some(9),
             seccomp_fd: 11,
+            landlock: None,
         })
         .expect("builds");
         // Issue #34: `--seccomp-fd 11` follows `--keep-fd 9`.
-        let argv = init_argv(7, 9, 11, 4242, NetworkMode::Explicit, false, &launch);
+        let fds = ChildFds {
+            control: 7,
+            info: 9,
+            seccomp: 11,
+            exe: None,
+            status: None,
+        };
+        let argv = init_argv(fds, 4242, NetworkMode::Explicit, false, &launch);
         assert_eq!(
             &argv[..12],
             [
@@ -377,10 +402,70 @@ mod tests {
             .map(OsString::from)
         );
         assert_eq!(&argv[12..], launch.argv());
-        let with_break = init_argv(7, 9, 11, 4242, NetworkMode::Transparent, true, &launch);
+        let with_break = init_argv(fds, 4242, NetworkMode::Transparent, true, &launch);
         assert_eq!(
             with_break[10..13],
             ["transparent", "--test-break-rules", "--"].map(OsString::from)
+        );
+    }
+
+    #[test]
+    fn init_argv_exe_fd_follows_seccomp_fd() {
+        // Issue #19: `--exe-fd E` sits between `--seccomp-fd S` and
+        // `--parent-pid`, and is absent unless the Landlock layer is on (the
+        // shape test above pins the absent form).
+        let launch = crate::bwrap::build(&crate::bwrap::Build {
+            policy: &crate::policy::Policy::from_json_str(
+                r#"{"version":1,"filesystem":{"ro":[],"rw":[],"deny":[]},"network":{"mode":"none","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#,
+            )
+            .expect("policy"),
+            session_dir: std::path::Path::new("/var/lib/sbx-test/s1"),
+            bwrap_path: std::path::Path::new("/usr/bin/bwrap"),
+            command: &["/bin/true".into()],
+            cwd: None,
+            passed_env: &Default::default(),
+            info_fd: Some(9),
+            seccomp_fd: 11,
+            landlock: None,
+        })
+        .expect("builds");
+        let fds = ChildFds {
+            control: 7,
+            info: 9,
+            seccomp: 11,
+            exe: Some(12),
+            status: None,
+        };
+        let argv = init_argv(fds, 4242, NetworkMode::None, false, &launch);
+        assert_eq!(
+            &argv[..14],
+            [
+                "__init",
+                "--fd",
+                "7",
+                "--keep-fd",
+                "9",
+                "--seccomp-fd",
+                "11",
+                "--exe-fd",
+                "12",
+                "--parent-pid",
+                "4242",
+                "--min-mode",
+                "none",
+                "--",
+            ]
+            .map(OsString::from)
+        );
+        // M1: `--status-fd S` follows `--exe-fd E` when the status pipe is present.
+        let with_status = ChildFds {
+            status: Some(13),
+            ..fds
+        };
+        let argv = init_argv(with_status, 4242, NetworkMode::None, false, &launch);
+        assert_eq!(
+            &argv[7..11],
+            ["--exe-fd", "12", "--status-fd", "13"].map(OsString::from)
         );
     }
 }

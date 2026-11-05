@@ -1,0 +1,661 @@
+//! The control protocol on `sbx.ctl` (issue #18, design point 6).
+//!
+//! 1. **Framing.** Every message is one frame: a one-byte opcode, a 4-byte
+//!    big-endian payload length, then the payload. The length is checked against
+//!    [`MAX_FRAME`] before the payload is allocated, so a peer cannot make the
+//!    holder reserve more than that. A clean close before the first byte is
+//!    [`ProtoError::Eof`]; any other short read is an I/O error.
+//! 2. **Strict decoding (fail closed).** Every opcode has one exact payload
+//!    shape. An unknown opcode, a wrong length, a non-UTF-8 field or an outcome
+//!    outside the pinned vocabulary is [`ProtoError::Malformed`], and the caller
+//!    drops the connection without answering. Nothing is guessed.
+//! 3. **Requests.** `A` attach (the policy bytes), `E` call end (the call id, rc,
+//!    duration and outcome), `S` stop. **Replies.** `K` accepted (the call id),
+//!    `D` done, `R` refused (a reason, cut to [`MAX_REASON`]).
+//! 4. **Outcome vocabulary.** A call's outcome is one of [`OUTCOMES`], the same
+//!    words the audit exit row uses (`run` module docs point 7), so the holder
+//!    writes them verbatim.
+
+use std::io;
+
+use super::pin::MAX_POLICY_BYTES;
+
+/// The largest payload any frame may carry (the policy cap; the other
+/// messages are far smaller).
+pub(crate) const MAX_FRAME: usize = MAX_POLICY_BYTES;
+/// The longest refusal reason sent (longer reasons are cut at a char boundary).
+pub(crate) const MAX_REASON: usize = 512;
+/// The call outcomes a `CallEnd` may carry (the audit exit-row vocabulary).
+pub(crate) const OUTCOMES: [&str; 5] = ["exited", "signaled", "timeout", "terminated", "failed"];
+
+/// The fixed part of a call end: call id, rc, duration, flags, outcome length.
+const CALL_END_FIXED: usize = 4 + 4 + 8 + 1 + 1;
+
+const OP_ATTACH: u8 = b'A';
+const OP_CALL_END: u8 = b'E';
+const OP_STOP: u8 = b'S';
+const OP_ACCEPTED: u8 = b'K';
+const OP_DONE: u8 = b'D';
+const OP_REFUSED: u8 = b'R';
+
+/// A protocol failure. `Eof` is a clean close; the rest drop the connection.
+#[derive(Debug)]
+pub(crate) enum ProtoError {
+    /// The peer closed before sending a frame.
+    Eof,
+    /// The stream failed or ended inside a frame.
+    Io(io::Error),
+    /// The declared payload exceeds [`MAX_FRAME`].
+    TooLarge(usize),
+    /// The frame does not match its opcode's shape.
+    Malformed(&'static str),
+}
+
+impl std::fmt::Display for ProtoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProtoError::Eof => f.write_str("the peer closed the connection"),
+            ProtoError::Io(err) => write!(f, "control I/O failed: {err}"),
+            ProtoError::TooLarge(n) => {
+                write!(f, "frame of {n} bytes exceeds the {MAX_FRAME}-byte cap")
+            }
+            ProtoError::Malformed(why) => write!(f, "malformed control message: {why}"),
+        }
+    }
+}
+
+impl From<io::Error> for ProtoError {
+    fn from(err: io::Error) -> Self {
+        ProtoError::Io(err)
+    }
+}
+
+/// One framed message before decoding.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+    pub(crate) op: u8,
+    pub(crate) payload: Vec<u8>,
+}
+
+/// The longest reason a call end carries (review 5): the rest is cut at a
+/// character boundary, like a refusal reason.
+pub(crate) const MAX_CALL_REASON: usize = 256;
+
+/// The flag bit of a call end whose output was cut at `limits.output_bytes`.
+const FLAG_TRUNCATED: u8 = 0b0000_0001;
+
+/// The end of one attached call, as the attach process reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallEnd {
+    pub(crate) call_id: u32,
+    pub(crate) rc: i32,
+    pub(crate) duration_ms: u64,
+    /// One of [`OUTCOMES`].
+    pub(crate) outcome: &'static str,
+    /// The call's output hit `limits.output_bytes` (the exit row's flag).
+    pub(crate) truncated: bool,
+    /// The exit row's reason text, at most [`MAX_CALL_REASON`] bytes.
+    pub(crate) reason: String,
+}
+
+/// A request from an attach process or `sbx stop`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// The attach's policy bytes; the holder pins-checks them and admits a call.
+    Attach(Vec<u8>),
+    /// An admitted call ended.
+    CallEnd(CallEnd),
+    /// End the session.
+    Stop,
+}
+
+/// The holder's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reply {
+    /// An attach was admitted under this call id (resident = 0 is never issued
+    /// to an attach), with the session's Landlock settings: the attach applies
+    /// exactly these, so it takes no Landlock flags of its own (see
+    /// [`SessionLandlock`]).
+    Accepted(u32, SessionLandlock),
+    /// The request was applied.
+    Done,
+    /// The request was refused; the text is the reason.
+    Refused(String),
+}
+
+impl Request {
+    /// The opcode and payload of this request.
+    pub(crate) fn encode(&self) -> (u8, Vec<u8>) {
+        match self {
+            Request::Attach(policy) => (OP_ATTACH, policy.clone()),
+            Request::CallEnd(end) => {
+                let mut reason_end = end.reason.len().min(MAX_CALL_REASON);
+                while !end.reason.is_char_boundary(reason_end) {
+                    reason_end -= 1;
+                }
+                let flags = if end.truncated { FLAG_TRUNCATED } else { 0 };
+                let mut p = Vec::with_capacity(CALL_END_FIXED + end.outcome.len() + reason_end);
+                p.extend_from_slice(&end.call_id.to_be_bytes());
+                p.extend_from_slice(&end.rc.to_be_bytes());
+                p.extend_from_slice(&end.duration_ms.to_be_bytes());
+                p.push(flags);
+                p.push(end.outcome.len() as u8);
+                p.extend_from_slice(end.outcome.as_bytes());
+                p.extend_from_slice(&end.reason.as_bytes()[..reason_end]);
+                (OP_CALL_END, p)
+            }
+            Request::Stop => (OP_STOP, Vec::new()),
+        }
+    }
+
+    /// Decodes a frame as a request (rule 2).
+    pub(crate) fn decode(frame: Frame) -> Result<Self, ProtoError> {
+        match frame.op {
+            OP_ATTACH => Ok(Request::Attach(frame.payload)),
+            OP_CALL_END => {
+                let p = &frame.payload;
+                if p.len() < CALL_END_FIXED {
+                    return Err(ProtoError::Malformed(
+                        "call end is shorter than its fixed fields",
+                    ));
+                }
+                let call_id = u32::from_be_bytes(p[0..4].try_into().expect("4 bytes"));
+                let rc = i32::from_be_bytes(p[4..8].try_into().expect("4 bytes"));
+                let duration_ms = u64::from_be_bytes(p[8..16].try_into().expect("8 bytes"));
+                let flags = p[16];
+                if flags & !FLAG_TRUNCATED != 0 {
+                    return Err(ProtoError::Malformed("call end sets an unknown flag"));
+                }
+                let outcome_len = p[17] as usize;
+                let rest = &p[CALL_END_FIXED..];
+                if rest.len() < outcome_len {
+                    return Err(ProtoError::Malformed(
+                        "call outcome is longer than the frame",
+                    ));
+                }
+                let (outcome_bytes, reason_bytes) = rest.split_at(outcome_len);
+                let text = std::str::from_utf8(outcome_bytes)
+                    .map_err(|_| ProtoError::Malformed("call outcome is not UTF-8"))?;
+                let outcome = OUTCOMES
+                    .iter()
+                    .copied()
+                    .find(|known| *known == text)
+                    .ok_or(ProtoError::Malformed(
+                        "call outcome is not in the vocabulary",
+                    ))?;
+                if reason_bytes.len() > MAX_CALL_REASON {
+                    return Err(ProtoError::Malformed("call reason is longer than the cap"));
+                }
+                let reason = std::str::from_utf8(reason_bytes)
+                    .map_err(|_| ProtoError::Malformed("call reason is not UTF-8"))?
+                    .to_owned();
+                Ok(Request::CallEnd(CallEnd {
+                    call_id,
+                    rc,
+                    duration_ms,
+                    outcome,
+                    truncated: flags & FLAG_TRUNCATED != 0,
+                    reason,
+                }))
+            }
+            OP_STOP => {
+                if !frame.payload.is_empty() {
+                    return Err(ProtoError::Malformed("stop takes no payload"));
+                }
+                Ok(Request::Stop)
+            }
+            _ => Err(ProtoError::Malformed("unknown request opcode")),
+        }
+    }
+}
+
+/// The Landlock settings a session was started with (`run --keep-alive
+/// --landlock … --landlock-bind-tcp …`). The holder pins them at start and sends
+/// them with every accepted attach, so the resident and every call run under
+/// one layer and an attach cannot weaken it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionLandlock {
+    pub(crate) mode: crate::landlock::Mode,
+    /// `--landlock-bind-tcp` ports, in command-line order (0 = ephemeral).
+    pub(crate) bind_tcp: Vec<u16>,
+}
+
+/// The most bind ports a session may name on the wire.
+pub(crate) const MAX_BIND_TCP: usize = 256;
+
+impl SessionLandlock {
+    /// No layer (the default; a plain session).
+    #[cfg(test)]
+    pub(crate) fn off() -> Self {
+        Self {
+            mode: crate::landlock::Mode::Off,
+            bind_tcp: Vec::new(),
+        }
+    }
+
+    /// The wire code of the mode: `off` 0, `best-effort` 1, `require` 2.
+    fn mode_code(&self) -> u8 {
+        match self.mode {
+            crate::landlock::Mode::Off => 0,
+            crate::landlock::Mode::BestEffort => 1,
+            crate::landlock::Mode::Require => 2,
+        }
+    }
+
+    /// Encodes the settings: mode code (1 byte), port count (2 bytes), ports (2
+    /// bytes each). The count is checked, never wrapped: a list longer than the
+    /// cap is a caller bug (debug builds assert), and in a release build the
+    /// count saturates, so the peer sees a count that no port list matches and
+    /// refuses the frame.
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert!(
+            self.bind_tcp.len() <= MAX_BIND_TCP,
+            "a session names at most {MAX_BIND_TCP} bind ports (got {})",
+            self.bind_tcp.len()
+        );
+        out.push(self.mode_code());
+        let count = u16::try_from(self.bind_tcp.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_be_bytes());
+        for port in &self.bind_tcp {
+            out.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+
+    /// Decodes the settings from the start of `bytes`; returns the rest.
+    fn decode_from(bytes: &[u8]) -> Result<(Self, &[u8]), ProtoError> {
+        let malformed = || ProtoError::Malformed("landlock settings are truncated");
+        let (&code, rest) = bytes.split_first().ok_or_else(malformed)?;
+        let mode = match code {
+            0 => crate::landlock::Mode::Off,
+            1 => crate::landlock::Mode::BestEffort,
+            2 => crate::landlock::Mode::Require,
+            _ => return Err(ProtoError::Malformed("unknown landlock mode code")),
+        };
+        if rest.len() < 2 {
+            return Err(malformed());
+        }
+        let count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+        if count > MAX_BIND_TCP {
+            return Err(ProtoError::Malformed("too many landlock bind ports"));
+        }
+        let ports_bytes = &rest[2..];
+        if ports_bytes.len() < 2 * count {
+            return Err(malformed());
+        }
+        let bind_tcp = ports_bytes[..2 * count]
+            .chunks_exact(2)
+            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+            .collect();
+        Ok((Self { mode, bind_tcp }, &ports_bytes[2 * count..]))
+    }
+}
+
+impl Reply {
+    /// The opcode and payload of this reply. A refusal reason is cut to
+    /// [`MAX_REASON`] at a character boundary.
+    pub(crate) fn encode(&self) -> (u8, Vec<u8>) {
+        match self {
+            Reply::Accepted(call_id, landlock) => {
+                let mut payload = call_id.to_be_bytes().to_vec();
+                landlock.encode_into(&mut payload);
+                (OP_ACCEPTED, payload)
+            }
+            Reply::Done => (OP_DONE, Vec::new()),
+            Reply::Refused(reason) => {
+                let mut end = reason.len().min(MAX_REASON);
+                while !reason.is_char_boundary(end) {
+                    end -= 1;
+                }
+                (OP_REFUSED, reason.as_bytes()[..end].to_vec())
+            }
+        }
+    }
+
+    /// Decodes a frame as a reply (rule 2).
+    pub(crate) fn decode(frame: Frame) -> Result<Self, ProtoError> {
+        match frame.op {
+            OP_ACCEPTED => {
+                let payload = frame.payload.as_slice();
+                if payload.len() < 4 {
+                    return Err(ProtoError::Malformed("accepted reply has no call id"));
+                }
+                let id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let (landlock, rest) = SessionLandlock::decode_from(&payload[4..])?;
+                if !rest.is_empty() {
+                    return Err(ProtoError::Malformed("accepted reply has trailing bytes"));
+                }
+                Ok(Reply::Accepted(id, landlock))
+            }
+            OP_DONE => {
+                if !frame.payload.is_empty() {
+                    return Err(ProtoError::Malformed("done takes no payload"));
+                }
+                Ok(Reply::Done)
+            }
+            OP_REFUSED => {
+                let text = String::from_utf8(frame.payload)
+                    .map_err(|_| ProtoError::Malformed("refusal reason is not UTF-8"))?;
+                Ok(Reply::Refused(text))
+            }
+            _ => Err(ProtoError::Malformed("unknown reply opcode")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::keepalive::ctl::{recv_frame, send_frame};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    /// The frames travel over a real socket pair, through the same send and
+    /// receive functions the holder and attach use.
+    fn round_trip_request(req: Request) -> Request {
+        let (a, b) = UnixStream::pair().expect("pair");
+        let (op, payload) = req.encode();
+        send_frame(&a, op, &payload, &[]).expect("send");
+        let (frame, fds) = recv_frame(&b).expect("recv");
+        assert!(fds.is_empty());
+        Request::decode(frame).expect("decode")
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        let attach = Request::Attach(b"{\"version\":1}".to_vec());
+        assert_eq!(round_trip_request(attach.clone()), attach);
+        assert_eq!(round_trip_request(Request::Stop), Request::Stop);
+        let end = Request::CallEnd(CallEnd {
+            call_id: 7,
+            rc: -1,
+            duration_ms: 1234,
+            outcome: "timeout",
+            truncated: true,
+            reason: "timed out after 2s".into(),
+        });
+        assert_eq!(round_trip_request(end.clone()), end);
+    }
+
+    #[test]
+    fn call_end_wire_layout_is_pinned() {
+        let end = Request::CallEnd(CallEnd {
+            call_id: 1,
+            rc: 2,
+            duration_ms: 3,
+            outcome: "exited",
+            truncated: true,
+            reason: "ok".into(),
+        });
+        let (op, payload) = end.encode();
+        assert_eq!(op, b'E');
+        // call id, rc, duration, flags (truncated), outcome length, outcome, reason.
+        let mut want = vec![0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 1, 6];
+        want.extend_from_slice(b"exited");
+        want.extend_from_slice(b"ok");
+        assert_eq!(payload, want);
+
+        let bare = Request::CallEnd(CallEnd {
+            call_id: 0,
+            rc: 0,
+            duration_ms: 0,
+            outcome: "failed",
+            truncated: false,
+            reason: String::new(),
+        });
+        assert_eq!(bare.encode().1.len(), CALL_END_FIXED + "failed".len());
+    }
+
+    #[test]
+    fn replies_round_trip() {
+        for reply in [
+            Reply::Accepted(42, SessionLandlock::off()),
+            Reply::Accepted(
+                7,
+                SessionLandlock {
+                    mode: crate::landlock::Mode::Require,
+                    bind_tcp: vec![8080, 0],
+                },
+            ),
+            Reply::Done,
+            Reply::Refused("policy differs from the session's policy".into()),
+        ] {
+            let (a, b) = UnixStream::pair().unwrap();
+            let (op, payload) = reply.encode();
+            send_frame(&a, op, &payload, &[]).unwrap();
+            let (frame, _) = recv_frame(&b).unwrap();
+            assert_eq!(Reply::decode(frame).unwrap(), reply);
+        }
+    }
+
+    #[test]
+    fn oversized_declared_length_is_refused_before_reading_the_payload() {
+        // Only the header arrives: a receiver that tried to read the payload
+        // would block or fail with I/O instead of reporting TooLarge.
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let mut wire = vec![b'A'];
+        wire.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
+        a.write_all(&wire).unwrap();
+        match recv_frame(&b) {
+            Err(ProtoError::TooLarge(n)) => assert_eq!(n, MAX_FRAME + 1),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_close_is_eof_and_a_cut_frame_is_io() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        assert!(matches!(recv_frame(&b), Err(ProtoError::Eof)));
+
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&[b'A', 0, 0, 0, 9, 1, 2]).unwrap();
+        drop(a);
+        assert!(matches!(recv_frame(&b), Err(ProtoError::Io(_))));
+    }
+
+    #[test]
+    fn send_refuses_oversized_payloads_before_writing() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let big = vec![0u8; MAX_FRAME + 1];
+        assert!(matches!(
+            send_frame(&a, b'A', &big, &[]),
+            Err(ProtoError::TooLarge(_))
+        ));
+        drop(a);
+        assert!(
+            matches!(recv_frame(&b), Err(ProtoError::Eof)),
+            "nothing was written"
+        );
+    }
+
+    #[test]
+    fn unknown_opcodes_and_bad_shapes_are_malformed() {
+        let f = |op: u8, payload: &[u8]| Frame {
+            op,
+            payload: payload.to_vec(),
+        };
+        assert!(matches!(
+            Request::decode(f(b'Z', &[])),
+            Err(ProtoError::Malformed(_))
+        ));
+        assert!(matches!(
+            Request::decode(f(b'S', b"x")),
+            Err(ProtoError::Malformed(_))
+        ));
+        assert!(matches!(
+            Request::decode(f(b'E', &[0; 15])),
+            Err(ProtoError::Malformed(_))
+        ));
+        let mut bad_outcome = vec![0u8; 16];
+        bad_outcome.extend_from_slice(b"exploded");
+        assert!(matches!(
+            Request::decode(f(b'E', &bad_outcome)),
+            Err(ProtoError::Malformed(_))
+        ));
+        assert!(matches!(
+            Reply::decode(f(b'K', &[0; 3])),
+            Err(ProtoError::Malformed(_))
+        ));
+        assert!(matches!(
+            Reply::decode(f(b'D', b"x")),
+            Err(ProtoError::Malformed(_))
+        ));
+        assert!(matches!(
+            Reply::decode(f(b'?', &[])),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn call_end_rejects_bad_flags_reasons_and_lengths() {
+        let frame = |bytes: Vec<u8>| Frame {
+            op: b'E',
+            payload: bytes,
+        };
+        let head = |flags: u8, olen: u8| {
+            let mut v = vec![0u8; 16];
+            v.push(flags);
+            v.push(olen);
+            v
+        };
+        // An unknown flag bit.
+        let mut bad_flag = head(0b10, 6);
+        bad_flag.extend_from_slice(b"exited");
+        assert!(matches!(
+            Request::decode(frame(bad_flag)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // An outcome length longer than the frame.
+        assert!(matches!(
+            Request::decode(frame(head(0, 9))),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A reason longer than the cap.
+        let mut long = head(0, 6);
+        long.extend_from_slice(b"exited");
+        long.extend(std::iter::repeat_n(b'x', MAX_CALL_REASON + 1));
+        assert!(matches!(
+            Request::decode(frame(long)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A reason that is not UTF-8.
+        let mut bad_utf8 = head(0, 6);
+        bad_utf8.extend_from_slice(b"exited");
+        bad_utf8.push(0xff);
+        assert!(matches!(
+            Request::decode(frame(bad_utf8)),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn call_end_reason_is_cut_to_the_cap_at_a_char_boundary() {
+        let reason = format!("{}é", "a".repeat(MAX_CALL_REASON - 1));
+        let end = Request::CallEnd(CallEnd {
+            call_id: 1,
+            rc: 0,
+            duration_ms: 0,
+            outcome: "exited",
+            truncated: false,
+            reason,
+        });
+        let back = round_trip_request(end);
+        match back {
+            Request::CallEnd(e) => assert_eq!(e.reason.len(), MAX_CALL_REASON - 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_vocabulary_outcome_is_accepted() {
+        for outcome in OUTCOMES {
+            let end = Request::CallEnd(CallEnd {
+                call_id: 1,
+                rc: 0,
+                duration_ms: 0,
+                outcome,
+                truncated: false,
+                reason: String::new(),
+            });
+            assert_eq!(round_trip_request(end.clone()), end);
+        }
+    }
+
+    #[test]
+    fn refusal_reason_is_cut_at_a_char_boundary() {
+        // 'é' is two bytes; a cut at 512 would split it, so it backs off to 511.
+        let reason = format!("{}é", "a".repeat(511));
+        let (_, payload) = Reply::Refused(reason).encode();
+        assert_eq!(payload.len(), 511);
+        assert!(std::str::from_utf8(&payload).is_ok());
+    }
+
+    #[test]
+    fn accepted_reply_carries_the_session_landlock_settings() {
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: vec![443, 0, 8080],
+        };
+        let (op, payload) = Reply::Accepted(9, settings.clone()).encode();
+        // call id, mode code, port count, the three ports (big-endian).
+        assert_eq!(payload, [0, 0, 0, 9, 1, 0, 3, 1, 187, 0, 0, 31, 144]);
+        let frame = Frame { op, payload };
+        assert_eq!(Reply::decode(frame).unwrap(), Reply::Accepted(9, settings));
+    }
+
+    #[test]
+    fn accepted_reply_carries_the_full_port_cap() {
+        // The largest list the cap admits round-trips, with its count intact.
+        let ports: Vec<u16> = (0..MAX_BIND_TCP as u16).collect();
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::Require,
+            bind_tcp: ports,
+        };
+        let (op, payload) = Reply::Accepted(3, settings.clone()).encode();
+        assert_eq!(&payload[4..7], &[2, 1, 0], "mode 2, count 256 (big-endian)");
+        assert_eq!(
+            Reply::decode(Frame { op, payload }).unwrap(),
+            Reply::Accepted(3, settings)
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a session names at most 256 bind ports (got 257)")]
+    fn encode_refuses_more_ports_than_the_cap_in_debug_builds() {
+        // A count that does not fit the cap is a caller bug: never a silent wrap.
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: vec![1; MAX_BIND_TCP + 1],
+        };
+        let _ = Reply::Accepted(1, settings).encode();
+    }
+
+    #[test]
+    fn accepted_reply_rejects_bad_landlock_settings() {
+        let frame = |payload: Vec<u8>| Frame { op: b'K', payload };
+        // An unknown mode code.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 9, 0, 0])),
+            Err(ProtoError::Malformed(_))
+        ));
+        // A port count longer than the payload.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 0, 0, 2, 0, 80])),
+            Err(ProtoError::Malformed(_))
+        ));
+        // More ports than the cap.
+        let mut many = vec![0, 0, 0, 1, 0];
+        many.extend_from_slice(&((MAX_BIND_TCP as u16) + 1).to_be_bytes());
+        many.extend(std::iter::repeat_n(0u8, 2 * (MAX_BIND_TCP + 1)));
+        assert!(matches!(
+            Reply::decode(frame(many)),
+            Err(ProtoError::Malformed(_))
+        ));
+        // Trailing bytes after the settings.
+        assert!(matches!(
+            Reply::decode(frame(vec![0, 0, 0, 1, 0, 0, 0, 7])),
+            Err(ProtoError::Malformed(_))
+        ));
+    }
+}

@@ -6,9 +6,9 @@ Usage: assert_conformance.py CONF_JSON RC [TITLE]
 Shared by the `test` job (on the runner) and the `kubernetes` job (inside the
 example pod), so the expected numbers live in one place. Passes when: the report
 is kind "conformance" version 1; the network mode is not "unavailable"; no check
-FAILs; the only non-ok/warn checks are the six network checks E01-E06, skipped as
-opt-in; the offline tiers (host, lab, init) have exactly OFFLINE_CHECKS checks and
-every one is ok or warn; and the exit code is 0. With TITLE, a one-line summary is
+FAILs; the only non-ok/warn checks are the six network checks E01-E06 and I04
+(foreign uid, issue #18), all skipped as opt-in; the offline tiers (host, lab,
+init) have exactly OFFLINE_CHECKS checks and every one is ok or warn (I04 aside); and the exit code is 0. With TITLE, a one-line summary is
 appended to $GITHUB_STEP_SUMMARY (when set). Exits 1 with every reason otherwise.
 """
 
@@ -16,9 +16,11 @@ import json
 import os
 import sys
 
-# host 46 + lab 19 + init 1 (update together with the catalog).
-OFFLINE_CHECKS = 46 + 19 + 1
+# host 55 + lab 19 + init 1 (update together with the catalog).
+OFFLINE_CHECKS = 55 + 19 + 1
 NETWORK = {"E01", "E02", "E03", "E04", "E05", "E06"}
+# I04 (foreign uid, issue #18) is an opt-in skip on every host by design.
+OPT_IN_OFFLINE = {"I04"}
 
 
 def problems(r, rc):
@@ -37,13 +39,17 @@ def problems(r, rc):
         for c in checks
         if c["status"] not in ("ok", "warn")
     }
-    want = {i: ("skip", "opt-in") for i in NETWORK}
+    want = {i: ("skip", "opt-in") for i in NETWORK | OPT_IN_OFFLINE}
     if non_ok != want:
         out.append(f"unexpected non-ok set: {non_ok}")
     offline = [c for c in checks if c["tier"] in ("host", "lab", "init")]
     if len(offline) != OFFLINE_CHECKS:
         out.append(f"{len(offline)} offline checks (expected {OFFLINE_CHECKS})")
-    bad = [c["id"] for c in offline if c["status"] not in ("ok", "warn")]
+    bad = [
+        c["id"]
+        for c in offline
+        if c["status"] not in ("ok", "warn") and c["id"] not in OPT_IN_OFFLINE
+    ]
     if bad:
         out.append(f"offline checks not ok or warn: {bad}")
     if rc != 0:

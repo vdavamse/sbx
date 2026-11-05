@@ -27,12 +27,18 @@ pub(crate) fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
 
 /// SIGKILL through a pidfd (no pid-reuse race). ESRCH (already gone) is Ok.
 pub(crate) fn pidfd_kill(fd: BorrowedFd<'_>) -> io::Result<()> {
+    pidfd_signal(fd, libc::SIGKILL)
+}
+
+/// Sends `sig` through a pidfd (issue #18: SIGTERM to an attach on stop). ESRCH
+/// is Ok, as for [`pidfd_kill`].
+pub(crate) fn pidfd_signal(fd: BorrowedFd<'_>, sig: libc::c_int) -> io::Result<()> {
     // SAFETY: SYS_pidfd_send_signal(pidfd, sig, siginfo=NULL, flags=0).
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             fd.as_raw_fd(),
-            libc::SIGKILL,
+            sig,
             std::ptr::null::<libc::c_void>(),
             0,
         )

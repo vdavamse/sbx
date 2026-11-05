@@ -49,11 +49,12 @@ pub enum CapId {
     BwrapProc,
     Seccomp,
     Landlock,
+    KeepAlive,
 }
 
 impl CapId {
     /// Every item, in report order.
-    pub const ALL: [CapId; 10] = [
+    pub const ALL: [CapId; 11] = [
         CapId::Userns,
         CapId::Netns,
         CapId::NetnsIpv6,
@@ -64,6 +65,7 @@ impl CapId {
         CapId::BwrapProc,
         CapId::Seccomp,
         CapId::Landlock,
+        CapId::KeepAlive,
     ];
 
     /// The pinned item name.
@@ -79,6 +81,7 @@ impl CapId {
             CapId::BwrapProc => "bwrap-proc",
             CapId::Seccomp => "seccomp",
             CapId::Landlock => "landlock",
+            CapId::KeepAlive => "keep-alive",
         }
     }
 }

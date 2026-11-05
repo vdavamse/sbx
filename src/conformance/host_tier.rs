@@ -1,4 +1,6 @@
-//! The host tier's 46 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
+//! The host tier's 55 checks: 49 scenario checks (issue #13, §4 groups A, B, C,
+//! D, F05/F06, G, H) and group I's six persistent-session checks (issue #18),
+//! which [`super::session_tier`] evaluates.
 //! the scenario plan and the pure evaluators over scenario evidence.
 //!
 //! Evaluation rules (review fixes):
@@ -77,6 +79,7 @@ pub fn scenarios_of(id: &str) -> &'static [&'static str] {
         "D10" | "H01" | "H02" | "H03" | "H04" | "H05" | "H06" => &["S12"],
         "D11" => &["S14"],
         "D12" => &["S15"],
+        "D13" | "D14" | "D15" => &["S16"],
         "F01" => &["S10"],
         "F05" => &["S4"],
         "F06" => &["S5"],
@@ -1420,6 +1423,118 @@ pub(super) fn d12(s: &Scns) -> R {
     Ok("a symlink planted inside an rw path is refused before launch".to_owned())
 }
 
+/// How a probe op that should have failed came out: `ok_word` on success,
+/// else the errno name.
+fn outcome(r: &OpResult, ok_word: &str) -> String {
+    if r.ok {
+        ok_word.to_owned()
+    } else {
+        errno_name(errno(r))
+    }
+}
+
+/// D13 (#45): host paths outside the policy are invisible: top-level host
+/// directories, a sibling of the allowed binds and `/etc/shadow`. Controls:
+/// the probe ran, a Stat of an allowed path succeeds (so ENOENT is not the
+/// op's only answer), and at least one path was probed.
+pub(super) fn d13(s: &Scns) -> R {
+    let a = sc(s, "S16")?;
+    ctl_ok(a, "s16.hello")?;
+    ctl_ok(a, "d13.ctl")?;
+    // A JSON array (paths may contain commas). The runner always probes at
+    // least the sibling of the binds; an empty or missing list here means
+    // the evidence is incomplete, never "nothing to check" (defensive: a
+    // vacuous pass must be impossible whatever the evidence says).
+    let paths: Vec<String> = a
+        .notes
+        .get("d13.paths")
+        .and_then(|p| serde_json::from_str(p).ok())
+        .unwrap_or_default();
+    ctl(!paths.is_empty(), "the probed host paths were not recorded")?;
+    for (i, path) in paths.iter().enumerate() {
+        let r = op(a, &format!("d13.{i}"))?;
+        need(
+            errno(r) == Some(libc::ENOENT),
+            format!(
+                "host path {path} inside the sandbox: expected ENOENT, got {}",
+                outcome(r, "visible")
+            ),
+        )?;
+    }
+    Ok(format!(
+        "host paths outside the policy are invisible ({})",
+        paths.join(", ")
+    ))
+}
+
+/// D14 (#45): writes into an `ro` bind fail with EROFS and leave the host
+/// unchanged. Controls: the bound file is readable inside, and a write into
+/// the `rw` bind of the same run succeeds and reaches the host.
+pub(super) fn d14(s: &Scns) -> R {
+    let a = sc(s, "S16")?;
+    ctl_ok(a, "d14.read")?;
+    let read = op(a, "d14.read")?;
+    let matched = read.data["matched"].as_array().map(Vec::len).unwrap_or(0);
+    ctl(
+        matched == 1,
+        "the ro-bound file does not read back its content",
+    )?;
+    ctl_ok(a, "d14.ctl")?;
+    let rw_new = a.notes.get("rw_new").map(String::as_str).unwrap_or("");
+    ctl(
+        rw_new == "X",
+        format!("the rw control write did not reach the host: {rw_new:?}"),
+    )?;
+    for (id, what) in [
+        ("d14.trunc", "truncating an existing file"),
+        ("d14.create", "creating a file"),
+    ] {
+        let r = op(a, id)?;
+        need(
+            !r.ok && errno(r) == Some(libc::EROFS),
+            format!(
+                "{what} in the ro bind: expected EROFS, got {}",
+                outcome(r, "success")
+            ),
+        )?;
+    }
+    let ro_file = a.notes.get("ro_file").map(String::as_str).unwrap_or("");
+    need(
+        ro_file == "RO",
+        format!("the host file behind the ro bind changed: {ro_file:?}"),
+    )?;
+    let ro_new = a.notes.get("ro_new").map(String::as_str).unwrap_or("");
+    need(
+        ro_new == "absent: NotFound",
+        format!("a file appeared on the host behind the ro bind: {ro_new:?}"),
+    )?;
+    Ok("writes into an ro bind fail with EROFS".to_owned())
+}
+
+/// D15 (#45): deny masks hide their targets under both an `ro` and an `rw`
+/// cover. Controls: the siblings of each denied directory are visible.
+pub(super) fn d15(s: &Scns) -> R {
+    let a = sc(s, "S16")?;
+    ctl_ok(a, "d15.ro.vis")?;
+    ctl_ok(a, "d15.rw.vis")?;
+    for (id, cover) in [("d15.ro", "ro"), ("d15.rw", "rw")] {
+        let r = op(a, id)?;
+        need(
+            errno(r) == Some(libc::ENOENT),
+            format!(
+                "denied token under the {cover} cover: expected ENOENT, got {}",
+                outcome(r, "visible")
+            ),
+        )?;
+    }
+    let tokens = a.notes.get("tokens").map(String::as_str).unwrap_or("");
+    need(
+        tokens == "TOKEN,TOKEN",
+        format!("the denied host tokens changed: {tokens:?}"),
+    )?;
+    Ok("deny masks hide their targets under ro and rw covers".to_owned())
+}
+
 pub(super) fn d10(s: &Scns) -> R {
     let s12 = sc(s, "S12")?;
     let p = op(s12, "d10.procs")?;
@@ -1451,6 +1566,9 @@ pub(super) fn d10(s: &Scns) -> R {
 
 /// Evaluate one host-tier check into a result.
 pub fn evaluate(id: &str, s: &Scns) -> CheckResult {
+    if super::session_tier::handles(id) {
+        return super::session_tier::evaluate(id, s);
+    }
     if id == "H06"
         && s.get("S12")
             .and_then(|x| x.notes.get("home_applicable"))
@@ -1517,6 +1635,9 @@ pub(super) fn eval_plain(id: &str, s: &Scns) -> R {
         "D10" => d10(s),
         "D11" => d11(s),
         "D12" => d12(s),
+        "D13" => d13(s),
+        "D14" => d14(s),
+        "D15" => d15(s),
         "F01" => f01(s),
         "F05" => f05(s),
         "F06" => f06(s),

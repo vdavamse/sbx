@@ -108,6 +108,11 @@ fn scenarios() -> Vec<Scenario> {
             run: seccomp_item_ok,
         },
         Scenario {
+            name: "keep-alive-item-ok",
+            gate: Gate::Userns,
+            run: keep_alive_item_ok,
+        },
+        Scenario {
             name: "bwrap-missing",
             gate: Gate::Userns,
             run: bwrap_missing,
@@ -371,6 +376,20 @@ fn seccomp_item_ok() -> Result<(), String> {
     Ok(())
 }
 
+/// Issue #18: where unprivileged user namespaces work, the `keep-alive` item is
+/// ok (a pidfd, and a same-uid setns into a fresh user and network namespace).
+/// The gate is the userns item, so this runs on a host without bwrap (this
+/// developer host: the probe needs no bwrap for these steps) and in CI's nested
+/// tier alike; the item never limits the network mode, so rc is not checked.
+fn keep_alive_item_ok() -> Result<(), String> {
+    let (_, report) = sbx_json(&["check", "--json"])?;
+    let ka = item(&report, "keep-alive")?;
+    if ka["status"] != "ok" {
+        return Err(format!("keep-alive item: {ka}"));
+    }
+    Ok(())
+}
+
 /// A missing bwrap is a failure item with the spawn detail, the two bwrap
 /// steps are reported as not probed, and the host is unavailable (rc 1).
 fn bwrap_missing() -> Result<(), String> {
@@ -554,9 +573,10 @@ fn nested_no_userns() -> Result<(), String> {
         .filter(|c| c["status"] == "skip")
         .count();
     // Seven since #34: the `seccomp` item is skipped too (its probe step
-    // needs bwrap-run, which cannot start without user namespaces).
-    if skipped != 7 {
-        return Err(format!("expected 7 skipped items, saw {skipped}"));
+    // needs bwrap-run, which cannot start without user namespaces). Eight since
+    // keep-alive (#18): its probe steps need the same user namespace.
+    if skipped != 8 {
+        return Err(format!("expected 8 skipped items, saw {skipped}"));
     }
     if report["network_mode"] != "unavailable" {
         return Err(format!("network_mode {}", report["network_mode"]));

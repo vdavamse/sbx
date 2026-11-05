@@ -4263,6 +4263,7 @@ fn run_dns_bwrap_in(
         passed_env: &passed_env,
         info_fd: None,
         seccomp_fd,
+        landlock: None,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 
