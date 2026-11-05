@@ -45,6 +45,7 @@ kind create cluster --name sbx --config examples/kubernetes/kind-config.yaml
 for _ in 1 2 3 4; do
   docker exec sbx-control-plane sh -c 'for m in $(awk "\$5 ~ \"^/sys/devices/virtual/dmi/id/\" {print \$5}" /proc/self/mountinfo); do umount "$m" || true; done'
 done
+docker exec sbx-control-plane sh -c 'awk "\$5 ~ \"^/sys/devices/virtual/dmi/\"" /proc/self/mountinfo'   # expect no output
 kind load docker-image sbx-k8s-example:dev --name sbx
 kubectl apply -f examples/kubernetes/pod.yaml
 kubectl wait --for=condition=Ready pod/sbx-example
@@ -251,7 +252,8 @@ How `sbx check` reports a namespace failure in a pod follows from `src/host/clas
   generic row (`U_EPERM`) cannot appear in such a pod.
 - In such a pod, the AppArmor row (`U_APPARMOR`, `unprivileged user namespaces are restricted by AppArmor
   (kernel.apparmor_restrict_unprivileged_userns = 1)`) appears only when the sysctl is 1 and a later
-  setup stage (`idmap`, `netns`, `listeners` or `ipv6`) fails with EPERM or EACCES. Its fix reads
+  setup stage (`idmap`, `netns`, `listeners` or `ipv6`) fails with EPERM or EACCES; a failure at `unshare`,
+  whatever its errno, never gives this row in such a pod. Its fix reads
   `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0, or give sbx an AppArmor profile
   that allows userns; Kubernetes: appArmorProfile Unconfined or a Localhost profile that allows
   userns`.
@@ -298,8 +300,9 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
   pod, and the kernel allows that inside a user namespace only when an existing sysfs mount is
   fully visible: every mount inherited below it (locked) must sit on a directory that sysfs itself
   keeps empty for mounts, such as `/sys/fs/cgroup` or `/sys/kernel/debug` (the kernel's
-  `mnt_already_visible` check). A file bind-mounted over a path under `/sys` never qualifies, and the pod sandbox fails with `error mounting "sysfs" to
-  rootfs at "/sys": ... operation not permitted`. Observed in CI: kind bind-mounts files over
+  `mnt_already_visible` check). A file bind-mounted over a path under `/sys` never qualifies,
+  and the pod sandbox fails with
+  `error mounting "sysfs" to rootfs at "/sys": ... operation not permitted`. Observed in CI: kind bind-mounts files over
   `/sys/devices/virtual/dmi/id/product_name` and `product_uuid` on hosts with DMI (GitHub runners;
   not WSL), and the example pod could not start until the job removed those mounts. On a real node,
   check for file overmounts under `/sys` if you see that error (not tested by sbx beyond kind).
@@ -420,7 +423,7 @@ above. It validates `pod.yaml` with kubeconform v0.8.0 (strict, Kubernetes 1.37.
 image, creates the kind cluster, and checks that `uid_map` is not the host map. Then:
 
 - report-only: the runner's AppArmor state (observed on `ubuntu-latest`, which was ubuntu-26.04,
-  image 20261101.186: AppArmor enabled, `kernel.apparmor_restrict_unprivileged_userns = 1`, and the
+  image 20261101.186.1: AppArmor enabled, `kernel.apparmor_restrict_unprivileged_userns = 1`, and the
   profiles `:glycin:bwrap`, `bwrap`, `unpriv_bwrap` and `unprivileged_userns` loaded);
 - the runner's AppArmor is relaxed the same two ways the test job relaxes it, before the cluster
   is created: `kernel.apparmor_restrict_unprivileged_userns=0`, and unloading the

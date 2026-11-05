@@ -776,8 +776,8 @@ jobs:
           # in the node when the host has DMI (GitHub runners do; WSL does not). The
           # kernel lets a user namespace mount a fresh sysfs only when an existing
           # sysfs mount is fully visible (mnt_already_visible: locked child mounts
-          # only on directories sysfs keeps empty for mounts), so runc's sysfs mount for a hostUsers: false sandbox fails
-          # with EPERM (observed here). Drop those file overmounts in this
+          # only on directories sysfs keeps empty for mounts), so runc's sysfs
+          # mount for a hostUsers: false sandbox fails with EPERM (observed here). Drop those file overmounts in this
           # single-node CI cluster; the unique product_uuid only matters with
           # several nodes.
           NODE="$CLUSTER-control-plane"
