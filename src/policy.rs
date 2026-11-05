@@ -41,6 +41,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
@@ -588,6 +589,10 @@ fn de_env_set<'de, D: Deserializer<'de>>(
     deserializer.deserialize_map(EnvSetVisitor)
 }
 
+/// The largest optional resource-limit value (`i64::MAX`): anything larger
+/// would approach `RLIM_INFINITY`, which means "no limit" (issue #43).
+pub const MAX_LIMIT: u64 = i64::MAX as u64;
+
 /// Resource limits for the sandboxed command.
 ///
 /// `sbx run` enforces these (issue #10); this schema only defines and
@@ -603,6 +608,33 @@ pub struct Limits {
 
     /// How many bytes of command output to capture; 0 means "capture none".
     pub output_bytes: u64,
+
+    /// Optional: the most processes and threads the sandbox may hold at once
+    /// (`RLIMIT_NPROC`, counted inside the sandbox's own user namespace on
+    /// Linux 5.14 and later; when sbx runs as root it is enforced only on 5.17
+    /// and later). bubblewrap itself uses two of them. Absent means "inherit
+    /// the caller's limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processes: Option<NonZeroU64>,
+
+    /// Optional: the highest file descriptor number + 1 each sandboxed process
+    /// may open (`RLIMIT_NOFILE`). Must not exceed the caller's own hard
+    /// limit. Absent means "inherit the caller's limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_files: Option<NonZeroU64>,
+
+    /// Optional: the largest file, in bytes, a sandboxed process may write
+    /// (`RLIMIT_FSIZE`); a write past it fails and the writer gets `SIGXFSZ`.
+    /// It bounds each file, not the total disk use. Absent means "inherit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_bytes: Option<NonZeroU64>,
+
+    /// Optional: the most virtual memory, in bytes, each sandboxed process may
+    /// map (`RLIMIT_AS`). This is address space, not resident memory: runtimes
+    /// that reserve large address ranges (JVM, V8, Go) need generous values.
+    /// Absent means "inherit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_space_bytes: Option<NonZeroU64>,
 }
 
 // One duration contract for CLI flags and policy files: reuse
@@ -717,6 +749,24 @@ impl RawPolicy {
         for name in self.env.set.keys() {
             if !valid_env_name(name) {
                 return Err(env_name_error("env.set key", name));
+            }
+        }
+        // Issue #43: a resource limit must be finite. Values above i64::MAX
+        // reach RLIM_INFINITY territory (u64::MAX IS RLIM_INFINITY), i.e.
+        // "no limit"; refuse them here so `check --policy` catches them.
+        for (field, value) in [
+            ("limits.processes", self.limits.processes),
+            ("limits.open_files", self.limits.open_files),
+            ("limits.file_bytes", self.limits.file_bytes),
+            (
+                "limits.address_space_bytes",
+                self.limits.address_space_bytes,
+            ),
+        ] {
+            if let Some(v) = value.filter(|v| v.get() > MAX_LIMIT) {
+                return Err(PolicyError(format!(
+                    "{field} is {v}; the largest accepted value is {MAX_LIMIT}"
+                )));
             }
         }
         Ok(())
@@ -1671,6 +1721,70 @@ mod tests {
         }
     }
 
+    // ---- optional resource limits (issue #43) -------------------------------
+
+    #[test]
+    fn resource_limits_are_optional_and_positive() {
+        // Absent: no limit, and serialization omits them (round-trip stable).
+        let base = policy_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            r#""output_bytes": 1"#,
+        ));
+        assert_eq!(base.limits.processes, None);
+        assert_eq!(base.limits.address_space_bytes, None);
+        let text = serde_json::to_string(&base.limits).expect("serialize");
+        assert!(!text.contains("processes"), "{text}");
+
+        let set = policy_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            r#""output_bytes": 1, "processes": 64, "open_files": 256,
+               "file_bytes": 1048576, "address_space_bytes": 4294967296"#,
+        ));
+        assert_eq!(set.limits.processes, NonZeroU64::new(64));
+        assert_eq!(set.limits.open_files, NonZeroU64::new(256));
+        assert_eq!(set.limits.file_bytes, NonZeroU64::new(1_048_576));
+        assert_eq!(set.limits.address_space_bytes, NonZeroU64::new(1 << 32));
+        let back: Limits =
+            serde_json::from_str(&serde_json::to_string(&set.limits).expect("ser")).expect("de");
+        assert_eq!(back, set.limits);
+
+        for field in [
+            "processes",
+            "open_files",
+            "file_bytes",
+            "address_space_bytes",
+        ] {
+            for bad in ["0", "-1", "1.5", "\"64\"", "18446744073709551616"] {
+                let json = draft_with(
+                    r#""output_bytes": 10485760"#,
+                    &format!(r#""output_bytes": 1, "{field}": {bad}"#),
+                );
+                err_of(&json); // rejection is the assertion
+            }
+        }
+        // Finite only: above i64::MAX approaches RLIM_INFINITY ("no limit").
+        let err = err_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            &format!(r#""output_bytes": 1, "address_space_bytes": {}"#, u64::MAX),
+        ));
+        assert!(err.contains("largest accepted value"), "{err}");
+        policy_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            &format!(r#""output_bytes": 1, "file_bytes": {MAX_LIMIT}"#),
+        ));
+        // `null` is the same as absent (the schema type is integer-or-null).
+        let null = policy_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            r#""output_bytes": 1, "processes": null"#,
+        ));
+        assert_eq!(null.limits.processes, None);
+        // deny_unknown_fields still holds on Limits.
+        err_of(&draft_with(
+            r#""output_bytes": 10485760"#,
+            r#""output_bytes": 1, "memory": 1"#,
+        ));
+    }
+
     // ---- env -----------------------------------------------------------------
 
     #[test]
@@ -1880,6 +1994,22 @@ mod tests {
         assert_eq!(timeout["type"], "string");
         assert_eq!(timeout["format"], "duration-string");
         assert_eq!(timeout["examples"], serde_json::json!(["120s"]));
+
+        // Issue #43: the optional resource limits are documented, not required,
+        // and positive integers.
+        for field in [
+            "processes",
+            "open_files",
+            "file_bytes",
+            "address_space_bytes",
+        ] {
+            let prop = &defs["Limits"]["properties"][field];
+            assert!(
+                prop["description"].as_str().is_some_and(|t| !t.is_empty()),
+                "{field}: {prop}"
+            );
+            assert_eq!(prop["minimum"], serde_json::json!(1), "{field}: {prop}");
+        }
     }
 
     #[test]

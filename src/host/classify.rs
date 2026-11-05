@@ -14,7 +14,7 @@ use crate::bwrap::version::{BWRAP_MIN, BwrapStatus, Unsupported};
 use crate::bwrap::{AliasCheck, PathCheck};
 use crate::init::Stage;
 use crate::init::fdpass::StagedFailure;
-use crate::init::probe::{ProbeReport, ProbeStep, StepStatus};
+use crate::init::probe::{KeepAlivePhase, ProbeReport, ProbeStep, StepStatus};
 use crate::policy::{NetworkMode, Policy};
 
 use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
@@ -141,6 +141,12 @@ const L_DISABLED: (&str, &str) = (
 const KA_PIDFD: (&str, &str) = (
     "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)",
     "run sbx on Linux 5.3 or newer, or give it an outer seccomp profile that allows pidfd_open (Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined)",
+);
+/// The holder stand-in's `unshare(CLONE_NEWUSER|CLONE_NEWNET)` is refused with
+/// EPERM or EACCES: nested namespace creation, not the join.
+const KA_UNSHARE: (&str, &str) = (
+    "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)",
+    "allow unshare(CLONE_NEWUSER|CLONE_NEWNET) for this user (a seccomp or container profile that blocks it; Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined; Docker: --security-opt seccomp=unconfined or an equivalent profile), or do not use run --keep-alive",
 );
 const KA_SETNS: (&str, &str) = (
     "an unprivileged setns into a fresh user and network namespace is refused (EPERM or EACCES; keep-alive attaches to a session this way)",
@@ -535,15 +541,17 @@ pub fn assemble(facts: &HostFacts) -> Report {
                     "bwrap-proc" => bwrap_step(CapId::BwrapProc, &reason),
                     "bwrap-seccomp" => seccomp_step(&reason),
                     "pidfd-open" => keep_alive_fail(KA_PIDFD, &reason, step.errno),
-                    "keep-alive" => keep_alive_fail(
-                        if is_permission(step.errno) {
-                            KA_SETNS
-                        } else {
-                            KA_OTHER
-                        },
-                        &reason,
-                        step.errno,
-                    ),
+                    // The phase says which child refused: the holder's unshare
+                    // and the joiner's setns have different fixes. A step with
+                    // no phase (not produced by this probe) is not guessed at.
+                    "keep-alive" => {
+                        let pinned = match (step.phase, is_permission(step.errno)) {
+                            (Some(KeepAlivePhase::Holder), true) => KA_UNSHARE,
+                            (Some(KeepAlivePhase::Join), true) => KA_SETNS,
+                            _ => KA_OTHER,
+                        };
+                        keep_alive_fail(pinned, &reason, step.errno)
+                    }
                     name => {
                         let Some(stage) = stage_of(name) else {
                             continue;
@@ -569,6 +577,14 @@ pub fn assemble(facts: &HostFacts) -> Report {
             let userns_failed = slots[index(CapId::Userns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
+            // Keep-alive needs unprivileged user namespaces. When userns failed
+            // at ANY stage (an early netns or listeners EPERM routed to userns by
+            // the AppArmor row included), its own step result is not evidence:
+            // the row is the userns skip, whatever the step reported.
+            if userns_failed {
+                slots[index(CapId::KeepAlive)] =
+                    Some(report_only(skip_row(CapId::KeepAlive, SKIP_USERNS)));
+            }
             let netns_failed = slots[index(CapId::Netns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
@@ -2276,14 +2292,20 @@ mod tests {
 
     #[test]
     fn keep_alive_join_refusal_is_split_by_errno() {
-        let refused = |errno: i32, reason: &str| {
-            let probe = with_step(
+        // The keep-alive step failed with `errno` in `phase` (or no phase).
+        let refused = |phase: Option<KeepAlivePhase>, errno: i32, reason: &str| {
+            let mut probe = with_step(
                 ok_steps(),
                 "keep-alive",
                 StepStatus::Fail,
                 Some(errno),
                 Some(reason),
             );
+            for step in &mut probe.steps {
+                if step.step == "keep-alive" {
+                    step.phase = phase;
+                }
+            }
             let report = assemble(&host(
                 ProbeOutcome::Ran(probe),
                 bwrap_ok(),
@@ -2291,7 +2313,12 @@ mod tests {
             ));
             keep_alive_of(&report).clone()
         };
-        let eperm = refused(libc::EPERM, "setns into the holder stand-in failed: EPERM");
+        let join = Some(KeepAlivePhase::Join);
+        let eperm = refused(
+            join,
+            libc::EPERM,
+            "setns into the holder stand-in failed: EPERM",
+        );
         assert_eq!(eperm.status, Status::Warn);
         assert_eq!(eperm.detail, KA_SETNS.0);
         assert_eq!(
@@ -2300,11 +2327,88 @@ mod tests {
         );
         assert_eq!(eperm.fix.as_deref(), Some(KA_SETNS.1));
         assert_eq!(eperm.impact, None);
-        let other = refused(libc::ENOSPC, "unshare failed: No space left on device");
+        let other = refused(
+            join,
+            libc::ENOSPC,
+            "setns into the holder stand-in failed: ENOSPC",
+        );
         assert_eq!(other.detail, KA_OTHER.0);
         assert_eq!(other.fix.as_deref(), Some(KA_OTHER.1));
-        let timed_out = refused(0, "the joiner did not answer within 5s");
+        let timed_out = refused(join, 0, "the joiner did not answer within 2s");
         assert_eq!(timed_out.detail, KA_OTHER.0, "no errno is not a permission");
+    }
+
+    #[test]
+    fn keep_alive_holder_unshare_refusal_is_not_a_setns_refusal() {
+        // The holder's unshare EPERM gets its own pinned row, not "allow setns".
+        let refused = |phase: Option<KeepAlivePhase>, errno: i32| {
+            let mut probe = with_step(
+                ok_steps(),
+                "keep-alive",
+                StepStatus::Fail,
+                Some(errno),
+                Some("unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed: EPERM"),
+            );
+            for step in &mut probe.steps {
+                if step.step == "keep-alive" {
+                    step.phase = phase;
+                }
+            }
+            let report = assemble(&host(
+                ProbeOutcome::Ran(probe),
+                bwrap_ok(),
+                RunFacts::default(),
+            ));
+            keep_alive_of(&report).clone()
+        };
+        let holder = refused(Some(KeepAlivePhase::Holder), libc::EPERM);
+        assert_eq!(holder.status, Status::Warn);
+        assert_eq!(holder.detail, KA_UNSHARE.0);
+        assert_eq!(holder.fix.as_deref(), Some(KA_UNSHARE.1));
+        assert_eq!(holder.impact, None, "report-only");
+        assert_ne!(holder.detail, KA_SETNS.0);
+        let eacces = refused(Some(KeepAlivePhase::Holder), libc::EACCES);
+        assert_eq!(eacces.detail, KA_UNSHARE.0);
+        // A holder refusal that is not a permission is the generic row.
+        let other = refused(Some(KeepAlivePhase::Holder), libc::ENOSPC);
+        assert_eq!(other.detail, KA_OTHER.0);
+        // No phase (a probe that does not say): a permission is not guessed at.
+        let unphased = refused(None, libc::EPERM);
+        assert_eq!(unphased.detail, KA_OTHER.0);
+    }
+
+    #[test]
+    fn keep_alive_joiner_signal_death_is_generic_and_says_the_signal() {
+        // The item-1 case through the classifier: the joiner was killed.
+        let mut probe = with_step(
+            ok_steps(),
+            "keep-alive",
+            StepStatus::Fail,
+            None,
+            Some("the joiner was killed by signal 31 before it answered"),
+        );
+        for step in &mut probe.steps {
+            if step.step == "keep-alive" {
+                step.phase = Some(KeepAlivePhase::Join);
+            }
+        }
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Warn, "never ok");
+        assert_eq!(ka.detail, KA_OTHER.0);
+        assert_eq!(
+            ka.evidence.as_deref(),
+            Some("the joiner was killed by signal 31 before it answered")
+        );
+        assert_eq!(
+            report.network_mode,
+            EffectiveMode::Transparent,
+            "report-only"
+        );
     }
 
     #[test]
@@ -2343,6 +2447,79 @@ mod tests {
         );
     }
 
+    /// `ok_steps()` with one step failed (keeping every other step as it is, so
+    /// the keep-alive steps can report ok on their own).
+    fn with_failed_step(name: &str, errno: i32) -> ProbeReport {
+        let mut probe = ok_steps();
+        for step in &mut probe.steps {
+            if step.step == name {
+                step.status = StepStatus::Fail;
+                step.errno = Some(errno);
+                step.reason = Some(format!("{name} failed"));
+            }
+        }
+        probe
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_a_later_stage() {
+        // AppArmor restricts unprivileged userns, and the netns EPERM is routed
+        // to the userns row (row 1). The keep-alive steps ran and reported ok,
+        // but the item must be the userns skip, not "ok" beside "userns FAIL".
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("netns", libc::EPERM)),
+            bwrap_ok(),
+            sysctls(Some(1), None, None),
+        ));
+        let userns = report
+            .capabilities
+            .iter()
+            .find(|c| c.id == CapId::Userns)
+            .expect("the userns item");
+        assert_eq!(userns.status, Status::Fail, "the routing is unchanged");
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None, "report-only: never limits the mode");
+        assert_eq!(ka.fix, None);
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_unshare() {
+        // The plain userns failure: keep-alive is the userns skip even when its
+        // own step failed too (the cascade's pidfd refusal, say).
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("unshare", libc::ENOSPC)),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None);
+
+        let mut probe = with_failed_step("unshare", libc::ENOSPC);
+        for step in &mut probe.steps {
+            if step.step == "pidfd-open" {
+                step.status = StepStatus::Fail;
+                step.errno = Some(libc::ENOSYS);
+                step.reason = Some("pidfd_open failed".to_owned());
+            }
+        }
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(
+            ka.status,
+            Status::Skip,
+            "a keep-alive warn is overridden too"
+        );
+        assert_eq!(ka.detail, SKIP_USERNS);
+    }
+
     #[test]
     fn keep_alive_pinned_texts() {
         assert_eq!(
@@ -2352,6 +2529,10 @@ mod tests {
         assert_eq!(
             KA_PIDFD.0,
             "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)"
+        );
+        assert_eq!(
+            KA_UNSHARE.0,
+            "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)"
         );
         assert_eq!(CapId::KeepAlive.as_str(), "keep-alive");
         assert_eq!(CapId::ALL.last(), Some(&CapId::KeepAlive));

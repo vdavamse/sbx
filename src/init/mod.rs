@@ -85,6 +85,7 @@
 pub mod consts;
 pub mod fdpass;
 pub mod probe;
+pub mod rlimit;
 // Private: implementation detail of the pipeline below. `fdpass` (the
 // parent-side API #10 drives) and `consts` (the cross-issue constant
 // surface) are the module's public face. (They were declared `pub` while
@@ -374,6 +375,9 @@ pub struct InitArgs {
     /// are namespace descriptors of a live session (`--join-user`, `--join-net`);
     /// `fd` is unused (pass -1).
     pub join: Option<(RawFd, RawFd)>,
+    /// The policy's resource limits (`--rlimit`, issue #43), applied right
+    /// before the exec.
+    pub rlimits: Vec<rlimit::Rlimit>,
     /// The payload argv, exec'd last.
     pub cmd: Vec<OsString>,
 }
@@ -483,6 +487,10 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     drop(listeners);
     drop(sock);
     fd_hygiene(fd, &keep_set(args));
+    // Issue #43: after the unshare (NPROC counts this user namespace only, see
+    // rlimit's module docs) and as late as possible, so no sbx code runs under
+    // the payload's limits. Fail closed: the payload never runs unlimited.
+    rlimit::apply(&args.rlimits).map_err(|reason| InitError::new(Stage::Exec, reason))?;
     Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
 }
 
@@ -573,6 +581,9 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
     rules::verify_dump(&mut sock)?; // Stage::NftVerify: the session's rules, now
     drop(sock);
     fd_hygiene(-1, &keep_set(args));
+    // Issue #43: an attached call runs under the session policy's limits, as the
+    // resident does. NPROC counts the joined user namespace (rlimit point 1).
+    rlimit::apply(&args.rlimits).map_err(|reason| InitError::new(Stage::Exec, reason))?;
     Err(exec_payload(&args.cmd))
 }
 
@@ -1212,6 +1223,7 @@ mod tests {
             parent_pid,
             min_mode: NetworkMode::Transparent,
             test_break_rules: false,
+            rlimits: Vec::new(),
             cmd: vec![OsString::from("/bin/true")],
         }
     }
@@ -1779,6 +1791,13 @@ mod tests {
         assert_eq!(
             msg(998),
             "sbx __init: control: --status-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        // Plain mode names its control flag `--fd`; the pinned text says so.
+        assert_eq!(
+            validate_status_fd(999, ControlFd::plain(999), None, None, None)
+                .expect_err("status equals --fd")
+                .to_string(),
+            "sbx __init: control: --status-fd 999 must differ from --fd"
         );
         let mut p = [0 as RawFd; 2];
         // SAFETY: pipe2 into a 2-element array; both ends are closed below.

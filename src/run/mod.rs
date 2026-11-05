@@ -40,9 +40,10 @@
 //!    sees a tty on fds 0–2.
 //! 7. **Audit.** `--audit` writes one JSON object per line (schema: notes §5),
 //!    append-only, 0600, regular file only, never inside the session directory.
-//!    The exit row's last key `net_mode` (issue #11) is the achieved network
-//!    mode (`transparent` or `explicit`), or null when setup never completed.
-//!    A write failure is fail-closed (Q7). The exit row is always last. No fsync.
+//!    The exit row's `net_mode` (issue #11) is the achieved network mode
+//!    (`transparent` or `explicit`), or null when setup never completed; its
+//!    last key `dns_suppressed` (issue #43) counts the `dns` rows the per-run
+//!    rate limit dropped (`audit::DnsBudget`). A write failure is fail-closed (Q7). The exit row is always last. No fsync.
 //! 8. **Supervision.** A failing or panicking network task, a dead network thread
 //!    or an audit failure ends the run with 125 (the latch wakes the main loop).
 //! 9. **Concurrency and session.** Each run has its own netns, DNS pool and
@@ -131,7 +132,7 @@ use plan::{
 };
 use serve::{Fault, FaultLatch, serve_tasks, start_net};
 use session::SessionLock;
-use spawn::{ChildFds, SetupEnd, init_command, wait_for_fds};
+use spawn::{ChildFds, InitFlags, SetupEnd, init_command, wait_for_fds};
 use stdio::{OutputBudget, Pumps};
 
 /// Exit code for GNU-timeout-style timeouts.
@@ -331,7 +332,7 @@ fn conclude_prepare(
 ) -> i32 {
     if let Some(audit) = audit {
         mark_audit_failure(&mut outcome, audit);
-        audit.finish(&exit_row_for(
+        audit.finish(exit_row_for(
             ts(SystemTime::now()),
             &outcome,
             t0.elapsed(),
@@ -419,7 +420,7 @@ fn report_failure(
     call_id: Option<u32>,
 ) -> ExitCode {
     if let Some(audit) = audit {
-        audit.finish(&exit_row_for(
+        audit.finish(exit_row_for(
             ts(SystemTime::now()),
             &Outcome::Failed(reason.to_owned()),
             t0.elapsed(),
@@ -740,6 +741,7 @@ fn execute(
         None => None,
     };
     let (stdin, stdin_piped) = stdin_mode();
+    let rlimits = crate::init::rlimit::from_limits(&policy.limits);
     let mut child = init_command(
         ChildFds {
             control: child_fd,
@@ -748,8 +750,11 @@ fn execute(
             exe: exe_fd,
             status: status_fd,
         },
-        policy.network.mode,
-        args.test_break_rules,
+        &InitFlags {
+            min_mode: policy.network.mode,
+            test_break_rules: args.test_break_rules,
+            rlimits: &rlimits,
+        },
         &launch,
         stdin,
     )

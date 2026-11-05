@@ -221,8 +221,8 @@ parts of the optional layer the kernel provides, see **Landlock layer** under [R
 and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
 into a fresh user and network namespace, the two things `run --keep-alive` and
 `attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
-failure is a `warn` and never limits the network mode, as `landlock` does, so a
-host that runs plain sandboxes still exits 0.
+failure is a `warn`. Like `landlock`, it is report only: it never limits the
+network mode, so a host that runs plain sandboxes still exits 0.
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
@@ -298,6 +298,7 @@ platform, the Kubernetes and Docker forms are given:
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
 | `keep-alive` | `pidfd_open` is refused (ENOSYS below Linux 5.3, or an outer seccomp profile) (report only) | run sbx on Linux 5.3 or newer; Kubernetes: a Localhost seccomp profile that allows `pidfd_open`, or `seccompProfile` Unconfined |
+| `keep-alive` | the holder stand-in's `unshare(CLONE_NEWUSER\|CLONE_NEWNET)` is refused (EPERM or EACCES). The probe's own namespace was created, so only the nested user and network namespaces are refused; report only | allow nested `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNET)` for this user (a seccomp or container profile that blocks them; Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | an unprivileged `setns` into a fresh user and network namespace is refused (EPERM or EACCES; report only) | allow `setns(CLONE_NEWUSER)` and `setns(CLONE_NEWNET)` for this user (a container seccomp profile often blocks `setns`; Kubernetes: a Localhost seccomp profile that allows it, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | the holder stand-in cannot be started, or the join fails for another reason (report only) | allow unprivileged user and network namespaces and `setns` for this user, or do not use `run --keep-alive`; plain `sbx run` does not need them |
 | `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |
@@ -488,6 +489,36 @@ sbx prints `sbx run: output truncated at N bytes (limits.output_bytes)` as its
 last line, and the exit row records `output_truncated: true`. If the caller closes
 sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
 
+**Resource limits.** `limits` may also set `processes`, `open_files`,
+`file_bytes` and `address_space_bytes` (positive integers; absent means the
+caller's own limit is inherited). They become `RLIMIT_NPROC`, `RLIMIT_NOFILE`,
+`RLIMIT_FSIZE` and `RLIMIT_AS`, with soft and hard limits both set, so the
+command cannot raise them. `__init` sets them after it creates the sandbox's
+user namespace and right before it execs bwrap. Per limit:
+
+- `processes` counts the sandbox's own processes and threads (Linux 5.14 and
+  later; older kernels count every process of the caller's uid). When sbx runs
+  as root, it is enforced only on Linux 5.17 and later. bwrap uses two of them.
+- `open_files` must not exceed the caller's hard limit (or `fs.nr_open`).
+- `file_bytes` bounds each file, not the total disk use. A write past it fails
+  and the writer gets `SIGXFSZ`.
+- `address_space_bytes` is virtual memory, not resident memory. Runtimes that
+  reserve large address ranges (JVM, V8, Go) need generous values.
+
+bwrap runs under the same limits, so very small values (`processes` below 3,
+a handful of `open_files`, a few MiB of address space) make bwrap itself fail.
+A limit the caller cannot grant fails setup (125, with
+`sbx __init: exec: cannot set limits.<field> …`). These are per-process
+limits, not a cgroup: they do not bound the total memory of all sandboxed
+processes, tmpfs sizes or the total disk use. See
+[R14](docs/threat-model.md#7-residual-risks).
+
+```json
+"limits": { "timeout": "120s", "output_bytes": 10485760,
+            "processes": 256, "open_files": 1024,
+            "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
+```
+
 **Session directory.** `--session-dir` is created with mode 0700 and must be
 owned by the current user. Only one run may use a session at a time: a lock on
 `sbx.lock` inside it is held for the whole run, and a second run fails with
@@ -513,14 +544,20 @@ allowed: a second TLS `ClientHello`, or an HTTP request on the connection that
 failed the checks (`relay torn down: HTTP request N denied: …`). Requests after
 the first one on a keep-alive connection are not logged one by one, because their
 name and port are the connection's. The `exit` row adds `code`, `outcome`, `signal`,
-`duration_ms`, `output_truncated`, `dns_poisoned` and `net_mode` (`transparent`
+`duration_ms`, `output_truncated`, `dns_poisoned`, `net_mode` (`transparent`
 or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
-(setup never completed); `net_mode` is the last key).
+(setup never completed)) and `dns_suppressed` (the last key).
+
+`dns` rows are rate limited per run, because every DNS datagram is one row: a
+burst of 1000 rows, then 100 rows per second. Rows over the limit are not
+written. The exit row's `dns_suppressed` counts them. The DNS answers
+themselves are not affected. Proxy rows (`connect`, `deny`, `close`) are not
+rate limited.
 
 ```json
 {"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}
 {"ts":"2026-10-15T18:23:01.123Z","event":"connect","host":"github.com","sni":"github.com","port":443,"bytes":null,"reason":"allowed github.com via 140.82.121.4:443","via":"transparent","verdict":"allowed","rcode":null,"qtype":null,"client":"10.255.255.1:40000"}
-{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent"}
+{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent","dns_suppressed":0}
 ```
 
 Rows are in event order: a connection's `connect`, then `deny` (teardown) if
@@ -758,7 +795,10 @@ sbx stop --session-dir S
   request and its reply.
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
-  rows carry no `call_id` (R30).
+  rows carry no `call_id` (R30). The `dns` rate limit covers the whole session,
+  so only the resident's exit row carries `dns_suppressed`.
+- **Resource limits.** The policy's `limits` RLIMITs apply to every attached
+  call as they apply to the resident.
 
 **Exit codes**
 

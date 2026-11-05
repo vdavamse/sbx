@@ -34,13 +34,18 @@ pub(crate) struct ExitFields {
     output_truncated: bool,
     dns_poisoned: bool,
     /// Issue #11: the achieved network mode (`transparent` | `explicit`), or
-    /// null when setup never completed. Additive; the last key of the row.
+    /// null when setup never completed. Additive.
     net_mode: Option<&'static str>,
     /// Issue #18: the attached call this exit row ends (`0` = the resident).
     /// Written only in persistent-session rows; absent (and not serialized)
     /// everywhere else, so plain-run rows keep their shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     call_id: Option<u32>,
+    /// Issue #43: how many `dns` rows the rate limit dropped (see
+    /// [`DnsBudget`]). Filled in by [`AuditLog::finish`] on the final exit row
+    /// only (the last key); absent on an attached call's exit row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dns_suppressed: Option<u64>,
 }
 
 /// One audit row. Field order IS the schema (§5 rows 1–12, then the exit-only
@@ -204,6 +209,9 @@ pub(crate) fn exit_row_for(
         output_truncated: truncated,
         dns_poisoned: poisoned,
         net_mode,
+        // A plain run's exit row always carries the key (finish fills the
+        // count); a session's rows carry it only on the resident's final row.
+        dns_suppressed: call_id.is_none().then_some(0),
         call_id,
     });
     row
@@ -239,6 +247,7 @@ pub(crate) fn call_exit_row(ts: String, call: &CallExit<'_>) -> Row {
         dns_poisoned: call.dns_poisoned,
         net_mode: call.net_mode,
         call_id: Some(call.call_id),
+        dns_suppressed: None,
     });
     row
 }
@@ -331,11 +340,60 @@ fn lock_bounded(fd: RawFd) -> Result<(), String> {
     }
 }
 
+/// Rows the DNS budget allows in a burst (issue #43).
+pub(crate) const DNS_BURST: u32 = 1_000;
+/// Rows per second the DNS budget refills (issue #43).
+pub(crate) const DNS_RATE: u32 = 100;
+
+/// A token bucket for `dns` rows (issue #43, threat model R18). Every DNS
+/// datagram is a decision, so without it a payload can grow the audit log as
+/// fast as it can send. Proxy rows are not limited: each one costs the payload
+/// a TCP connection. Dropped rows are counted and reported once, on the exit
+/// row (`dns_suppressed`); the DNS answers themselves are unaffected.
+pub(crate) struct DnsBudget {
+    tokens: f64,
+    last: Instant,
+    suppressed: u64,
+}
+
+impl DnsBudget {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            tokens: f64::from(DNS_BURST),
+            last: now,
+            suppressed: 0,
+        }
+    }
+
+    /// Takes one token if one is left; otherwise counts a suppressed row.
+    pub(crate) fn take(&mut self, now: Instant) -> bool {
+        // `now` is read before the log mutex, so calls can arrive out of order:
+        // never move `last` backwards (that would refill the same interval twice).
+        if now > self.last {
+            let refill = (now - self.last).as_secs_f64() * f64::from(DNS_RATE);
+            self.tokens = (self.tokens + refill).min(f64::from(DNS_BURST));
+            self.last = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            false
+        }
+    }
+
+    pub(crate) fn suppressed(&self) -> u64 {
+        self.suppressed
+    }
+}
+
 struct AuditState {
     file: File,
     /// The first write failure, verbatim (M1: fail closed, reported by the caller).
     failure: Option<String>,
     finished: bool,
+    dns: DnsBudget,
 }
 
 /// The run's audit sink (both the proxy and the DNS side write through it).
@@ -353,6 +411,7 @@ impl AuditLog {
                     file,
                     failure: None,
                     finished: false,
+                    dns: DnsBudget::new(Instant::now()),
                 })
             }),
             latch,
@@ -401,6 +460,11 @@ impl AuditLog {
         if state.failure.is_some() || state.finished {
             return;
         }
+        self.append_locked(&mut state, row);
+    }
+
+    /// Appends under the held log mutex; the first failure latches (Q7).
+    fn append_locked(&self, state: &mut AuditState, row: &Row) {
         if let Err(text) = Self::append(&state.file, &line(row)) {
             self.latch.trip(Fault::Audit(text.clone()));
             state.failure = Some(text);
@@ -413,15 +477,27 @@ impl AuditLog {
         self.write(row);
     }
 
-    /// Writes the exit row (unless the log already failed) and closes the log for
-    /// further rows. The exit row is therefore always the last one.
-    pub(crate) fn finish(&self, row: &Row) {
+    /// A `dns` row at time `now`, subject to the run's [`DnsBudget`] (issue
+    /// #43). The token and the append happen under ONE guard, so every row is
+    /// either written or counted in `dns_suppressed`, never lost in between.
+    fn write_dns_at(&self, row: &Row, now: Instant) {
         let Some(mut state) = self.lock() else { return };
+        if state.failure.is_some() || state.finished || !state.dns.take(now) {
+            return;
+        }
+        self.append_locked(&mut state, row);
+    }
+
+    /// Writes the exit row (unless the log already failed) and closes the log for
+    /// further rows. The exit row is therefore always the last one. The log fills
+    /// in the row's `dns_suppressed` count.
+    pub(crate) fn finish(&self, mut row: Row) {
+        let Some(mut state) = self.lock() else { return };
+        if let Some(exit) = row.exit.as_mut() {
+            exit.dns_suppressed = Some(state.dns.suppressed());
+        }
         if state.failure.is_none() {
-            if let Err(text) = Self::append(&state.file, &line(row)) {
-                self.latch.trip(Fault::Audit(text.clone()));
-                state.failure = Some(text);
-            }
+            self.append_locked(&mut state, &row);
         }
         state.finished = true;
     }
@@ -454,7 +530,7 @@ impl DecisionSink for AuditLog {
 
 impl DnsSink for AuditLog {
     fn record(&self, decision: &DnsDecision) {
-        self.write(&dns_row(ts(SystemTime::now()), decision));
+        self.write_dns_at(&dns_row(ts(SystemTime::now()), decision), Instant::now());
     }
 }
 
@@ -706,7 +782,7 @@ mod tests {
                 None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":1234,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":1234,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null,\"dns_suppressed\":0}}\n"
             )
         );
         assert_eq!(
@@ -719,7 +795,7 @@ mod tests {
                 None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"timed out after 2m\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":124,\"outcome\":\"timeout\",\"signal\":null,\"duration_ms\":120004,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"timed out after 2m\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":124,\"outcome\":\"timeout\",\"signal\":null,\"duration_ms\":120004,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null,\"dns_suppressed\":0}}\n"
             )
         );
         assert_eq!(
@@ -732,7 +808,7 @@ mod tests {
                 None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"terminated by SIGTERM\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":143,\"outcome\":\"terminated\",\"signal\":15,\"duration_ms\":5000,\"output_truncated\":true,\"dns_poisoned\":false,\"net_mode\":null}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"terminated by SIGTERM\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":143,\"outcome\":\"terminated\",\"signal\":15,\"duration_ms\":5000,\"output_truncated\":true,\"dns_poisoned\":false,\"net_mode\":null,\"dns_suppressed\":0}}\n"
             )
         );
         assert_eq!(
@@ -745,7 +821,7 @@ mod tests {
                 None
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"network service failed: transparent proxy panicked: boom\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":125,\"outcome\":\"failed\",\"signal\":null,\"duration_ms\":17,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"network service failed: transparent proxy panicked: boom\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":125,\"outcome\":\"failed\",\"signal\":null,\"duration_ms\":17,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":null,\"dns_suppressed\":0}}\n"
             )
         );
     }
@@ -992,7 +1068,7 @@ mod tests {
             allowed("a.example", "1.2.3.4:80"),
         );
         DecisionSink::record(&*log, &c);
-        log.finish(&exit_row(
+        log.finish(exit_row(
             TS.into(),
             &Outcome::Exited(0),
             Duration::ZERO,
@@ -1020,7 +1096,7 @@ mod tests {
             Verdict::Denied(Rejected::PortNotAllowed { port: 22 }),
         );
         DecisionSink::record(&*log, &c);
-        log.finish(&exit_row(
+        log.finish(exit_row(
             TS.into(),
             &Outcome::Exited(0),
             Duration::ZERO,
@@ -1033,8 +1109,92 @@ mod tests {
     }
 
     #[test]
+    fn dns_budget_allows_a_burst_then_the_refill_rate() {
+        let t0 = Instant::now();
+        let mut b = DnsBudget::new(t0);
+        for _ in 0..DNS_BURST {
+            assert!(b.take(t0));
+        }
+        assert!(!b.take(t0));
+        assert!(!b.take(t0));
+        assert_eq!(b.suppressed(), 2);
+        // One second refills DNS_RATE tokens, never more than the burst.
+        let t1 = t0 + Duration::from_secs(1);
+        for _ in 0..DNS_RATE {
+            assert!(b.take(t1));
+        }
+        assert!(!b.take(t1));
+        assert_eq!(b.suppressed(), 3);
+        let later = t1 + Duration::from_secs(3600);
+        for _ in 0..DNS_BURST {
+            assert!(b.take(later));
+        }
+        assert!(!b.take(later));
+        // An out-of-order (earlier) instant refills nothing and keeps `last`.
+        assert!(!b.take(t1));
+        assert!(!b.take(later));
+    }
+
+    #[test]
+    fn dns_flood_is_capped_and_counted_on_the_exit_row() {
+        // Issue #43 (R18): a DNS flood writes at most a burst of rows, and the
+        // exit row reports how many were dropped. Proxy rows are not limited.
+        let dir = std::env::temp_dir().join(format!("sbx-run-audit-{}-dns", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("flood.jsonl");
+        std::fs::remove_file(&path).ok();
+        let latch = FaultLatch::new().expect("latch");
+        let log = AuditLog::new(Some(open_audit(&path).expect("open")), latch);
+        let dropped = DnsDecision {
+            client: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 255, 255, 1), 41000)),
+            question: None,
+            verdict: DnsVerdict::Dropped(DnsDropped::Short { len: 5 }),
+        };
+        let extra = 50;
+        // A fixed instant an hour ahead: the trailing real-clock record below
+        // is always earlier, so nothing refills and the counts are exact.
+        let now = Instant::now() + Duration::from_secs(3600);
+        let row = dns_row(TS.into(), &dropped);
+        for _ in 0..(DNS_BURST + extra) {
+            log.write_dns_at(&row, now);
+        }
+        // The production sink path goes through the same budget.
+        DnsSink::record(&*log, &dropped);
+        let c = decision(
+            "10.0.0.1:1",
+            transparent("1.2.3.4:80"),
+            None,
+            Verdict::Denied(Rejected::PortNotAllowed { port: 22 }),
+        );
+        DecisionSink::record(&*log, &c);
+        log.finish(exit_row(
+            TS.into(),
+            &Outcome::Exited(0),
+            Duration::ZERO,
+            false,
+            false,
+            None,
+        ));
+        let text = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        let dns = lines
+            .iter()
+            .filter(|l| l.contains("\"event\":\"dns\""))
+            .count();
+        assert_eq!(dns, DNS_BURST as usize);
+        let exit: serde_json::Value =
+            serde_json::from_str(lines.last().expect("exit")).expect("json");
+        assert_eq!(exit["event"], "exit");
+        let suppressed = exit["dns_suppressed"].as_u64().expect("count");
+        assert_eq!(suppressed, u64::from(extra) + 1);
+        assert_eq!(lines.len(), dns + 2, "one proxy row + the exit row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn exit_row_net_mode_golden() {
-        // Issue #11 (Q5): the achieved mode is the last key of the exit row.
+        // Issue #11 (Q5): the achieved mode follows dns_poisoned; issue #43
+        // appended dns_suppressed after it.
         let d = Duration::from_millis;
         assert_eq!(
             json(&exit_row(
@@ -1046,7 +1206,7 @@ mod tests {
                 Some("transparent")
             )),
             format!(
-                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":7,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":\"transparent\"}}\n"
+                "{{\"ts\":\"{TS}\",\"event\":\"exit\",\"host\":null,\"sni\":null,\"port\":null,\"bytes\":null,\"reason\":\"command exited with status 0\",\"via\":null,\"verdict\":null,\"rcode\":null,\"qtype\":null,\"client\":null,\"code\":0,\"outcome\":\"exited\",\"signal\":null,\"duration_ms\":7,\"output_truncated\":false,\"dns_poisoned\":false,\"net_mode\":\"transparent\",\"dns_suppressed\":0}}\n"
             )
         );
         assert!(
@@ -1058,7 +1218,7 @@ mod tests {
                 false,
                 Some("explicit")
             ))
-            .ends_with(",\"net_mode\":\"explicit\"}\n")
+            .ends_with(",\"net_mode\":\"explicit\",\"dns_suppressed\":0}\n")
         );
     }
 

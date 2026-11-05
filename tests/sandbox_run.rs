@@ -96,6 +96,8 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
         // #19: the Landlock probes (mkdir at /, a TCP bind on the port in arg 0,
         // kill(1, 0), a write under /work); see `landlock_probe_role`.
         "landlock-probe" => landlock_probe_role(&arg(0)),
+        // #43: the RLIMIT rows, then forks until the process limit refuses one.
+        "limits" => limits_role(),
         // #34: an x32-ABI syscall, which the filter kills (SIGSYS, rc 159).
         "x32-syscall" => x32_syscall_role(),
         // #34: an i386 compat syscall through `int 0x80`, which the arch gate kills.
@@ -590,6 +592,73 @@ fn denylist_role() -> u8 {
     0
 }
 
+/// `uname -r` major.minor is below `major.minor` (unparsable counts as below).
+fn kernel_below(major: u32, minor: u32) -> bool {
+    // SAFETY: uname fills one struct we own.
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return true;
+    }
+    // SAFETY: the kernel NUL-terminates release.
+    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }.to_string_lossy();
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse::<u32>().ok());
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => (a, b) < (major, minor),
+        _ => true,
+    }
+}
+
+/// #43: prints the policy-controlled `/proc/self/limits` rows (whitespace
+/// normalised, `LIMIT ` prefix), then forks idle children until a fork fails,
+/// prints `FORKS <n> <errno>`, and kills them again.
+fn limits_role() -> u8 {
+    let text = fs::read_to_string("/proc/self/limits").unwrap_or_default();
+    for line in text.lines() {
+        if [
+            "Max processes",
+            "Max open files",
+            "Max file size",
+            "Max address space",
+        ]
+        .iter()
+        .any(|p| line.starts_with(p))
+        {
+            println!(
+                "LIMIT {}",
+                line.split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+        }
+    }
+    let mut kids = Vec::new();
+    let mut errno = 0;
+    for _ in 0..256 {
+        // SAFETY: the child only calls pause/_exit (async-signal-safe).
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        if pid < 0 {
+            errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
+            break;
+        }
+        kids.push(pid);
+    }
+    println!("FORKS {} {errno}", kids.len());
+    for pid in kids {
+        // SAFETY: signalling and reaping our own children.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    0
+}
+
 /// #34: an x32 syscall (bit 30 set). The filter kills the process.
 #[cfg(target_arch = "x86_64")]
 fn x32_syscall_role() -> u8 {
@@ -814,6 +883,11 @@ fn scenarios() -> Vec<Scenario> {
             name: "seccomp-status",
             gate: Bwrap,
             run: seccomp_status,
+        },
+        Scenario {
+            name: "policy-rlimits",
+            gate: Bwrap,
+            run: policy_rlimits,
         },
         Scenario {
             name: "seccomp-x32-killed-159",
@@ -1559,6 +1633,8 @@ struct Pol {
     role: Option<String>,
     env_set: Vec<(String, String)>,
     env_pass: Vec<String>,
+    /// Extra raw `limits` members (issue #43), e.g. `,"processes":16`.
+    limits_extra: String,
 }
 
 impl Pol {
@@ -1575,6 +1651,7 @@ impl Pol {
             role: Some(role.to_owned()),
             env_set: Vec::new(),
             env_pass: Vec::new(),
+            limits_extra: String::new(),
         }
     }
 
@@ -1608,7 +1685,7 @@ impl Pol {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[{deny}]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}}}}}"#,
+            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[{deny}]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}{limits_extra}}}}}"#,
             mode = self.mode,
             ro_extra = self
                 .ro_extra
@@ -1630,6 +1707,7 @@ impl Pol {
                 .join(","),
             timeout = self.timeout,
             out = self.output_bytes,
+            limits_extra = self.limits_extra,
         )
     }
 
@@ -2064,6 +2142,55 @@ fn seccomp_io_uring_enosys() -> Result<(), String> {
     let map = seccomp_sockets()?;
     for label in ["uring-setup", "uring-enter", "uring-register"] {
         expect_socket(&map, label, "errno=38")?;
+    }
+    Ok(())
+}
+
+/// #43: the policy's optional limits reach the payload through the real
+/// `run` → `__init` → bwrap chain (soft == hard), and the process limit counts
+/// the sandbox only. With `processes: 16`, the binding count is `__init`'s
+/// user namespace: the outer bwrap, bwrap's pid 1 and the payload use 3, so
+/// the payload forks 13 children (14 on 5.14–5.16, whose NPROC check was off
+/// by one) and the next fork fails with EAGAIN. Accepting 11..=14 leaves slack
+/// for a helper process, while a per-uid count (limit set before the unshare,
+/// or a pre-5.14 kernel) would also count the runner's own processes and fail.
+/// Kernels before 5.17 count NPROC per uid (< 5.14) or exempt kuid 0
+/// (5.14–5.16), so the fork assertion below only holds from 5.17.
+fn policy_rlimits() -> Result<(), String> {
+    if kernel_below(5, 17) {
+        println!("  (policy-rlimits: kernel older than 5.17, NPROC semantics differ; not run)");
+        return Ok(());
+    }
+    let (done, dir) = run_role_case(
+        "policy-rlimits",
+        "limits",
+        &[],
+        |p| {
+            p.limits_extra = r#","processes":16,"open_files":64,"file_bytes":1048576,"address_space_bytes":17179869184"#.to_owned();
+        },
+        &[],
+    )?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)?;
+    for want in [
+        "LIMIT Max processes 16 16 processes",
+        "LIMIT Max open files 64 64 files",
+        "LIMIT Max file size 1048576 1048576 bytes",
+        "LIMIT Max address space 17179869184 17179869184 bytes",
+    ] {
+        if !done.stdout.lines().any(|line| line == want) {
+            return Err(format!("missing {want:?}\nstdout: {:?}", done.stdout));
+        }
+    }
+    let forks = done
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("FORKS "))
+        .ok_or_else(|| format!("no FORKS line\nstdout: {:?}", done.stdout))?;
+    let (n, errno) = forks.split_once(' ').ok_or("malformed FORKS line")?;
+    let n: u32 = n.parse().map_err(|_| format!("bad FORKS {forks:?}"))?;
+    if !(11..=14).contains(&n) || errno != libc::EAGAIN.to_string() {
+        return Err(format!("expected 11..=14 forks then EAGAIN, got {forks:?}"));
     }
     Ok(())
 }
