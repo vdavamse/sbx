@@ -62,8 +62,10 @@
 //!    documented worst case and make `Failed::ConnectTimeout`'s `secs`
 //!    untruthful — owned by [`GuardedConnector`]), and a 1 ms→100 ms
 //!    bounded accept backoff. The two timeout scopes never nest, so the
-//!    pinned reasons never compete. No relay idle timeout and no
-//!    concurrency cap in v1 (Q7 — revisit with #10 via [`Limits`]).
+//!    pinned reasons never compete. A per-run concurrency cap
+//!    ([`Limits::max_connections`], issue #43) covers both listeners: an
+//!    accept over it is closed unread with one [`Rejected::ConnLimit`]
+//!    decision. No relay idle timeout in v1 (#29).
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
 //!    must not pass (Q1). TLS is PASSED THROUGH, never terminated (no CA in

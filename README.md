@@ -235,8 +235,9 @@ is flagged), `bind-sockets` (a `warn` listing the unix socket files under
 verification of `run` below, which fails the policy when `run` would refuse),
 `bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
 paths under its binds), `deny-links` (warns when a file under a deny path has a
-hard link outside it) and `pin-cost` (warns above 50 directory pins). A `warn`
-does not stop the policy from running.
+hard link outside it), `pin-cost` (warns above 50 directory pins) and
+`deny-tmpfs-size` (warns when bwrap is older than 0.10 and the policy has deny
+masks, which then stay unsized). A `warn` does not stop the policy from running.
 
 **JSON.** `sbx check --json` prints the same report as a JSON object with
 `"version": 1`: `network_mode`, `runnable_modes`, `probe_error` and one object per
@@ -502,6 +503,29 @@ processes, tmpfs sizes or the total disk use. See
             "processes": 256, "open_files": 1024,
             "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
 ```
+
+**Run-level caps (issue #43).** Three more bounds apply to every run, with no
+policy field:
+
+- **Deny masks are sized.** With bubblewrap 0.10 or later, each `deny` tmpfs is
+  capped at 1 MiB (`--size`), so a payload cannot fill RAM through a writable
+  mask. Older bubblewrap has no `--size`: the masks stay unsized, and
+  `sbx check --policy P --host` warns (`deny-tmpfs-size`).
+- **Concurrent proxy connections.** At most 256 connections are open through the
+  proxies at once (both listeners together); set another value with
+  `sbx run --max-connections N` (1 to 65536). A connection over the cap is
+  closed unread and gets one `deny` audit row whose reason starts with
+  `conn_limit:`.
+- **Fake-IP names.** A run maps at most 4096 distinct names (a `--keep-alive`
+  session shares one map across its calls). A new name past that gets
+  NXDOMAIN, with a `dns` audit row under the run's DNS row budget; names
+  already mapped keep answering.
+
+`sbx check` also reports the host's conntrack table (`conntrack`, report-only).
+The nat redirect in the sandbox needs conntrack; on current kernels each network
+namespace's entries are checked against the host's `nf_conntrack_max`, and they
+use host kernel memory. Disk use in `rw` binds and the session directory is not
+bounded (no quotas; R14).
 
 **Session directory.** `--session-dir` is created with mode 0700 and must be
 owned by the current user. Only one run may use a session at a time: a lock on
