@@ -67,7 +67,7 @@ use sbx::dns::{
     serve_dns,
 };
 use sbx::init::fdpass;
-use sbx::policy::{self, Domain};
+use sbx::policy::{self, Domain, DomainRule};
 use sbx::proxy::hello::build_client_hello;
 use sbx::proxy::{
     ConnectError, Connected, Connector, Decision, DecisionSink, DialFn, DnsMap, ExplicitKind,
@@ -1105,7 +1105,7 @@ fn policy_network(allow: &[&str], ports: &[u16]) -> policy::Network {
         mode: policy::NetworkMode::Transparent,
         allow: allow
             .iter()
-            .map(|name| Domain::parse(name).expect("fixture name must parse"))
+            .map(|name| DomainRule::parse(name).expect("fixture name must parse"))
             .collect(),
         ports: ports.to_vec(),
     }

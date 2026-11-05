@@ -130,6 +130,35 @@ this host. `check --print-schema` prints the policy JSON Schema (draft 2020-12)
 to stdout. `--print-schema` cannot be combined with `--policy`, `--host` or
 `--json`. Policy files follow schema version 1 — see [`examples/`](examples/).
 
+## Policy allow list
+
+`network.allow` lists the names the sandbox may reach. Each entry is a domain
+name with no scheme, port, path, wildcard or IP literal. A plain entry allows
+the name and every subdomain of it. An entry prefixed with `=` allows that
+exact host only, not its subdomains:
+
+```json
+"network": {
+  "mode": "transparent",
+  "allow": ["github.com", "=api.example.com"],
+  "ports": [443, 80]
+}
+```
+
+With that policy, `github.com`, `api.github.com` and any other subdomain of
+`github.com` are allowed. `api.example.com` is allowed. `example.com`,
+`v2.api.example.com` and `evilgithub.com` are denied. Case and IDNA spelling
+normalize the same way for both forms, so `=EXAMPLE.com` is the entry
+`=example.com`. A trailing root dot is rejected in a policy, as it is for a
+plain entry.
+
+Prefer `=name` when one host is enough. A broad entry also allows every
+subdomain, including user-content subdomains on a shared platform (residual R3
+in the [threat model](docs/threat-model.md)). `sbx check --policy` rejects `=`
+alone, `==name`, `=*.name`, `= name` and `=1.2.3.4` with the same messages as
+any other invalid domain, and any entry whose name normalises to start with `=`
+(for example a fullwidth `＝name`, which is not read as the marker).
+
 ## Host check
 
 `sbx check` reports what this host can run, and which fix would unlock more.
@@ -252,7 +281,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-71 checks in eight groups, the same code that `cargo test --test conformance`
+72 checks in eight groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 

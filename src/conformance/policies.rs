@@ -18,8 +18,14 @@ pub enum Builtin {
     NoNetwork,
 }
 
-/// The allow list of the transparent policy.
-pub const TRANSPARENT_ALLOW: [&str; 3] = ["allowed.conformance.test", "pypi.org", "localhost"];
+/// The allow list of the transparent policy. `=exact.conformance.test` is the
+/// exact-only rule A13 exercises (issue #44).
+pub const TRANSPARENT_ALLOW: [&str; 4] = [
+    "allowed.conformance.test",
+    "pypi.org",
+    "localhost",
+    "=exact.conformance.test",
+];
 /// The allow list of the explicit and none policies.
 pub const ALLOWED_ONLY: [&str; 1] = ["allowed.conformance.test"];
 

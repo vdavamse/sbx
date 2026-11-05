@@ -351,6 +351,116 @@ impl JsonSchema for Domain {
     }
 }
 
+/// One entry of `network.allow`: a [`Domain`], optionally exact-only.
+///
+/// `"github.com"` allows `github.com` and every subdomain of it. The same
+/// name written with a leading `=`, `"=github.com"`, allows `github.com`
+/// itself and nothing below it. The `=` is rule syntax, not part of the
+/// name: both forms normalize through [`Domain::parse`] identically, and
+/// the canonical text keeps the marker (`"=github.com"`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DomainRule {
+    domain: Domain,
+    exact: bool,
+}
+
+impl DomainRule {
+    /// Parse one allow-list entry: strip exactly one leading `=` (the
+    /// exact-only marker), then parse the rest with [`Domain::parse`].
+    ///
+    /// Anything the marker does not cover is rejected with the pinned
+    /// message, always quoting the whole entry as written: `=` alone,
+    /// `=*.a.com`, `= a.com` and `=1.2.3.4` fail in the Domain pipeline. A
+    /// normalized name that starts with `=` is rejected too: the URL
+    /// deny-list accepts `=` as an ordinary character, and UTS #46 folds
+    /// compatibility forms (fullwidth `＝`, `﹦`, `⁼`) and drops ignored code
+    /// points (soft hyphen, U+200B) in front of it, so without this check
+    /// `==a.com`, `＝a.com` or `=\u{AD}=a.com` would parse to a rule whose
+    /// canonical text re-parses differently (or not at all).
+    /// Runtime hosts never go through this: they use [`Domain::parse`]
+    /// directly, so `=` cannot be a marker there.
+    pub fn parse(raw: &str) -> Result<Self, DomainError> {
+        let (exact, name) = match raw.strip_prefix('=') {
+            Some(name) => (true, name),
+            None => (false, raw),
+        };
+        let domain = Domain::parse(name).map_err(|err| {
+            if exact {
+                let shown = err
+                    .0
+                    .replace(&format!("(got {name:?})"), &format!("(got {raw:?})"));
+                // Every pinned Domain message ends in `(got {name:?})`; a new
+                // one that does not would drop the marker from the quote.
+                debug_assert_ne!(shown, err.0, "message must quote the name");
+                DomainError(shown)
+            } else {
+                err
+            }
+        })?;
+        if domain.as_str().starts_with('=') {
+            return Err(DomainError(format!(
+                "not a valid domain name (got {raw:?})"
+            )));
+        }
+        Ok(Self { domain, exact })
+    }
+
+    /// The normalized domain this rule names, without any `=` marker.
+    pub fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
+    /// Whether the rule matches only the named host, not its subdomains.
+    pub fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// The canonical entry text: `"=<domain>"` when exact, `"<domain>"`
+    /// otherwise. Parsing this text yields an equal rule.
+    pub fn as_str(&self) -> Cow<'_, str> {
+        if self.exact {
+            Cow::Owned(format!("={}", self.domain.as_str()))
+        } else {
+            Cow::Borrowed(self.domain.as_str())
+        }
+    }
+}
+
+impl std::fmt::Display for DomainRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_str())
+    }
+}
+
+impl Serialize for DomainRule {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DomainRule {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        // Same as Domain: the DomainError Display is the pinned message.
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for DomainRule {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("DomainRule")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        // No `format: hostname`: a leading '=' is not a hostname character,
+        // so the format would reject the very entries this type adds.
+        json_schema!({
+            "type": "string",
+            "description": "A domain name from the allow list, written as for a domain (lowercase punycode, IDNA / UTS #46; wildcards and IP literals are rejected). The name matches itself and all of its subdomains. Prefix it with '=' (for example '=api.example.com') to match that exact host only, not its subdomains."
+        })
+    }
+}
+
 /// A sandbox policy: the versioned contract between a policy author and sbx.
 ///
 /// Every section is required — for a security artifact, explicit beats
@@ -410,8 +520,9 @@ pub struct Network {
     pub mode: NetworkMode,
 
     /// Domain names the sandbox may reach. Normalized to lowercase punycode;
-    /// wildcards and IP literals are rejected.
-    pub allow: Vec<Domain>,
+    /// wildcards and IP literals are rejected. A name allows itself and its
+    /// subdomains; prefix it with `=` to allow that exact host only.
+    pub allow: Vec<DomainRule>,
 
     /// Destination ports the sandbox may use. Port 0 is not a valid
     /// destination port and is rejected.
@@ -837,7 +948,7 @@ mod tests {
                 .network
                 .allow
                 .iter()
-                .map(Domain::as_str)
+                .map(|rule| rule.domain().as_str())
                 .collect::<Vec<_>>(),
             ["github.com", "pypi.org"]
         );
@@ -1116,7 +1227,7 @@ mod tests {
         // real DNS resolution, so these stay legal.
         for name in ["123.com", "1.2.3.4.com", "0xdead.beef"] {
             let policy = policy_of(&with_allow(name));
-            assert_eq!(policy.network.allow[0].as_str(), name);
+            assert_eq!(policy.network.allow[0].domain().as_str(), name);
         }
     }
 
@@ -1130,7 +1241,11 @@ mod tests {
         ];
         for (input, expected) in cases {
             let policy = policy_of(&with_allow(input));
-            assert_eq!(policy.network.allow[0].as_str(), expected, "{input:?}");
+            assert_eq!(
+                policy.network.allow[0].domain().as_str(),
+                expected,
+                "{input:?}"
+            );
         }
     }
 
@@ -1291,6 +1406,150 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- DomainRule (exact-only `=name` entries) --------------------------
+
+    #[test]
+    fn domain_rule_accepted_forms() {
+        // Plain names keep the subdomain-matching meaning; `=`-prefixed names
+        // are exact-only. Both shapes accept the same name grammar.
+        let label63 = "a".repeat(63);
+        for (raw, exact) in [
+            ("example.com", false),
+            ("localhost", false),
+            ("ex_ample.com", false),
+            ("123.com", false),
+            ("=example.com", true),
+            ("=api.example.com", true),
+            ("=localhost", true),
+            ("=ex_ample.com", true),
+            ("=123.com", true),
+            ("=0xdead.beef", true),
+            ("=a--b.com", true),
+            (format!("={label63}.com").as_str(), true),
+        ] {
+            let rule = DomainRule::parse(raw).unwrap_or_else(|err| panic!("{raw:?}: {err}"));
+            assert_eq!(rule.is_exact(), exact, "{raw:?}");
+        }
+        // The policy path accepts the same entries, mixed with plain ones.
+        let policy = policy_of(&draft_with(
+            r#""allow": ["github.com", "pypi.org"]"#,
+            r#""allow": ["=api.github.com", "pypi.org"]"#,
+        ));
+        let exact: Vec<bool> = policy
+            .network
+            .allow
+            .iter()
+            .map(DomainRule::is_exact)
+            .collect();
+        assert_eq!(exact, [true, false]);
+    }
+
+    #[test]
+    fn exact_rule_normalises_like_domain() {
+        // The `=` is stripped before normalization, so case, IDNA, fullwidth
+        // and the Domain pipeline's rules apply exactly as for plain names.
+        let cases = [
+            ("=EXAMPLE.COM", "=example.com"),
+            ("=例え.jp", "=xn--r8jz45g.jp"),
+            ("=XN--R8JZ45G.JP", "=xn--r8jz45g.jp"),
+            ("=ｅｘａｍｐｌｅ.ｃｏｍ", "=example.com"),
+            ("EXAMPLE.COM", "example.com"),
+            ("例え.jp", "xn--r8jz45g.jp"),
+        ];
+        for (input, expected) in cases {
+            let policy = policy_of(&with_allow(input));
+            let rule = &policy.network.allow[0];
+            assert_eq!(rule.as_str(), expected, "{input:?}");
+            assert_eq!(
+                rule.domain().as_str(),
+                expected.trim_start_matches('='),
+                "{input:?}"
+            );
+        }
+        // Still no root dot, even behind the marker.
+        let err = DomainRule::parse("=example.com.").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("not a valid domain name (got {:?})", "=example.com.")
+        );
+    }
+
+    #[test]
+    fn exact_rule_rejected_forms() {
+        // Everything the marker does not cover is rejected by the Domain
+        // pipeline with its pinned message; the `=` never reaches a host.
+        let not_valid = |raw: &str| format!("not a valid domain name (got {raw:?})");
+        let wildcard = |raw: &str| format!("wildcard domains are not allowed (got {raw:?})");
+        let ip =
+            |raw: &str| format!("IP literals are not allowed; use a domain name (got {raw:?})");
+        // Every message quotes the entry exactly as written.
+        let cases = [
+            ("=", not_valid("=")),
+            ("==a.com", not_valid("==a.com")),
+            ("=*.a.com", wildcard("=*.a.com")),
+            ("= a.com", not_valid("= a.com")),
+            ("=1.2.3.4", ip("=1.2.3.4")),
+            // Compatibility forms of `=` and ignored code points in front of
+            // it fold to a leading `=` under UTS #46 (review #44 M1).
+            ("\u{FF1D}a.com", not_valid("\u{FF1D}a.com")),
+            ("\u{FE66}a.com", not_valid("\u{FE66}a.com")),
+            ("\u{207C}a.com", not_valid("\u{207C}a.com")),
+            ("\u{AD}=a.com", not_valid("\u{AD}=a.com")),
+            ("\u{200B}=a.com", not_valid("\u{200B}=a.com")),
+            ("=\u{FF1D}a.com", not_valid("=\u{FF1D}a.com")),
+            ("=\u{AD}=a.com", not_valid("=\u{AD}=a.com")),
+            ("=\u{FF1D}", not_valid("=\u{FF1D}")),
+        ];
+        for (input, expected) in cases {
+            let err = DomainRule::parse(input).unwrap_err();
+            assert_eq!(err.to_string(), expected, "{input:?}");
+            // The policy path reports the identical text, as Domain does.
+            let policy_err = err_of(&with_allow(input));
+            assert!(policy_err.contains(&expected), "{input:?}: {policy_err}");
+        }
+    }
+
+    #[test]
+    fn domain_rule_canonical_round_trip() {
+        // The canonical text is `=<domain>` or `<domain>`; parsing it back
+        // yields an equal rule, through Display, serde and a whole policy.
+        for input in ["=a.com", "a.com", "=EXAMPLE.COM", "EXAMPLE.COM"] {
+            let rule = DomainRule::parse(input).unwrap_or_else(|err| panic!("{input:?}: {err}"));
+            let text = rule.to_string();
+            assert_eq!(text, rule.as_str(), "{input:?}");
+            assert_eq!(DomainRule::parse(&text), Ok(rule.clone()), "{input:?}");
+            let json = serde_json::to_string(&rule).expect("serializes");
+            assert_eq!(json, json_str(&text), "{input:?}");
+            let back: DomainRule = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, rule, "{input:?}");
+        }
+        // Whatever parses, its canonical text re-parses to the same rule
+        // (review #44 M1: no spelling may turn into a different rule).
+        for input in ["a=b.com", "=a=b.com", "=\u{FF41}.com", "\u{FF41}.com"] {
+            if let Ok(rule) = DomainRule::parse(input) {
+                assert_eq!(
+                    DomainRule::parse(&rule.to_string()),
+                    Ok(rule.clone()),
+                    "{input:?}"
+                );
+            }
+        }
+        assert_eq!(DomainRule::parse("=A.com").unwrap().to_string(), "=a.com");
+        assert_eq!(DomainRule::parse("A.com").unwrap().to_string(), "a.com");
+
+        let policy = policy_of(&draft_with(
+            r#""allow": ["github.com", "pypi.org"]"#,
+            r#""allow": ["=github.com", "pypi.org"]"#,
+        ));
+        let json = serde_json::to_value(&policy).expect("serializes");
+        assert_eq!(
+            json["network"]["allow"],
+            serde_json::json!(["=github.com", "pypi.org"])
+        );
+        let again = Policy::from_json_str(&json.to_string()).expect("re-parses");
+        assert_eq!(again, policy);
     }
 
     // ---- ports -----------------------------------------------------------
@@ -1577,8 +1836,21 @@ mod tests {
         // Validated newtypes: named $defs with their manual schemas.
         assert_eq!(defs["AbsolutePath"]["type"], "string");
         assert_eq!(defs["AbsolutePath"]["pattern"], "^/([^/]+/)*[^/]+$");
-        assert_eq!(defs["Domain"]["type"], "string");
-        assert_eq!(defs["Domain"]["format"], "hostname");
+        // Network.allow references DomainRule (the `=` marker is not a
+        // hostname character, so it carries no `format`); Domain is no
+        // longer reachable from the policy schema.
+        assert_eq!(defs["DomainRule"]["type"], "string");
+        assert!(defs["DomainRule"].get("format").is_none());
+        assert!(
+            defs["DomainRule"]["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("'='"))
+        );
+        assert_eq!(
+            defs["Network"]["properties"]["allow"]["items"]["$ref"],
+            "#/$defs/DomainRule"
+        );
+        assert!(defs.get("Domain").is_none());
 
         // u16 ports: range lands in the schema for free.
         let ports = &defs["Network"]["properties"]["ports"]["items"];

@@ -66,7 +66,7 @@
 //! nftables redirect, bwrap, …) from a probe that runs the very same setup
 //! stages, and `run` shares that classifier for its refusals (rc 125).
 //! [`conformance`] (issue #13) is `sbx check --conformance`: every security
-//! guarantee as an executable check (69 checks, eight groups): the host, init,
+//! guarantee as an executable check (72 checks, eight groups): the host, init,
 //! lab (a nested user/net/mount namespace with local fixtures) and opt-in
 //! network tiers.
 //! [`landlock`] (issue #19) is the optional Landlock layer behind `run --landlock`:

@@ -185,6 +185,14 @@ fn s1() -> Scn {
             Some(libc::EPERM),
             json!({"send_errno": libc::EPERM}),
         ),
+        dns("a13.exact", &x(60), 0, &["198.18.0.3"]),
+        dns("a13.sub", &x(61), 3, &[]),
+        tcp(
+            "a13.connect",
+            &x(62),
+            true,
+            reply("HTTP/1.1 403 Forbidden\r\n\r\n"),
+        ),
         dns("c06.a8", &x(40), 0, &["198.18.0.3"]),
         dns("c06.other8", &x(41), 3, &[]),
         dns("c06.a1", &x(42), 0, &["198.18.0.4"]),
@@ -290,6 +298,15 @@ fn s1() -> Scn {
             denied_dns(
                 "127.0.0.1:50030",
                 "other.conformance.test is not in the policy allow list",
+            ),
+            denied_dns(
+                "127.0.0.1:50061",
+                "sub.exact.conformance.test is not in the policy allow list",
+            ),
+            deny(
+                "127.0.0.1:50062",
+                "explicit-connect",
+                "sub.exact.conformance.test is not in the policy allow list",
             ),
             deny(
                 "127.0.0.1:50003",
@@ -713,6 +730,16 @@ fn bad(id: &str, control: bool) -> Option<Scns> {
             .retain(|r| r["client"] != format!("{TRANS}:50013")),
         ("A11", true) => edit!(s1_of(&mut m), "a01.a", |r: &mut OpResult| r.data["rcode"] =
             json!(3)),
+        ("A13", false) => edit!(
+            s1_of(&mut m),
+            "a13.sub",
+            |r: &mut OpResult| r.data["rcode"] = json!(0)
+        ),
+        ("A13", true) => edit!(
+            s1_of(&mut m),
+            "a13.exact",
+            |r: &mut OpResult| r.data["rcode"] = json!(3)
+        ),
         ("B10", false) => edit!(
             s1_of(&mut m),
             "b10.abs",
@@ -1005,9 +1032,9 @@ fn every_host_check_fails_on_its_assertion_mutation() {
 #[test]
 fn every_host_check_with_a_control_fails_as_control_when_the_control_breaks() {
     let with_control = [
-        "A07", "A08", "A09", "A11", "B10", "C04", "C13", "D01", "D03", "D04", "D05", "D06", "D07",
-        "D08", "D09", "F01", "F06", "G01", "G02", "G03", "G04", "G05", "H01", "H02", "H03", "H05",
-        "H06",
+        "A07", "A08", "A09", "A11", "A13", "B10", "C04", "C13", "D01", "D03", "D04", "D05", "D06",
+        "D07", "D08", "D09", "F01", "F06", "G01", "G02", "G03", "G04", "G05", "H01", "H02", "H03",
+        "H05", "H06",
     ];
     for id in with_control {
         let Some(m) = bad(id, true) else {
@@ -1023,6 +1050,20 @@ fn every_host_check_with_a_control_fails_as_control_when_the_control_breaks() {
             "{id} control break is not a control failure: {detail}"
         );
     }
+}
+
+#[test]
+fn a13_connect_leg_alone_regressing_is_a_fail() {
+    // DNS still refuses the subdomain, but the CONNECT leg's deny row is gone
+    // (a proxy matcher diverging from DNS): A13 must fail on its assertion.
+    let mut m = good();
+    m.get_mut("S1")
+        .unwrap()
+        .audit
+        .retain(|r| r["client"] != "127.0.0.1:50062");
+    let (st, detail, control) = status_of("A13", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+    assert!(!control, "{detail}");
 }
 
 #[test]

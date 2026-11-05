@@ -81,7 +81,7 @@ use hickory_proto::op::{Query, ResponseCode};
 use hickory_proto::rr::Name;
 
 use crate::egress;
-use crate::policy::{self, Domain};
+use crate::policy::{self, Domain, DomainRule};
 use crate::proxy::{AUDIT_TEXT_CAP, canonicalize_host};
 use wire::{Gate, HeaderOnly, Parsed};
 
@@ -334,7 +334,7 @@ pub trait DnsSink: Send + Sync + 'static {
 /// The resolver's shared state: the allow-list, the run's map, the sink.
 pub struct DnsServer {
     /// Cloned from `policy.network.allow`.
-    pub allow: Vec<Domain>,
+    pub allow: Vec<DomainRule>,
     /// The SAME `Arc` the proxy reads through [`crate::proxy::DnsMap`].
     pub map: Arc<FakeIpMap>,
     /// Audit seam.
@@ -626,6 +626,10 @@ mod tests {
         Domain::parse(raw).expect("test domain parses")
     }
 
+    fn rule(raw: &str) -> DomainRule {
+        DomainRule::parse(raw).expect("test rule parses")
+    }
+
     fn peer() -> SocketAddr {
         "127.0.0.1:40000".parse().expect("addr")
     }
@@ -691,7 +695,7 @@ mod tests {
         let map = Arc::new(FakeIpMap::new(&limits));
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: allow.iter().map(|s| dom(s)).collect(),
+            allow: allow.iter().map(|s| rule(s)).collect(),
             ports: vec![443],
         };
         let server = DnsServer::new(&network, Arc::clone(&map), sink.clone());
@@ -955,6 +959,27 @@ mod tests {
             "{:?}",
             decision.verdict
         );
+    }
+
+    #[test]
+    fn exact_rule_answers_only_the_named_host() {
+        // `=exact.test` (issue #44): the name itself is answered, a
+        // subdomain is NXDOMAIN with no fake IP allocated for it.
+        let network_allow = ["=exact.test"];
+        let (server, map, _sink) = server_with(&network_allow, DnsLimits::default());
+        let (exact, _) = handle(&server, &a_query(20, "exact.test"));
+        assert!(
+            matches!(exact.verdict, DnsVerdict::Answered { .. }),
+            "{:?}",
+            exact.verdict
+        );
+        let (sub, reply) = handle(&server, &a_query(21, "sub.exact.test"));
+        assert!(matches!(
+            sub.verdict,
+            DnsVerdict::Denied(DnsRejected::NotAllowed { .. })
+        ));
+        assert_eq!(rcode_of(&reply.expect("reply")), 3);
+        assert_eq!(map.ip_for(&dom("sub.exact.test")), None);
     }
 
     #[test]
@@ -1334,7 +1359,7 @@ mod tests {
         let sink = Arc::new(PanicOnceSink::default());
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: vec![dom("allowed.test")],
+            allow: vec![rule("allowed.test")],
             ports: vec![443],
         };
         let server = DnsServer::new(
