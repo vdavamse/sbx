@@ -90,6 +90,7 @@
 //!     [`crate::landlock`] module docs point 9.
 
 mod audit;
+pub(crate) mod cgroup;
 pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
@@ -443,6 +444,19 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     "non-string panic payload".to_owned()
 }
 
+/// The sandbox's limited cgroup (issue #43) when the policy sets
+/// `limits.memory_bytes` or `limits.pids`; `None` otherwise. A missing
+/// delegation is a refusal (125), never a silent drop.
+fn cgroup_for(policy: &Policy) -> Result<Option<cgroup::SandboxCgroup>, Early> {
+    let limits = cgroup::CgroupLimits::of(&policy.limits);
+    if !limits.any() {
+        return Ok(None);
+    }
+    cgroup::setup_live(limits)
+        .map(Some)
+        .map_err(|err| RunError::new(err.to_string()).into())
+}
+
 /// The `bwrap --version` gate (S6): the only spawn before the fd window. Bounded
 /// by the run deadline and interruptible by sbx's signals (a slow or hung
 /// `bwrap` must not outlive `--timeout`; the child is killed on overrun).
@@ -721,6 +735,11 @@ fn execute(
     // directory and the audit log (S5/S7 ran already).
     verify_launch(&launch)?;
 
+    // S8b (issue #43): the cgroup v2 limits. Prepared before the spawn so a
+    // missing delegation refuses (125) before anything runs; the limit is
+    // never dropped silently.
+    let limits_cgroup = cgroup_for(&policy)?;
+
     // S9–S11: the control socketpair and the single spawn window.
     let (parent_end, child_end) = fdpass::control_socketpair()
         .map_err(|err| RunError::new(format!("cannot create the control socketpair: {err}")))?;
@@ -764,6 +783,19 @@ fn execute(
     )
     .spawn()
     .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    // S11a (issue #43): __init forks nothing before the go byte, so moving it
+    // now puts bwrap and every payload process in the limited cgroup.
+    if let Some(cg) = &limits_cgroup {
+        if let Err(err) = cg.attach(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunError::new(err.to_string()).into());
+        }
+    }
+    // `limits_cgroup` is dropped (and the child cgroup removed) explicitly
+    // right after teardown has reaped the tree: this function ends in
+    // `process::exit`, which runs no destructors. Early returns before that
+    // point drop it normally.
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);
@@ -971,6 +1003,9 @@ fn execute(
         h.end_calls(keepalive::holder::CALL_GRACE);
     }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
+    // Issue #43: the tree is reaped; remove the limited cgroup now (the
+    // process::exit below would skip its Drop).
+    drop(limits_cgroup);
     outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`

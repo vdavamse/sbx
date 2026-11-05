@@ -632,6 +632,21 @@ pub struct Limits {
     /// Absent means "inherit".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address_space_bytes: Option<NonZeroU64>,
+
+    /// Optional: the most memory, in bytes, the whole sandbox may use at once
+    /// (cgroup v2 `memory.max` on a child cgroup, with swap pinned to 0 where
+    /// swap is accounted). Over it the kernel OOM-kills a sandboxed process.
+    /// It needs a delegated, writable cgroup: when none is available, the run
+    /// is refused (exit 125) rather than run without the limit. Absent means
+    /// "no cgroup limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<NonZeroU64>,
+
+    /// Optional: the most processes and threads the whole sandbox may hold at
+    /// once (cgroup v2 `pids.max` on a child cgroup). Same delegation rule as
+    /// `memory_bytes`. Absent means "no cgroup limit".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<NonZeroU64>,
 }
 
 // One duration contract for CLI flags and policy files: reuse
@@ -759,6 +774,8 @@ impl RawPolicy {
                 "limits.address_space_bytes",
                 self.limits.address_space_bytes,
             ),
+            ("limits.memory_bytes", self.limits.memory_bytes),
+            ("limits.pids", self.limits.pids),
         ] {
             if let Some(v) = value.filter(|v| v.get() > MAX_LIMIT) {
                 return Err(PolicyError(format!(
@@ -1750,6 +1767,8 @@ mod tests {
             "open_files",
             "file_bytes",
             "address_space_bytes",
+            "memory_bytes",
+            "pids",
         ] {
             for bad in ["0", "-1", "1.5", "\"64\"", "18446744073709551616"] {
                 let json = draft_with(
@@ -1999,6 +2018,8 @@ mod tests {
             "open_files",
             "file_bytes",
             "address_space_bytes",
+            "memory_bytes",
+            "pids",
         ] {
             let prop = &defs["Limits"]["properties"][field];
             assert!(
