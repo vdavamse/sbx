@@ -569,6 +569,10 @@ mod tests {
         let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
         let holder = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("the stop connects");
+            // Read the request first, as the real holder does: answering and
+            // closing before the client has sent its Stop races its write
+            // into EPIPE (seen on CI).
+            ctl::recv_frame(&conn).expect("the stop request arrives");
             let (op, payload) = Reply::Refused("session is stopping".into()).encode();
             ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
         });
