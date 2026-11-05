@@ -444,11 +444,13 @@ The filter also closes the other ways to reach those families:
 `kexec_load`, `kexec_file_load`, kernel modules (`init_module`, `finit_module`,
 `delete_module`), `open_by_handle_at`, the mount APIs (`mount`, `umount2`,
 `pivot_root`, `open_tree`, `open_tree_attr`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`, `mount_setattr`, `quotactl_fd`), `syslog`, `swapon`, `swapoff`, `reboot`, `acct` and,
-on x86_64, `iopl` and `ioperm`. `personality(2)` accepts only Docker's personas
+`fsmount`, `fspick`, `mount_setattr`), `quotactl`, `quotactl_fd`, `syslog`,
+`swapon`, `swapoff`, `reboot`, `acct` and, on x86_64, `iopl`, `ioperm` and
+`uselib`. `personality(2)` accepts only Docker's personas
 (`PER_LINUX`, `PER_LINUX32`, `UNAME26` and the query); `ADDR_NO_RANDOMIZE`
-fails, so `setarch -R` fails and gdb warns that it cannot disable address
-randomization. A payload started with a non-default personality (for example
+fails, so `setarch -R` fails, gdb warns that it cannot disable address
+randomization (`set disable-randomization off` silences it), and lldb cannot
+launch a process until `settings set target.disable-aslr false` is set. A payload started with a non-default personality (for example
 `sbx run` itself launched under `setarch -R`) cannot write that personality back.
 Behaviour changes: `perf`, `rr`, `bpftool`, `bpftrace`, `dmesg` and `keyctl` fail
 inside the sandbox, and tools that cache credentials in the kernel keyring

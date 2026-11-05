@@ -560,12 +560,12 @@ fn denylist_role() -> u8 {
             "syslog",
             libc::syscall(libc::SYS_syslog, 10 as c_long, 0 as c_long, 0 as c_long) as c_long,
         );
-        // ioperm(0, 0, 0) (x86_64, the tail of the deny chain): turning ports
-        // off needs no capability, so it succeeds unfiltered.
+        // ioperm(0x80, 1, 0) (x86_64, near the tail of the deny chain):
+        // turning a port off needs no capability, so it succeeds unfiltered.
         #[cfg(target_arch = "x86_64")]
         report(
             "ioperm",
-            libc::syscall(libc::SYS_ioperm, 0 as c_long, 0 as c_long, 0 as c_long) as c_long,
+            libc::syscall(libc::SYS_ioperm, 0x80 as c_long, 1 as c_long, 0 as c_long) as c_long,
         );
         report(
             "personality-query",
@@ -1709,11 +1709,25 @@ fn denylist_probes(sandboxed: bool) -> Result<std::collections::BTreeMap<String,
 /// on the NULL attr), `ioperm` (x86_64) and `personality-no-randomize`;
 /// `syslog` too where `dmesg_restrict` is 0. `bpf`, `userfaultfd`, `fsopen`
 /// and `open-by-handle-at` may already be EPERM from host sysctls or the
-/// capability drop. The host baseline (unfiltered, with capabilities of the
-/// test user) is printed for context only.
+/// capability drop. The host baseline (unfiltered) must leave at least one
+/// discriminating probe not EPERM; on a host that already denies them all
+/// (an outer seccomp profile) the scenario SKIPs, because the sandbox's
+/// EPERM would not prove the filter.
 fn seccomp_denylist_eperm() -> Result<(), String> {
     let host = denylist_probes(false)?;
     println!("host denylist baseline (unfiltered): {host:?}");
+    let proven: Vec<&str> = ["keyctl", "perf-event-open", "personality-no-randomize"]
+        .into_iter()
+        .chain(cfg!(target_arch = "x86_64").then_some("ioperm"))
+        .filter(|label| host.get(*label).is_some_and(|v| v != "errno=1"))
+        .collect();
+    if proven.is_empty() {
+        println!(
+            "SKIP seccomp-denylist-eperm: the host already denies every discriminating probe with EPERM"
+        );
+        return Ok(());
+    }
+    println!("discriminating probes (not EPERM on the host): {proven:?}");
     let map = denylist_probes(true)?;
     for label in [
         "keyctl",
