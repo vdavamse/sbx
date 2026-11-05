@@ -301,10 +301,11 @@ jobs:
           assert not fails, f"FAIL checks: {fails}"
           net = {"E01", "E02", "E03", "E04", "E05", "E06"}
           non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
-          want = {i: ("skip", "opt-in") for i in net}
+          # I04 (foreign uid, issue #18) is an opt-in skip on every host by design.
+          want = {i: ("skip", "opt-in") for i in net | {"I04"}}
           assert non_ok == want, f"unexpected non-ok set: {non_ok}"
           offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-          assert len(offline) == 46 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "66 offline checks must pass"
+          assert len(offline) == 52 + 19 + 1 and all(c["status"] in ("ok", "warn") or c["id"] == "I04" for c in offline), "72 offline checks must pass (I04 an opt-in skip)"
           assert rc == 0, f"rc {rc} (PR2 expects 0)"
           PY
           python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
@@ -549,8 +550,8 @@ jobs:
           fi
           LIST=$("$BIN" check --conformance --list 2>&1)
           check_rc 0 $? "sbx check --conformance --list"
-          [ "$(echo "$LIST" | grep -c '^  [A-H][0-9][0-9]  ')" -eq 72 ] || { echo "FAIL: --list is not 72 rows"; FAIL=1; }
-          "$BIN" check --conformance --list --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["checks"]) == 72' || { echo "FAIL: --list --json is not 72 checks"; FAIL=1; }
+          [ "$(echo "$LIST" | grep -c '^  [A-I][0-9][0-9]  ')" -eq 78 ] || { echo "FAIL: --list is not 78 rows"; FAIL=1; }
+          "$BIN" check --conformance --list --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["checks"]) == 78' || { echo "FAIL: --list --json is not 78 checks"; FAIL=1; }
           "$BIN" check --conformance --only Z99 > /dev/null 2>&1
           check_rc 2 $? "sbx check --conformance --only Z99"
           echo '{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}' > conf-policy.json
@@ -676,6 +677,23 @@ jobs:
 
           "$BIN" gc --older-than 0s /tmp/root > /dev/null 2>&1
           check_rc 2 $? "sbx gc with a zero --older-than (usage error)"
+
+          # Issue #18: persistent sessions. Usage errors are rc 2 before any holder,
+          # socket or namespace is touched; stop on a directory with no session is rc 0.
+          "$BIN" run --keep-alive --max-lifetime 25h --policy p.json --session-dir /tmp/s -- true > /dev/null 2>&1
+          check_rc 2 $? "sbx run --keep-alive --max-lifetime 25h (usage error)"
+
+          "$BIN" run --idle-timeout 1s --policy p.json --session-dir /tmp/s -- true > /dev/null 2>&1
+          check_rc 2 $? "sbx run --idle-timeout without --keep-alive (usage error)"
+
+          "$BIN" attach --policy p.json --session-dir /tmp/s > /dev/null 2>&1
+          check_rc 2 $? "sbx attach without a command (usage error)"
+
+          "$BIN" stop > /dev/null 2>&1
+          check_rc 2 $? "sbx stop without --session-dir (usage error)"
+
+          "$BIN" stop --session-dir /tmp/sbx-smoke-no-such-session > /dev/null 2>&1
+          check_rc 0 $? "sbx stop on a directory with no session"
 
           exit "$FAIL"
 

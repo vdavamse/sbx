@@ -89,6 +89,7 @@
 //!     [`crate::landlock`] module docs point 9.
 
 mod audit;
+pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
 mod plan;
@@ -121,8 +122,8 @@ use crate::policy::Policy;
 use crate::proxy::Proxy;
 use sys::pollfd;
 
-use audit::{AuditLog, exit_row, open_audit, ts};
-use lifecycle::{Cause, Pid1, Sandbox, main_loop, teardown};
+use audit::{AuditLog, exit_row_for, open_audit, ts};
+use lifecycle::{Cause, Pid1, Sandbox, main_loop, supervise, teardown};
 use mode::{effective_network, fallback_notice, refusal};
 use plan::{
     absolutize, audit_inside_session, effective_timeout, exit_code, lexical_normalize, passed_env,
@@ -169,6 +170,12 @@ pub struct RunArgs {
     pub landlock: crate::landlock::Mode,
     /// `--landlock-bind-tcp` ports (issue #19), in command-line order.
     pub landlock_bind_tcp: Vec<u16>,
+    /// `--keep-alive`: start a persistent session holder (issue #18).
+    pub keep_alive: bool,
+    /// `--idle-timeout` (keep-alive only); None = [`keepalive::limits::DEFAULT_IDLE`].
+    pub idle_timeout: Option<Duration>,
+    /// `--max-lifetime` (keep-alive only); None = the 8h default.
+    pub max_lifetime: Option<Duration>,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -210,34 +217,67 @@ pub enum Outcome {
 }
 
 /// The CLI seam. Pre-spawn failures return 125; every path after the `__init`
-/// spawn ends in `process::exit` (the runtime is never dropped).
+/// spawn ends in `process::exit` (the runtime is never dropped). `--keep-alive`
+/// forks a session holder first (see [`keepalive::holder`]).
 pub fn run(args: RunArgs) -> ExitCode {
+    if args.keep_alive {
+        return keepalive::holder::launch(args);
+    }
+    run_session(args, None)
+}
+
+/// The run body shared by a plain run (`hold` is `None`) and the session holder
+/// (`hold` is `Some`, issue #18: it reports readiness to the launcher and the
+/// session's exit rows carry `call_id` 0).
+pub(crate) fn run_session(args: RunArgs, mut hold: Option<keepalive::holder::Hold>) -> ExitCode {
     let t0 = Instant::now();
     let mut audit: Option<Arc<AuditLog>> = None;
+    let call_id = hold.is_some().then_some(0);
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute(args, t0, &mut audit)
+        execute(args, t0, &mut audit, &mut hold)
     }));
     std::panic::set_hook(previous_hook);
     let failure = match result {
         Ok(Ok(never)) => match never {},
         Ok(Err(Early::Failed(err))) => err.reason().to_owned(),
-        Ok(Err(Early::Signal(sig))) => conclude(
-            Outcome::Terminated(sig),
-            audit.as_deref(),
-            t0,
-            Conclusion::default(),
-        ),
-        Ok(Err(Early::TimedOut(limit))) => conclude(
-            Outcome::TimedOut(limit),
-            audit.as_deref(),
-            t0,
-            Conclusion::default(),
-        ),
+        Ok(Err(Early::Signal(sig))) => {
+            let text = format!("terminated by signal {sig}");
+            if let Some(h) = hold.as_mut() {
+                h.fail(&text);
+            }
+            conclude(
+                Outcome::Terminated(sig),
+                audit.as_deref(),
+                t0,
+                Conclusion {
+                    call_id,
+                    ..Conclusion::default()
+                },
+            )
+        }
+        Ok(Err(Early::TimedOut(limit))) => {
+            let text = format!("timed out after {limit:?}");
+            if let Some(h) = hold.as_mut() {
+                h.fail(&text);
+            }
+            conclude(
+                Outcome::TimedOut(limit),
+                audit.as_deref(),
+                t0,
+                Conclusion {
+                    call_id,
+                    ..Conclusion::default()
+                },
+            )
+        }
         Err(payload) => format!("internal error: {}", panic_text(payload.as_ref())),
     };
-    report_failure(&failure, t0, audit.as_deref())
+    if let Some(h) = hold.as_mut() {
+        h.fail(&failure);
+    }
+    report_failure(&failure, t0, audit.as_deref(), call_id)
 }
 
 /// Why `execute` stopped before the supervised phase: an sbx failure (125), a
@@ -257,6 +297,8 @@ impl From<RunError> for Early {
 /// Facts about the run that only the end of the run knows.
 #[derive(Default)]
 struct Conclusion {
+    /// Persistent sessions only (issue #18): the call id of the exit row.
+    call_id: Option<u32>,
     truncated: bool,
     poisoned: bool,
     stragglers: bool,
@@ -271,16 +313,29 @@ struct Conclusion {
 /// The final step of every run that got past S5: M1 (an audit write failure
 /// anywhere in the run is a failure, never a silent success), the exit row,
 /// the diagnostics (after the pumps are done, m8), then `process::exit`.
-fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: Conclusion) -> ! {
+fn conclude(outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: Conclusion) -> ! {
+    std::process::exit(conclude_prepare(outcome, audit, t0, facts))
+}
+
+/// The run's last writes (the exit row and sbx's diagnostics); returns the exit
+/// code without exiting, so the caller can release its locks and answer its
+/// peers first.
+fn conclude_prepare(
+    mut outcome: Outcome,
+    audit: Option<&AuditLog>,
+    t0: Instant,
+    facts: Conclusion,
+) -> i32 {
     if let Some(audit) = audit {
         mark_audit_failure(&mut outcome, audit);
-        audit.finish(&exit_row(
+        audit.finish(&exit_row_for(
             ts(SystemTime::now()),
             &outcome,
             t0.elapsed(),
             facts.truncated,
             facts.poisoned,
             facts.net_mode,
+            facts.call_id,
         ));
         mark_audit_failure(&mut outcome, audit);
     }
@@ -298,7 +353,7 @@ fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: 
         lines.push("sbx run: sandbox did not exit within 5s of SIGKILL".to_owned());
     }
     write_diagnostics(facts.stderr_partial, &lines);
-    std::process::exit(exit_code(&outcome))
+    exit_code(&outcome)
 }
 
 /// Writes sbx's own stderr lines, best effort (review 4): a closed or broken stderr
@@ -354,15 +409,21 @@ fn ready_wait_cause(
 }
 
 /// The single site that writes the `sbx run: ` prefix for pre-spawn failures.
-fn report_failure(reason: &str, t0: Instant, audit: Option<&AuditLog>) -> ExitCode {
+fn report_failure(
+    reason: &str,
+    t0: Instant,
+    audit: Option<&AuditLog>,
+    call_id: Option<u32>,
+) -> ExitCode {
     if let Some(audit) = audit {
-        audit.finish(&exit_row(
+        audit.finish(&exit_row_for(
             ts(SystemTime::now()),
             &Outcome::Failed(reason.to_owned()),
             t0.elapsed(),
             false,
             false,
             None,
+            call_id,
         ));
     }
     write_diagnostics(false, &[format!("sbx run: {reason}")]);
@@ -497,11 +558,21 @@ fn execute(
     args: RunArgs,
     t0: Instant,
     audit_slot: &mut Option<Arc<AuditLog>>,
+    hold: &mut Option<keepalive::holder::Hold>,
 ) -> Result<Infallible, Early> {
     // S3 first: the policy is read BEFORE any signal is blocked (review 5). The open
     // is non-blocking and a non-regular file is refused, so a FIFO or device cannot
     // hang the run with the signals masked.
-    let policy = load_policy(&args.policy)?;
+    // A holder pins the exact bytes it parsed (issue #18); a plain run does not keep them.
+    let (policy, pinned): (Policy, Option<Vec<u8>>) = if hold.is_some() {
+        let bytes = keepalive::pin::read_policy_bytes(&args.policy).map_err(RunError::new)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| RunError::new(format!("{} is not valid UTF-8", args.policy.display())))?;
+        let policy = Policy::from_json_str(text).map_err(|err| RunError::new(err.to_string()))?;
+        (policy, Some(bytes))
+    } else {
+        (load_policy(&args.policy)?, None)
+    };
 
     // S1–S2: signal state before any thread and before any spawn.
     sys::reset_sigchld();
@@ -523,7 +594,21 @@ fn execute(
         .iter()
         .map(|p| p.as_path().to_path_buf())
         .collect();
-    let timeout = effective_timeout(args.timeout, policy.limits.timeout);
+    // A session that attach can join needs the nftables redirect (issue #18):
+    // refuse before anything is spawned when the policy is not transparent.
+    if hold.is_some() && policy.network.mode != crate::policy::NetworkMode::Transparent {
+        return Err(RunError::new(
+            "--keep-alive needs network mode transparent: attach joins the session's nftables rules, which explicit and none policies do not load",
+        )
+        .into());
+    }
+    // A holder's setup is bounded like any run's (SETUP_TIMEOUT). Its lifetime is
+    // not: the session clock (`--max-lifetime`) starts at t0 and bounds it, and the
+    // resident is never bound by the policy's limits.timeout (issue #18, review 6).
+    let timeout = match hold.as_ref() {
+        Some(_) => SETUP_TIMEOUT,
+        None => effective_timeout(args.timeout, policy.limits.timeout),
+    };
     let deadline = deadline_from(t0, timeout);
     let session = lexical_normalize(&absolutize(&args.session_dir)?);
     let audit_path = match &args.audit {
@@ -550,6 +635,9 @@ fn execute(
 
     // S4: the session lock comes before materialize and before any audit row.
     let lock = SessionLock::acquire(&session)?;
+    if hold.is_some() {
+        keepalive::holder::redirect_log(&session)?;
+    }
 
     // S5: the audit log (refuses before any spawn).
     let latch = FaultLatch::new()
@@ -597,27 +685,16 @@ fn execute(
     // here (O_CLOEXEC, like every std open) and becomes the shim's program, and a
     // status pipe carries the shim's failure reason back (M1). The read end is
     // non-blocking; the write end is handed over in the spawn window.
-    let (exe_file, status_pipe) = match args.landlock {
-        crate::landlock::Mode::Off => (None, None),
-        _ => {
-            let exe = File::open("/proc/self/exe")
-                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
-            let pipe = sys::pipe_cloexec().map_err(|err| {
-                RunError::new(format!("cannot create the shim status pipe: {err}"))
-            })?;
-            (Some(exe), Some(pipe))
-        }
-    };
-    let landlock_layer = match (&exe_file, &status_pipe) {
-        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
-            mode: args.landlock,
-            bind_tcp: args.landlock_bind_tcp.clone(),
-            exe_fd: file.as_raw_fd(),
-            status_fd: status_write.as_raw_fd(),
-            host_abi: crate::landlock::host_abi(),
-        }),
-        _ => None,
-    };
+    let LandlockSetup {
+        exe: exe_file,
+        status: status_pipe,
+    } = landlock_setup(args.landlock)?;
+    let landlock_layer = landlock_layer(
+        &exe_file,
+        &status_pipe,
+        args.landlock,
+        &args.landlock_bind_tcp,
+    );
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -631,18 +708,10 @@ fn execute(
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
-    // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
-    // will resolve under a bind cover, rw or ro (fd-relative, no symlinks,
-    // nothing missing under an rw policy bind), and that no deny mask is reachable through a
-    // host symlink. Refusal is 125; nothing is created outside the session
+    // S8a (#39/#40, N19): before anything is spawned, verify the launch (see
+    // verify_launch). Refusal is 125; nothing is created outside the session
     // directory and the audit log (S5/S7 ran already).
-    for check in launch.path_checks() {
-        crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
-    }
-    crate::bwrap::guard::verify_aliases(launch.alias_checks())
-        .map_err(|err| RunError::new(err.to_string()))?;
-    crate::bwrap::guard::verify_binds(launch.bind_specs())
-        .map_err(|err| RunError::new(err.to_string()))?;
+    verify_launch(&launch)?;
 
     // S9–S11: the control socketpair and the single spawn window.
     let (parent_end, child_end) = fdpass::control_socketpair()
@@ -717,6 +786,7 @@ fn execute(
     // The map is shared by the proxies and the resolver, and read at teardown.
     let map = Arc::new(FakeIpMap::new(&DnsLimits::default()));
     let mut pumps: Option<Pumps> = None;
+    let mut holder: Option<keepalive::holder::Holder> = None;
 
     // S13–S17. Any failure here is a Cause::Setup and goes through teardown.
     // The achieved network mode, recorded on the exit row (issue #11, Q5).
@@ -753,6 +823,37 @@ fn execute(
                 net_mode = Some(mode.label());
                 if let AchievedMode::Explicit { reason, .. } = &mode {
                     write_diagnostics(false, &[fallback_notice(reason, policy.network.mode)]);
+                }
+                // Issue #18: a session that fell back to explicit mode can never be
+                // attached (no nftables rules to join): refuse it at startup.
+                if hold.is_some() && !matches!(mode, AchievedMode::Transparent) {
+                    return Err(Cause::Setup(RunError::new(
+                        "--keep-alive needs the transparent network mode, but this host provides only explicit (the nftables redirect is unavailable); attach could not join this session; run `sbx check`",
+                    )));
+                }
+                // Issue #18: bind sbx.ctl and capture the session namespaces
+                // while __init is parked, before the go byte. The Landlock settings
+                // are the session's: an attach applies exactly these.
+                if let Some(h) = hold.as_ref() {
+                    holder = Some(
+                        keepalive::holder::prepare(
+                            h,
+                            t0,
+                            &session,
+                            sb.bwrap_pid,
+                            keepalive::holder::HolderInputs {
+                                pin_bytes: pinned.clone().unwrap_or_default(),
+                                net_mode: mode.label(),
+                                audit: audit.clone(),
+                                map: map.clone(),
+                                landlock: keepalive::proto::SessionLandlock {
+                                    mode: args.landlock,
+                                    bind_tcp: args.landlock_bind_tcp.clone(),
+                                },
+                            },
+                        )
+                        .map_err(Cause::Setup)?,
+                    );
                 }
                 fds
             }
@@ -825,19 +926,117 @@ fn execute(
         })?;
         sb.go_sent = true;
         drop(parent_end);
+        // Issue #18: the session is up. The launcher may return now.
+        if let Some(h) = hold.as_mut() {
+            h.signal_ready();
+        }
         Ok(())
     })();
 
     // S18: supervise until the first cause, then tear down.
     let cause = match startup {
-        Ok(()) => main_loop(&mut sb, &signals, &latch, deadline, timeout),
+        Ok(()) => match holder.as_mut() {
+            // A holder's supervisor also serves the control socket (issue #18).
+            Some(h) => supervise(
+                &mut sb,
+                &signals,
+                &latch,
+                deadline_from(t0, Duration::from_secs(60 * 60 * 24 * 365 * 100)),
+                timeout,
+                h,
+            ),
+            None => main_loop(&mut sb, &signals, &latch, deadline, timeout),
+        },
         Err(cause) => cause,
     };
+    if let Some(h) = holder.as_mut() {
+        h.end_calls(keepalive::holder::CALL_GRACE);
+    }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
-    // M1 and round 3 item 2: the status pipe says whether the shim started and
-    // whether it failed (module docs point 11). It ends the run as `failed` only
-    // when the payload's own outcome is not already a failure.
-    if let Some(bytes) = status_read.as_ref().and_then(read_status) {
+    outcome = landlock_status_outcome(outcome, status_read.as_ref());
+    let _ = lock.touch();
+    // The exit row is written before the lock is released and before a `sbx stop`
+    // is answered (issue #18, review 2): a stop that returns has left the audit
+    // file complete and the directory free for the next holder.
+    let code = conclude_prepare(
+        outcome,
+        Some(&audit),
+        t0,
+        Conclusion {
+            call_id: hold.is_some().then_some(0),
+            truncated: end.truncated,
+            stderr_partial: end.stderr_partial,
+            poisoned: map.poisoned(),
+            stragglers,
+            cap: policy.limits.output_bytes,
+            net_mode,
+        },
+    );
+    // Review 6 of #57: the control socket is closed before the lock is released,
+    // and the stops are answered after both (exit row, socket and lock are done).
+    let stops = holder.take().map(|h| h.close_control());
+    drop(lock);
+    if let Some(stops) = stops {
+        stops.answer();
+    }
+    std::process::exit(code)
+}
+
+/// The Landlock descriptors of one launch (issue #19): sbx's own executable, for
+/// the shim, and the shim's status pipe. Both are opened only under a layer.
+pub(crate) struct LandlockSetup {
+    pub(crate) exe: Option<File>,
+    /// The status pipe: (read end, write end).
+    pub(crate) status: Option<(OwnedFd, OwnedFd)>,
+}
+
+/// Opens the descriptors a launch with `mode` needs (none when `mode` is off).
+/// `run` and every persistent-session attach call go through this one function
+/// (issue #18 with #56: the layer is the session's in both).
+pub(crate) fn landlock_setup(mode: crate::landlock::Mode) -> Result<LandlockSetup, RunError> {
+    match mode {
+        crate::landlock::Mode::Off => Ok(LandlockSetup {
+            exe: None,
+            status: None,
+        }),
+        _ => {
+            let exe = File::open("/proc/self/exe")
+                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
+            let pipe = sys::pipe_cloexec().map_err(|err| {
+                RunError::new(format!("cannot create the shim status pipe: {err}"))
+            })?;
+            Ok(LandlockSetup {
+                exe: Some(exe),
+                status: Some(pipe),
+            })
+        }
+    }
+}
+
+/// The [`crate::landlock::Layer`] for a launch, or `None` when there is none.
+pub(crate) fn landlock_layer(
+    exe: &Option<File>,
+    status: &Option<(OwnedFd, OwnedFd)>,
+    mode: crate::landlock::Mode,
+    bind_tcp: &[u16],
+) -> Option<crate::landlock::Layer> {
+    match (exe, status) {
+        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
+            mode,
+            bind_tcp: bind_tcp.to_vec(),
+            exe_fd: file.as_raw_fd(),
+            status_fd: status_write.as_raw_fd(),
+            host_abi: crate::landlock::host_abi(),
+        }),
+        _ => None,
+    }
+}
+
+/// The outcome after the shim's status pipe is read (issue #19 M1 and round 3
+/// item 2): the pipe says whether the shim started and whether it failed. It ends
+/// the run as `failed` only when the payload's own outcome is not already one.
+pub(crate) fn landlock_status_outcome(mut outcome: Outcome, status: Option<&OwnedFd>) -> Outcome {
+    if let Some(bytes) = status.and_then(read_status) {
         match crate::landlock::decode_status(&bytes) {
             crate::landlock::StatusReport::Started => {}
             crate::landlock::StatusReport::Failed(reason) => {
@@ -854,20 +1053,7 @@ fn execute(
             }
         }
     }
-    let _ = lock.touch();
-    conclude(
-        outcome,
-        Some(&audit),
-        t0,
-        Conclusion {
-            truncated: end.truncated,
-            stderr_partial: end.stderr_partial,
-            poisoned: map.poisoned(),
-            stragglers,
-            cap: policy.limits.output_bytes,
-            net_mode,
-        },
-    )
+    outcome
 }
 
 /// Reads the shim's status pipe without blocking (issue #19 M1): the bytes there
@@ -888,6 +1074,22 @@ fn read_status(fd: &OwnedFd) -> Option<Vec<u8>> {
         }
     }
     Some(bytes)
+}
+
+/// The S8a pre-launch verification of a built launch (#39/#40, N19): every path
+/// bwrap will resolve under a bind cover (rw or ro) is a real directory chain,
+/// no deny mask is reachable through a host symlink, and no two binds overlap
+/// through a host symlink. Run before any spawn, by `run` and by every attach
+/// call (a payload can plant a link between the resident's start and an attach).
+pub(crate) fn verify_launch(launch: &crate::bwrap::Launch) -> Result<(), RunError> {
+    for check in launch.path_checks() {
+        crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
+    }
+    crate::bwrap::guard::verify_aliases(launch.alias_checks())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    crate::bwrap::guard::verify_binds(launch.bind_specs())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    Ok(())
 }
 
 /// Which writable location an audit path collides with (for the pinned messages).

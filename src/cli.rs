@@ -103,12 +103,28 @@ pub enum Cmd {
 
         /// Kill the command after this long (e.g. 90s, 2h); default and upper
         /// bound: the policy's limits.timeout.
-        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration, conflicts_with = "keep_alive")]
         timeout: Option<Duration>,
 
         /// Audit log file (JSON Lines).
         #[arg(long, value_name = "FILE")]
         audit: Option<PathBuf>,
+
+        /// Start a persistent session: `CMD` becomes its resident command and
+        /// the session stays up for `sbx attach` until it idles out, reaches
+        /// its max lifetime, or `sbx stop` ends it (issue #18).
+        #[arg(long)]
+        keep_alive: bool,
+
+        /// (with --keep-alive) End the session after no attached call has run
+        /// for this long (default 15m).
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration, requires = "keep_alive")]
+        idle_timeout: Option<Duration>,
+
+        /// (with --keep-alive) End the session this long after it started
+        /// (default 8h; at most 24h).
+        #[arg(long, value_name = "DURATION", value_parser = crate::run::keepalive::limits::parse_max_lifetime, requires = "keep_alive")]
+        max_lifetime: Option<Duration>,
 
         /// Command to run, verbatim — everything after `--`.
         //
@@ -142,6 +158,43 @@ pub enum Cmd {
         /// ephemeral range). Without a port, binds are denied.
         #[arg(long = "landlock-bind-tcp", value_name = "PORT", value_parser = clap::value_parser!(u16))]
         landlock_bind_tcp: Vec<u16>,
+    },
+
+    /// Run a command in a persistent session started with `run --keep-alive`
+    /// (issue #18). The policy must be byte-identical to the session's.
+    Attach {
+        /// Sandbox policy file (JSON); must match the session's policy exactly.
+        #[arg(long, value_name = "PATH")]
+        policy: PathBuf,
+
+        /// The session directory of the running session.
+        #[arg(long, value_name = "DIR")]
+        session_dir: PathBuf,
+
+        /// Working directory for the command inside the sandbox.
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+
+        /// Kill this call after this long (rc 124); default: the policy's limits.timeout.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        timeout: Option<Duration>,
+
+        /// Command to run, verbatim — everything after `--`.
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            num_args = 1..,
+            required = true
+        )]
+        cmd: Vec<OsString>,
+    },
+
+    /// End a persistent session: kill its calls and resident, then remove its
+    /// control socket. Idempotent (rc 0 when nothing is running).
+    Stop {
+        /// The session directory of the running session.
+        #[arg(long, value_name = "DIR")]
+        session_dir: PathBuf,
     },
 
     /// Report what this host can run, or validate a policy file.
@@ -258,8 +311,18 @@ pub enum Cmd {
         // discipline). Validated in the pipeline's `control` stage BEFORE
         // any namespace work, so a bad fd fails fast and deterministically.
         // `//` rationale, not `///`: clap renders doc comments as help text.
-        #[arg(long, value_name = "FD", value_parser = parse_control_fd, required_unless_present = "probe")]
+        #[arg(long, value_name = "FD", value_parser = parse_control_fd, required_unless_present_any = ["probe", "join_user"])]
         fd: Option<RawFd>,
+
+        /// (hidden) Issue #18: the session's user-namespace descriptor (selects the join pipeline).
+        //
+        // `run`'s attach path passes the holder's descriptors (see keepalive::attach).
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd, requires = "join_net", conflicts_with_all = ["fd", "probe", "min_mode", "test_break_rules"])]
+        join_user: Option<RawFd>,
+
+        /// (hidden) Issue #18: the session's network-namespace descriptor.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd, requires = "join_user")]
+        join_net: Option<RawFd>,
 
         /// (hidden) The bwrap `--info-fd` pipe write end `run` hands through.
         //
@@ -517,6 +580,9 @@ pub fn run() -> ExitCode {
             cwd,
             timeout,
             audit,
+            keep_alive,
+            idle_timeout,
+            max_lifetime,
             cmd,
             test_break_rules,
             landlock,
@@ -531,6 +597,9 @@ pub fn run() -> ExitCode {
             test_break_rules,
             landlock,
             landlock_bind_tcp,
+            keep_alive,
+            idle_timeout,
+            max_lifetime,
         }),
         Cmd::Landlock {
             exe_fd,
@@ -549,6 +618,20 @@ pub fn run() -> ExitCode {
             rules: rule,
             cmd,
         }),
+        Cmd::Attach {
+            policy,
+            session_dir,
+            cwd,
+            timeout,
+            cmd,
+        } => crate::run::keepalive::client::attach(crate::run::keepalive::client::AttachArgs {
+            policy,
+            session_dir,
+            cwd,
+            timeout,
+            cmd,
+        }),
+        Cmd::Stop { session_dir } => crate::run::keepalive::client::stop(session_dir),
         Cmd::Check {
             print_schema: true, ..
         } => check_print_schema(),
@@ -580,6 +663,8 @@ pub fn run() -> ExitCode {
         }),
         Cmd::Init {
             fd,
+            join_user,
+            join_net,
             keep_fd,
             seccomp_fd,
             exe_fd,
@@ -594,11 +679,14 @@ pub fn run() -> ExitCode {
             if probe {
                 return crate::init::probe::run_probe(bwrap, test_break_rules);
             }
-            let Some(fd) = fd else {
-                unreachable!("clap enforces --fd unless --probe")
+            // `--fd` is required unless `--probe` or the join form (clap enforces it).
+            let join = match (join_user, join_net) {
+                (Some(user), Some(net)) => Some((user, net)),
+                _ => None,
             };
             crate::init::run_init(crate::init::InitArgs {
-                fd,
+                fd: fd.unwrap_or(-1),
+                join,
                 keep_fd,
                 seccomp_fd,
                 exe_fd,
@@ -680,10 +768,14 @@ mod tests {
                 cwd,
                 timeout,
                 audit,
+                keep_alive,
+                idle_timeout,
+                max_lifetime,
                 cmd,
                 test_break_rules,
                 ..
             } => {
+                assert!(!keep_alive && idle_timeout.is_none() && max_lifetime.is_none());
                 assert!(!test_break_rules);
                 assert_eq!(policy, Path::new("p.json"));
                 assert_eq!(session_dir, Path::new("/tmp/s"));

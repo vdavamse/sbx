@@ -7,13 +7,14 @@
 //! controls) harder to reason about. The same reasoning as `sandbox_check`.
 //!
 //! Gates (SKIP-with-message, exit 0; any assertion failure exits 1):
-//! * the report is produced and parsed (`kind`, `version`, 72 checks in
+//! * the report is produced and parsed (`kind`, `version`, 78 checks in
 //!   catalog order, matching `--list --json`);
 //! * no check FAILs; the rc matches `summary.conformant`;
 //! * PR2 state: every offline check is `ok` (or `warn`); the E checks are
 //!   `opt-in` without `SBX_CONFORMANCE_NETWORK=1` and `ok` with it (E05 may be
 //!   an opt-in skip when `npm` is absent); no capability or not-implemented
-//!   skip exists on a host that can run sandboxes;
+//!   skip exists on a host that can run sandboxes, except I04 (foreign uid),
+//!   which is an opt-in skip on every host by design (it needs a second uid);
 //! * when the host cannot run sandboxes at all, the suite prints
 //!   `SKIP conformance: host cannot run sandboxes` and exits 0.
 //!
@@ -105,13 +106,13 @@ fn list_scenario() -> Result<(), String> {
         .lines()
         .filter(|l| l.starts_with("  ") && l.len() > 6)
         .count();
-    if rows != 72 {
-        return Err(format!("--list printed {rows} rows, expected 72"));
+    if rows != 78 {
+        return Err(format!("--list printed {rows} rows, expected 78"));
     }
     let json = sbx(&["check", "--conformance", "--list", "--json"])?;
     let v: serde_json::Value =
         serde_json::from_str(&text(&json)).map_err(|e| format!("--list --json: {e}"))?;
-    if v["kind"] != "conformance-catalog" || v["checks"].as_array().map(Vec::len) != Some(72) {
+    if v["kind"] != "conformance-catalog" || v["checks"].as_array().map(Vec::len) != Some(78) {
         return Err("--list --json: wrong shape".to_owned());
     }
     Ok(())
@@ -271,7 +272,7 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         .iter()
         .map(|c| c["id"].as_str().unwrap_or(""))
         .collect();
-    if got != want || got.len() != 72 {
+    if got != want || got.len() != 78 {
         return Err(format!(
             "report ids differ from the catalog: {} entries",
             got.len()
@@ -285,6 +286,8 @@ fn full_report_scenario() -> Result<Option<String>, String> {
         .iter()
         .filter(|c| matches!(c["tier"].as_str(), Some("host" | "lab" | "init")))
         .collect();
+    // A host that cannot run sandboxes skips every offline check as a capability
+    // skip, I04 included (the gate in `run_one` orders capability before opt-in).
     let all_capability = !offline.is_empty()
         && offline
             .iter()
@@ -316,6 +319,8 @@ fn full_report_scenario() -> Result<Option<String>, String> {
                     c["status"], kind
                 ));
             }
+        } else if id == "I04" && c["status"] == "skip" && kind == Some("opt-in") {
+            // Group I's foreign-uid check: an opt-in skip where sandboxes work.
         } else if c["status"] != "ok" && c["status"] != "warn" {
             return Err(format!(
                 "{id}: expected ok, got {} ({})",

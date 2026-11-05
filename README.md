@@ -107,6 +107,12 @@ sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] [--audit FILE]
         [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
         -- COMMAND [ARGS...]
+sbx run --keep-alive --policy policy.json --session-dir DIR
+        [--idle-timeout DURATION] [--max-lifetime DURATION]
+        [--audit FILE] -- COMMAND [ARGS...]
+sbx attach --policy policy.json --session-dir DIR [--cwd PATH]
+        [--timeout DURATION] -- COMMAND [ARGS...]
+sbx stop --session-dir DIR
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -281,7 +287,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-72 checks in eight groups, the same code that `cargo test --test conformance`
+78 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -300,6 +306,10 @@ checks that prove it, and lists what they do not prove.
   no path open; a broken nftables load or audit log ends the run with rc 125.
 - **G: cleanup** (`cleanup`): background processes die on exit, timeout and
   signals; the sandbox network namespace is empty afterwards.
+- **I: persistent sessions** (`session`): an attached call cannot see or signal
+  the resident or another call; a holder SIGKILL ends the resident and the calls;
+  a different policy is refused; a foreign-uid connection is refused (an opt-in
+  skip here, see the threat model); the idle and max-lifetime ends. Needs bwrap.
 - **H: secrets** (`secrets`): the caller's environment, `/proc` environments,
   inherited descriptors, HOME and processes are not visible to the payload.
 
@@ -638,6 +648,84 @@ about 14 ms to every exec of the binary (the same build measured there:
 binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
 build is not the cost. CI runs on ext4 and reports the number on every run
 (report-only, with a warning at ≥ 25 ms).
+
+## Persistent sessions
+
+`sbx run --keep-alive` starts a session. The command after `--` is its
+resident, and a holder process stays alive with the session's namespaces, proxies
+and audit writer, so later commands can join it. `sbx attach` runs a command in a
+running session, and `sbx stop` ends it. Use this when a process from one call
+(a dev server, say) must stay reachable from the next. No daemon is needed.
+
+```
+sbx run --keep-alive --policy P --session-dir S -- npm run dev   # returns once the session is up
+sbx attach --policy P --session-dir S -- curl -s http://127.0.0.1:3000/
+sbx stop --session-dir S
+```
+
+- **Opt in.** Plain `sbx run` is unchanged. `--keep-alive` is the only way to
+  create a session.
+- **Same policy.** Attach refuses a policy that is not byte-identical to the
+  session's policy (rc 125, the reason on stderr). Nothing runs in that case.
+- **Each call is a sandbox.** Every attached call gets its own bwrap, with its
+  own pid namespace, mounts and seccomp filter, built as for `sbx run`. Calls
+  and the resident share the session's network namespace, its localhost ports
+  and its abstract unix sockets (their namespace is the network namespace). That
+  sharing is what makes a dev server reachable, and it is a documented exception
+  to isolation (S19, R31).
+- **Landlock.** `run --keep-alive --landlock MODE [--landlock-bind-tcp PORT]…`
+  sets the optional Landlock layer for the resident and for every attached call,
+  through the same code path as `run --landlock`. The settings are the session's:
+  the holder pins them at start, and an attach applies exactly those. `sbx attach`
+  takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
+  layer. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
+  ABI 6), the signal scope adds a second barrier behind the per-call pid namespace
+  (S19): a call cannot signal the resident or another call. The holder can still
+  end a call (on stop, or when the holder dies), because the
+  holder and the attach sit outside every call's Landlock domain (S24).
+- **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
+  run for that long. `--max-lifetime` (default 8h) ends it after that long
+  regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
+  exit ends the session too. Each end kills the resident and every running call,
+  writes their exit rows, and removes the control socket. The clock starts when
+  `run --keep-alive` starts, so setup counts toward `--max-lifetime`.
+- **Policy timeout.** The resident is not bound by the policy's `limits.timeout`.
+  Only the session lifetime (`--max-lifetime`) bounds it. Each attached call is
+  bounded by its own `--timeout`, or by `limits.timeout` when that is absent.
+- **Output.** The holder's output (the resident's stdout and stderr) goes to
+  `S/holder.log`, not to the caller, and it is bounded by `limits.output_bytes`.
+  Attached calls print to the caller as in `sbx run`.
+- **Death.** If the holder is killed, the resident and every attached call die
+  too (S20). A later `sbx run --keep-alive` on the same directory starts a new
+  session.
+- **Transparent mode only.** `run --keep-alive` refuses to start a session whose
+  policy is not `transparent` (rc 125, before anything runs). It also refuses a
+  host that falls back to explicit mode, because then no nftables rules exist for
+  an attach to join. Attach keeps its own refusal for a session in that state.
+- **Control socket.** `sbx.ctl` lives in the session directory and is reachable
+  only by the same uid on the host. The sandbox cannot reach it: the session root
+  is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
+  path that is or contains the session directory is refused, lexically by the
+  launch builder and through a symlink by the pre-launch guard, for `run` and for
+  every attach call (R35, closed). A same-uid
+  client can hold the control loop for up to 2 s per connection, in batches of
+  8 connections per wake (R34). Each connection has one 2 s deadline for its
+  request and its reply.
+- **Audit.** With `--audit`, the session writes one file. Each call's exit row
+  carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
+  rows carry no `call_id` (R30).
+
+**Exit codes**
+
+| command | rc | meaning |
+|---|---|---|
+| `run --keep-alive` | 0 | the session is up (the holder keeps running) |
+| `run --keep-alive` | 125 | the session could not start; the reason is on stderr |
+| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h) |
+| `attach` | the call's own rc | as in `sbx run`: 124 on `--timeout`, 128+N on a signal |
+| `attach` | 125 | refused or failed: no session, a different policy, an explicit-mode session, or the holder exited |
+| `stop` | 0 | the session is stopped, or nothing was running |
+| `stop` | 125 | the holder refused the stop or could not be reached |
 
 ## Garbage collection
 

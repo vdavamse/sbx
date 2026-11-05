@@ -50,6 +50,12 @@ Please **do not** file a public issue for a security report.
   bind sources; bwrap 0.12.0 fixes only the dest side), and bwrap before 0.12.0
   itself, are documented residuals (`docs/threat-model.md` R26, R27), not
   silently accepted.
+- **In scope — persistent sessions (issue #18):** a call that reaches the
+  resident or another call through pid or mount namespaces; a connection to a
+  session's control socket from another uid that is accepted; an attach that runs
+  under a policy other than the session's pinned policy; a call that outlives its
+  holder. The network namespace and localhost are shared by the calls of one
+  session by design (R31), so that sharing is a residual, not a report.
 - **In scope — conformance (issue #13):** a `FAIL` from `sbx check --conformance`
   on a host where `sbx check` reports the needed network mode is a sandbox
   defect; attach the JSON report and the kept artifacts directory. `warn` rows
