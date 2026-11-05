@@ -22,7 +22,9 @@ COPY --chmod=0755 sbx /usr/local/bin/sbx
 
 # sbx needs no privileges: it builds the sandbox from unprivileged user
 # namespaces, so the image runs it as an ordinary user.
-RUN useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin sbx
+RUN groupadd --system --gid 10001 sbx \
+    && useradd --system --uid 10001 --gid 10001 --no-log-init --create-home \
+       --shell /usr/sbin/nologin sbx
 USER 10001:10001
 WORKDIR /home/sbx
 
