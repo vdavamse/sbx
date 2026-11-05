@@ -68,10 +68,9 @@ pub type Scns = BTreeMap<&'static str, Scn>;
 /// The scenario names a check's evidence comes from.
 pub fn scenarios_of(id: &str) -> &'static [&'static str] {
     match id {
-        "A01" | "A07" | "A08" | "A09" | "A10" | "A11" | "B10" | "C01" | "C03" | "C05" | "C06"
-        | "C08" | "C09" | "C10" | "C11" | "C12" | "C13" | "C14" | "D01" | "D02" | "D03" | "D04" => {
-            &["S1"]
-        }
+        "A01" | "A07" | "A08" | "A09" | "A10" | "A11" | "A13" | "B10" | "C01" | "C03" | "C05"
+        | "C06" | "C08" | "C09" | "C10" | "C11" | "C12" | "C13" | "C14" | "D01" | "D02" | "D03"
+        | "D04" => &["S1"],
         "D05" => &["S13"],
         "C04" => &["S2", "S3"],
         "D06" | "D07" | "D08" | "D09" => &["S11a", "S11b"],
@@ -516,6 +515,49 @@ pub(super) fn a11(s: &Scns) -> R {
         "port 8443 is not in the policy port list",
     )?;
     Ok("non-allowed port on an allowed name denied on both legs".to_owned())
+}
+
+pub(super) fn a13(s: &Scns) -> R {
+    let s1 = sc(s, "S1")?;
+    // `=exact.conformance.test` in p-transparent: the name itself is answered
+    // (the control), its subdomain is not (the assertions, on DNS and CONNECT).
+    answered_ctl(s1, "a13.exact")?;
+    let d = op(s1, "a13.sub")?;
+    need(
+        rcode(d) == 3,
+        format!(
+            "dns sub.exact.conformance.test: expected rcode 3, got {}",
+            rcode(d)
+        ),
+    )?;
+    let l = local(d)?;
+    if !dns_row(
+        s1,
+        &l,
+        "denied",
+        "sub.exact.conformance.test is not in the policy allow list",
+    ) {
+        return Err(F {
+            msg: format!("no audit dns denied row for the sub.exact.conformance.test query ({l})"),
+            ev: rows_for_client(s1, &l),
+            control: false,
+        });
+    }
+    let c = op(s1, "a13.connect")?;
+    need(
+        status_code(c) == "403",
+        format!(
+            "CONNECT sub.exact.conformance.test:443: expected 403, got {:?}",
+            first_line(c)
+        ),
+    )?;
+    leg_denied(
+        s1,
+        "a13.connect",
+        "explicit-connect",
+        "sub.exact.conformance.test is not in the policy allow list",
+    )?;
+    Ok("exact-only name answered; its subdomain denied on DNS and CONNECT".to_owned())
 }
 
 pub(super) fn b10(s: &Scns) -> R {
@@ -1382,6 +1424,7 @@ pub(super) fn eval_plain(id: &str, s: &Scns) -> R {
         "A09" => a09(s),
         "A10" => a10(s),
         "A11" => a11(s),
+        "A13" => a13(s),
         "B10" => b10(s),
         "C01" => c01(s),
         "C03" => c03(s),

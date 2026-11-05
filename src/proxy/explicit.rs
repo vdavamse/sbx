@@ -714,7 +714,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
 
     use super::*;
-    use crate::policy;
+    use crate::policy::{self, DomainRule};
     use crate::proxy::AUDIT_TEXT_CAP;
     use crate::proxy::hello::{build_client_hello, first_record_end};
     use crate::proxy::{
@@ -734,6 +734,10 @@ mod tests {
 
     fn dom(s: &str) -> Domain {
         Domain::parse(s).expect("test domain parses")
+    }
+
+    fn rule(s: &str) -> DomainRule {
+        DomainRule::parse(s).expect("test rule parses")
     }
 
     fn sock(s: &str) -> SocketAddr {
@@ -780,7 +784,7 @@ mod tests {
             Arc::new(GuardedConnector::new(resolve, dial, limits.connect_timeout));
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: vec![dom("allowed.test")],
+            allow: vec![rule("allowed.test")],
             ports: vec![443, 80, 8080, 22],
         };
         let sink: Arc<dyn DecisionSink> = Arc::new(Sink::default());
@@ -1130,7 +1134,7 @@ mod tests {
                 Arc::new(GuardedConnector::new(resolve, dial, limits.connect_timeout));
             let network = policy::Network {
                 mode: policy::NetworkMode::Transparent,
-                allow: vec![dom("allowed.test")],
+                allow: vec![rule("allowed.test")],
                 ports: vec![443],
             };
             let sink = Arc::new(ClosedSink::default());
@@ -1214,7 +1218,7 @@ mod tests {
                 Arc::new(GuardedConnector::new(resolve, dial, limits.connect_timeout));
             let network = policy::Network {
                 mode: policy::NetworkMode::Transparent,
-                allow: vec![dom("allowed.test")],
+                allow: vec![rule("allowed.test")],
                 ports: vec![443],
             };
             let sink = Arc::new(ClosedSink::default());
@@ -1817,7 +1821,7 @@ mod tests {
         };
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: vec![dom("allowed.test")],
+            allow: vec![rule("allowed.test")],
             ports: vec![443, 80, 8080, 22],
         };
         let sink: Arc<dyn DecisionSink> = Arc::new(Sink::default());

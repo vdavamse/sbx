@@ -21,8 +21,10 @@
 //! 4. **Match rule** — exact match or dot-boundaried suffix, never a bare
 //!    suffix (the eBPF bug class: allowing `github.com` must not allow
 //!    `evilgithub.com`; pinned by `bare_suffix_check_is_the_bug_class`).
-//!    First match wins in list order; the verdict is identical whichever
-//!    entry matched — only the audit line differs.
+//!    An exact-only entry (`=name` in the policy, [`DomainRule::is_exact`])
+//!    matches the host itself and never its subdomains. First match wins in
+//!    list order; the verdict is identical whichever entry matched — only
+//!    the audit line differs.
 //! 5. **Caller contract (host shape)** — a bare UTF-8 hostname: no port,
 //!    scheme, brackets or userinfo; callers strip/reject first. #7 passes
 //!    rustls-validated SNI; #8 must reject non-UTF-8 httparse bytes
@@ -62,7 +64,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::policy::Domain;
+use crate::policy::{Domain, DomainRule};
 
 /// The allow-list entry that accepted a runtime host.
 ///
@@ -71,14 +73,15 @@ use crate::policy::Domain;
 /// so the borrow never crosses an await).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleMatch<'a> {
-    domain: &'a Domain,
+    rule: &'a DomainRule,
 }
 
 impl<'a> RuleMatch<'a> {
-    /// The matched policy entry in canonical stored form — the audit
-    /// trail's "which rule allowed this" (#10 logs `as_str()`).
-    pub fn domain(&self) -> &'a Domain {
-        self.domain
+    /// The matched policy entry — the audit trail's "which rule allowed
+    /// this" (#10 logs its canonical text, `rule().as_str()`, which keeps
+    /// the `=` marker of an exact-only rule).
+    pub fn rule(&self) -> &'a DomainRule {
+        self.rule
     }
 }
 
@@ -91,7 +94,7 @@ impl<'a> RuleMatch<'a> {
 /// all return `None`; this seam carries no diagnostics — callers wanting
 /// the rejection reason call [`Domain::parse`] themselves. `host` must be
 /// a bare UTF-8 hostname (module docs point 5).
-pub fn allowed<'a>(host: &str, allow: &'a [Domain]) -> Option<RuleMatch<'a>> {
+pub fn allowed<'a>(host: &str, allow: &'a [DomainRule]) -> Option<RuleMatch<'a>> {
     // Strip exactly ONE trailing ASCII root dot (resolvers/SNI may carry
     // it; policy entries never do). "github.com.." leaves "github.com.",
     // which Domain::parse rejects — fail-closed. Fullwidth '。' is NOT
@@ -106,21 +109,23 @@ pub fn allowed<'a>(host: &str, allow: &'a [Domain]) -> Option<RuleMatch<'a>> {
     let host = parsed.as_str();
     // Linear scan, first match wins (list order is deterministic; the
     // verdict is identical whichever entry matched — only the audit line
-    // differs). Dot-boundaried suffix, never a bare suffix: the char
-    // immediately before the matched suffix must be '.'. (No length guard
-    // needed: Domain::parse rejects empty labels, so a parsed host can
-    // never contain ".." or start with '.', and host == rule is the first
-    // arm.)
+    // differs). Every rule matches the host itself. A plain rule also
+    // matches a dot-boundaried suffix, never a bare suffix: the char
+    // immediately before the matched suffix must be '.'. An exact rule
+    // (`=name`) matches only the host itself. (No length guard needed:
+    // Domain::parse rejects empty labels, so a parsed host can never
+    // contain ".." or start with '.'.)
     allow
         .iter()
         .find(|rule| {
-            let rule = rule.as_str();
-            host == rule
-                || host
-                    .strip_suffix(rule)
-                    .is_some_and(|rest| rest.ends_with('.'))
+            let name = rule.domain().as_str();
+            host == name
+                || (!rule.is_exact()
+                    && host
+                        .strip_suffix(name)
+                        .is_some_and(|rest| rest.ends_with('.')))
         })
-        .map(|domain| RuleMatch { domain })
+        .map(|rule| RuleMatch { rule })
 }
 
 /// Why [`guard`] denied an address — the audit taxonomy (#10 logs
@@ -533,9 +538,15 @@ mod tests {
         Domain::parse(s).unwrap_or_else(|err| panic!("{s:?} must parse: {err}"))
     }
 
-    /// An allow list built from canonical fixture spellings.
-    fn allow(list: &[&str]) -> Vec<Domain> {
-        list.iter().map(|s| dom(s)).collect()
+    /// Parse one allow-list entry (fixtures must be valid entries; a leading
+    /// `=` makes it exact-only).
+    fn rule(s: &str) -> DomainRule {
+        DomainRule::parse(s).unwrap_or_else(|err| panic!("{s:?} must parse: {err}"))
+    }
+
+    /// An allow list built from canonical fixture entries.
+    fn allow(list: &[&str]) -> Vec<DomainRule> {
+        list.iter().map(|s| rule(s)).collect()
     }
 
     /// Parse an address fixture (must succeed).
@@ -556,7 +567,7 @@ mod tests {
         for host in ["github.com", "api.github.com"] {
             let rule =
                 allowed(host, &entries).unwrap_or_else(|| panic!("{host:?} must be allowed"));
-            assert_eq!(rule.domain().as_str(), "github.com", "{host:?}");
+            assert_eq!(rule.rule().as_str(), "github.com", "{host:?}");
         }
         for host in ["evilgithub.com", "github.com.evil.tld", "GITHUB.COM.evil"] {
             assert!(allowed(host, &entries).is_none(), "{host:?} must be denied");
@@ -753,7 +764,7 @@ mod tests {
     #[test]
     fn empty_allow_list_denies_everything() {
         // The examples/locked-down.json shape: mode "none", allow [].
-        let entries: Vec<Domain> = Vec::new();
+        let entries: Vec<DomainRule> = Vec::new();
         for host in ["github.com", "127.0.0.1", ""] {
             assert!(allowed(host, &entries).is_none(), "{host:?}");
         }
@@ -814,12 +825,14 @@ mod tests {
             let path = entry.expect("readable dir entry").path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 let policy = Policy::from_file(&path).expect("shipped examples must be valid");
-                for domain in &policy.network.allow {
-                    for host in [
-                        domain.as_str().to_owned(),
-                        format!("{}.", domain.as_str()),
-                        format!("sub.{}", domain.as_str()),
-                    ] {
+                for rule in &policy.network.allow {
+                    // An exact-only entry has no subdomain form to check.
+                    let name = rule.domain().as_str();
+                    let mut hosts = vec![name.to_owned(), format!("{name}.")];
+                    if !rule.is_exact() {
+                        hosts.push(format!("sub.{name}"));
+                    }
+                    for host in hosts {
                         assert!(
                             allowed(&host, &policy.network.allow).is_some(),
                             "{}: {host:?} must match its own policy entry",
@@ -840,7 +853,7 @@ mod tests {
         assert_eq!(
             allowed("api.github.com", &broad_first)
                 .expect("must match")
-                .domain()
+                .rule()
                 .as_str(),
             "github.com"
         );
@@ -848,10 +861,109 @@ mod tests {
         assert_eq!(
             allowed("api.github.com", &narrow_first)
                 .expect("must match")
-                .domain()
+                .rule()
                 .as_str(),
             "api.github.com"
         );
+    }
+
+    // ---- allowed(): exact-only rules (`=name`) --------------------------------
+
+    #[test]
+    fn exact_rule_allows_only_the_named_host() {
+        // Issue #44: `=github.com` allows github.com in any spelling the
+        // runtime pipeline folds to it, and denies every subdomain.
+        let entries = allow(&["=github.com"]);
+        for host in ["github.com", "GitHub.com", "github.com."] {
+            let matched =
+                allowed(host, &entries).unwrap_or_else(|| panic!("{host:?} must be allowed"));
+            assert_eq!(matched.rule().as_str(), "=github.com", "{host:?}");
+            assert!(matched.rule().is_exact(), "{host:?}");
+        }
+        for host in [
+            "api.github.com",
+            "a.b.github.com",
+            "github.com.evil.tld",
+            "evilgithub.com",
+            "api.github.com.",
+        ] {
+            assert!(allowed(host, &entries).is_none(), "{host:?} must be denied");
+        }
+    }
+
+    #[test]
+    fn exact_rule_inside_a_mixed_list() {
+        // `=a.com` alongside a plain `b.com`: a.com is exact-only, b.com
+        // keeps its subdomains, and an unlisted sibling stays denied.
+        let entries = allow(&["=a.com", "b.com"]);
+        for host in ["a.com", "A.COM", "b.com", "x.b.com", "y.x.b.com"] {
+            assert!(allowed(host, &entries).is_some(), "{host:?}");
+        }
+        for host in [
+            "sub.a.com",
+            "x.a.com",
+            "a.com.evil.tld",
+            "ab.com",
+            "a.b.com.evil",
+        ] {
+            assert!(allowed(host, &entries).is_none(), "{host:?}");
+        }
+        assert_eq!(
+            allowed("a.com", &entries).expect("matches").rule().as_str(),
+            "=a.com"
+        );
+        assert_eq!(
+            allowed("x.b.com", &entries)
+                .expect("matches")
+                .rule()
+                .as_str(),
+            "b.com"
+        );
+    }
+
+    #[test]
+    fn broad_and_exact_rule_for_the_same_name() {
+        // A broad rule plus an exact rule for one name: the union is the
+        // broad rule. The exact host matches either way; subdomains match
+        // only through the broad rule, so the verdict is order-independent
+        // and only the audit line (which rule matched) differs.
+        for list in [
+            allow(&["github.com", "=github.com"]),
+            allow(&["=github.com", "github.com"]),
+        ] {
+            assert!(allowed("github.com", &list).is_some());
+            assert!(allowed("api.github.com", &list).is_some());
+        }
+        // The exact rule alone does not reach subdomains.
+        assert!(allowed("api.github.com", &allow(&["=github.com"])).is_none());
+        // Audit line: the exact entry is reported for the bare host when it
+        // comes first; the broad entry for a subdomain either way.
+        let exact_first = allow(&["=github.com", "github.com"]);
+        assert_eq!(
+            allowed("github.com", &exact_first)
+                .expect("matches")
+                .rule()
+                .as_str(),
+            "=github.com"
+        );
+        assert_eq!(
+            allowed("api.github.com", &exact_first)
+                .expect("matches")
+                .rule()
+                .as_str(),
+            "github.com"
+        );
+    }
+
+    #[test]
+    fn exact_rule_normalises_the_host_not_the_marker() {
+        // The host is folded as usual; an exact rule still needs the folded
+        // host to equal the folded name exactly.
+        let entries = allow(&["=xn--r8jz45g.jp"]);
+        for host in ["例え.jp", "ＸＮ--Ｒ８ＪＺ４５Ｇ.ＪＰ", "xn--r8jz45g.jp."] {
+            assert!(allowed(host, &entries).is_some(), "{host:?}");
+        }
+        assert!(allowed("sub.例え.jp", &entries).is_none());
     }
 
     // ---- guard(): the issue's families --------------------------------------
@@ -1819,6 +1931,25 @@ mod tests {
 
     proptest! {
         #[test]
+        fn prop_exact_rule_matches_only_the_named_host(
+            entry in prop_domain(),
+            prefixes in proptest::collection::vec(prop_label(), 1..=2),
+        ) {
+            // `=entry` allows entry itself and nothing strictly below it.
+            // The subdomain is self-canonical (labels are lowercase
+            // alphanumerics, tld alphabetic), so it reaches the matcher
+            // unchanged.
+            let exact = vec![rule(&format!("={entry}"))];
+            let sub = format!("{}.{entry}", prefixes.join("."));
+            prop_assert!(
+                Domain::parse(&sub).is_ok_and(|p| p.as_str() == sub.as_str()),
+                "generated host {sub:?} must be self-canonical"
+            );
+            prop_assert!(allowed(&entry, &exact).is_some());
+            prop_assert!(allowed(&sub, &exact).is_none());
+        }
+
+        #[test]
         fn prop_out_of_set_hosts_never_allowed(
             allow_names in proptest::collection::vec(prop_domain(), 1..=4),
             host in prop_host(),
@@ -1833,7 +1964,7 @@ mod tests {
                     "generated name {name:?} must be self-canonical"
                 );
             }
-            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            let entries: Vec<DomainRule> = allow_names.iter().map(|s| rule(s)).collect();
             prop_assert_eq!(
                 allowed(&host, &entries).is_some(),
                 in_set_oracle(&host, &allow_names)
@@ -1859,7 +1990,7 @@ mod tests {
                 Domain::parse(&host).is_ok_and(|p| p.as_str() == host.as_str()),
                 "generated host {host:?} must be self-canonical"
             );
-            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            let entries: Vec<DomainRule> = allow_names.iter().map(|s| rule(s)).collect();
             prop_assert!(allowed(&host, &entries).is_some());
         }
 
@@ -1888,7 +2019,7 @@ mod tests {
             // one ASCII dot, then parse (mirrors allowed()'s own steps).
             let bare = host.strip_suffix('.').unwrap_or(&host);
             prop_assert!(Domain::parse(bare).is_ok_and(|p| p.as_str() == entry.as_str()));
-            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            let entries: Vec<DomainRule> = allow_names.iter().map(|s| rule(s)).collect();
             prop_assert!(allowed(&host, &entries).is_some());
         }
 
@@ -1913,7 +2044,7 @@ mod tests {
                 Domain::parse(&host).is_ok_and(|p| p.as_str() == host.as_str()),
                 "mutation {host:?} must be self-canonical"
             );
-            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            let entries: Vec<DomainRule> = allow_names.iter().map(|s| rule(s)).collect();
             prop_assert_eq!(
                 allowed(&host, &entries).is_some(),
                 in_set_oracle(&host, &allow_names)
@@ -1942,7 +2073,7 @@ mod tests {
                 Ok(parsed) => in_set_oracle(parsed.as_str(), &allow_names),
                 Err(_) => false,
             };
-            let entries: Vec<Domain> = allow_names.iter().map(|s| dom(s)).collect();
+            let entries: Vec<DomainRule> = allow_names.iter().map(|s| rule(s)).collect();
             prop_assert_eq!(allowed(&host, &entries).is_some(), expected);
         }
 

@@ -495,6 +495,8 @@ fn s1(env: &Env) -> Scn {
         dns("a08.pypi", "pypi.org"),
         dns("a09.evil", "pypi.org.evil.com"),
         dns("a09.idn", "xn--pyp-lhd.org"),
+        dns("a13.exact", "exact.conformance.test"),
+        dns("a13.sub", "sub.exact.conformance.test"),
         dns("d02.dns", "localhost"),
         dns_q(
             "c06.a8",
@@ -659,13 +661,14 @@ fn s1(env: &Env) -> Scn {
         ),
     ];
     let proxy = "127.0.0.1:3128";
-    let connects: [(&str, &str); 6] = [
+    let connects: [(&str, &str); 7] = [
         ("a07.connect", "other.conformance.test:443"),
         ("a08.connect", "notpypi.org:443"),
         ("a09.connect", "pypi.org.evil.com:443"),
         ("a09.idnconnect", "xn--pyp-lhd.org:443"),
         ("a10.connect", "9.9.9.9:443"),
         ("a11.connect", "allowed.conformance.test:8443"),
+        ("a13.connect", "sub.exact.conformance.test:443"),
     ];
     for (id, target) in connects {
         ops.push(tcp_addr(

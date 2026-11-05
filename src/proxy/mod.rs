@@ -208,7 +208,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::egress;
 use crate::init::consts;
-use crate::policy::{self, Domain};
+use crate::policy::{self, Domain, DomainRule};
 
 /// The ports with a v1 protocol inspector (module docs point 7): 443 is
 /// inspected as TLS ([`hello`]), 80 as HTTP/1 ([`http`]). Any other
@@ -966,7 +966,7 @@ impl Connector for GuardedConnector {
 /// spawned connection task.
 pub struct Proxy {
     /// Cloned from `policy.network.allow`.
-    pub allow: Vec<Domain>,
+    pub allow: Vec<DomainRule>,
     /// Cloned from `policy.network.ports`.
     pub ports: Vec<u16>,
     /// Seam (a) — #9: [`crate::dns::FakeIpMap`].
@@ -1507,6 +1507,10 @@ mod tests {
         Domain::parse(s).unwrap_or_else(|err| panic!("{s:?} must parse: {err}"))
     }
 
+    fn rule(s: &str) -> DomainRule {
+        DomainRule::parse(s).unwrap_or_else(|err| panic!("{s:?} must parse: {err}"))
+    }
+
     fn sock(s: &str) -> SocketAddr {
         s.parse()
             .unwrap_or_else(|err| panic!("{s:?} must parse: {err}"))
@@ -1594,7 +1598,7 @@ mod tests {
     fn order_proxy(sink: Arc<OrderSink>) -> Arc<Proxy> {
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: vec![dom("allowed.test")],
+            allow: vec![rule("allowed.test")],
             ports: vec![TLS_PORT, HTTP_PORT],
         };
         let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
@@ -1938,7 +1942,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
-            allow: allow.iter().map(|s| dom(s)).collect(),
+            allow: allow.iter().map(|s| rule(s)).collect(),
             ports: ports.to_vec(),
         };
         let proxy = Proxy::new(&network, Arc::new(map), sink.clone(), connector, limits);
