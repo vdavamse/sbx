@@ -591,6 +591,29 @@ output is informational only, since its wording varies on foreign-arch
 binaries. PIE is kept wherever the toolchain provides it — forcing a
 single spelling would sacrifice ASLR for the sandbox launcher itself.
 
+## Releases
+
+Pushing a `vX.Y.Z` tag that matches `Cargo.toml` runs
+`.github/workflows/release.yml`, which publishes:
+
+- **GitHub Release:** `sbx-X.Y.Z-{x86_64,aarch64}-unknown-linux-musl.tar.gz`
+  (the static binary, LICENSE, README), a `.sha256` per tarball, the wheels
+  and a combined `SHA256SUMS`. Every tarball and wheel carries a build
+  provenance attestation:
+  `gh attestation verify sbx-X.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo vdavamse/sbx`.
+- **PyPI:** [`sbx-bin`](https://pypi.org/project/sbx-bin/), a platform wheel
+  per architecture that bundles the same binary and exposes only
+  `sbx_bin.binary_path()` (the `ripgrep` wheel pattern). Uploaded with
+  trusted publishing (OIDC); no PyPI token exists.
+- **Container image:** `ghcr.io/vdavamse/sbx:X.Y.Z` (amd64 and arm64):
+  Debian slim with `bubblewrap` and `sbx` as the entrypoint, attested by
+  digest. The container runtime must allow unprivileged user namespaces.
+
+Release artifacts are the default-feature build: pure Rust, no C crypto.
+Opt-in features are never enabled in them. On pull requests that touch the
+pipeline (and on manual dispatch), the workflow is a dry run: it builds and
+checks everything and publishes nothing.
+
 ## Development
 
 ```sh
