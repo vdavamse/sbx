@@ -60,8 +60,19 @@ def load(path):
         sys.exit(f"FAIL: cannot read {path}: {err}")
 
 
+# The `sbx check` items (src/host/classify.rs CapId), all of which must be present.
+ITEMS = {
+    "userns", "netns", "netns-ipv6", "nft", "fallback",
+    "bwrap", "bwrap-run", "bwrap-proc", "seccomp", "landlock",
+}
+
+
 def assert_ok(path, rc):
     r = load(path)
+    missing = sorted(ITEMS - {c["id"] for c in r["capabilities"]})
+    if missing:
+        print(json.dumps(r, indent=2))
+        sys.exit(f"FAIL: items missing from the report: {missing}")
     bad = [
         f"{c['id']}={c['status']}"
         for c in r["capabilities"]
@@ -82,10 +93,12 @@ def assert_fail(path, rc, pairs):
     if r["network_mode"] != "unavailable":
         problems.append(f"network mode {r['network_mode']} (expected unavailable)")
     for item, errno in zip(pairs[::2], pairs[1::2]):
+        # `item` may carry a required detail substring: "userns:blocked by a seccomp filter".
+        item, _, text = item.partition(":")
         c = by.get(item)
         want = None if errno == "-" else int(errno)
-        if c is None or c["status"] != "fail" or c["errno"] != want:
-            problems.append(f"{item}: {c} (expected FAIL with errno {want})")
+        if c is None or c["status"] != "fail" or c["errno"] != want or text not in c["detail"]:
+            problems.append(f"{item}: {c} (expected FAIL with errno {want} and detail containing {text!r})")
         else:
             print(f"ok: {item} FAIL errno {c['errno']}: {c['detail']}")
     if problems:

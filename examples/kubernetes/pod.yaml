@@ -44,9 +44,10 @@ spec:
           localhostProfile: profiles/sbx/sbx-userns.json
         # Expected to be required on AppArmor nodes: containerd's default profile
         # denies mount and most /proc/sys writes (its source, v2.3.4). Not tested
-        # by sbx: AppArmor was off on the test host, where this is a no-op. Not enough on Ubuntu nodes with
-        # the userns restriction or bwrap-userns-restrict: docs/kubernetes.md,
-        # "AppArmor". PSA baseline rejects Unconfined.
+        # by sbx: AppArmor was off on the test host, where this is a no-op.
+        # Probably not enough on Ubuntu nodes with the userns restriction or
+        # bwrap-userns-restrict (Ubuntu documentation; not tested by sbx): see
+        # docs/kubernetes.md, "AppArmor". PSA baseline rejects Unconfined.
         appArmorProfile:
           type: Unconfined
       resources:

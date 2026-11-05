@@ -26,8 +26,8 @@ def problems(r, rc):
     if r.get("kind") != "conformance" or r.get("version") != 1:
         out.append(f"not a version-1 conformance report: kind {r.get('kind')!r}")
         return out
-    if r.get("network_mode") == "unavailable":
-        out.append("network mode unavailable")
+    if r.get("network_mode") not in ("transparent", "explicit"):
+        out.append(f"network mode {r.get('network_mode')!r} (expected transparent or explicit)")
     checks = r.get("checks", [])
     fails = [c["id"] for c in checks if c["status"] == "fail"]
     if fails:

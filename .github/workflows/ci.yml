@@ -679,6 +679,7 @@ jobs:
       KIND_VERSION: v0.33.0
       KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
       KUBECTL_VERSION: v1.37.0
+      KUBECTL_SHA256: 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
       KUBECONFORM_VERSION: v0.8.0
       KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
       # yannh/kubernetes-json-schema at a fixed commit (schemas for v1.37.0).
@@ -706,7 +707,7 @@ jobs:
           curl -fsSL --retry 5 -o "$D/kind" "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64"
           echo "$KIND_SHA256  $D/kind" | sha256sum -c
           curl -fsSL --retry 5 -o "$D/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
-          echo "$(curl -fsSL --retry 5 "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256")  $D/kubectl" | sha256sum -c
+          echo "$KUBECTL_SHA256  $D/kubectl" | sha256sum -c
           curl -fsSL --retry 5 -o "$D/kubeconform.tar.gz" "https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION/kubeconform-linux-amd64.tar.gz"
           echo "$KUBECONFORM_SHA256  $D/kubeconform.tar.gz" | sha256sum -c
           tar -xzf "$D/kubeconform.tar.gz" -C "$D" kubeconform
@@ -820,7 +821,7 @@ jobs:
           kubectl exec sbx-no-procmount -- sbx check --json > no-procmount.json
           python3 -I .github/scripts/k8s_example.py assert-fail no-procmount.json $? netns-ipv6 30 bwrap-run - || FAIL=1
           kubectl exec sbx-seccomp-runtimedefault -- sbx check --json > seccomp-runtimedefault.json
-          python3 -I .github/scripts/k8s_example.py assert-fail seccomp-runtimedefault.json $? userns 1 || FAIL=1
+          python3 -I .github/scripts/k8s_example.py assert-fail seccomp-runtimedefault.json $? "userns:blocked by a seccomp filter" 1 || FAIL=1
           exit "$FAIL"
 
       - name: "Report: without appArmorProfile (report-only)"
@@ -832,6 +833,30 @@ jobs:
           echo "pod LSM label: $(kubectl exec sbx-no-apparmor -- cat /proc/self/attr/current 2>&1)" | tee -a "$GITHUB_STEP_SUMMARY"
           kubectl exec sbx-no-apparmor -- sbx check --json > no-apparmor.json
           python3 -I .github/scripts/k8s_example.py summary no-apparmor.json "sbx check without appArmorProfile (report-only, issue #15)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Diagnostics only when something above failed (issue #15: the first runner
+      # runs could not start the hostUsers: false pod sandbox, sysfs mount EPERM).
+      - name: "Diagnostics on failure: runner kernel and the kind node's mounts"
+        if: failure()
+        continue-on-error: true
+        run: |
+          set +e
+          {
+            echo "### kubernetes job diagnostics"
+            echo '```'
+            echo "runner kernel: $(uname -r)"
+            NODE="$CLUSTER-control-plane"
+            docker exec "$NODE" uname -r
+            docker exec "$NODE" sh -c 'runc --version; containerd --version' 2>&1
+            echo "--- node mountinfo entries at or under /sys and /proc"
+            docker exec "$NODE" cat /proc/self/mountinfo | awk '$5 ~ "^/(sys|proc)(/|$)"'
+            echo "--- node /proc/sys/user/max_user_namespaces: $(docker exec "$NODE" cat /proc/sys/user/max_user_namespaces)"
+            echo "--- docker info (security options)"
+            docker info --format '{{json .SecurityOptions}} cgroup={{.CgroupVersion}} driver={{.Driver}}'
+            echo "--- kind node container settings"
+            docker inspect "$NODE" --format 'privileged={{.HostConfig.Privileged}} security={{json .HostConfig.SecurityOpt}} cgroupns={{.HostConfig.CgroupnsMode}}'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Delete the kind cluster
         if: always()

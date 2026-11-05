@@ -188,8 +188,9 @@ separately.
 conformance 66 ok). The pod then has no syscall filter of its own, and the payload is left with
 sbx's own filter only: the socket-family allow list plus a deny list, not a syscall allow list
 (S2, R16). The sbx container itself, including the proxies that parse payload bytes (R28), then
-runs with no seccomp filter at all. The Pod Security Standards
-Baseline level forbids `Unconfined` seccomp.
+runs with no seccomp filter at all. Per the
+[Pod Security Standards](https://kubernetes.io/docs/concepts/security/pod-security-standards/),
+the Baseline level forbids `Unconfined` seccomp.
 
 **Installing the profile.** The kubelet resolves `localhostProfile` relative to its seccomp
 directory (`/var/lib/kubelet/seccomp` by default). The file must exist on every node that can run
@@ -241,7 +242,7 @@ How `sbx check` reports a namespace failure in a pod follows from `src/host/clas
   caused the EPERM: seccomp, AppArmor or an SELinux policy. The one exception is
   `kernel.unprivileged_userns_clone = 0`, which is reported as that sysctl (`U_CLONE_SYSCTL`). The
   generic row (`U_EPERM`) cannot appear in such a pod.
-- The AppArmor row (`U_APPARMOR`, `unprivileged user namespaces are restricted by AppArmor
+- In such a pod, the AppArmor row (`U_APPARMOR`, `unprivileged user namespaces are restricted by AppArmor
   (kernel.apparmor_restrict_unprivileged_userns = 1)`) appears only when the sysctl is 1 and a later
   setup stage (`idmap`, `netns`, `listeners` or `ipv6`) fails with EPERM or EACCES. Its fix reads
   `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0, or give sbx an AppArmor profile
@@ -277,9 +278,9 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
 
 ## Node requirements
 
-- **User namespaces for pods.** Stable since Kubernetes v1.36. Per the
+- **User namespaces for pods.** Per the
   [Kubernetes documentation](https://kubernetes.io/docs/concepts/workloads/pods/user-namespaces/):
-  Linux 6.3 or later (tmpfs idmap mounts), idmap mount support on the filesystem of
+  stable since Kubernetes v1.36; Linux 6.3 or later (tmpfs idmap mounts), idmap mount support on the filesystem of
   `/var/lib/kubelet/pods/` and of every volume the pod uses (NFS volumes cannot be used), runc 1.2+
   or crun 1.9+, and containerd 2.0+ or CRI-O 1.25+. A pod with `hostUsers: false` cannot also set
   `hostNetwork`, `hostIPC` or `hostPID`. In the kind cluster the API server reported the
@@ -288,8 +289,8 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
 - **Unprivileged user namespaces in the kernel.** sbx creates its own user and network namespaces
   inside the pod. The `userns` item names the sysctl or policy that blocks them
   (`user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, the AppArmor restriction above,
-  or a seccomp policy); in a pod an EPERM at `unshare` is always reported as seccomp (see
-  [AppArmor](#apparmor)).
+  or a seccomp policy); in a pod with a seccomp profile, an EPERM at `unshare` is reported as
+  seccomp unless `kernel.unprivileged_userns_clone = 0` (see [AppArmor](#apparmor)).
 - **nftables modules for transparent mode.** A pod cannot load kernel modules. If the node kernel
   lacks the NAT redirect, `nft` fails with `nftables NAT redirect is unavailable` and the host
   provides only `explicit` (`T_LOAD`); load the modules on the node (`nf_tables nf_nat
@@ -302,7 +303,8 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
   seccomp profile, `sbx check` reports it as the seccomp row (`U_SECCOMP`), not as the generic
   "not permitted" row that names SELinux (see [AppArmor](#apparmor) for the rule). A denial at a
   later stage is reported for that stage (for example `userns` "cannot write the user namespace id
-  maps" at `idmap`).
+  maps" at `idmap`), unless the AppArmor sysctl is 1, in which case an EPERM or EACCES there is
+  reported as the AppArmor row.
 
 ## Network modes in a pod
 
@@ -325,7 +327,7 @@ were not run in a pod. What differs:
   are out of model and can reach the sandbox from outside (R24).
 - **`hostAliases` and the pod's `/etc/hosts`.** The sandbox gets a generated `/etc/hosts` with
   `localhost` entries only (R5, closed; observed in the pod), so the kubelet-managed file is not
-  disclosed (R13). The proxy resolves allowed names on the pod side, where `hostAliases` entries
+  disclosed. The proxy resolves allowed names on the pod side, where `hostAliases` entries
   apply. Per the README section [Running commands](../README.md#running-commands) (`/etc/hosts`),
   such a name works only when it maps to a public address; private, link-local and other
   special-purpose addresses stay denied by the resolved-address guard (S7). Not tested in a pod.

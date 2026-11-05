@@ -674,7 +674,7 @@ deletes sessions, so it is conservative by design.
 [docs/kubernetes.md](docs/kubernetes.md) shows how to run sbx in a pod with its own user namespace
 (`hostUsers: false`), without privileged mode or added capabilities: the pod settings sbx needs
 (`procMount: Unmasked`, a Localhost seccomp profile, the AppArmor setting), which `sbx check` item
-fails without each one, node requirements, Pod Security Admission, and what changes in the threat
+fails without each one (AppArmor: not observed), node requirements, Pod Security Admission, and what changes in the threat
 model. The example manifests, image and kind config are in
 [`examples/kubernetes/`](examples/kubernetes/), and the `kubernetes` CI job runs `sbx check` and the
 offline conformance tiers in that pod.
