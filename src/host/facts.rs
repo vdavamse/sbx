@@ -671,10 +671,10 @@ mod tests {
         let both = socket_scan_bounded(&[base.as_path(), proj.as_path()], &[], &[], 1000, 8);
         assert_eq!(both.found, vec![sock.clone()], "{both:?}");
         assert_eq!(both.unlisted, vec![locked.clone()]);
-        // A directory the caller cannot even search (0700 owned by another
-        // user is modelled by 0600 here: no x for the owner) is unreachable
-        // to the payload too: not recorded, no warning (review of #61).
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).expect("chmod");
+        // A directory the caller can neither list nor search (0700 owned by
+        // another user, modelled by 0000) is unreachable to the payload too:
+        // not recorded, no warning (review of #61).
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
         let closed = socket_scan_bounded(&[base.as_path()], &[], &[], 1000, 8);
         assert!(closed.unlisted.is_empty(), "{closed:?}");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).expect("chmod");
@@ -706,6 +706,46 @@ mod tests {
         );
         assert!(!tight.truncated, "sub walked twice: {tight:?}");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Review of #61: a directory found unlisted only during an extra root's
+    /// walk is honoured too (fixpoint): base ⊃ A(0311) ⊃ p1 ⊃ B(0311) ⊃ p2.
+    #[test]
+    fn socket_scan_follows_unlisted_dirs_found_by_extra_walks() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("socket-scan-unlisted-chain");
+        let a = base.join("A");
+        let p1 = a.join("p1");
+        let b = p1.join("B");
+        let p2 = b.join("p2");
+        fs::create_dir_all(&p2).expect("mkdir");
+        let sock = p2.join("s.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        for d in [&a, &b] {
+            fs::set_permissions(d, fs::Permissions::from_mode(0o311)).expect("chmod");
+        }
+        let restore = || {
+            for d in [&b, &a] {
+                let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
+            }
+        };
+        if fs::read_dir(&a).is_ok() {
+            restore();
+            let _ = fs::remove_dir_all(&base);
+            eprintln!("skip: running as root, 0311 is listable");
+            return;
+        }
+        let scan = socket_scan_bounded(
+            &[base.as_path(), p1.as_path(), p2.as_path()],
+            &[],
+            &[],
+            1000,
+            8,
+        );
+        assert_eq!(scan.found, vec![sock.clone()], "{scan:?}");
+        assert_eq!(scan.unlisted, vec![a.clone(), b.clone()]);
+        restore();
         let _ = fs::remove_dir_all(&base);
     }
 

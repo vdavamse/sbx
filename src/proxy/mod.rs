@@ -656,10 +656,10 @@ const TRUNCATION_MARK: &str = "...";
 /// is replaced by `<redacted>@`, and the result is capped at
 /// [`AUDIT_TEXT_CAP`] bytes on a char boundary (with `...`).
 pub(crate) fn redact_for_audit(raw: &str) -> String {
-    let after_scheme = match raw.find("://") {
-        Some(at) => &raw[at + 3..],
-        None => raw,
-    };
+    // Only a LEADING scheme is skipped: a `://` inside the path or query
+    // must not move the authority past content it would then expose (review
+    // of #61, e.g. CONNECT `h:443/x?t=a://SECRET/y`).
+    let after_scheme = &raw[scheme_end(raw)..];
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
@@ -675,7 +675,7 @@ fn scheme_end(raw: &str) -> usize {
     let Some(at) = raw.find("://") else {
         return 0;
     };
-    let first_delim = raw.find(['/', '?', '#', '@']).unwrap_or(raw.len());
+    let first_delim = raw.find(['/', '?', '#', '@', '\\']).unwrap_or(raw.len());
     let scheme = &raw[..at];
     let valid = scheme
         .bytes()
@@ -706,8 +706,9 @@ const REDACTED_REST: &str = "<redacted>";
 /// [`AUDIT_TEXT_CAP`] cap applies.
 pub(crate) fn redact_opaque(raw: &str) -> String {
     let start = scheme_end(raw);
+    // A backslash cuts too: some clients treat it as a path separator.
     let cut = raw[start..]
-        .find(['/', '?', '#'])
+        .find(['/', '?', '#', '\\'])
         .map_or(raw.len(), |at| start + at);
     let head = &raw[..cut];
     let mut out = match head[start..].rfind('@') {
@@ -3365,5 +3366,25 @@ mod tests {
         assert_eq!(canonicalize_host("a.test.."), None);
         assert_eq!(canonicalize_host(".a.test"), None);
         assert_eq!(canonicalize_host("1.2.3.4"), None);
+    }
+
+    /// Review of #61: a `://` that is not a leading scheme never moves the
+    /// redaction boundary past the content it protects, in either helper.
+    #[test]
+    fn embedded_scheme_separator_never_exposes_content() {
+        assert_eq!(redact_for_audit("h:443/x?t=a://SECRET/y"), "h:443");
+        assert_eq!(
+            redact_for_audit("http://u:p@evil.test:80/x"),
+            "<redacted>@evil.test:80"
+        );
+        assert_eq!(
+            redact_opaque("allowed.test\\tok=SECRET"),
+            "allowed.test\\<redacted>"
+        );
+        assert_eq!(redact_opaque("h\\x://SECRET"), "h\\<redacted>");
+        for raw in ["h:443/x?t=a://SECRET/y", "a#b://SECRET", "u@x://SECRET@y"] {
+            assert!(!redact_for_audit(raw).contains("SECRET"), "{raw}");
+            assert!(!redact_opaque(raw).contains("SECRET"), "{raw}");
+        }
     }
 }
