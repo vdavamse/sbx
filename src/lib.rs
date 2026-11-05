@@ -41,7 +41,7 @@
 //! policy's port + domain allow-lists, and inspects WITHOUT terminating the
 //! protocol preamble — TLS `ClientHello` SNI on 443 (rustls's `Acceptor`
 //! with NO crypto provider; ECH denied) and the HTTP request line + `Host`
-//! on 80 — then resolves and dials BY NAME under [`egress::guard`] (every
+//! on 80 — then resolves and dials BY NAME under [`egress::guard_host`] (every
 //! resolved address, plus the connected `peer_addr()` re-check as the
 //! DNS-rebinding backstop), replays the buffered bytes, and relays
 //! bidirectionally — the validated name binding enforced for the whole

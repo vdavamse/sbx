@@ -720,7 +720,17 @@ fn execute(
         };
         // S15: the proxies and the resolver share one map and one sink.
         let net = effective_network(&policy);
-        let proxy = Proxy::system(&net, map.clone(), audit.clone());
+        // Issue #41: the proxy dials from this (the host's) network
+        // namespace, so the host's own interface addresses join the guard's
+        // deny set. Gathered once, here; failing to list them refuses the
+        // run rather than running with a silently empty set (fail-closed).
+        let host_addrs = sys::host_interface_addrs().map_err(|err| {
+            Cause::Setup(RunError::new(format!(
+                "cannot list the host's interface addresses: {err}"
+            )))
+        })?;
+        let host_addrs = crate::egress::HostAddrs::new(host_addrs);
+        let proxy = Proxy::system(&net, map.clone(), audit.clone(), host_addrs);
         let dns = DnsServer::new(&net, map.clone(), audit.clone());
         // S16: start the runtime; go only after every task was first-polled.
         let ready = start_net(serve_tasks(fds, proxy, dns), latch.clone()).map_err(|err| {
