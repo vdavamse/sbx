@@ -238,6 +238,9 @@ fn run_call(
         landlock: None, // TEMPORARY during the rebase: the session's Landlock is wired next.
     })
     .map_err(|err| RunError::new(err.to_string()))?;
+    // S8a (#39/#40, N19) on every call: a payload may have planted a link under a
+    // writable bind since the resident started, so the call re-verifies its launch.
+    crate::run::verify_launch(&launch)?;
 
     let info_fd = sys::clear_cloexec(info_write.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;

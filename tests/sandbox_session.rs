@@ -592,3 +592,61 @@ fn stop_returns_after_the_exit_row_is_written_and_the_lock_released() {
     assert!(stop(&shim, &session).status.success());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn attach_refuses_a_call_after_a_symlink_is_planted_under_a_writable_bind() {
+    // S8a on every attach call: a payload can plant a link in a writable tree
+    // after the resident started. The attach's guard refuses the call (rc 125)
+    // instead of building its bwrap argv from the planted link.
+    let dir = scratch("plant");
+    let Some(shim) = skip_or(&dir, "attach-guard-after-planted-link") else {
+        return;
+    };
+    let tree = dir.join("tree");
+    let deny = tree.join("sub");
+    fs::create_dir_all(&deny).unwrap();
+    fs::create_dir_all(tree.join("other")).unwrap();
+    let policy = dir.join("policy.json");
+    fs::write(
+        &policy,
+        format!(
+            "{{\"version\":1,\"filesystem\":{{\"ro\":[\"/usr\"],\"rw\":[{:?}],\"deny\":[{:?}]}},\"network\":{{\"mode\":\"transparent\",\"allow\":[\"pypi.org\"],\"ports\":[443,80]}},\"env\":{{\"pass\":[],\"set\":{{}}}},\"limits\":{{\"timeout\":\"30s\",\"output_bytes\":1048576}}}}",
+            tree.display().to_string(),
+            deny.display().to_string()
+        ),
+    )
+    .unwrap();
+    let session = dir.join("s");
+    let out = sbx(&shim)
+        .args(["run", "--keep-alive", "--idle-timeout", "60s", "--policy"])
+        .arg(&policy)
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "sleep", "300"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "launch: {}", text(&out.stderr));
+
+    // The planted link: the denied subdirectory becomes a symlink to a sibling.
+    fs::remove_dir(&deny).unwrap();
+    std::os::unix::fs::symlink(tree.join("other"), &deny).unwrap();
+
+    // The same policy file as the session's, so the attach is admitted; only the guard refuses.
+    let out = sbx(&shim)
+        .args(["attach", "--policy"])
+        .arg(&policy)
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "true"])
+        .output()
+        .unwrap();
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(125), "{err}");
+    assert!(err.contains("sbx attach:"), "{err}");
+    assert!(
+        err.contains("unsafe filesystem path") && err.contains("symbolic link"),
+        "{err}"
+    );
+    assert!(stop(&shim, &session).status.success());
+    let _ = fs::remove_dir_all(&dir);
+}

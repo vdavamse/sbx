@@ -719,18 +719,10 @@ fn execute(
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
-    // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
-    // will resolve under a bind cover, rw or ro (fd-relative, no symlinks,
-    // nothing missing under an rw policy bind), and that no deny mask is reachable through a
-    // host symlink. Refusal is 125; nothing is created outside the session
+    // S8a (#39/#40, N19): before anything is spawned, verify the launch (see
+    // verify_launch). Refusal is 125; nothing is created outside the session
     // directory and the audit log (S5/S7 ran already).
-    for check in launch.path_checks() {
-        crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
-    }
-    crate::bwrap::guard::verify_aliases(launch.alias_checks())
-        .map_err(|err| RunError::new(err.to_string()))?;
-    crate::bwrap::guard::verify_binds(launch.bind_specs())
-        .map_err(|err| RunError::new(err.to_string()))?;
+    verify_launch(&launch)?;
 
     // S9–S11: the control socketpair and the single spawn window.
     let (parent_end, child_end) = fdpass::control_socketpair()
@@ -1027,6 +1019,22 @@ fn read_status(fd: &OwnedFd) -> Option<Vec<u8>> {
         }
     }
     Some(bytes)
+}
+
+/// The S8a pre-launch verification of a built launch (#39/#40, N19): every path
+/// bwrap will resolve under a bind cover (rw or ro) is a real directory chain,
+/// no deny mask is reachable through a host symlink, and no two binds overlap
+/// through a host symlink. Run before any spawn, by `run` and by every attach
+/// call (a payload can plant a link between the resident's start and an attach).
+pub(crate) fn verify_launch(launch: &crate::bwrap::Launch) -> Result<(), RunError> {
+    for check in launch.path_checks() {
+        crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
+    }
+    crate::bwrap::guard::verify_aliases(launch.alias_checks())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    crate::bwrap::guard::verify_binds(launch.bind_specs())
+        .map_err(|err| RunError::new(err.to_string()))?;
+    Ok(())
 }
 
 /// Which writable location an audit path collides with (for the pinned messages).
