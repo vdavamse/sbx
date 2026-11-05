@@ -454,29 +454,44 @@ fn idle_end(ctx: &Ctx, name: &'static str) -> Scn {
         return Scn::unavailable(name, e);
     }
     let holder = holder_pid(&session);
-    let mut call = match ctx.attach_spawn(&session, &ctx.policy, &["sleep", "5"]) {
+    // A unique argv, so the call's host pid is found exactly.
+    let call_argv = ["sleep", "5.00017"];
+    let mut call = match ctx.attach_spawn(&session, &ctx.policy, &call_argv) {
         Ok(c) => c,
         Err(e) => {
             ctx.cleanup(&session, &holder.into_iter().collect::<Vec<_>>());
             return Scn::unavailable(name, e);
         }
     };
-    // Past the 3 s idle limit while the call runs: the holder must still be up.
+    let call_pid = exact_pid(&call_argv);
+    record_pid(&mut scn, "call", call_pid);
+    // Past the 3 s idle limit while the call runs: the call and the holder must
+    // both still be up (the idle clock is suspended by the running call).
     std::thread::sleep(Duration::from_secs(4));
-    let held = holder.is_some_and(alive);
+    note(
+        &mut scn,
+        "call_alive_while_idle_limit_passed",
+        call_pid.is_some_and(alive),
+        "the call was not running past the idle limit",
+    );
     note(
         &mut scn,
         "held_while_call_runs",
-        held,
+        holder.is_some_and(alive),
         "the session ended while a call was running",
     );
-    let _ = reap(&mut call, Duration::from_secs(20));
+    let attach_rc = reap(&mut call, Duration::from_secs(20));
+    if let Some(rc) = attach_rc {
+        scn.nums.insert("attach_rc", rc as u64);
+    }
     let ended = wait(Duration::from_secs(15), || {
         !session.join("sbx.ctl").exists()
     });
     let gone = holder.is_some_and(|h| wait(Duration::from_secs(10), || !alive(h)));
+    let call_gone = call_pid.is_some_and(|p| wait(Duration::from_secs(10), || !alive(p)));
     scn.nums.insert("ended", u64::from(ended));
     scn.nums.insert("holder_gone", u64::from(gone));
+    scn.nums.insert("call_gone", u64::from(call_gone));
     ctx.cleanup(&session, &holder.into_iter().collect::<Vec<_>>());
     scn
 }
@@ -493,13 +508,16 @@ fn max_lifetime_end(ctx: &Ctx, name: &'static str) -> Scn {
         return Scn::unavailable(name, e);
     }
     let holder = holder_pid(&session);
-    let mut call = match ctx.attach_spawn(&session, &ctx.policy, &["sleep", "60"]) {
+    let call_argv = ["sleep", "60.00006"];
+    let mut call = match ctx.attach_spawn(&session, &ctx.policy, &call_argv) {
         Ok(c) => c,
         Err(e) => {
             ctx.cleanup(&session, &holder.into_iter().collect::<Vec<_>>());
             return Scn::unavailable(name, e);
         }
     };
+    let call_pid = exact_pid(&call_argv);
+    record_pid(&mut scn, "call", call_pid);
     std::thread::sleep(Duration::from_millis(1500));
     note(
         &mut scn,
@@ -507,14 +525,24 @@ fn max_lifetime_end(ctx: &Ctx, name: &'static str) -> Scn {
         holder.is_some_and(alive),
         "the session was not up before its max lifetime",
     );
+    note(
+        &mut scn,
+        "call_alive_before_max",
+        call_pid.is_some_and(alive),
+        "the call was not running before the max lifetime",
+    );
     let ended = wait(Duration::from_secs(15), || {
         !session.join("sbx.ctl").exists()
     });
     let gone = holder.is_some_and(|h| wait(Duration::from_secs(10), || !alive(h)));
-    let call_rc = reap(&mut call, Duration::from_secs(15));
+    let call_gone = call_pid.is_some_and(|p| wait(Duration::from_secs(10), || !alive(p)));
+    let attach_rc = reap(&mut call, Duration::from_secs(15));
+    if let Some(rc) = attach_rc {
+        scn.nums.insert("attach_rc", rc as u64);
+    }
     scn.nums.insert("ended", u64::from(ended));
     scn.nums.insert("holder_gone", u64::from(gone));
-    scn.nums.insert("call_ended", u64::from(call_rc.is_some()));
+    scn.nums.insert("call_gone", u64::from(call_gone));
     ctx.cleanup(&session, &holder.into_iter().collect::<Vec<_>>());
     scn
 }
@@ -575,10 +603,12 @@ fn i02(s: &Scns) -> R {
     if num(scn, "callb_gone") != Some(1) {
         return Err(fail("the attached call survived the holder's SIGKILL"));
     }
-    if num(scn, "callb_attach_rc").is_none_or(|rc| rc == 0) {
-        return Err(fail(
-            "the attach did not report the holder's death (rc 0 or none)",
-        ));
+    // The attach watches the holder's pidfd and reports the holder's death as rc 125.
+    if num(scn, "callb_attach_rc") != Some(125) {
+        return Err(fail(format!(
+            "the attach did not report the holder's death: rc {:?}, expected 125",
+            num(scn, "callb_attach_rc")
+        )));
     }
     Ok("SIGKILL of the holder took down the resident and the attached call".to_owned())
 }
@@ -607,11 +637,21 @@ fn i03(s: &Scns) -> R {
 
 fn i05(s: &Scns) -> R {
     let scn = sc(s, "SS-idle")?;
+    ctl_held(scn, "call_alive_while_idle_limit_passed")?;
     ctl_held(scn, "held_while_call_runs")?;
+    if num(scn, "attach_rc") != Some(0) {
+        return Err(fail(format!(
+            "the call did not run to completion (attach rc {:?}); the idle timeout is not what ended it",
+            num(scn, "attach_rc")
+        )));
+    }
     if num(scn, "ended") != Some(1) || num(scn, "holder_gone") != Some(1) {
         return Err(fail(
             "the idle timeout did not end the session after the call ended",
         ));
+    }
+    if num(scn, "call_gone") != Some(1) {
+        return Err(fail("the call outlived the session it ran in"));
     }
     Ok("a running call holds the session; the idle timeout ends it after the call".to_owned())
 }
@@ -619,15 +659,24 @@ fn i05(s: &Scns) -> R {
 fn i06(s: &Scns) -> R {
     let scn = sc(s, "SS-life")?;
     ctl_held(scn, "alive_before_max")?;
+    ctl_held(scn, "call_alive_before_max")?;
     if num(scn, "ended") != Some(1) || num(scn, "holder_gone") != Some(1) {
         return Err(fail(
             "the max lifetime did not end the session while a call ran",
         ));
     }
-    if num(scn, "call_ended") != Some(1) {
+    if num(scn, "call_gone") != Some(1) {
         return Err(fail("the running call outlived the session"));
     }
-    Ok("the max lifetime ends the session and its running call".to_owned())
+    // The call ends by the holder's teardown (SIGTERM, rc 143), not by an
+    // immediate handshake refusal (rc 125) or by its own exit.
+    if num(scn, "attach_rc") != Some(143) {
+        return Err(fail(format!(
+            "the attach did not end by the holder's teardown: rc {:?}, expected 143",
+            num(scn, "attach_rc")
+        )));
+    }
+    Ok("the max lifetime ends the session and its running call (teardown, rc 143)".to_owned())
 }
 
 /// Evaluates one group-I check into a result.
