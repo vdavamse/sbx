@@ -1038,7 +1038,7 @@ fn bind_sockets_item(scan: &SocketScan, roots: usize) -> PolicyItem {
             id: "bind-sockets",
             status: Status::Warn,
             detail: format!(
-                "no unix socket file found, but the scan is not exhaustive: these directories under filesystem.ro/rw cannot be listed, and a socket inside one is still reachable by name: {}",
+                "no unix socket file found, but the scan is not exhaustive: these directories under filesystem.ro/rw can be searched but not listed, so a socket inside one is still reachable by name: {}",
                 shown.join(", ")
             ),
             fix: Some(

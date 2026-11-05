@@ -516,8 +516,9 @@ bypasses the fake-IP DNS). Keep socket directories out of `filesystem.ro` and
 host sockets under it are not reachable; under `/proc` and `/dev` this holds for
 deeper binds too, since those mounts come after every bind. `sbx check --policy
 P --host` warns about each reachable socket file under a bind (`bind-sockets`),
-and also warns when a directory under a bind cannot be listed, since `connect`
-needs only search permission and a socket inside it stays reachable by name. The
+and also warns when a directory under a bind can be searched but not listed
+(such as mode 0711), since `connect` needs only search permission and a socket
+inside it stays reachable by name. The
 conformance check `D05` warns about any socket file visible inside the sandbox.
 
 **`/etc/hosts` (issue #35).** The sandbox's `/etc/hosts` is generated, like

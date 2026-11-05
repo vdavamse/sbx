@@ -866,6 +866,11 @@ mod tests {
                 "http://u:pw@allowed.test/p?k=v",
                 "http://<redacted>@allowed.test/<redacted>",
             ),
+            // Review of #61: a `://` that is not a leading scheme separator
+            // must not move the boundary past what it protects.
+            ("allowed.test/p?k=v://x", "allowed.test/<redacted>"),
+            ("u:pw@h/x://y", "<redacted>@h/<redacted>"),
+            ("1http://u:pw@h", "1http:/<redacted>"),
         ] {
             let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
             let err = parse(head.as_bytes()).expect_err("decorated Host must be denied");

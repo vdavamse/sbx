@@ -666,6 +666,32 @@ pub(crate) fn redact_for_audit(raw: &str) -> String {
     redact_opaque(&after_scheme[..authority_end])
 }
 
+/// The byte offset just past a leading `scheme://`, or 0. A `://` counts
+/// only when it comes before every `/ ? # @` and follows a valid scheme
+/// (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, RFC 3986 §3.1): a `://`
+/// inside a path or query must not move the redaction boundary past the
+/// content it protects (review of #61).
+fn scheme_end(raw: &str) -> usize {
+    let Some(at) = raw.find("://") else {
+        return 0;
+    };
+    let first_delim = raw.find(['/', '?', '#', '@']).unwrap_or(raw.len());
+    let scheme = &raw[..at];
+    let valid = scheme
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic())
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+    // The `/` of `://` itself is the first delimiter when the scheme is real.
+    if valid && first_delim == at + 1 {
+        at + 3
+    } else {
+        0
+    }
+}
+
 /// Replaces the content after the first `/`, `?` or `#` in
 /// [`redact_opaque`] (the delimiter itself is kept, to show the shape).
 const REDACTED_REST: &str = "<redacted>";
@@ -679,7 +705,7 @@ const REDACTED_REST: &str = "<redacted>";
 /// allowed `allowed.test`. Userinfo is replaced by `<redacted>@` and the
 /// [`AUDIT_TEXT_CAP`] cap applies.
 pub(crate) fn redact_opaque(raw: &str) -> String {
-    let start = raw.find("://").map_or(0, |at| at + 3);
+    let start = scheme_end(raw);
     let cut = raw[start..]
         .find(['/', '?', '#'])
         .map_or(raw.len(), |at| start + at);
