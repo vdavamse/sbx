@@ -301,10 +301,11 @@ jobs:
           assert not fails, f"FAIL checks: {fails}"
           net = {"E01", "E02", "E03", "E04", "E05", "E06"}
           non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
-          want = {i: ("skip", "opt-in") for i in net}
+          # I04 (foreign uid, issue #18) is an opt-in skip on every host by design.
+          want = {i: ("skip", "opt-in") for i in net | {"I04"}}
           assert non_ok == want, f"unexpected non-ok set: {non_ok}"
           offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-          assert len(offline) == 46 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "66 offline checks must pass"
+          assert len(offline) == 52 + 19 + 1 and all(c["status"] in ("ok", "warn") or c["id"] == "I04" for c in offline), "72 offline checks must pass (I04 an opt-in skip)"
           assert rc == 0, f"rc {rc} (PR2 expects 0)"
           PY
           python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
