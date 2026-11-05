@@ -494,13 +494,16 @@ pub(crate) fn decode_joiner_outcome(
 }
 
 /// Test-only fault injection into the keep-alive children. Production always
-/// passes [`Inject::None`].
+/// passes [`Inject::None`]; the other variants are built by the unit tests only.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Inject {
     None,
     /// The joiner raises this signal before it joins, as an outer seccomp KILL
     /// of `setns` would. The signal must be fatal; a survivor exits 3.
     JoinerSignal(libc::c_int),
+    /// The holder never answers, so the probe's bound has to end it.
+    HolderStall,
 }
 
 /// The keep-alive join (module docs): a holder stand-in in a fresh user and
@@ -529,6 +532,8 @@ pub(crate) fn keep_alive_join_with(
 
     let (answer_read, answer_write) =
         pipe_cloexec().map_err(|e| fault_of(KeepAlivePhase::Holder, &e, "cannot create a pipe"))?;
+    // SAFETY: getpid takes no arguments and cannot fail.
+    let parent = unsafe { libc::getpid() };
     // SAFETY: fork in the single-threaded probe; the child runs only libc calls
     // and never returns (`holder_child`).
     let pid = unsafe { libc::fork() };
@@ -540,13 +545,14 @@ pub(crate) fn keep_alive_join_with(
         ));
     }
     if pid == 0 {
-        holder_child(answer_write.as_raw_fd());
+        holder_child(answer_write.as_raw_fd(), parent, inject);
     }
     drop(answer_write);
     // Every path below ends with both children reaped: each Reaper kills and
-    // waits in its Drop, which unwinding runs too.
-    forked.push(pid);
+    // waits in its Drop, which runs on unwinding too. The Reaper is made first,
+    // so a panic in the next line still reaps the child.
     let mut holder = Reaper(Some(pid));
+    forked.push(pid);
     let bytes = read_bounded(answer_read.as_raw_fd(), deadline)
         .map_err(|e| {
             fault_of(
@@ -588,12 +594,13 @@ pub(crate) fn keep_alive_join_with(
             user.as_raw_fd(),
             net.as_raw_fd(),
             join_write.as_raw_fd(),
+            parent,
             inject,
         );
     }
     drop(join_write);
-    forked.push(pid);
     let mut joiner = Reaper(Some(pid));
+    forked.push(pid);
     let bytes = read_bounded(join_read.as_raw_fd(), deadline)
         .map_err(|e| fault_of(KeepAlivePhase::Join, &e, "cannot read the joiner's answer"))?
         .ok_or_else(|| timeout_reason(KeepAlivePhase::Join, "the joiner"))?;
@@ -606,12 +613,17 @@ pub(crate) fn keep_alive_join_with(
     decode_joiner_outcome(&bytes, status)
 }
 
-/// The holder stand-in (the child that never returns): arms its death signal,
-/// unshares a fresh user and network namespace, reports `K` or `E`+errno, and
-/// parks until the probe reaps it.
-fn holder_child(report: RawFd) -> ! {
-    // SAFETY: prctl, unshare, write, pause and _exit take plain integers and a
-    // buffer this function owns; no Rust state is touched after the fork.
+/// Arms the parent-death signal in a keep-alive child, then checks that the
+/// parent is still `parent` (the probe, recorded before the fork). A probe that
+/// died between the fork and the `prctl` leaves the child reparented, and the
+/// signal never fires for it; this check closes that window, as
+/// `init::arm_parent_death` does for `__init`. `false` means the parent is gone
+/// and the caller exits at once.
+///
+/// # Safety
+/// Calls `prctl` and `getppid` only, which take plain integers.
+unsafe fn arm_child_death(parent: libc::pid_t) -> bool {
+    // SAFETY: prctl with plain integer arguments; no pointers.
     unsafe {
         libc::prctl(
             libc::PR_SET_PDEATHSIG,
@@ -620,6 +632,26 @@ fn holder_child(report: RawFd) -> ! {
             0,
             0,
         );
+        libc::getppid() == parent
+    }
+}
+
+/// The holder stand-in (the child that never returns): arms its death signal,
+/// unshares a fresh user and network namespace, reports `K` or `E`+errno, and
+/// parks until the probe reaps it.
+fn holder_child(report: RawFd, parent: libc::pid_t, inject: Inject) -> ! {
+    // SAFETY: prctl, unshare, write, pause and _exit take plain integers and a
+    // buffer this function owns; no Rust state is touched after the fork.
+    unsafe {
+        if !arm_child_death(parent) {
+            libc::_exit(1);
+        }
+        if inject == Inject::HolderStall {
+            // Test-only: never answer, so the parent's bound has to end this child.
+            loop {
+                libc::pause();
+            }
+        }
         let mut msg = [0u8; 5];
         if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) == 0 {
             msg[0] = b'K';
@@ -638,16 +670,12 @@ fn holder_child(report: RawFd) -> ! {
 /// The joiner (the child that never returns): arms its death signal, joins the
 /// holder's namespaces as the attach does, and exits 0, or reports the errno of
 /// the failed `setns` (four bytes) and exits 1.
-fn joiner_child(user: RawFd, net: RawFd, report: RawFd, inject: Inject) -> ! {
+fn joiner_child(user: RawFd, net: RawFd, report: RawFd, parent: libc::pid_t, inject: Inject) -> ! {
     // SAFETY: as for `holder_child`; the joiner exits through `_exit`.
     unsafe {
-        libc::prctl(
-            libc::PR_SET_PDEATHSIG,
-            libc::SIGKILL as libc::c_ulong,
-            0,
-            0,
-            0,
-        );
+        if !arm_child_death(parent) {
+            libc::_exit(1);
+        }
         if let Inject::JoinerSignal(sig) = inject {
             libc::raise(sig);
             // The signal was not fatal: fail visibly, not as a success.
@@ -1099,6 +1127,24 @@ mod tests {
             }
             Err(fault) => panic!("the keep-alive join must succeed: {fault:?}"),
         }
+    }
+
+    #[test]
+    fn holder_that_never_answers_is_bounded_and_reaped() {
+        // The timeout path: the holder stalls, the bound ends the step, and the
+        // Reaper leaves neither the stalled holder nor a joiner behind.
+        let mut forked = Vec::new();
+        let fault = keep_alive_join_with(Inject::HolderStall, &mut forked).expect_err("no answer");
+        assert_eq!(fault.phase, KeepAlivePhase::Holder);
+        assert_eq!(
+            fault.reason,
+            format!(
+                "the holder stand-in did not answer within {}s",
+                KEEP_ALIVE_PROBE_TIMEOUT.as_secs()
+            )
+        );
+        assert_eq!(forked.len(), 1, "the joiner is never forked");
+        assert_all_reaped(&forked);
     }
 
     #[test]
