@@ -471,6 +471,36 @@ sbx prints `sbx run: output truncated at N bytes (limits.output_bytes)` as its
 last line, and the exit row records `output_truncated: true`. If the caller closes
 sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
 
+**Resource limits.** `limits` may also set `processes`, `open_files`,
+`file_bytes` and `address_space_bytes` (positive integers; absent means the
+caller's own limit is inherited). They become `RLIMIT_NPROC`, `RLIMIT_NOFILE`,
+`RLIMIT_FSIZE` and `RLIMIT_AS`, with soft and hard limits both set, so the
+command cannot raise them. `__init` sets them after it creates the sandbox's
+user namespace and right before it execs bwrap. Per limit:
+
+- `processes` counts the sandbox's own processes and threads (Linux 5.14 and
+  later; older kernels count every process of the caller's uid). When sbx runs
+  as root, it is enforced only on Linux 5.17 and later. bwrap uses two of them.
+- `open_files` must not exceed the caller's hard limit (or `fs.nr_open`).
+- `file_bytes` bounds each file, not the total disk use. A write past it fails
+  and the writer gets `SIGXFSZ`.
+- `address_space_bytes` is virtual memory, not resident memory. Runtimes that
+  reserve large address ranges (JVM, V8, Go) need generous values.
+
+bwrap runs under the same limits, so very small values (`processes` below 3,
+a handful of `open_files`, a few MiB of address space) make bwrap itself fail.
+A limit the caller cannot grant fails setup (125, with
+`sbx __init: exec: cannot set limits.<field> …`). These are per-process
+limits, not a cgroup: they do not bound the total memory of all sandboxed
+processes, tmpfs sizes or the total disk use. See
+[R14](docs/threat-model.md#7-residual-risks).
+
+```json
+"limits": { "timeout": "120s", "output_bytes": 10485760,
+            "processes": 256, "open_files": 1024,
+            "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
+```
+
 **Session directory.** `--session-dir` is created with mode 0700 and must be
 owned by the current user. Only one run may use a session at a time: a lock on
 `sbx.lock` inside it is held for the whole run, and a second run fails with
@@ -490,14 +520,20 @@ same keys in the same order:
 `ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,
 `port`, `bytes` (`{"up","down"}` on `close`), `reason`, `via`, `verdict`,
 `rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
-`duration_ms`, `output_truncated`, `dns_poisoned` and `net_mode` (`transparent`
+`duration_ms`, `output_truncated`, `dns_poisoned`, `net_mode` (`transparent`
 or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
-(setup never completed); `net_mode` is the last key).
+(setup never completed)) and `dns_suppressed` (the last key).
+
+`dns` rows are rate limited per run, because every DNS datagram is one row: a
+burst of 1000 rows, then 100 rows per second. Rows over the limit are not
+written. The exit row's `dns_suppressed` counts them. The DNS answers
+themselves are not affected. Proxy rows (`connect`, `deny`, `close`) are not
+rate limited.
 
 ```json
 {"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}
 {"ts":"2026-10-15T18:23:01.123Z","event":"connect","host":"github.com","sni":"github.com","port":443,"bytes":null,"reason":"allowed github.com via 140.82.121.4:443","via":"transparent","verdict":"allowed","rcode":null,"qtype":null,"client":"10.255.255.1:40000"}
-{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent"}
+{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent","dns_suppressed":0}
 ```
 
 Rows are in event order: a connection's `connect`, then `deny` (teardown) if
@@ -730,7 +766,10 @@ sbx stop --session-dir S
   request and its reply.
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
-  rows carry no `call_id` (R30).
+  rows carry no `call_id` (R30). The `dns` rate limit covers the whole session,
+  so only the resident's exit row carries `dns_suppressed`.
+- **Resource limits.** The policy's `limits` RLIMITs apply to every attached
+  call as they apply to the resident.
 
 **Exit codes**
 
