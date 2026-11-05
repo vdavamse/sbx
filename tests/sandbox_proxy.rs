@@ -3784,6 +3784,8 @@ fn scenario_netns_explicit_sni_mismatch() -> Result<(), String> {
 fn network_proxy(allow: &[&str]) -> Result<Explicit, String> {
     let system: Arc<dyn Connector> = Arc::new(GuardedConnector::system(
         Limits::default().connect_timeout,
+        // Deliberately empty: this tier dials public names only; the
+        // host-address set is covered by the unit tests (issue #41).
         sbx::egress::HostAddrs::default(),
     ));
     start_explicit(allow, &[443], system)

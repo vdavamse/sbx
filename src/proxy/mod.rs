@@ -12,7 +12,7 @@
 //!    WITHOUT termination (443 → TLS ClientHello SNI via rustls's
 //!    `Acceptor`, never a completed handshake; 80 → httparse request line +
 //!    `Host`), the name is resolved and dialed under
-//!    [`crate::egress::guard`], the buffered bytes are replayed, and the
+//!    [`crate::egress::guard_host`], the buffered bytes are replayed, and the
 //!    connection is relayed (`relay::relay` — `copy_bidirectional` with
 //!    the 443 client→upstream second-hello scanner, module docs point 12).
 //!    Every connection ends in exactly ONE [`Decision`] recorded to the
@@ -86,7 +86,7 @@
 //!    single-threaded runtime). Static-musl resolution reads the HOST's
 //!    `/etc/resolv.conf`/`/etc/hosts` at call time, which is correct: the
 //!    parent runs in the host netns and the sandbox itself never resolves
-//!    (#9's fake-IP design). musl returns A+AAAA; `egress::guard` covers
+//!    (#9's fake-IP design). musl returns A+AAAA; `egress::guard_host` covers
 //!    the IPv6 special-purpose tables identically.
 //! 9. **Replay correctness** — the socket is read into a scratch chunk
 //!    which is appended to the replay buffer FIRST; rustls only ever sees a
@@ -404,7 +404,7 @@ pub enum Rejected {
     ConnectHasBody,
     /// Request framing is ambiguous (smuggling shape); `detail` pinned.
     AmbiguousFraming { detail: &'static str },
-    /// [`crate::egress::guard`] denied a resolved address or the connected
+    /// [`crate::egress::guard_host`] denied a resolved address or the connected
     /// peer: composition per egress.rs — `denied dial to {addr}: {denied}`
     /// (Q3: `{addr}` is the SocketAddr).
     DialDenied {
@@ -916,7 +916,7 @@ impl GuardedConnector {
     //   3. guard EVERY resolved    ⇒ DialDenied (first failure denies
     //      the WHOLE connection)
     //   4. dial by name            → Err ⇒ Connect
-    //   5. guard(peer_addr)        ⇒ DialDenied (rebinding backstop,
+    //   5. guard_host(peer_addr)   ⇒ DialDenied (rebinding backstop,
     //      BEFORE any byte is forwarded)
     // Elapsed at ANY point ⇒ Timeout — so the phase that overran is
     // indistinguishable in the audit row, which is exactly what the

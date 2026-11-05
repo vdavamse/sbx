@@ -290,7 +290,7 @@ pub(crate) fn host_interface_addrs() -> io::Result<Vec<std::net::IpAddr>> {
         }
         // SAFETY: ifa_addr is non-null and points to a sockaddr; unaligned
         // reads avoid relying on the allocator's alignment.
-        let family = unsafe { std::ptr::read_unaligned(ifa.ifa_addr) }.sa_family;
+        let family = unsafe { std::ptr::addr_of!((*ifa.ifa_addr).sa_family).read_unaligned() };
         match i32::from(family) {
             libc::AF_INET => {
                 // SAFETY: AF_INET ⇒ the storage is a sockaddr_in.
@@ -391,6 +391,25 @@ mod tests {
         // exercised end to end by the conformance lab, whose 9.9.9.9 fixture
         // on `lo` would otherwise be denied.
         let addrs = host_interface_addrs().expect("getifaddrs");
+        // Non-vacuity: if the kernel lists an UP non-loopback interface
+        // that carries an address, the wrapper must report something.
+        let up_non_lo = std::fs::read_dir("/sys/class/net")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name() != "lo")
+            .any(|e| {
+                std::fs::read_to_string(e.path().join("operstate")).is_ok_and(|s| s.trim() == "up")
+            });
+        let v4_routes = std::fs::read_to_string("/proc/net/route")
+            .map(|s| s.lines().skip(1).any(|l| !l.starts_with("lo")))
+            .unwrap_or(false);
+        if up_non_lo && v4_routes {
+            assert!(
+                !addrs.is_empty(),
+                "an UP interface with routes, but no addresses"
+            );
+        }
         assert!(
             addrs.iter().all(|a| !a.is_loopback()),
             "loopback-interface address leaked: {addrs:?}"
