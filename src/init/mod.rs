@@ -792,7 +792,7 @@ fn bwrap_separator(argv: &[OsString]) -> Option<usize> {
 /// `--`: `/proc/self/fd/E __landlock`. `--status-fd S` needs `--exe-fd` and must
 /// appear in the shim head, between `__landlock` and the shim's own `--`. A shim
 /// pair that appears only in the payload's arguments does not count.
-fn validate_shim_command(
+pub(crate) fn validate_shim_command(
     cmd: &[OsString],
     exe: Option<RawFd>,
     status: Option<RawFd>,
