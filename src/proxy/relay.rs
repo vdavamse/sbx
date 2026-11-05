@@ -169,16 +169,43 @@
 //! 7. **Cost** — slice-at-a-time state machine (no per-byte hot loop
 //!    outside the ≤4-byte message-header accumulation; non-handshake
 //!    record bodies are skipped in one `min()` step). Only port-443 relays
-//!    are scanned; the HTTP path passes `scan_from: None` and keeps the
-//!    plain `copy_bidirectional` shape.
+//!    are scanned. The HTTP/1 paths (port 80, CONNECT-80, absolute-form forward) run
+//!    [`relay_http`] instead (issue #29, F3): the per-request relay, whose client
+//!    side is framed by `h1::RequestStream` and inspected per request (proxy
+//!    module docs point 14).
+//! 8. **Idle watchdog (issue #29, C4)** — every relay (443 scanned, port 80,
+//!    CONNECT-443, CONNECT-80 and forward) runs under [`until_idle`]. [`Activity`]
+//!    records the time of the last payload byte moved in EITHER direction, stamped
+//!    by [`Watched`] on each read or write that moves at least one byte (TCP
+//!    keepalives do not count). When no byte has moved for
+//!    [`crate::proxy::Limits::relay_idle_timeout`] the relay future is dropped,
+//!    which drops both sockets with no linger, and the `close` row carries
+//!    `reason: "idle_timeout"`. The decision phase is not covered: it has
+//!    [`crate::proxy::Limits::decision_timeout`]. Deadlines use checked arithmetic.
+//! 9. **Teardown vocabulary (issue #29)** — [`Teardown`] is the single build site of
+//!    the relay-phase denial details: `SecondHello` and `TlsFraming` (the two pinned
+//!    scanner strings), and `Request { index, rejected }`, rendered as
+//!    `relay torn down: HTTP request N denied: <reason>`, where request 1 is the
+//!    decision phase's and N counts up from there. [`relay_http`] writes every
+//!    validated byte before a request's outcome is acted on, so a denied element
+//!    never reaches the upstream and the bytes before it do. Upstream EOF ends the
+//!    segment (client half-close, then linger). A last request's framed end, or a
+//!    client EOF, half-closes the upstream write half.
 
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional};
+
+use super::h1::{H1Limits, RequestMeta, RequestStream, Step};
+use super::http::{HeadCheck, inspect_head, upstream_head};
+use super::{Limits, NameSource, Rejected};
+use crate::policy::Domain;
 
 /// The pinned teardown detail: a ClientHello (handshake type 0x01) after
 /// the inspected one — plaintext-phase (immediate, on the type byte), or
@@ -545,12 +572,11 @@ impl<C: AsyncWrite + Unpin> AsyncWrite for Scanned<C> {
 pub(crate) enum RelayEnd {
     /// Both directions ended cleanly (normal lifecycle).
     Finished,
-    /// The scanner tripped: the detail is one of the two pinned teardown
-    /// strings ([`TORN_DOWN_SECOND_HELLO`] / [`TORN_DOWN_FRAMING`]).
-    /// `handle_connection` reports it to
-    /// [`crate::proxy::DecisionSink::teardown`] — a blocked attack must
-    /// not be audit-invisible behind its `allowed …` line.
-    TornDown(&'static str),
+    /// The scanner tripped: the teardown class (module docs point 9); the
+    /// caller reports its detail to [`crate::proxy::DecisionSink::teardown`]
+    /// — a blocked attack must not be audit-invisible behind its `allowed …`
+    /// line.
+    TornDown(Teardown),
 }
 
 /// The relay phase: write the FULL replay buffer upstream (proxy module
@@ -591,9 +617,9 @@ where
                 // reach the upstream (module docs point 6). Every scan
                 // Err site sets `torn_down`; the fallback keeps the
                 // unreachable arm panic-free (house rule).
-                return Ok(RelayEnd::TornDown(
+                return Ok(RelayEnd::TornDown(Teardown::from_scanner(
                     scanner.torn_down().unwrap_or(TORN_DOWN_FRAMING),
-                ));
+                )));
             }
             Some(scanner)
         }
@@ -611,7 +637,7 @@ where
             // scanner's pinned detail is the identity — never
             // string-match the io error (module docs point 5).
             if let Some(detail) = scanned.scanner.torn_down() {
-                return Ok(RelayEnd::TornDown(detail));
+                return Ok(RelayEnd::TornDown(Teardown::from_scanner(detail)));
             }
             copied?;
             Ok(RelayEnd::Finished)
@@ -655,52 +681,493 @@ pub(crate) async fn linger_close<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut
     let _ = tokio::time::timeout(LINGER_TIMEOUT, drain).await;
 }
 
-/// The explicit CONNECT-80 / absolute-form relay (issue #8, Q6/D7): the
-/// request was rewritten to `Connection: close`, so the response's end is
-/// the upstream's EOF. Replays the FULL buffer upstream, then copies both
-/// ways. The client→upstream direction half-closes the upstream on client
-/// EOF; upstream EOF ends the whole exchange (both sockets close).
-pub(crate) async fn relay_until_upstream_eof<C, U>(
+/// Why a relay tore down before its natural end (module docs point 9): the
+/// pinned detail is the test-visible identity of each class.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Teardown {
+    /// A second ClientHello after the inspected one (443 scanner).
+    SecondHello,
+    /// Plaintext-phase TLS framing that cannot be a legal continuation (443).
+    TlsFraming,
+    /// An HTTP request on the connection was denied; `index` is its 1-based
+    /// number, `rejected` the check that failed (port 80 and CONNECT-80).
+    Request { index: u32, rejected: Rejected },
+}
+
+impl Teardown {
+    fn from_scanner(detail: &'static str) -> Self {
+        if detail == TORN_DOWN_SECOND_HELLO {
+            Teardown::SecondHello
+        } else {
+            Teardown::TlsFraming
+        }
+    }
+
+    /// The pinned audit detail (module docs point 9; the single build site).
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            Teardown::SecondHello => TORN_DOWN_SECOND_HELLO.to_owned(),
+            Teardown::TlsFraming => TORN_DOWN_FRAMING.to_owned(),
+            Teardown::Request { index, rejected } => format!(
+                "relay torn down: HTTP request {index} denied: {}",
+                rejected.reason()
+            ),
+        }
+    }
+}
+
+/// The per-connection relay activity clock (module docs point 8): the time of
+/// the last payload byte moved in EITHER direction, shared by every wrapper of
+/// one relay. `Send` (atomic), so `tokio::spawn` accepts the relay.
+#[derive(Debug, Clone)]
+pub(crate) struct Activity {
+    base: Instant,
+    last_nanos: Arc<AtomicU64>,
+}
+
+impl Activity {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            last_nanos: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn touch(&self) {
+        let nanos = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last_nanos.store(nanos, Ordering::Relaxed);
+    }
+
+    fn last_nanos(&self) -> u64 {
+        self.last_nanos.load(Ordering::Relaxed)
+    }
+
+    /// The instant a recorded activity stamp denotes (saturating).
+    fn at(&self, nanos: u64) -> Instant {
+        self.base
+            .checked_add(Duration::from_nanos(nanos))
+            .unwrap_or(self.base)
+    }
+}
+
+/// Wraps one side of a relay and stamps [`Activity`] on every read that
+/// returns at least one byte and every write that accepts at least one byte.
+/// TCP keepalives and empty polls do not count.
+pub(crate) struct Watched<S> {
+    inner: S,
+    act: Activity,
+}
+
+impl<S> Watched<S> {
+    pub(crate) fn new(inner: S, act: Activity) -> Self {
+        Self { inner, act }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            if buf.filled().len() > before {
+                this.act.touch();
+            }
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res {
+            if *n > 0 {
+                this.act.touch();
+            }
+        }
+        res
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &res {
+            if *n > 0 {
+                this.act.touch();
+            }
+        }
+        res
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// The inactivity watchdog (module docs point 8): completes once no payload
+/// byte has moved for `idle`. A deadline that overflows `Instant` never
+/// fires (checked arithmetic, house rule).
+pub(crate) async fn idle_watchdog(act: Activity, idle: Duration) {
+    loop {
+        let seen = act.last_nanos();
+        let Some(deadline) = act.at(seen).checked_add(idle) else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        if act.last_nanos() == seen {
+            return;
+        }
+    }
+}
+
+/// Race `fut` against the idle watchdog: `Some(output)` when the future
+/// finished first, `None` once the relay has been idle for `idle` — `fut` is
+/// dropped then, which drops both sockets without a linger (module docs
+/// point 8).
+pub(crate) async fn until_idle<F: Future>(
+    act: &Activity,
+    idle: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    let mut fut = Box::pin(fut);
+    let mut watchdog = Box::pin(idle_watchdog(act.clone(), idle));
+    poll_fn(|cx| {
+        if let Poll::Ready(output) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        if watchdog.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+/// Which request path a per-request relay serves (module docs point 4): the
+/// name source for every head check follows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HttpFlavor {
+    /// Transparent :80 — the name is the DNS-map name.
+    Transparent,
+    /// CONNECT-80 — the name is the CONNECT target host.
+    ConnectTunnel,
+    /// Absolute-form forward — one request only (explicit module docs point
+    /// 12); its name is the request-target host.
+    Forward,
+}
+
+impl HttpFlavor {
+    fn source(self) -> NameSource {
+        match self {
+            HttpFlavor::Transparent => NameSource::DnsMap,
+            HttpFlavor::ConnectTunnel => NameSource::ConnectTarget,
+            HttpFlavor::Forward => NameSource::RequestTarget,
+        }
+    }
+}
+
+/// The name a per-request relay binds every later request to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HttpBinding {
+    pub name: Domain,
+    pub port: u16,
+    pub flavor: HttpFlavor,
+}
+
+/// Everything request 1's decision phase hands the relay: the binding, the
+/// request's facts, and the client bytes already read past its head.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HttpStart {
+    pub binding: HttpBinding,
+    pub first: RequestMeta,
+    pub pending: Vec<u8>,
+}
+
+/// How a per-request relay ended (module docs point 4).
+#[derive(Debug)]
+pub(crate) enum HttpEnd {
+    /// Upstream EOF ended the relay (normal lifecycle).
+    Finished,
+    /// A later request was denied (module docs point 4): silent teardown.
+    TornDown(Teardown),
+}
+
+/// The read chunk for the client side (the head cap bounds what a chunk can
+/// add to the accumulator).
+const READ_CHUNK: usize = 4096;
+
+/// The outcome of feeding client bytes through the request stream.
+#[derive(Debug)]
+enum Flow {
+    /// More client bytes may follow.
+    Continue,
+    /// The last request's framed end passed: stop reading the client.
+    AfterLast,
+    /// The client half-closed (EOF) before the stream ended.
+    Eof,
+    /// A request was denied.
+    Torn(Teardown),
+}
+
+/// Race outcome of [`relay_http`]'s two directions.
+enum Race {
+    Down(io::Result<u64>),
+    Up(io::Result<Flow>),
+}
+
+/// Feed `input` through the request stream and forward every validated
+/// byte (module docs points 4 and 6). Heads are inspected and admitted one
+/// at a time, so a denied head is never written.
+async fn forward_input<W: AsyncWrite + Unpin>(
+    stream: &mut RequestStream,
+    binding: &HttpBinding,
+    max_headers: usize,
+    up_w: &mut W,
+    input: &[u8],
+) -> io::Result<Flow> {
+    let mut pos = 0usize;
+    while pos < input.len() {
+        if stream.after_last() {
+            return Ok(Flow::AfterLast);
+        }
+        let mut out = Vec::new();
+        let result = stream.feed(&input[pos..], &mut out);
+        // Validated bytes go upstream before the outcome is acted on: a
+        // denied element's predecessors are exactly what the stream emitted.
+        if !out.is_empty() {
+            up_w.write_all(&out).await?;
+        }
+        let step = match result {
+            Ok(step) => step,
+            Err(rejected) => {
+                return Ok(Flow::Torn(Teardown::Request {
+                    index: stream.index(),
+                    rejected,
+                }));
+            }
+        };
+        match step {
+            Step::Progress { consumed } => {
+                if consumed == 0 {
+                    return Err(io::Error::other("request stream made no progress"));
+                }
+                pos += consumed;
+            }
+            Step::AfterLast { .. } => return Ok(Flow::AfterLast),
+            Step::Head { consumed, head } => {
+                pos += consumed;
+                let index = stream.index();
+                let meta = match admit_next(binding, &head, max_headers) {
+                    Ok(meta) => meta,
+                    Err(rejected) => {
+                        return Ok(Flow::Torn(Teardown::Request { index, rejected }));
+                    }
+                };
+                up_w.write_all(&upstream_head(head, &meta)).await?;
+                stream.admit(&meta);
+            }
+        }
+    }
+    Ok(if stream.after_last() {
+        Flow::AfterLast
+    } else {
+        Flow::Continue
+    })
+}
+
+/// The client→upstream side's exit: a last request's framed end (or a client
+/// EOF) half-closes the upstream write half, so the server sees the end of
+/// the request stream. Nothing else is ever sent after it. A denial is
+/// returned as is: the caller drops the sockets.
+async fn finish_up<W: AsyncWrite + Unpin>(up_w: &mut W, flow: Flow) -> io::Result<Flow> {
+    if matches!(flow, Flow::AfterLast) {
+        up_w.shutdown().await?;
+    }
+    Ok(flow)
+}
+
+/// Inspect one later request head (module docs point 7). Forward never
+/// reaches here: its only request is LAST, so the stream never yields a
+/// second head (the arm is a fail-closed backstop).
+fn admit_next(
+    binding: &HttpBinding,
+    head: &[u8],
+    max_headers: usize,
+) -> Result<RequestMeta, Rejected> {
+    match binding.flavor {
+        HttpFlavor::Transparent | HttpFlavor::ConnectTunnel => {
+            let check = HeadCheck {
+                expected: &binding.name,
+                port: binding.port,
+                source: binding.flavor.source(),
+            };
+            inspect_head(head, &check, max_headers)
+        }
+        HttpFlavor::Forward => Err(Rejected::NotProxyRequest),
+    }
+}
+
+/// The per-request relay (issue #29, F3; module docs point 4): writes the
+/// request-1 head, then pumps the client's bytes through the request stream,
+/// inspecting and admitting every later head before its bytes are written.
+/// Upstream bytes flow back unparsed (`copy`). Upstream EOF ends the relay
+/// (client half-closed, linger as before); a client EOF shuts the upstream
+/// write half; a last request's end stops reading the client. Every outcome
+/// is returned, never swallowed.
+pub(crate) async fn relay_http<C, U>(
     client: C,
-    replay: &[u8],
+    head: &[u8],
+    start: HttpStart,
     upstream: &mut U,
-) -> io::Result<RelayEnd>
+    limits: &Limits,
+) -> io::Result<HttpEnd>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    upstream.write_all(replay).await?;
+    let HttpStart {
+        binding,
+        first,
+        pending,
+    } = start;
+    let max_headers = limits.max_http_headers;
+    let decision_timeout = limits.decision_timeout;
+    let mut stream = RequestStream::after_first(&first, H1Limits::from_limits(limits));
     let (mut client_r, mut client_w) = tokio::io::split(client);
     let (mut up_r, mut up_w) = tokio::io::split(&mut *upstream);
-    let mut down = Box::pin(tokio::io::copy(&mut up_r, &mut client_w));
-    let mut up = Box::pin(async {
-        tokio::io::copy(&mut client_r, &mut up_w).await?;
-        up_w.shutdown().await
-    });
+
+    // The request-1 head and the pending bytes go upstream BEFORE the race
+    // starts: the downstream copy may finish first (an upstream that is
+    // already closed), and the head must never be skipped.
+    up_w.write_all(head).await?;
+    let first = forward_input(&mut stream, &binding, max_headers, &mut up_w, &pending).await?;
+    if let Flow::Torn(teardown) = first {
+        return Ok(HttpEnd::TornDown(teardown));
+    }
+    let up = async {
+        if !matches!(first, Flow::Continue) {
+            return finish_up(&mut up_w, first).await;
+        }
+        let mut chunk = [0u8; READ_CHUNK];
+        // (request number, instant the head's first byte was seen): the
+        // per-head deadline restarts for every head (module docs point 7).
+        let mut head_started: Option<(u32, Instant)> = None;
+        loop {
+            let deadline = if stream.head_in_progress() {
+                let index = stream.index();
+                let started = match head_started {
+                    Some((seen, at)) if seen == index => at,
+                    _ => {
+                        let at = Instant::now();
+                        head_started = Some((index, at));
+                        at
+                    }
+                };
+                started.checked_add(decision_timeout)
+            } else {
+                head_started = None;
+                None
+            };
+            let read = match deadline {
+                Some(at) => match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(at),
+                    client_r.read(&mut chunk),
+                )
+                .await
+                {
+                    Ok(read) => read?,
+                    Err(_elapsed) => {
+                        return Ok(Flow::Torn(Teardown::Request {
+                            index: stream.index(),
+                            rejected: Rejected::DecisionTimeout {
+                                secs: decision_timeout.as_secs(),
+                            },
+                        }));
+                    }
+                },
+                None => client_r.read(&mut chunk).await?,
+            };
+            if read == 0 {
+                // Client EOF: a partial head is dropped, never forwarded.
+                up_w.shutdown().await?;
+                return Ok(Flow::Eof);
+            }
+            let flow = forward_input(
+                &mut stream,
+                &binding,
+                max_headers,
+                &mut up_w,
+                &chunk[..read],
+            )
+            .await?;
+            if !matches!(flow, Flow::Continue) {
+                return finish_up(&mut up_w, flow).await;
+            }
+        }
+    };
+    let down = async { tokio::io::copy(&mut up_r, &mut client_w).await };
+    let mut up = Box::pin(up);
+    let mut down = Box::pin(down);
     let mut up_done = false;
-    let down_result = poll_fn(|cx| {
+    let race = poll_fn(|cx| {
         if let Poll::Ready(result) = down.as_mut().poll(cx) {
-            return Poll::Ready(result.map(|_| ()));
+            return Poll::Ready(Race::Down(result));
         }
         if !up_done {
             if let Poll::Ready(result) = up.as_mut().poll(cx) {
                 up_done = true;
-                if let Err(err) = result {
-                    return Poll::Ready(Err(err));
+                match &result {
+                    // A denial or a transport error ends the relay now; the
+                    // other outcomes keep the downstream copy running until
+                    // upstream EOF.
+                    Ok(Flow::Torn(_)) | Err(_) => return Poll::Ready(Race::Up(result)),
+                    Ok(_) => {}
                 }
             }
         }
         Poll::Pending
     })
     .await;
-    drop(down);
     drop(up);
-    // Upstream EOF (or a transport error) ends the exchange.
-    down_result?;
-    let _ = client_w.shutdown().await;
-    let mut client = client_r.unsplit(client_w);
-    linger_close(&mut client).await;
-    Ok(RelayEnd::Finished)
+    drop(down);
+    match race {
+        Race::Down(Ok(_)) => {
+            // Upstream EOF ends the segment (module docs point 4): half-close
+            // the client, then linger as relay_until_upstream_eof did.
+            let _ = client_w.shutdown().await;
+            let mut client = client_r.unsplit(client_w);
+            linger_close(&mut client).await;
+            Ok(HttpEnd::Finished)
+        }
+        Race::Down(Err(err)) => Err(err),
+        Race::Up(Ok(Flow::Torn(teardown))) => Ok(HttpEnd::TornDown(teardown)),
+        Race::Up(Err(err)) => Err(err),
+        // Only Torn/Err reach the race's Up arm (see above).
+        Race::Up(Ok(_)) => Ok(HttpEnd::Finished),
+    }
 }
 
 /// Upstream byte counter for the close audit row (issue #10, T9). `up` counts
@@ -832,22 +1299,35 @@ mod tests {
     #[test]
     fn relay_counts_replay_as_up() {
         block_on(async {
-            // Replay bytes are written upstream first; a counted relay must
-            // report them as `up` (issue #10, T9).
+            // The request-1 head is written upstream first; a counted relay must
+            // report it as `up` (issue #10, T9). Upstream EOF ends the relay.
             let (mut far, near) = tokio::io::duplex(4096);
             let (client, _client_far) = tokio::io::duplex(4096);
             let mut counted = Counted::new(near);
-            let replay = b"GET / HTTP/1.1\r\n\r\n";
+            let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
             let far_task = tokio::spawn(async move {
-                let mut got = vec![0u8; b"GET / HTTP/1.1\r\n\r\n".len()];
+                let mut got = vec![0u8; b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".len()];
                 far.read_exact(&mut got).await.expect("far read");
-                assert_eq!(&got[..], &b"GET / HTTP/1.1\r\n\r\n"[..]);
                 far.shutdown().await.expect("far shutdown");
             });
-            let r = relay_until_upstream_eof(client, replay, &mut counted).await;
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: Domain::parse("a.test").expect("name"),
+                    port: 80,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first: RequestMeta {
+                    framing: super::super::http::Framing::None,
+                    minor_version: 1,
+                    close: true,
+                    upgrade: false,
+                },
+                pending: Vec::new(),
+            };
+            let r = relay_http(client, head, start, &mut counted, &Limits::default()).await;
             far_task.await.expect("far task");
-            assert!(r.is_ok());
-            assert_eq!(counted.up(), replay.len() as u64);
+            assert!(matches!(r, Ok(HttpEnd::Finished)), "{r:?}");
+            assert_eq!(counted.up(), head.len() as u64);
         });
     }
 
@@ -1417,7 +1897,7 @@ mod tests {
             let mut received = Vec::new();
             let _ = upstream_peer.read_to_end(&mut received).await;
             match relay_end.expect("a teardown is not a transport error") {
-                RelayEnd::TornDown(detail) => assert_eq!(detail, TORN_DOWN_SECOND_HELLO),
+                RelayEnd::TornDown(detail) => assert_eq!(detail, Teardown::SecondHello),
                 other => panic!("the pre-feed must tear down on the alert mask: {other:?}"),
             }
             assert!(received.is_empty(), "the pre-feed runs BEFORE write_all");
@@ -1687,7 +2167,7 @@ mod tests {
             let back = peer_task.await.expect("peer task");
             let received = upstream_task.await.expect("upstream task");
             match relay_end.expect("a teardown is not a transport error") {
-                RelayEnd::TornDown(detail) => assert_eq!(detail, TORN_DOWN_SECOND_HELLO),
+                RelayEnd::TornDown(detail) => assert_eq!(detail, Teardown::SecondHello),
                 other => panic!("the scanner must tear the relay down: {other:?}"),
             }
             assert_eq!(
@@ -1719,7 +2199,7 @@ mod tests {
             let mut received = Vec::new();
             let _ = upstream_peer.read_to_end(&mut received).await;
             match relay_end.expect("a teardown is not a transport error") {
-                RelayEnd::TornDown(detail) => assert_eq!(detail, TORN_DOWN_SECOND_HELLO),
+                RelayEnd::TornDown(detail) => assert_eq!(detail, Teardown::SecondHello),
                 other => panic!("the pre-feed must tear down: {other:?}"),
             }
             assert!(received.is_empty(), "the pre-feed runs BEFORE write_all");
@@ -1744,7 +2224,7 @@ mod tests {
             let mut received = Vec::new();
             let _ = upstream_peer.read_to_end(&mut received).await;
             match relay_end.expect("a teardown is not a transport error") {
-                RelayEnd::TornDown(detail) => assert_eq!(detail, TORN_DOWN_FRAMING),
+                RelayEnd::TornDown(detail) => assert_eq!(detail, Teardown::TlsFraming),
                 other => panic!("the pre-feed must tear down on the mid-fragment CCS: {other:?}"),
             }
             assert!(received.is_empty(), "the pre-feed runs BEFORE write_all");
@@ -1833,6 +2313,422 @@ mod tests {
             let mut expected = ch1;
             expected.extend_from_slice(&tail);
             assert_eq!(received, expected, "every byte must reach the upstream");
+        });
+    }
+
+    // ---- the per-request relay (issue #29, F3) -----------------------------
+
+    /// What one [`run_http`] exchange observed.
+    struct Harness {
+        /// Every byte the upstream received before its quiet deadline.
+        upstream_received: Vec<u8>,
+        /// Every byte the client received (until the relay closed it).
+        client_received: Vec<u8>,
+        end: io::Result<HttpEnd>,
+    }
+
+    /// A keep-alive-capable request-1 meta (HTTP/1.1, no body, no close).
+    fn keep_alive() -> RequestMeta {
+        RequestMeta {
+            framing: super::super::http::Framing::None,
+            minor_version: 1,
+            close: false,
+            upgrade: false,
+        }
+    }
+
+    /// Drive `relay_http` over duplex pairs. The client writes `steps` (each
+    /// after its delay in ms), then half-closes when `half_close`. The upstream
+    /// collects bytes until 400 ms of quiet, then answers a 200 and closes.
+    async fn run_http(
+        head: &[u8],
+        first: RequestMeta,
+        pending: &[u8],
+        steps: Vec<(u64, Vec<u8>)>,
+        half_close: bool,
+        limits: Limits,
+    ) -> Harness {
+        let (server_side, mut client_peer) = tokio::io::duplex(64 * 1024);
+        let (mut upstream, mut up_peer) = tokio::io::duplex(64 * 1024);
+        let up_task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                // Longer than small_limits' decision timeout, so a stalled head
+                // is torn down by the relay before the upstream's EOF arrives.
+                let quiet = Duration::from_millis(400);
+                match tokio::time::timeout(quiet, up_peer.read(&mut chunk)).await {
+                    Ok(Ok(n)) if n > 0 => seen.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+            let _ = up_peer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = up_peer.shutdown().await;
+            seen
+        });
+        let head = head.to_vec();
+        let pending = pending.to_vec();
+        let relay_task = tokio::spawn(async move {
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: Domain::parse("allowed.test").expect("name"),
+                    port: 80,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first,
+                pending,
+            };
+            relay_http(server_side, &head, start, &mut upstream, &limits).await
+        });
+        let client_task = tokio::spawn(async move {
+            for (delay_ms, bytes) in steps {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if client_peer.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+            if half_close {
+                let _ = client_peer.shutdown().await;
+            }
+            let mut got = Vec::new();
+            let _ = client_peer.read_to_end(&mut got).await;
+            got
+        });
+        let end = relay_task.await.expect("relay task");
+        let upstream_received = up_task.await.expect("upstream task");
+        let client_received = client_task.await.expect("client task");
+        Harness {
+            upstream_received,
+            client_received,
+            end,
+        }
+    }
+
+    fn small_limits() -> Limits {
+        Limits {
+            decision_timeout: Duration::from_millis(200),
+            ..Limits::default()
+        }
+    }
+
+    const GET1: &[u8] = b"GET /a HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+    const GET2: &[u8] = b"GET /b HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+    const GET3: &[u8] = b"GET /c HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+
+    fn torn(end: &io::Result<HttpEnd>) -> Teardown {
+        match end {
+            Ok(HttpEnd::TornDown(teardown)) => teardown.clone(),
+            other => panic!("expected a teardown: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_keepalive_two_gets_forwarded_verbatim() {
+        block_on(async {
+            // Request 2 in its own write: forwarded byte-identical, no close
+            // inserted on either keep-alive request.
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, GET2.to_vec())],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(GET2);
+            assert_eq!(got.upstream_received, want);
+            assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
+            assert!(got.client_received.starts_with(b"HTTP/1.1 200 OK"));
+        });
+    }
+
+    #[test]
+    fn http_pipelined_gets_in_one_write() {
+        block_on(async {
+            // Requests 2 and 3 already sit in the pending bytes of request 1's read.
+            let mut pending = GET2.to_vec();
+            pending.extend_from_slice(GET3);
+            let got = run_http(GET1, keep_alive(), &pending, vec![], true, small_limits()).await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(&pending);
+            assert_eq!(got.upstream_received, want);
+        });
+    }
+
+    #[test]
+    fn http_foreign_host_second_request_torn_down() {
+        block_on(async {
+            let evil: &[u8] = b"GET /b HTTP/1.1\r\nHost: evil.test\r\n\r\n";
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, evil.to_vec())],
+                true,
+                small_limits(),
+            )
+            .await;
+            // The upstream saw request 1 only; the denied head never left.
+            assert_eq!(got.upstream_received, GET1.to_vec());
+            assert_eq!(
+                torn(&got.end).detail(),
+                "relay torn down: HTTP request 2 denied: HTTP Host evil.test does not match the DNS-map name allowed.test"
+            );
+        });
+    }
+
+    #[test]
+    fn http_post_body_last_then_after_last_not_forwarded() {
+        block_on(async {
+            // Request 2 is a POST with a body: it is LAST, so the close token
+            // goes in, the body is forwarded, and the pipelined request 3 after
+            // the body is never forwarded (module docs point 7 of h1.rs).
+            let post_head = b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\n";
+            let mut tail = post_head.to_vec();
+            tail.extend_from_slice(b"body");
+            tail.extend_from_slice(GET3);
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, tail)],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody");
+            assert_eq!(got.upstream_received, want);
+            assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
+        });
+    }
+
+    #[test]
+    fn http_chunked_body_then_after_last_not_forwarded() {
+        block_on(async {
+            let chunked_head =
+                b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let mut tail = chunked_head.to_vec();
+            tail.extend_from_slice(b"3\r\nabc\r\n0\r\n\r\n");
+            tail.extend_from_slice(GET3);
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, tail)],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+            assert_eq!(got.upstream_received, want);
+        });
+    }
+
+    #[test]
+    fn http_bad_chunk_line_torn_down_before_forwarding() {
+        block_on(async {
+            // Request 2's first chunk is valid, the second size line is not:
+            // the valid chunk and the head are forwarded, the bad line never is.
+            let mut bad =
+                b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    .to_vec();
+            bad.extend_from_slice(b"3\r\nabc\r\nzz\r\n");
+            let got = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, bad)],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n");
+            assert_eq!(got.upstream_received, want);
+            assert_eq!(
+                torn(&got.end).detail(),
+                "relay torn down: HTTP request 2 denied: ambiguous HTTP request framing: invalid chunk-size line"
+            );
+        });
+    }
+
+    #[test]
+    fn http_second_head_too_large() {
+        block_on(async {
+            let limits = Limits {
+                max_head_bytes: 64,
+                ..small_limits()
+            };
+            let mut flood = b"GET /".to_vec();
+            flood.extend(std::iter::repeat_n(b'X', 200));
+            let got = run_http(GET1, keep_alive(), b"", vec![(0, flood)], true, limits).await;
+            assert_eq!(got.upstream_received, GET1.to_vec());
+            assert_eq!(
+                torn(&got.end).detail(),
+                "relay torn down: HTTP request 2 denied: HTTP request head exceeds the 64-byte cap"
+            );
+        });
+    }
+
+    #[test]
+    fn http_second_head_timeout_starts_at_first_byte() {
+        block_on(async {
+            // A partial second head that stalls past the decision timeout is
+            // torn down ...
+            let stalled = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                vec![(0, b"GET /b HTTP/1.1\r\n".to_vec())],
+                false,
+                small_limits(),
+            )
+            .await;
+            assert!(
+                torn(&stalled.end)
+                    .detail()
+                    .starts_with("relay torn down: HTTP request 2 denied: decision-phase timeout"),
+                "{:?}",
+                stalled.end
+            );
+            // ... but a PAUSE between requests longer than the timeout is
+            // allowed: the deadline starts at the second head's first byte.
+            let paused = run_http(
+                GET1,
+                keep_alive(),
+                b"",
+                // 300 ms: longer than the 200 ms decision timeout, shorter than the
+                // upstream's 400 ms quiet window.
+                vec![(300, GET2.to_vec())],
+                true,
+                small_limits(),
+            )
+            .await;
+            let mut want = GET1.to_vec();
+            want.extend_from_slice(GET2);
+            assert_eq!(paused.upstream_received, want);
+            assert!(
+                matches!(paused.end, Ok(HttpEnd::Finished)),
+                "{:?}",
+                paused.end
+            );
+        });
+    }
+
+    #[test]
+    fn http_client_eof_shuts_upstream_and_upstream_eof_ends_segment() {
+        block_on(async {
+            // Client half-close: the upstream sees EOF after the head, answers,
+            // and the relay ends with the client's clean EOF after the reply.
+            let got = run_http(GET1, keep_alive(), b"", vec![], true, small_limits()).await;
+            assert_eq!(got.upstream_received, GET1.to_vec());
+            assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
+            assert_eq!(
+                got.client_received,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+            );
+        });
+    }
+
+    #[test]
+    fn after_last_request_forwards_nothing_more() {
+        block_on(async {
+            // A `close` request is last: the pipelined GET after it is discarded.
+            let close = RequestMeta {
+                close: true,
+                ..keep_alive()
+            };
+            let close_head = b"GET /a HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+            let got = run_http(close_head, close, GET2, vec![], false, small_limits()).await;
+            assert_eq!(got.upstream_received, close_head.to_vec());
+            assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
+        });
+    }
+
+    #[test]
+    fn forward_pipelined_second_request_never_forwarded() {
+        // Explicit forward is one request per connection (explicit module docs
+        // point 12): any pipelined follow-up is dropped, whatever its authority.
+        block_on(async {
+            let forward = RequestMeta {
+                close: true,
+                ..keep_alive()
+            };
+            let rewritten = b"GET /a HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+            let other = b"GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n";
+            let got = run_http(rewritten, forward, other, vec![], false, small_limits()).await;
+            assert_eq!(got.upstream_received, rewritten.to_vec());
+        });
+    }
+
+    #[test]
+    fn teardown_detail_pinned() {
+        // Module docs point 9: the three arms, byte-exact.
+        assert_eq!(Teardown::SecondHello.detail(), TORN_DOWN_SECOND_HELLO);
+        assert_eq!(Teardown::TlsFraming.detail(), TORN_DOWN_FRAMING);
+        let request = Teardown::Request {
+            index: 2,
+            rejected: Rejected::HostMismatch {
+                host: Domain::parse("evil.test").expect("host"),
+                name: Domain::parse("allowed.test").expect("name"),
+                source: NameSource::DnsMap,
+            },
+        };
+        assert_eq!(
+            request.detail(),
+            "relay torn down: HTTP request 2 denied: HTTP Host evil.test does not match the DNS-map name allowed.test"
+        );
+    }
+
+    #[test]
+    fn activity_in_either_direction_resets_idle() {
+        // Payload in EITHER direction keeps the relay alive; only silence ends it.
+        block_on(async {
+            let act = Activity::new();
+            let (mut far, near) = tokio::io::duplex(4096);
+            let mut watched = Watched::new(near, act.clone());
+            let writer = tokio::spawn(async move {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    far.write_all(b"x").await.expect("far write");
+                }
+                far.shutdown().await.expect("far shutdown");
+            });
+            let mut seen = 0usize;
+            let relayed = until_idle(&act, Duration::from_millis(80), async {
+                let mut one = [0u8; 1];
+                while let Ok(1) = watched.read(&mut one).await {
+                    seen += 1;
+                }
+            })
+            .await;
+            writer.await.expect("writer");
+            assert!(
+                relayed.is_some(),
+                "payload every 20 ms must not trip an 80 ms idle bound"
+            );
+            assert_eq!(seen, 10);
+        });
+    }
+
+    #[test]
+    fn idle_watchdog_fires_without_activity() {
+        block_on(async {
+            let act = Activity::new();
+            let (_far, near) = tokio::io::duplex(4096);
+            let mut watched = Watched::new(near, act.clone());
+            let relayed = until_idle(&act, Duration::from_millis(30), async {
+                let mut one = [0u8; 1];
+                let _ = watched.read(&mut one).await;
+            })
+            .await;
+            assert!(relayed.is_none(), "silence must trip the watchdog");
         });
     }
 }

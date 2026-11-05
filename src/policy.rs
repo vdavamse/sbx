@@ -525,7 +525,10 @@ pub struct Network {
     pub allow: Vec<DomainRule>,
 
     /// Destination ports the sandbox may use. Port 0 is not a valid
-    /// destination port and is rejected.
+    /// destination port and is rejected. Only 443 (TLS, SNI-checked) and 80
+    /// (HTTP, `Host`-checked) have inspectors. Any other listed port is denied,
+    /// fail closed, by design: an opaque TCP pass-through cannot verify the name
+    /// and would bypass the allow list. There is no plan to add other ports.
     pub ports: Vec<u16>,
 }
 

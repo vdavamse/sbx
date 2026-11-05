@@ -986,6 +986,21 @@ fn scenarios() -> Vec<Scenario> {
             run: audit_rows_check,
         },
         Scenario {
+            name: "run-relay-idle-timeout-zero-rc2",
+            gate: Always,
+            run: relay_idle_timeout_zero_rc2,
+        },
+        Scenario {
+            name: "run-relay-idle-timeout-garbage-rc2",
+            gate: Always,
+            run: relay_idle_timeout_garbage_rc2,
+        },
+        Scenario {
+            name: "run-relay-idle-timeout-accepted-none-mode",
+            gate: Bwrap,
+            run: relay_idle_timeout_accepted_none_mode,
+        },
+        Scenario {
             name: "mode-none-clamped",
             gate: Bwrap,
             run: mode_none_clamped,
@@ -2527,6 +2542,55 @@ fn audit_rows_check() -> Result<(), String> {
         return Err(format!("last row is not exit: {last}"));
     }
     Ok(())
+}
+
+/// Issue #29, C4: `--relay-idle-timeout` goes through the same duration rules
+/// as `--timeout`: zero is a usage error (rc 2), never a sentinel.
+fn relay_idle_timeout_zero_rc2() -> Result<(), String> {
+    let dir = scratch("ritzero");
+    let policy = Pol::new("dns").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--relay-idle-timeout", "0s"],
+        &payload(&["a.example"]),
+    );
+    let done = run_sbx(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 2)
+}
+
+/// Issue #29, C4: a value that is not a duration is a usage error (rc 2).
+fn relay_idle_timeout_garbage_rc2() -> Result<(), String> {
+    let dir = scratch("ritgarb");
+    let policy = Pol::new("dns").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--relay-idle-timeout", "garbage"],
+        &payload(&["a.example"]),
+    );
+    let done = run_sbx(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 2)
+}
+
+/// Issue #29, C4: a valid value is accepted on a `none`-mode run, where no
+/// relay exists and the flag does nothing.
+fn relay_idle_timeout_accepted_none_mode() -> Result<(), String> {
+    let dir = scratch("ritnone");
+    let mut pol = Pol::new("dns");
+    pol.mode = "none";
+    let policy = pol.write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--relay-idle-timeout", "90s"],
+        &payload(&["a.example"]),
+    );
+    let done = run_sbx(&args)?;
+    let _ = fs::remove_dir_all(&dir);
+    expect_rc(&done, 0)
 }
 
 fn mode_none_clamped() -> Result<(), String> {

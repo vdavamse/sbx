@@ -47,45 +47,55 @@
 //!    [`Rejected::HostInvalid`] (scheme/userinfo/brackets/IP-literal junk
 //!    all land here — the bare-hostname contract, egress.rs point 5) and
 //!    equal the DNS-map name ⇒ else [`Rejected::HostMismatch`].
-//! 6. **The connection lifetime is enforced (round-2 review fix)** — the
-//!    name binding above covers the FIRST head only; HTTP/1.1 defaults to
-//!    keep-alive, so a subsequent request with a foreign `Host` would ride
-//!    the unscanned relay to a vhost-routing server (CDN edges co-host
-//!    thousands of names per IP — an allow-list bypass needing NO server
-//!    quirk at all, since vhost routing by `Host` is the intended behavior
-//!    of fully compliant servers). [`inspect_http`] therefore REWRITES the
-//!    validated head to carry `Connection: close` before it is replayed —
-//!    inserted immediately before the final CRLF; the request line, every
-//!    client header, and every body byte stay byte-identical (POST/PUT
-//!    untouched). A pre-existing client `Connection` header is kept
+//! 6. **The connection lifetime is enforced per request (issue #29, F3)** —
+//!    the name binding above covers request 1 in the decision phase. Every
+//!    later request on the same connection is inspected by the relay
+//!    ([`crate::proxy::relay::relay_http`]) with the same functions (point 7),
+//!    so a follow-up request with a foreign `Host` is denied before any of its
+//!    bytes is forwarded. The validated head of a LAST request
+//!    ([`crate::proxy::h1::RequestMeta::is_last`]: HTTP/1.0, `close`,
+//!    `Upgrade`, or a body) is rewritten by [`upstream_head`] to carry
+//!    `Connection: close`, inserted immediately before the final CRLF; the
+//!    request line, every client header and every body byte stay
+//!    byte-identical. A pre-existing client `Connection` header is kept
 //!    verbatim: RFC 9110 combines the field's values as a list, and the
 //!    `close` token in it is decisive — RFC 9112 §9.6 obliges a conforming
-//!    server to close after responding and to NOT process further requests
-//!    on the connection. Deliberate costs: no keep-alive for sandbox HTTP
-//!    clients (every request is re-inspected and re-audited on its own
-//!    connection — fail-closed by construction), no protocol upgrades on
-//!    port 80 (the inserted `close` rides the combined `Connection` list —
-//!    RFC 9110 §7.6.1 — and §9.6's close-after-response obligation is
-//!    irreconcilable with a 101 switch, RFC 9110 §7.8, so conforming
-//!    servers will not honor `ws://` WebSocket — RFC 6455 §4.1 — or `h2c`
-//!    upgrade handshakes), and the ONE documented deviation from "the
-//!    upstream sees the client's byte stream verbatim" (mod.rs point 9).
-//!    Recorded residuals (mod.rs point 12): a NON-conforming server
-//!    ignoring `Connection: close` (one that also honors an upgrade opens
-//!    an uninspectable tunnel, not merely follow-up requests), and the
-//!    443 twin no rewrite can reach — h2 `:authority` vhost confusion after an
-//!    SNI-checked handshake (ALPN rides through uninspected; inherent to
-//!    any non-terminating proxy; #14's threat model). A full per-request
-//!    relay scanner (this module's [`crate::proxy::relay::RelayScanner`]
-//!    analogue) remains the shape for lifting the no-keep-alive cost.
-
+//!    server to close after responding and to NOT process further requests on
+//!    the connection. Nothing after a last request is ever forwarded. A
+//!    bodyless HTTP/1.1 request is not last and keeps its head byte-identical
+//!    (point 8). The no-keep-alive cost of the original design is gone for
+//!    these requests; an `Upgrade` request is still last, so no 101 switch
+//!    reaches an uninspected tunnel on port 80 (RFC 6455 §4.1 and h2c are
+//!    therefore not honored on port 80). The 443 twin no rewrite can reach —
+//!    h2 `:authority` vhost confusion after an SNI-checked handshake (ALPN
+//!    rides through uninspected; inherent to any non-terminating proxy; #14's
+//!    threat model). Recorded residuals (mod.rs point 12): a NON-conforming
+//!    server that mis-frames a body-bearing request (CL.0, a chunk
+//!    differential) and also ignores `Connection: close`.
+//! 7. **Per-request checks (requests 2+)** — [`inspect_head`] runs, in order:
+//!    the head cap and the head deadline ([`crate::proxy::h1::HeadAccumulator`],
+//!    the deadline measured from the head's first byte), httparse with
+//!    [`Limits::max_http_headers`] slots and the terminator differential
+//!    (`consumed == head.len()`), the CONNECT denial, the request-target (origin
+//!    form or `*`, or absolute-form equal to the bound name and port), exactly
+//!    one `Host` equal to the bound name, the strict framing table, and the
+//!    last-request computation (no denial). Port, DNS map, allow list and dial
+//!    are connection-invariant on transparent :80 and CONNECT-80: the name and
+//!    port are fixed when the connection is decided, and the policy is immutable
+//!    for the run. They are NOT re-run, and that is by design, not an omission.
+//! 8. **Keep-alive rules** — on the transparent and CONNECT-80 paths the
+//!    client's `Connection` header is never stripped. A non-last request's head
+//!    is forwarded byte-identical, which removes point 9's deviation for
+//!    keep-alive requests (the deviation remains for last requests only).
+//!    `Expect: 100-continue` is forwarded verbatim and the proxy never generates
+//!    `100`. HTTP/1.0 is always last, even with `Connection: keep-alive`
+//!    (RFC 9112 App. C.2.2 keep-alive is not supported). The explicit forward
+//!    path is always one request per connection (explicit module docs point 12).
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use super::h1::{HeadAccumulator, RequestMeta};
 use super::{Limits, NameSource, Rejected, canonicalize_host, redact_for_audit};
 use crate::policy::Domain;
-
-/// The head terminator — the read loop stops after the first occurrence.
-const HEAD_TERMINATOR: [u8; 4] = *b"\r\n\r\n";
 
 /// The pinned denial detail when httparse's consumed extent disagrees
 /// with the located `\r\n\r\n` terminator (module docs point 1): a bare-LF
@@ -114,28 +124,26 @@ pub(crate) struct Head {
 }
 
 /// Read until the head terminator (issue #8 seam): the byte cap and EOF
-/// bound the loop; the caller owns the decision timeout.
+/// bound the loop; the caller owns the decision timeout. The search and the
+/// cap are [`HeadAccumulator`]'s, shared with request 2+ (issue #29, F3).
 pub(crate) async fn read_head<S: AsyncRead + Unpin>(
     client: &mut S,
     limits: &Limits,
 ) -> Result<Head, Rejected> {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut acc = HeadAccumulator::new(limits.max_head_bytes);
     let mut chunk = [0u8; READ_CHUNK];
-    // Bytes already ruled out as a terminator start; the search resumes
-    // 3 bytes earlier so a terminator straddling two reads is found.
-    let mut scanned = 0usize;
     loop {
-        if let Some(head_end) = find_terminator(&buf, &mut scanned) {
-            return Ok(Head { buf, head_end });
-        }
-        if buf.len() > limits.max_head_bytes {
-            return Err(Rejected::HeadTooLarge {
-                cap: limits.max_head_bytes,
-            });
-        }
         match client.read(&mut chunk).await {
             Ok(0) => return Err(Rejected::Eof),
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                if let Some((mut buf, used)) = acc.push(&chunk[..n])? {
+                    // The head is everything up to the terminator; the bytes of
+                    // this read past it are pipelined and kept in the replay.
+                    let head_end = buf.len();
+                    buf.extend_from_slice(&chunk[used..n]);
+                    return Ok(Head { buf, head_end });
+                }
+            }
             // Transport failure = the client is gone before a complete
             // preamble — the same fail-closed family as a clean EOF (same
             // documented choice as hello.rs).
@@ -144,31 +152,16 @@ pub(crate) async fn read_head<S: AsyncRead + Unpin>(
     }
 }
 
-/// Locate the `\r\n\r\n` terminator in `buf`, returning the offset just
-/// past it. `scanned` records how far the buffer was already ruled out, so
-/// the next call resumes 3 bytes earlier (a terminator straddling two
-/// reads is still found) instead of rescanning from the start.
-fn find_terminator(buf: &[u8], scanned: &mut usize) -> Option<usize> {
-    let from = scanned.saturating_sub(3);
-    if let Some(rel) = buf
-        .get(from..)?
-        .windows(4)
-        .position(|window| window == HEAD_TERMINATOR)
-    {
-        return Some(from + rel + HEAD_TERMINATOR.len());
+/// The head bytes sent upstream (module docs point 6, FLAG-3): a LAST
+/// request gets [`CONNECTION_CLOSE_HEADER`] inserted immediately before its
+/// final CRLF — the request line, the client headers and any body stay
+/// byte-identical; every other head is returned unchanged.
+pub(crate) fn upstream_head(mut head: Vec<u8>, meta: &RequestMeta) -> Vec<u8> {
+    if meta.is_last() {
+        let at = head.len().saturating_sub(2);
+        head.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
     }
-    *scanned = buf.len();
-    None
-}
-
-/// Insert [`CONNECTION_CLOSE_HEADER`] before the head's final CRLF
-/// (module docs point 6). `head_end` is the index just past the located
-/// `\r\n\r\n` — always ≥ the 4-byte terminator — so the insertion point is
-/// `head_end - 2`; everything else (request line, client headers,
-/// pipelined body bytes) stays byte-identical.
-fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
-    let at = head_end - 2;
-    buf.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
+    head
 }
 
 /// The per-request check inputs (issue #8, Q4): the name to match, the
@@ -181,16 +174,25 @@ pub(crate) struct HeadCheck<'a> {
     pub source: NameSource,
 }
 
-/// Read + inspect the HTTP request head on 80 (module docs point 1).
-/// Returns the FULL replay buffer (head + any pipelined body bytes) on
-/// success. This is [`inspect_http_with`] for the transparent path (#7
-/// behaviour, pinned).
+/// What request 1's inspection hands the relay (issue #29, F3): the head
+/// exactly as the client sent it, the client bytes read past its terminator
+/// (`pending`, in order), and the request's facts. The upstream bytes are
+/// `upstream_head(head, &meta)`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Inspected {
+    pub head: Vec<u8>,
+    pub pending: Vec<u8>,
+    pub meta: RequestMeta,
+}
+
+/// Read + inspect the HTTP request head on 80 (module docs point 1). This is
+/// [`inspect_http_with`] for the transparent path (#7 behaviour, pinned).
 pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
     client: &mut S,
     expected: &Domain,
     orig_port: u16,
     limits: &Limits,
-) -> Result<Vec<u8>, Rejected> {
+) -> Result<Inspected, Rejected> {
     let check = HeadCheck {
         expected,
         port: orig_port,
@@ -199,34 +201,52 @@ pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
     inspect_http_with(client, &check, limits).await
 }
 
-/// Read, validate and frame-check one request head, then force
-/// `Connection: close` (issue #8 seam; #7's `inspect_http` is the DnsMap
-/// wrapper). Returns the FULL buffer (head + pipelined bytes) to replay.
+/// Read and inspect request 1's head (issue #8 seam; #7's `inspect_http` is the
+/// DnsMap wrapper). The head is returned verbatim; the rewrite is
+/// [`upstream_head`]'s job, applied by the relay.
 pub(crate) async fn inspect_http_with<S: AsyncRead + Unpin>(
     client: &mut S,
     check: &HeadCheck<'_>,
     limits: &Limits,
-) -> Result<Vec<u8>, Rejected> {
+) -> Result<Inspected, Rejected> {
     let Head { mut buf, head_end } = read_head(client, limits).await?;
-    // parse_head_with returns the consumed head length; the FULL buffer
-    // (head + pipelined body) is the replay.
-    let consumed = parse_head_with(&buf, check, limits.max_http_headers)?;
+    // parse_head_with reports the consumed head length; the bytes past it are
+    // the pipelined residue.
+    let parsed = parse_head_with(&buf, check, limits.max_http_headers)?;
     // The parser and the terminator search MUST agree on where the head
     // ends (module docs point 1): httparse tolerates bare-LF line endings,
     // the search does not, and a differential means two parsers see two
     // different requests in the same bytes — the smuggling shape, denied
     // fail-closed, never relayed.
-    if consumed != head_end {
+    if parsed.consumed != head_end {
         return Err(Rejected::HttpMalformed {
             detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
         });
     }
-    // The connection-lifetime enforcement (module docs point 6): the
-    // validated head is rewritten to carry Connection: close BEFORE it is
-    // replayed. Runs AFTER the differential check above; the rewrite never
-    // feeds back into parse_head_with.
-    force_connection_close(&mut buf, head_end);
-    Ok(buf)
+    let pending = buf.split_off(head_end);
+    Ok(Inspected {
+        head: buf,
+        pending,
+        meta: parsed.meta,
+    })
+}
+
+/// Inspect ONE complete request head on a connection's second or later
+/// request (module docs point 7). `head` is exactly the head bytes, through
+/// its terminator; a head whose parse does not consume all of it is the
+/// terminator differential and is denied.
+pub(crate) fn inspect_head(
+    head: &[u8],
+    check: &HeadCheck<'_>,
+    max_headers: usize,
+) -> Result<RequestMeta, Rejected> {
+    let parsed = parse_head_with(head, check, max_headers)?;
+    if parsed.consumed != head.len() {
+        return Err(Rejected::HttpMalformed {
+            detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
+        });
+    }
+    Ok(parsed.meta)
 }
 
 /// The #7 entry point (DnsMap wording) — kept as a thin
@@ -244,7 +264,15 @@ pub(crate) fn parse_head(
         port: orig_port,
         source: NameSource::DnsMap,
     };
-    parse_head_with(head, &check, max_headers)
+    parse_head_with(head, &check, max_headers).map(|parsed| parsed.consumed)
+}
+
+/// What a validated head yields: the consumed head length (the terminator
+/// differential's input) and the request's facts for the stream.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParsedHead {
+    pub consumed: usize,
+    pub meta: RequestMeta,
 }
 
 /// The PURE head parser (module docs points 2-5; `parse_head_table` drives
@@ -255,7 +283,7 @@ pub(crate) fn parse_head_with(
     head: &[u8],
     check: &HeadCheck<'_>,
     max_headers: usize,
-) -> Result<usize, Rejected> {
+) -> Result<ParsedHead, Rejected> {
     // httparse's Header is Copy; a runtime-sized slot count needs the Vec
     // (the array form the design sketch shows cannot take a runtime len).
     // Exceeding it yields TooHeaders ⇒ HttpMalformed — fail-closed, never a
@@ -305,8 +333,46 @@ pub(crate) fn parse_head_with(
         check.source,
         true,
     )?;
-    check_framing(request.headers, request.version.unwrap_or(1))?;
-    Ok(consumed)
+    let minor_version = request.version.unwrap_or(1);
+    let framing = check_framing(request.headers, minor_version)?;
+    let (close, upgrade) = connection_semantics(request.headers);
+    Ok(ParsedHead {
+        consumed,
+        meta: RequestMeta {
+            framing,
+            minor_version,
+            close,
+            upgrade,
+        },
+    })
+}
+
+/// `(close, upgrade)` for a request's header list (module docs point 8): a
+/// `close` token in `Connection` or `Proxy-Connection`; an `Upgrade` field, or
+/// an `upgrade` token in `Connection`. Tokens are comma-separated, OWS-trimmed,
+/// and compared ASCII-case-insensitively.
+pub(crate) fn connection_semantics(headers: &[httparse::Header<'_>]) -> (bool, bool) {
+    let mut close = false;
+    let mut upgrade = false;
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("upgrade") {
+            upgrade = true;
+        }
+        let is_connection = header.name.eq_ignore_ascii_case("connection");
+        if !is_connection && !header.name.eq_ignore_ascii_case("proxy-connection") {
+            continue;
+        }
+        for token in header.value.split(|b| *b == b',') {
+            let token = trim_ows(token);
+            if token.eq_ignore_ascii_case(b"close") {
+                close = true;
+            }
+            if is_connection && token.eq_ignore_ascii_case(b"upgrade") {
+                upgrade = true;
+            }
+        }
+    }
+    (close, upgrade)
 }
 
 pub(crate) fn check_target(
@@ -450,6 +516,13 @@ pub(crate) const FRAMING_INVALID_CL: &str = "Content-Length is not a single deci
 pub(crate) const FRAMING_TE_NOT_CHUNKED: &str =
     "Transfer-Encoding does not end in a single final chunked coding";
 pub(crate) const FRAMING_TE_HTTP10: &str = "Transfer-Encoding in an HTTP/1.0 request";
+pub(crate) const FRAMING_CHUNK_SIZE: &str = "invalid chunk-size line";
+pub(crate) const FRAMING_CHUNK_LINE_TOO_LONG: &str = "chunk-size line exceeds the 4096-byte cap";
+pub(crate) const FRAMING_CHUNK_DATA_CRLF: &str = "chunk data is not followed by CRLF";
+pub(crate) const FRAMING_TRAILER_INVALID: &str = "invalid chunked trailer section";
+pub(crate) const FRAMING_TRAILER_TOO_LARGE: &str = "chunked trailer section exceeds the head caps";
+pub(crate) const FRAMING_TRAILER_FORBIDDEN: &str =
+    "chunked trailer names Host, Content-Length or Transfer-Encoding";
 
 /// The strict framing table (issue #8, Q8): deny every shape whose body
 /// boundary two parsers could disagree on. Checked in this pinned order.
@@ -954,9 +1027,9 @@ mod tests {
 
     #[test]
     fn inspect_http_replays_pipelined_body() {
-        // The replay buffer carries the head AND the pipelined body bytes
-        // — the head with the inserted Connection: close (module docs
-        // point 6), the body byte-identical.
+        // The pipelined bytes past request 1's terminator are returned as
+        // `pending`, in order; the head is verbatim (a bodyless HTTP/1.1
+        // request without close is not last, module docs point 8).
         let mut bytes = Vec::from(b"POST /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n".as_slice());
         let head_end = bytes.len();
         bytes.extend_from_slice(b"body-bytes");
@@ -967,7 +1040,10 @@ mod tests {
             peer.write_all(&bytes).await.expect("write");
             inspect_http(&mut client, &expected, 80, &limits).await
         });
-        assert_eq!(result.expect("must pass"), closed_at(&bytes, head_end));
+        let inspected = result.expect("must pass");
+        assert_eq!(inspected.head, bytes[..head_end].to_vec());
+        assert_eq!(inspected.pending, b"body-bytes".to_vec());
+        assert!(!inspected.meta.is_last());
     }
 
     #[test]
@@ -992,7 +1068,7 @@ mod tests {
             writer.await.expect("writer task");
             outcome
         });
-        assert_eq!(result.expect("must pass"), closed_at(head, head.len()));
+        assert_eq!(result.expect("must pass").head, head.to_vec());
     }
 
     #[test]
@@ -1014,7 +1090,11 @@ mod tests {
     /// Run [`inspect_http`] over a duplex pre-fed `bytes` (expected name
     /// `allowed.test`, orig port 80); `close_after` shuts the writer down
     /// first (EOF after the buffered bytes).
-    fn inspect_with(bytes: &[u8], limits: Limits, close_after: bool) -> Result<Vec<u8>, Rejected> {
+    fn inspect_with(
+        bytes: &[u8],
+        limits: Limits,
+        close_after: bool,
+    ) -> Result<Inspected, Rejected> {
         let (mut client, mut peer) = duplex(64 * 1024);
         let expected = dom("allowed.test");
         block_on(async {
@@ -1026,58 +1106,67 @@ mod tests {
         })
     }
 
-    /// The expected replay for a validated head: `Connection: close`
-    /// inserted before the final CRLF of the head ending at `head_end`
-    /// (module docs point 6); every other byte — including any pipelined
-    /// body — identical.
-    fn closed_at(input: &[u8], head_end: usize) -> Vec<u8> {
-        let mut out = input[..head_end - 2].to_vec();
-        out.extend_from_slice(CONNECTION_CLOSE_HEADER);
-        out.extend_from_slice(&input[head_end - 2..]);
-        out
+    /// The upstream bytes for an inspected request 1 (what the relay writes).
+    fn upstream_of(bytes: &[u8]) -> Vec<u8> {
+        let inspected = inspect_with(bytes, Limits::default(), false).expect("must pass");
+        upstream_head(inspected.head, &inspected.meta)
     }
 
     #[test]
-    fn inspect_http_forces_connection_close() {
-        // The name binding must outlive the first head (module docs point
-        // 6, round-2 review fix): HTTP/1.1 keep-alive would let a
-        // foreign-Host follow-up request ride the unscanned relay to a
-        // vhost-routing server. The validated head is therefore rewritten
-        // to carry Connection: close — byte-exact, immediately before the
-        // final CRLF — while the request line, the client headers, and the
-        // pipelined body bytes stay untouched (POST/PUT unaffected).
-        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
-        let result = inspect_with(head, Limits::default(), false).expect("must pass");
-        assert_eq!(
-            result,
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
-        );
-        let mut with_body = Vec::from(head.as_slice());
-        with_body.extend_from_slice(b"body");
-        let result = inspect_with(&with_body, Limits::default(), false).expect("must pass");
-        assert_eq!(result, closed_at(&with_body, head.len()));
+    fn inspect_http_forces_close_only_on_last_requests() {
+        // Module docs points 6 and 8 (issue #29, F3): a bodyless HTTP/1.1
+        // keep-alive request is forwarded byte-identical; a request with a
+        // body, HTTP/1.0 and an explicit close are LAST and get the close
+        // token inserted immediately before the final CRLF.
+        let keep_alive = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        assert_eq!(upstream_of(keep_alive), keep_alive.to_vec());
+        let rows: &[(&[u8], &[u8])] = &[
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\n",
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                b"GET / HTTP/1.0\r\nHost: allowed.test\r\n\r\n",
+                b"GET / HTTP/1.0\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\nConnection: close\r\n\r\n",
+            ),
+        ];
+        for (input, want) in rows {
+            assert_eq!(upstream_of(input), want.to_vec(), "{input:?}");
+        }
     }
 
     #[test]
     fn existing_connection_headers_do_not_defeat_close() {
-        // A client-supplied Connection header is kept VERBATIM (the
-        // rewrite is a single insertion — the differential check and the
-        // body bytes rely on that), and the inserted close token still
-        // rides the combined field list: RFC 9112 §9.6 makes `close`
-        // decisive for a conforming server even next to keep-alive. An
-        // already-present close is a harmless duplicate.
-        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: keep-alive\r\n\r\n";
-        let result = inspect_with(head, Limits::default(), false).expect("must pass");
-        assert_eq!(result, closed_at(head, head.len()));
-        assert!(
-            result
-                .windows(CONNECTION_CLOSE_HEADER.len())
-                .any(|window| window == CONNECTION_CLOSE_HEADER),
-            "the close token must ride the replay: {result:?}"
+        // A client-supplied Connection header is kept VERBATIM (the rewrite is
+        // a single insertion — the differential check and the body bytes rely
+        // on that), and the inserted close token still rides the combined
+        // field list: RFC 9112 §9.6 makes `close` decisive for a conforming
+        // server. A keep-alive token next to a last-request marker changes
+        // nothing: the request is last, so the close is inserted.
+        let head = b"GET / HTTP/1.0\r\nHost: allowed.test\r\nConnection: keep-alive\r\n\r\n";
+        let got = upstream_of(head);
+        assert_eq!(
+            got,
+            b"GET / HTTP/1.0\r\nHost: allowed.test\r\nConnection: keep-alive\r\nConnection: close\r\n\r\n"
         );
+        assert!(
+            got.windows(CONNECTION_CLOSE_HEADER.len())
+                .any(|window| window == CONNECTION_CLOSE_HEADER),
+            "the close token must ride the upstream head: {got:?}"
+        );
+        // Keep-alive on a 1.1 bodyless request is NOT last: verbatim.
+        let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: keep-alive\r\n\r\n";
+        assert_eq!(upstream_of(head), head.to_vec());
+        // Explicit close on 1.1: last, close inserted (a harmless duplicate).
         let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
-        let result = inspect_with(head, Limits::default(), false).expect("must pass");
-        assert_eq!(result, closed_at(head, head.len()));
+        assert_eq!(
+            upstream_of(head),
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\nConnection: close\r\n\r\n"
+        );
     }
 
     #[test]
@@ -1103,15 +1192,17 @@ mod tests {
         // traffic (with and without a pipelined body).
         let head = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
         assert_eq!(
-            inspect_with(head, Limits::default(), false).expect("CRLF head must pass"),
-            closed_at(head, head.len())
+            inspect_with(head, Limits::default(), false)
+                .expect("CRLF head must pass")
+                .head,
+            head.to_vec()
         );
         let mut with_body = head.to_vec();
         with_body.extend_from_slice(b"body");
-        assert_eq!(
-            inspect_with(&with_body, Limits::default(), false).expect("CRLF head + body must pass"),
-            closed_at(&with_body, head.len())
-        );
+        let inspected =
+            inspect_with(&with_body, Limits::default(), false).expect("CRLF head + body must pass");
+        assert_eq!(inspected.head, head.to_vec());
+        assert_eq!(inspected.pending, b"body".to_vec());
     }
 
     #[test]
@@ -1129,8 +1220,10 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(
-            inspect_with(head, at_cap, false).expect("len == cap must pass"),
-            closed_at(head, head.len())
+            inspect_with(head, at_cap, false)
+                .expect("len == cap must pass")
+                .head,
+            head.to_vec()
         );
         // A complete head ONE BYTE OVER a shrunk cap, arriving in one
         // chunk: STILL accepted — the terminator is found before the cap
@@ -1142,8 +1235,9 @@ mod tests {
         };
         assert_eq!(
             inspect_with(head, under, false)
-                .expect("a complete head beats the shrunk cap (terminator-first)"),
-            closed_at(head, head.len())
+                .expect("a complete head beats the shrunk cap (terminator-first)")
+                .head,
+            head.to_vec()
         );
         // Terminator-less bytes: exactly cap → the search ends at Eof on
         // the client's close (the cap is NOT exceeded — strict `>`);
@@ -1160,6 +1254,167 @@ mod tests {
             inspect_with(&[b'X'; 33], limits, false).expect_err("must deny"),
             Rejected::HeadTooLarge { cap: 32 }
         );
+    }
+
+    // ---- per-request inspection (issue #29, F3) -----------------------------
+
+    /// The request-2+ check for `allowed.test` on port 80 (DnsMap wording).
+    fn check_allowed(expected: &Domain) -> HeadCheck<'_> {
+        HeadCheck {
+            expected,
+            port: 80,
+            source: NameSource::DnsMap,
+        }
+    }
+
+    #[test]
+    fn inspect_head_table() {
+        // Every row is one complete head (through its terminator); the Ok rows
+        // pin the last-request computation, the Err rows pin the denial shape.
+        let expected = dom("allowed.test");
+        let check = check_allowed(&expected);
+        let ok_rows: &[(&[u8], bool)] = &[
+            (b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n", false),
+            (
+                b"GET http://allowed.test/x HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                false,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 2\r\n\r\n",
+                true,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+                true,
+            ),
+            (b"GET / HTTP/1.0\r\nHost: allowed.test\r\n\r\n", true),
+            (
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nUpgrade: h2c\r\n\r\n",
+                true,
+            ),
+        ];
+        for (head, last) in ok_rows {
+            let meta = inspect_head(head, &check, 64).expect("must pass");
+            assert_eq!(meta.is_last(), *last, "{head:?}");
+        }
+        let err_rows: Vec<(&[u8], Rejected)> = vec![
+            (
+                b"CONNECT allowed.test:80 HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                Rejected::ConnectMethod,
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n",
+                Rejected::HostMismatch {
+                    host: dom("evil.test"),
+                    name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
+                },
+            ),
+            (
+                b"GET http://evil.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n",
+                Rejected::TargetMismatch {
+                    target: "evil.test".to_owned(),
+                    name: dom("allowed.test"),
+                    source: NameSource::DnsMap,
+                },
+            ),
+            (
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                Rejected::AmbiguousFraming {
+                    detail: FRAMING_CL_AND_TE,
+                },
+            ),
+            (
+                // The terminator differential on the head alone: bytes past the
+                // terminator are not part of THIS head.
+                b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET /",
+                Rejected::HttpMalformed {
+                    detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
+                },
+            ),
+        ];
+        for (head, expected_err) in err_rows {
+            assert_eq!(
+                inspect_head(head, &check, 64),
+                Err(expected_err),
+                "{head:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_semantics_table() {
+        // (header lines, (close, upgrade)). Tokens are case-insensitive and
+        // comma-separated; `closed` is not `close`; Keep-Alive is not a
+        // Connection token list.
+        let rows: &[(&str, (bool, bool))] = &[
+            ("", (false, false)),
+            ("Connection: close\r\n", (true, false)),
+            ("Connection: keep-alive, Close\r\n", (true, false)),
+            ("Connection:  CLOSE \r\n", (true, false)),
+            ("Connection: closed\r\n", (false, false)),
+            ("Proxy-Connection: close\r\n", (true, false)),
+            ("Connection: upgrade\r\n", (false, true)),
+            ("Connection: Upgrade, keep-alive\r\n", (false, true)),
+            ("Upgrade: h2c\r\n", (false, true)),
+            ("Keep-Alive: close\r\n", (false, false)),
+        ];
+        for (lines, want) in rows {
+            let head = format!("GET / HTTP/1.1\r\nHost: allowed.test\r\n{lines}\r\n");
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut request = httparse::Request::new(&mut headers);
+            request.parse(head.as_bytes()).expect("parses");
+            assert_eq!(connection_semantics(request.headers), *want, "{lines:?}");
+        }
+    }
+
+    /// The chunked-framing details are pinned text (module docs point 3); the
+    /// `MAX_CHUNK_LINE` agreement is pinned in h1's tests.
+    #[test]
+    fn chunked_framing_details_pinned() {
+        assert_eq!(FRAMING_CHUNK_SIZE, "invalid chunk-size line");
+        assert_eq!(
+            FRAMING_CHUNK_LINE_TOO_LONG,
+            "chunk-size line exceeds the 4096-byte cap"
+        );
+        assert_eq!(
+            FRAMING_CHUNK_DATA_CRLF,
+            "chunk data is not followed by CRLF"
+        );
+        assert_eq!(FRAMING_TRAILER_INVALID, "invalid chunked trailer section");
+        assert_eq!(
+            FRAMING_TRAILER_TOO_LARGE,
+            "chunked trailer section exceeds the head caps"
+        );
+        assert_eq!(
+            FRAMING_TRAILER_FORBIDDEN,
+            "chunked trailer names Host, Content-Length or Transfer-Encoding"
+        );
+        let denial = Rejected::AmbiguousFraming {
+            detail: FRAMING_CHUNK_SIZE,
+        };
+        assert_eq!(
+            denial.reason(),
+            "ambiguous HTTP request framing: invalid chunk-size line"
+        );
+    }
+
+    /// The drift alarm for the head-agreement assumption (module docs of the
+    /// stream, point 1): httparse must keep rejecting obs-fold and whitespace
+    /// before the colon in REQUESTS. If a httparse upgrade starts accepting
+    /// either, the terminator and framing reasoning must be re-read.
+    #[test]
+    fn httparse_rejects_obs_fold_and_ws_before_colon() {
+        let rows: &[&[u8]] = &[
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nX-A: b\r\n c\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nX-A : b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost : allowed.test\r\n\r\n",
+        ];
+        for head in rows {
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut request = httparse::Request::new(&mut headers);
+            assert!(request.parse(head).is_err(), "{head:?} must not parse");
+        }
     }
 
     // ---- the pure-parser table ----------------------------------------------

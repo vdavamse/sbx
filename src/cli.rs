@@ -106,6 +106,12 @@ pub enum Cmd {
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         timeout: Option<Duration>,
 
+        /// Close a proxied connection after this long with no bytes in either
+        /// direction (default 300s). Applies to every relay; the decision
+        /// phase keeps its own timeout.
+        #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+        relay_idle_timeout: Option<Duration>,
+
         /// Audit log file (JSON Lines).
         #[arg(long, value_name = "FILE")]
         audit: Option<PathBuf>,
@@ -419,6 +425,7 @@ pub fn run() -> ExitCode {
             session_dir,
             cwd,
             timeout,
+            relay_idle_timeout,
             audit,
             cmd,
             test_break_rules,
@@ -427,6 +434,7 @@ pub fn run() -> ExitCode {
             session_dir,
             cwd,
             timeout,
+            relay_idle_timeout,
             audit,
             cmd,
             test_break_rules,
@@ -557,11 +565,13 @@ mod tests {
                 session_dir,
                 cwd,
                 timeout,
+                relay_idle_timeout,
                 audit,
                 cmd,
                 test_break_rules,
             } => {
                 assert!(!test_break_rules);
+                assert_eq!(relay_idle_timeout, None);
                 assert_eq!(policy, Path::new("p.json"));
                 assert_eq!(session_dir, Path::new("/tmp/s"));
                 assert_eq!(cwd.as_deref(), Some(Path::new("/w")));
@@ -796,6 +806,55 @@ mod tests {
         // parser rejects "abc" (the binary reports `invalid value 'abc' for
         // '--timeout <DURATION>'` and exits 2).
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// The `run` invocation prefix shared by the relay-idle-timeout rows.
+    fn run_with(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let mut args = vec![
+            "sbx",
+            "run",
+            "--policy",
+            "p.json",
+            "--session-dir",
+            "/tmp/s",
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--", "true"]);
+        Cli::try_parse_from(args)
+    }
+
+    #[test]
+    fn run_relay_idle_timeout_parsed() {
+        // Issue #29, C4: the relay idle timeout is a plain duration.
+        let cli = run_with(&["--relay-idle-timeout", "90s"]).expect("valid value parses");
+        match cli.command {
+            Cmd::Run {
+                relay_idle_timeout, ..
+            } => assert_eq!(relay_idle_timeout, Some(Duration::from_secs(90))),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_relay_idle_timeout_absent_is_none() {
+        let cli = run_with(&[]).expect("minimal run invocation must parse");
+        match cli.command {
+            Cmd::Run {
+                relay_idle_timeout, ..
+            } => assert_eq!(relay_idle_timeout, None),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_rejects_zero_and_garbage_relay_idle_timeout() {
+        // Zero and garbage are usage errors (exit 2) through the same
+        // parse_duration contract as --timeout.
+        for value in ["0s", "0", "garbage", "-5s"] {
+            let err = run_with(&["--relay-idle-timeout", value])
+                .expect_err("a bad --relay-idle-timeout must fail");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "{value:?}");
+        }
     }
 
     #[test]

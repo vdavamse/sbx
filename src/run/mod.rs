@@ -1,7 +1,7 @@
 //! `sbx run` — the sandbox lifecycle (issue #10).
 //!
 //! 1. **Contract.** `sbx run --policy P --session-dir D [--cwd C] [--timeout T]
-//!    [--audit F] -- CMD…` runs `CMD` verbatim (no shell) inside the bwrap
+//!    [--relay-idle-timeout T] [--audit F] -- CMD…` runs `CMD` verbatim (no shell) inside the bwrap
 //!    sandbox built from the policy, with sbx's transparent/explicit proxies and
 //!    fake-IP DNS in a private network namespace. Exit codes: §6 below.
 //! 2. **Startup order (S0–S18).** Signals are blocked before any thread exists
@@ -142,6 +142,9 @@ pub struct RunArgs {
     pub cwd: Option<PathBuf>,
     /// None = the policy's `limits.timeout` (Q2).
     pub timeout: Option<Duration>,
+    /// None = [`crate::proxy::Limits::default`]'s relay idle timeout (300 s).
+    /// Accepted in `none` mode, where no relay exists (issue #29, C4).
+    pub relay_idle_timeout: Option<Duration>,
     pub audit: Option<PathBuf>,
     /// The payload argv, verbatim (Q9).
     pub cmd: Vec<OsString>,
@@ -710,7 +713,15 @@ fn execute(
             )))
         })?;
         let host_addrs = crate::egress::HostAddrs::new(host_addrs);
-        let proxy = Proxy::system(&net, map.clone(), audit.clone(), host_addrs);
+        // Issue #29, C4: the relay idle timeout is the only proxy limit an
+        // operator tunes; every other limit keeps its pinned default.
+        let limits = crate::proxy::Limits {
+            relay_idle_timeout: args
+                .relay_idle_timeout
+                .unwrap_or(crate::proxy::Limits::default().relay_idle_timeout),
+            ..crate::proxy::Limits::default()
+        };
+        let proxy = Proxy::system(&net, map.clone(), audit.clone(), host_addrs, limits);
         let dns = DnsServer::new(&net, map.clone(), audit.clone());
         // S16: start the runtime; go only after every task was first-polled.
         let ready = start_net(serve_tasks(fds, proxy, dns), latch.clone()).map_err(|err| {

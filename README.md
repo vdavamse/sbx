@@ -71,9 +71,13 @@ request line + `Host` on 80. Allowed names are resolved and dialed by
 name under the resolved-address guard — every resolved address, plus a
 connected-peer re-check as the DNS-rebinding backstop — then the
 buffered bytes are replayed and the connection is relayed, with the
-validated name binding enforced for the whole connection lifetime: HTTP
-heads are replayed with an inserted `Connection: close` (no keep-alive
-reuse past the validated request), and on 443 a relay-phase scanner
+validated name binding enforced for every request on a connection: each
+HTTP/1 request is inspected before its bytes are forwarded (`Host`, target
+and framing; bodies are framed and streamed). Bodyless HTTP/1.1 requests keep
+the connection alive, while a request with a body, `Connection: close`,
+`Upgrade` or HTTP/1.0 is the last one forwarded, and nothing after it reaches
+the server. Explicit forward is always one request per connection. On 443 a
+relay-phase scanner
 tears the connection down on any second `ClientHello` (the post-HRR
 retry shape) — the library module docs record the accepted residuals;
 every connection produces exactly one audit decision with the pinned deny
@@ -104,7 +108,8 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
+        [--timeout DURATION] [--relay-idle-timeout DURATION] [--audit FILE]
+        -- COMMAND [ARGS...]
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -118,6 +123,10 @@ greater than zero — a zero `--older-than` cutoff would match every session,
 and a zero `--timeout` is ambiguous. `--timeout` defaults to the policy's
 `limits.timeout`, and the effective timeout is the smaller of the two (the
 CLI value can shorten the policy limit, never extend it).
+`--relay-idle-timeout` (default `300s`) closes a proxied connection after that
+long with no payload byte in either direction, on every relay, long-poll and
+idle WebSocket included; it does nothing in `none` mode and is never capped by
+`limits.timeout`.
 Everything after `--` in `sbx run` is the command, verbatim, including
 hyphenated arguments.
 
@@ -156,6 +165,11 @@ in the [threat model](docs/threat-model.md)). `sbx check --policy` rejects `=`
 alone, `==name`, `=*.name`, `= name` and `=1.2.3.4` with the same messages as
 any other invalid domain, and any entry whose name normalises to start with `=`
 (for example a fullwidth `＝name`, which is not read as the marker).
+
+`network.ports` is a deny-by-default list. Only 443 (TLS, SNI-checked) and 80
+(HTTP, `Host`-checked) have inspectors. Any other listed port is denied, fail
+closed. That is by design: an opaque TCP pass-through cannot verify the name, so
+it would bypass the allow list. There is no plan to add other ports.
 
 ## Host check
 
@@ -278,7 +292,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-72 checks in eight groups, the same code that `cargo test --test conformance`
+74 checks in eight groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -465,7 +479,13 @@ same keys in the same order:
 
 `ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,
 `port`, `bytes` (`{"up","down"}` on `close`), `reason`, `via`, `verdict`,
-`rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
+`rcode`, `qtype`, `client`. On `close`, `reason` is `null` for a natural end or
+`"idle_timeout"` when the relay idle timeout closed the connection. A `deny` row
+with `verdict` `teardown` records a relay-phase denial after the connection was
+allowed: a second TLS `ClientHello`, or an HTTP request on the connection that
+failed the checks (`relay torn down: HTTP request N denied: …`). Requests after
+the first one on a keep-alive connection are not logged one by one, because their
+name and port are the connection's. The `exit` row adds `code`, `outcome`, `signal`,
 `duration_ms`, `output_truncated`, `dns_poisoned` and `net_mode` (`transparent`
 or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
 (setup never completed); `net_mode` is the last key).
@@ -477,12 +497,17 @@ or `explicit`: the network mode the run got, or `null` when `__init` never repor
 ```
 
 Rows are in event order: a connection's `connect`, then `deny` (teardown) if
-any, then `close`. The `exit` row is always last. A connection still open when
+any, then `close`. An explicit connection is one request (or one tunnel) and
+gets exactly one such group. The `exit` row is always last. A connection still open when
 the run ends gets no `close` row. The log is not fsynced. If a write fails
 mid-run the run fails closed (rc 125, `sbx run: audit log write failed: …`).
 
 **Network.** Only ports 443 (TLS, SNI-checked) and 80 (HTTP, `Host`-checked)
-are inspected; any other listed port is denied. ECH and GREASE-ECH are denied. In
+are inspected; any other listed port is denied. ECH and GREASE-ECH are denied.
+HTTP keep-alive on port 80 (and inside CONNECT-80 tunnels) covers bodyless
+requests only: each request's head is checked before its bytes go upstream, and
+a request with a body, `Connection: close`, `Upgrade` or HTTP/1.0 ends the
+connection after it. In
 transparent mode sbx sets no proxy environment variables. In explicit mode the
 payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 `NO_PROXY` and their lowercase twins) pointing at the explicit listener. The

@@ -28,10 +28,10 @@ use super::spawn::{SbxRun, poll_gone};
 use crate::host::Status;
 use crate::proxy::relay::TORN_DOWN_SECOND_HELLO;
 
-/// The 19 lab checks, in catalog order.
-pub const LAB_IDS: [&str; 19] = [
+/// The 21 lab checks, in catalog order.
+pub const LAB_IDS: [&str; 21] = [
     "A02", "A03", "A04", "A05", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07",
-    "B08", "B09", "C02", "C07", "F02", "F04",
+    "B08", "B09", "B11", "B12", "C02", "C07", "F02", "F04",
 ];
 
 /// The evaluator inputs: the scenario results plus the fixture logs at the
@@ -63,8 +63,8 @@ pub fn run_all(
     let want = |ids: &[&str]| selected.iter().any(|s| ids.contains(s));
     let mut scns: Scns = BTreeMap::new();
     if want(&[
-        "A02", "A03", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "C02",
-        "C07",
+        "A02", "A03", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11",
+        "C02", "C07",
     ]) {
         let s = l1(env);
         scns.insert(s.name, s);
@@ -251,6 +251,19 @@ fn l1_ops(nonce: &str) -> Vec<Op> {
         ],
     ));
     v.push(tcp_name(
+        "b11",
+        &b("b11"),
+        80,
+        vec![
+            text(&format!(
+                "POST / HTTP/1.1\r\nHost: {0}\r\nContent-Length: 4\r\n\r\nbody\
+                 GET / HTTP/1.1\r\nHost: other-b11.conformance.test\r\n\r\n",
+                b("b11")
+            )),
+            read_to_end(),
+        ],
+    ));
+    v.push(tcp_name(
         "b07",
         &b("b07"),
         443,
@@ -316,6 +329,19 @@ fn l2(env: &Env) -> Scn {
                 connect("b09"),
                 read_until("\r\n\r\n"),
                 hello("other-b09.conformance.test"),
+                read_to_end(),
+            ],
+        ),
+        // Issue #29, B12: two absolute-form requests in ONE write. The first is
+        // answered; the pipelined follow-up (another Host) is never forwarded.
+        tcp_env(
+            "b12",
+            vec![
+                text(&format!(
+                    "GET http://{0}/x HTTP/1.1\r\nHost: {0}\r\n\r\n\
+                     GET http://{0}/x HTTP/1.1\r\nHost: other-b12.conformance.test\r\n\r\n",
+                    a("b12")
+                )),
                 read_to_end(),
             ],
         ),
@@ -567,6 +593,8 @@ fn evaluate(id: &str, ev: &Ev<'_>) -> R {
         "B04" => b04(ev),
         "B05" => b05(ev),
         "B06" => b06(ev),
+        "B11" => b11(ev),
+        "B12" => b12(ev),
         "B07" => b07(ev),
         "B08" => b08(ev),
         "B09" => b09(ev),
@@ -996,6 +1024,93 @@ fn b06(ev: &Ev<'_>) -> R {
         second == 0,
         format!("b06: {second} bytes came back for the foreign Host"),
     )?;
+    // Issue #29: the keep-alive first request is forwarded verbatim (no close
+    // token), so the fixture saw exactly one request for the name, and the
+    // proxy's teardown of the follow-up is audited.
+    let on_conn: Vec<&HttpRec> = ev
+        .http
+        .iter()
+        .filter(|h| h.host.as_deref() == Some(n.as_str()))
+        .collect();
+    need(
+        on_conn.len() == 1,
+        format!(
+            "b06: fixture saw {} requests for {n}, expected exactly 1",
+            on_conn.len()
+        ),
+    )?;
+    let torn = s.audit.iter().any(|r| {
+        r["event"] == "deny"
+            && r["verdict"] == "teardown"
+            && r["host"].as_str() == Some(n.as_str())
+            && r["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("relay torn down: HTTP request 2 denied:"))
+    });
+    need(torn, "b06: no teardown row for the foreign-Host follow-up")?;
+    need(
+        !ev.http
+            .iter()
+            .any(|h| h.host.as_deref() == Some("other-b06.conformance.test")),
+        "b06: the fixture saw the foreign Host",
+    )?;
+    Ok("keep-alive follow-up with a foreign Host is not forwarded".to_owned())
+}
+
+/// B11 (issue #29, F3): a body-bearing request is LAST — the close token goes
+/// in, and nothing pipelined after its body reaches the fixture.
+fn b11(ev: &Ev<'_>) -> R {
+    let s = l1_scn(ev)?;
+    let r = res(s, "b11")?;
+    let n = name("b11");
+    ctl(
+        read_text(r, 0).starts_with("HTTP/1.1 200"),
+        format!("the POST was not answered ({:?})", read_text(r, 0)),
+    )?;
+    let on_conn: Vec<&HttpRec> = ev
+        .http
+        .iter()
+        .filter(|h| h.host.as_deref() == Some(n.as_str()))
+        .collect();
+    need(
+        on_conn.len() == 1 && on_conn[0].connection_close && on_conn[0].method == "POST",
+        format!(
+            "b11: fixture saw {} requests for {n}, expected exactly 1 POST with Connection: close",
+            on_conn.len()
+        ),
+    )?;
+    need(
+        on_conn[0].post_close_bytes == 0,
+        format!(
+            "b11: {} bytes after the body were forwarded",
+            on_conn[0].post_close_bytes
+        ),
+    )?;
+    need(
+        !ev.http
+            .iter()
+            .any(|h| h.host.as_deref() == Some("other-b11.conformance.test")),
+        "b11: the fixture saw the pipelined foreign Host",
+    )?;
+    Ok("bytes after a request body are not forwarded".to_owned())
+}
+
+/// B12 (issue #29, C2): explicit forward is one request per connection. The
+/// pipelined follow-up (another Host) is never forwarded, and the first
+/// request reaches the fixture with `Connection: close`.
+fn b12(ev: &Ev<'_>) -> R {
+    let s = l2_scn(ev)?;
+    let r = res(s, "b12")?;
+    let n = name("b12");
+    let text_all = read_text(r, 0);
+    ctl(
+        text_all.starts_with("HTTP/1.1 200"),
+        format!("the first request was not answered ({text_all:?})"),
+    )?;
+    need(
+        text_all.matches("HTTP/1.1 ").count() == 1,
+        "b12: a response came back for the pipelined follow-up",
+    )?;
     let on_conn: Vec<&HttpRec> = ev
         .http
         .iter()
@@ -1004,17 +1119,17 @@ fn b06(ev: &Ev<'_>) -> R {
     need(
         on_conn.len() == 1 && on_conn[0].connection_close,
         format!(
-            "b06: fixture saw {} requests for {n}, expected exactly 1 with Connection: close",
+            "b12: fixture saw {} requests for {n}, expected exactly 1 with Connection: close",
             on_conn.len()
         ),
     )?;
     need(
         !ev.http
             .iter()
-            .any(|h| h.host.as_deref() == Some("other-b06.conformance.test")),
-        "b06: the fixture saw the foreign Host",
+            .any(|h| h.host.as_deref() == Some("other-b12.conformance.test")),
+        "b12: the fixture saw the pipelined follow-up",
     )?;
-    Ok("keep-alive follow-up with a foreign Host is not forwarded".to_owned())
+    Ok("explicit: a pipelined follow-up request is not forwarded".to_owned())
 }
 
 fn b07(ev: &Ev<'_>) -> R {
@@ -1261,12 +1376,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lab_ids_are_the_nineteen() {
-        assert_eq!(LAB_IDS.len(), 19);
+    fn lab_ids_are_the_twenty_one() {
+        assert_eq!(LAB_IDS.len(), 21);
         let mut sorted = LAB_IDS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 19);
+        assert_eq!(sorted.len(), 21);
     }
 
     #[test]

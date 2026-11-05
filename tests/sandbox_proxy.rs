@@ -70,8 +70,8 @@ use sbx::init::fdpass;
 use sbx::policy::{self, Domain, DomainRule};
 use sbx::proxy::hello::build_client_hello;
 use sbx::proxy::{
-    ConnectError, Connected, Connector, Decision, DecisionSink, DialFn, DnsMap, ExplicitKind,
-    GuardedConnector, Limits, NameSource, Proxy, Rejected, ResolveFn, Verdict, Via,
+    CloseReason, ConnectError, Connected, Connector, Decision, DecisionSink, DialFn, DnsMap,
+    ExplicitKind, GuardedConnector, Limits, NameSource, Proxy, Rejected, ResolveFn, Verdict, Via,
 };
 
 /// Env var selecting the child role (single parameter; targets are
@@ -91,6 +91,9 @@ const ALLOWED: &str = "allowed.test";
 const NOTALLOWED: &str = "notallowed.test";
 /// The SNI the mismatch role sends.
 const EVIL: &str = "evil.test";
+
+/// A second allow-listed name (issue #29: a foreign Host that is ALLOWED).
+const OTHER_HOST: &str = "other.test";
 
 // ---------------------------------------------------------------------------
 // runner
@@ -272,6 +275,16 @@ fn scenarios() -> Vec<Scenario> {
             run: scenario_explicit_upstream_eof_closes,
         },
         Scenario {
+            name: "explicit-forward-pipelined-follow-up-not-forwarded",
+            gate: Gate::Always,
+            run: scenario_explicit_forward_pipelined_follow_up,
+        },
+        Scenario {
+            name: "explicit-connect-80-followup-foreign-host",
+            gate: Gate::Always,
+            run: scenario_explicit_connect_80_followup_foreign_host,
+        },
+        Scenario {
             name: "explicit-resolve-fail-502",
             gate: Gate::Always,
             run: scenario_explicit_resolve_fail_502,
@@ -410,6 +423,26 @@ fn scenarios() -> Vec<Scenario> {
             name: "http-allowed-relay-80",
             gate: Gate::Userns,
             run: scenario_http_allowed_relay_80,
+        },
+        Scenario {
+            name: "http-keepalive-two-requests-80",
+            gate: Gate::Userns,
+            run: scenario_http_keepalive_two_requests_80,
+        },
+        Scenario {
+            name: "http-keepalive-body-last-80",
+            gate: Gate::Userns,
+            run: scenario_http_keepalive_body_last_80,
+        },
+        Scenario {
+            name: "http-keepalive-foreign-host-torn-down-80",
+            gate: Gate::Userns,
+            run: scenario_http_keepalive_foreign_host_torn_down_80,
+        },
+        Scenario {
+            name: "relay-idle-timeout-closes",
+            gate: Gate::Userns,
+            run: scenario_relay_idle_timeout_closes,
         },
         Scenario {
             name: "sni-mismatch-denied",
@@ -854,6 +887,7 @@ impl DnsMap for StaticMap {
 struct RecordingSink {
     decisions: Mutex<Vec<Decision>>,
     teardowns: Mutex<Vec<String>>,
+    closes: Mutex<Vec<CloseReason>>,
 }
 
 impl RecordingSink {
@@ -862,6 +896,9 @@ impl RecordingSink {
     }
     fn teardowns(&self) -> Vec<String> {
         self.teardowns.lock().expect("sink lock").clone()
+    }
+    fn closes(&self) -> Vec<CloseReason> {
+        self.closes.lock().expect("sink lock").clone()
     }
 }
 
@@ -877,6 +914,9 @@ impl DecisionSink for RecordingSink {
             .lock()
             .expect("sink lock")
             .push(detail.to_owned());
+    }
+    fn closed(&self, _decision: &Decision, _up: u64, _down: u64, end: CloseReason) {
+        self.closes.lock().expect("sink lock").push(end);
     }
 }
 
@@ -978,6 +1018,9 @@ enum EchoOutcome {
     StoppedClean,
     /// No connection within BOUND.
     Deadline,
+    /// `EchoMode::Http`: one entry per connection, each the requests (head +
+    /// body, exact bytes) received on it, in order.
+    Http(Vec<Vec<Vec<u8>>>),
     Failed(String),
 }
 
@@ -1017,6 +1060,68 @@ impl Drop for EchoServer {
     }
 }
 
+/// The byte offset just past the first `\r\n\r\n`, if any.
+fn head_end_of(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| at + 4)
+}
+
+/// The `Content-Length` of a head (0 when absent or malformed), case-insensitive.
+fn content_length_of(head: &[u8]) -> usize {
+    String::from_utf8_lossy(head)
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// The keep-alive responder for one upstream connection (issue #29, EchoMode::Http):
+/// frames each request by its head and Content-Length, records the exact
+/// request bytes, and answers `200` with a body naming the request's index on
+/// this connection. It closes after a request that carries `Connection: close`,
+/// or when the proxy closes (EOF) or goes quiet for 2 s.
+fn serve_http_connection(stream: &mut TcpStream) -> Vec<Vec<u8>> {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut requests: Vec<Vec<u8>> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let head_end = loop {
+            if let Some(end) = head_end_of(&buf) {
+                break end;
+            }
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return requests,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let total = head_end + content_length_of(&buf[..head_end]);
+        while buf.len() < total {
+            let mut chunk = [0u8; 4096];
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => return requests,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let request: Vec<u8> = buf[..total].to_vec();
+        buf.drain(..total);
+        let close = String::from_utf8_lossy(&request[..head_end])
+            .to_ascii_lowercase()
+            .contains("connection: close");
+        requests.push(request);
+        let body = format!("ECHO {}", requests.len());
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        if stream.write_all(response.as_bytes()).is_err() || close {
+            return requests;
+        }
+    }
+}
+
 fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .map_err(|e| format!("echo bind: {e}"))?;
@@ -1030,8 +1135,16 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
     let stop_flag = Arc::clone(&stop);
     let handle = std::thread::spawn(move || {
         let deadline = Instant::now() + BOUND;
+        let http = matches!(mode, EchoMode::Http);
+        let mut conns: Vec<Vec<Vec<u8>>> = Vec::new();
         loop {
             match listener.accept() {
+                Ok((mut stream, _peer)) if http => {
+                    // The keep-alive responder serves every connection (the
+                    // loop continues), so a second upstream connection is seen.
+                    let _ = stream.set_nonblocking(false);
+                    conns.push(serve_http_connection(&mut stream));
+                }
                 Ok((mut stream, _peer)) => {
                     let served = (|| -> Result<Vec<u8>, String> {
                         stream
@@ -1039,6 +1152,8 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
                             .map_err(|e| format!("echo set_read_timeout: {e}"))?;
                         let mut buf = Vec::new();
                         match mode {
+                            // Served by the arm above; never reaches here.
+                            EchoMode::Http => {}
                             EchoMode::OnEof => {
                                 stream
                                     .read_to_end(&mut buf)
@@ -1082,10 +1197,18 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
                     // checked only after an accept came up empty, so a
                     // connection racing the stop flag is still served.
                     if stop_flag.load(Ordering::SeqCst) {
-                        return EchoOutcome::StoppedClean;
+                        return if http {
+                            EchoOutcome::Http(conns)
+                        } else {
+                            EchoOutcome::StoppedClean
+                        };
                     }
                     if Instant::now() >= deadline {
-                        return EchoOutcome::Deadline;
+                        return if http {
+                            EchoOutcome::Http(conns)
+                        } else {
+                            EchoOutcome::Deadline
+                        };
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -1134,6 +1257,9 @@ enum EchoSpec {
     /// back as its signal that the relay phase is live (R12: signal-driven,
     /// no fixed sleeps).
     ExpectHitEchoing,
+    /// Keep-alive HTTP responder: every connection and request is recorded
+    /// (`EchoOutcome::Http`); the server stops once the payload is reaped.
+    ExpectHttp,
 }
 
 /// The echo server's write-back discipline.
@@ -1147,6 +1273,10 @@ enum EchoMode {
     /// RECEIVED bytes are the proof there, and the role side asserts the
     /// echoed prefix independently).
     Immediate,
+    /// A keep-alive HTTP/1.1 responder (issue #29): serves EVERY connection,
+    /// answers each request with a Content-Length response naming its index on
+    /// that connection, and records each request (`EchoOutcome::Http`).
+    Http,
 }
 
 /// One serve thread on its own current-thread runtime; the result travels
@@ -1220,6 +1350,8 @@ struct NetnsRun {
     payload: PayloadOutcome,
     decisions: Vec<Decision>,
     teardowns: Vec<String>,
+    /// The `closed` hook's end reasons, one per relayed segment (issue #29).
+    closes: Vec<CloseReason>,
     connector_log: Vec<String>,
     dial_ran: bool,
     echo_addr: Option<SocketAddr>,
@@ -1258,10 +1390,26 @@ fn run_netns_full(
     connector: ConnectorSpec,
     echo: EchoSpec,
 ) -> Result<NetnsRun, String> {
+    run_netns_limits(role, map, allow, ports, connector, echo, Limits::default())
+}
+
+/// [`run_netns_full`] with the in-process proxy's [`Limits`] (issue #29: the
+/// relay idle timeout is set here exactly as `sbx run --relay-idle-timeout`
+/// sets it in production).
+fn run_netns_limits(
+    role: &str,
+    map: MapSpec<'_>,
+    allow: &[&str],
+    ports: &[u16],
+    connector: ConnectorSpec,
+    echo: EchoSpec,
+    limits: Limits,
+) -> Result<NetnsRun, String> {
     let echo_server = match echo {
         EchoSpec::None => None,
         EchoSpec::ExpectHit | EchoSpec::ExpectMiss => Some(spawn_echo_server(EchoMode::OnEof)?),
         EchoSpec::ExpectHitEchoing => Some(spawn_echo_server(EchoMode::Immediate)?),
+        EchoSpec::ExpectHttp => Some(spawn_echo_server(EchoMode::Http)?),
     };
     // Captured up front: the echo server itself moves into the teardown
     // join below, but the relay scenarios assert `upstream == echo addr`.
@@ -1332,13 +1480,7 @@ fn run_netns_full(
             (Arc::clone(&fake) as Arc<dyn DnsMap>, Some(fake))
         }
     };
-    let proxy = Proxy::new(
-        &network,
-        dns_map,
-        sink.clone(),
-        connector_arc,
-        Limits::default(),
-    );
+    let proxy = Proxy::new(&network, dns_map, sink.clone(), connector_arc, limits);
 
     // THE go guarantee (fdpass): serving starts BEFORE the go byte.
     let explicit_serve = if explicit_role {
@@ -1372,7 +1514,11 @@ fn run_netns_full(
     let explicit_stop = explicit_serve.map(ServeHandle::stop).transpose();
     let dns_stop = dns_serve.map(DnsServeHandle::stop).transpose();
     let echo_outcome = echo_server
-        .map(|srv| srv.into_outcome(matches!(echo, EchoSpec::ExpectMiss)))
+        .map(|srv| {
+            // The keep-alive responder stops once the payload is reaped (its
+            // connections are closed by then), like an expect-miss echo.
+            srv.into_outcome(matches!(echo, EchoSpec::ExpectMiss | EchoSpec::ExpectHttp))
+        })
         .transpose();
     // The explicit + static-dns fds are held until the payload is reaped,
     // then dropped here (no listener-gone races while the payload runs).
@@ -1405,6 +1551,7 @@ fn run_netns_full(
         payload,
         decisions: sink.recorded(),
         teardowns: sink.teardowns(),
+        closes: sink.closes(),
         connector_log: log_of(&log),
         dial_ran: dial_ran.load(Ordering::SeqCst),
         echo_addr,
@@ -2030,17 +2177,18 @@ fn tls_relay_payload() -> Vec<u8> {
     bytes
 }
 
-/// The exact bytes the pt-http-ok role sends.
+/// The exact bytes the pt-http-ok role sends: a request WITH a body, so it is
+/// the last request on its connection (issue #29, F3).
 fn http_relay_payload() -> Vec<u8> {
-    b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\nbody".to_vec()
+    b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\nbody".to_vec()
 }
 
 /// The exact bytes the proxy replays upstream for [`http_relay_payload`]:
 /// the validated head with `Connection: close` inserted before the final
-/// CRLF (http.rs module docs point 6 — the name binding's
-/// connection-lifetime enforcement), the body byte-identical.
+/// CRLF (http.rs module docs points 6 and 8), the body byte-identical.
 fn http_relay_expected() -> Vec<u8> {
-    b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\nbody".to_vec()
+    b"GET / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody"
+        .to_vec()
 }
 
 /// AC allowed host works (443): the ClientHello + pipelined bytes pass
@@ -2155,6 +2303,326 @@ fn scenario_tls_second_hello_torn_down() -> Result<(), String> {
             "the connector must see exactly one by-name request: {:?}",
             run.connector_log
         ));
+    }
+    Ok(())
+}
+
+/// The two request heads the keep-alive roles send (issue #29): bodyless
+/// GETs with the same Host, so both belong to the connection's one name.
+const KEEPALIVE_REQ1: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+const KEEPALIVE_REQ2: &[u8] = b"GET /b HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+
+/// Reads one framed response (head through its Content-Length body) from the
+/// proxy; the bytes are returned exactly as received.
+fn read_framed_response(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if let Some(end) = head_end_of(&buf) {
+            let total = end + content_length_of(&buf[..end]);
+            if buf.len() >= total {
+                buf.truncate(total);
+                return Ok(buf);
+            }
+        }
+        let mut chunk = [0u8; 1024];
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("read response: {e}"))?;
+        if n == 0 {
+            return Err("EOF before a complete response".to_owned());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// Connects to the transparent :80 name (TEST3) with the read bound set.
+fn connect_http80() -> Result<TcpStream, String> {
+    let addr = SocketAddr::V4(SocketAddrV4::new(TEST3, 80));
+    let stream =
+        TcpStream::connect_timeout(&addr, BOUND).map_err(|e| format!("connect {addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(BOUND))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    Ok(stream)
+}
+
+/// Reads to the end of the stream after the client's write side is shut.
+/// Zero bytes is the only acceptable outcome for a closed relay: a clean EOF
+/// or a reset (the proxy closed with our write unread) both count.
+fn expect_no_more_bytes(stream: &mut TcpStream, what: &str) -> Result<(), String> {
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+            ) => {}
+        Err(e) => return Err(format!("{what}: read: {e}")),
+    }
+    if !rest.is_empty() {
+        return Err(format!(
+            "{what}: {} bytes came back (must be none): {:?}",
+            rest.len(),
+            String::from_utf8_lossy(&rest)
+        ));
+    }
+    Ok(())
+}
+
+/// Two bodyless keep-alive requests on one connection, the second sent only
+/// after the first response (issue #29, F3).
+fn role_http_keepalive() -> Result<(), String> {
+    let mut stream = connect_http80()?;
+    stream
+        .write_all(KEEPALIVE_REQ1)
+        .map_err(|e| format!("write request 1: {e}"))?;
+    let first = read_framed_response(&mut stream)?;
+    if !first.ends_with(b"ECHO 1") {
+        return Err(format!("response 1: {:?}", String::from_utf8_lossy(&first)));
+    }
+    stream
+        .write_all(KEEPALIVE_REQ2)
+        .map_err(|e| format!("write request 2: {e}"))?;
+    let second = read_framed_response(&mut stream)?;
+    if !second.ends_with(b"ECHO 2") {
+        return Err(format!(
+            "response 2: {:?}",
+            String::from_utf8_lossy(&second)
+        ));
+    }
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown(Write): {e}"))?;
+    expect_no_more_bytes(&mut stream, "after the two responses")?;
+    marker("relay ok keep-alive two responses");
+    Ok(())
+}
+
+/// A request WITH a body is the last on its connection (issue #29, FLAG-3):
+/// the proxy forwards it with `Connection: close`, and a pipelined-after
+/// follow-up is never forwarded.
+fn role_http_keepalive_body() -> Result<(), String> {
+    let mut stream = connect_http80()?;
+    stream
+        .write_all(b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\nbody")
+        .map_err(|e| format!("write the POST: {e}"))?;
+    let first = read_framed_response(&mut stream)?;
+    if !first.ends_with(b"ECHO 1") {
+        return Err(format!(
+            "response to the POST: {:?}",
+            String::from_utf8_lossy(&first)
+        ));
+    }
+    // The follow-up goes out after the last request's response. The proxy
+    // no longer reads the client, so these bytes never reach the upstream.
+    let _ = stream.write_all(KEEPALIVE_REQ2);
+    let _ = stream.shutdown(Shutdown::Write);
+    expect_no_more_bytes(&mut stream, "after the body-ended request")?;
+    marker("relay ok body-ended connection");
+    Ok(())
+}
+
+/// Request 1 on Host A, then request 2 on the same connection with Host B —
+/// an ALLOWED name, but not the connection's name (issue #29, F3). The
+/// connection is torn down without a response to request 2.
+fn role_http_foreign_host() -> Result<(), String> {
+    let mut stream = connect_http80()?;
+    stream
+        .write_all(KEEPALIVE_REQ1)
+        .map_err(|e| format!("write request 1: {e}"))?;
+    let first = read_framed_response(&mut stream)?;
+    if !first.ends_with(b"ECHO 1") {
+        return Err(format!("response 1: {:?}", String::from_utf8_lossy(&first)));
+    }
+    let foreign = format!("GET /b HTTP/1.1\r\nHost: {OTHER_HOST}\r\n\r\n");
+    let _ = stream.write_all(foreign.as_bytes());
+    let _ = stream.shutdown(Shutdown::Write);
+    expect_no_more_bytes(&mut stream, "after the foreign Host")?;
+    marker("relay ok foreign Host torn down");
+    Ok(())
+}
+
+/// A keep-alive connection with no further traffic is closed by the relay
+/// idle timeout (issue #29, C4): the client sees the close after roughly the
+/// configured idle bound, never sooner, and never after the harness bound.
+fn role_http_idle() -> Result<(), String> {
+    let mut stream = connect_http80()?;
+    stream
+        .write_all(KEEPALIVE_REQ1)
+        .map_err(|e| format!("write request 1: {e}"))?;
+    let first = read_framed_response(&mut stream)?;
+    if !first.ends_with(b"ECHO 1") {
+        return Err(format!("response 1: {:?}", String::from_utf8_lossy(&first)));
+    }
+    let idle_since = Instant::now();
+    let mut rest = Vec::new();
+    match stream.read_to_end(&mut rest) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ) => {}
+        Err(e) => return Err(format!("idle read: {e}")),
+    }
+    let waited = idle_since.elapsed();
+    if !rest.is_empty() {
+        return Err(format!("bytes after the idle close: {rest:?}"));
+    }
+    if waited < Duration::from_millis(500) {
+        return Err(format!("closed too early: after {waited:?}"));
+    }
+    marker(&format!("relay ok idle close after {waited:?}"));
+    Ok(())
+}
+
+/// Issue #29, keep-alive: two bodyless GETs on ONE transparent :80
+/// connection, the second after the first response. Both responses arrive,
+/// the upstream saw both requests on one connection, and neither forwarded
+/// head carries an inserted `Connection: close`.
+fn scenario_http_keepalive_two_requests_80() -> Result<(), String> {
+    let run = run_netns(
+        "pt-http-keepalive",
+        &[(TEST3, ALLOWED)],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHttp,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok keep-alive two responses"])?;
+    let conns = expect_http_echo(&run.echo)?;
+    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
+    if shape != [2] {
+        return Err(format!(
+            "the upstream must see exactly two requests on ONE connection, saw {shape:?}"
+        ));
+    }
+    if conns[0][0] != KEEPALIVE_REQ1 || conns[0][1] != KEEPALIVE_REQ2 {
+        return Err(format!(
+            "forwarded heads must be byte-identical: {:?}",
+            conns[0]
+        ));
+    }
+    if conns[0]
+        .iter()
+        .any(|head| head.windows(17).any(|w| w == b"Connection: close"))
+    {
+        return Err("a bodyless keep-alive head must not carry Connection: close".to_owned());
+    }
+    expect_clean_allowed(&run)
+}
+
+/// Issue #29, FLAG-3: request 1 with a Content-Length body is the last request
+/// on its connection. It is forwarded with `Connection: close` (body
+/// byte-identical), and the request after it is never forwarded.
+fn scenario_http_keepalive_body_last_80() -> Result<(), String> {
+    let run = run_netns(
+        "pt-http-keepalive-body",
+        &[(TEST3, ALLOWED)],
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHttp,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok body-ended connection"])?;
+    let conns = expect_http_echo(&run.echo)?;
+    let want: &[u8] = b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
+    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
+    if shape != [1] || conns[0][0] != want {
+        return Err(format!(
+            "the body request must be the only request, with Connection: close: {shape:?} {:?}",
+            conns.first()
+        ));
+    }
+    expect_clean_allowed(&run)
+}
+
+/// Issue #29, F3: request 1 on Host A (allowed), request 2 on the same
+/// connection with Host B (also allowed, but not this connection's name). The
+/// upstream saw request 1 only; the connection is torn down with the pinned
+/// per-request detail and no response to request 2.
+fn scenario_http_keepalive_foreign_host_torn_down_80() -> Result<(), String> {
+    let run = run_netns(
+        "pt-http-foreign-host",
+        &[(TEST3, ALLOWED)],
+        &[ALLOWED, OTHER_HOST],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHttp,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok foreign Host torn down"])?;
+    let conns = expect_http_echo(&run.echo)?;
+    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
+    if shape != [1] || conns[0][0] != KEEPALIVE_REQ1 {
+        return Err(format!(
+            "the upstream must see request 1 only: {shape:?} {:?}",
+            conns.first()
+        ));
+    }
+    let want = format!(
+        "relay torn down: HTTP request 2 denied: HTTP Host {OTHER_HOST} does not match the DNS-map name {ALLOWED}"
+    );
+    if run.teardowns != [want.clone()] {
+        return Err(format!(
+            "teardown hook: {:?} (want {want:?})",
+            run.teardowns
+        ));
+    }
+    // One allowed connect and the expected teardown above; the clean-tail
+    // helper forbids teardowns, so only the decisions are checked here.
+    if run.decisions.len() != 1 || !matches!(run.decisions[0].verdict, Verdict::Allowed { .. }) {
+        return Err(format!("decisions: {:?}", run.decisions));
+    }
+    Ok(())
+}
+
+/// Issue #29, C4 end to end: a keep-alive relay with no traffic after its
+/// first response is closed by the idle timeout (1 s here, the in-process
+/// equivalent of `sbx run --relay-idle-timeout 1s`), and the `closed` hook
+/// reports `IdleTimeout`, which the audit writes as `reason: "idle_timeout"`.
+fn scenario_relay_idle_timeout_closes() -> Result<(), String> {
+    let limits = Limits {
+        relay_idle_timeout: Duration::from_secs(1),
+        ..Limits::default()
+    };
+    let run = run_netns_limits(
+        "pt-http-idle",
+        MapSpec::Static(&[(TEST3, ALLOWED)]),
+        &[ALLOWED],
+        &[443, 80],
+        ConnectorSpec::Echo,
+        EchoSpec::ExpectHttp,
+        limits,
+    )?;
+    assert_payload_success(&run.payload, &["relay ok idle close"])?;
+    if run.closes != [CloseReason::IdleTimeout] {
+        return Err(format!("closed hook: {:?}", run.closes));
+    }
+    if !run.teardowns.is_empty() {
+        return Err(format!("unexpected teardowns: {:?}", run.teardowns));
+    }
+    Ok(())
+}
+
+/// The echo's per-connection request record, or a precise failure.
+fn expect_http_echo(echo: &Option<EchoOutcome>) -> Result<Vec<Vec<Vec<u8>>>, String> {
+    match echo {
+        Some(EchoOutcome::Http(conns)) => Ok(conns.clone()),
+        other => Err(format!("the keep-alive upstream must be hit: {other:?}")),
+    }
+}
+
+/// One allowed connect decision and no teardown, the common tail of the
+/// keep-alive scenarios.
+fn expect_clean_allowed(run: &NetnsRun) -> Result<(), String> {
+    if run.decisions.len() != 1 || !matches!(run.decisions[0].verdict, Verdict::Allowed { .. }) {
+        return Err(format!("decisions: {:?}", run.decisions));
+    }
+    if !run.teardowns.is_empty() {
+        return Err(format!("unexpected teardowns: {:?}", run.teardowns));
     }
     Ok(())
 }
@@ -2407,6 +2875,10 @@ fn child_main(role: &str) -> ExitCode {
         }
         "pt-tls-second-hello" => role_second_hello(),
         "pt-http-ok" => role_relay(&http_relay_payload(), &http_relay_expected(), TEST3, 80),
+        "pt-http-keepalive" => role_http_keepalive(),
+        "pt-http-keepalive-body" => role_http_keepalive_body(),
+        "pt-http-foreign-host" => role_http_foreign_host(),
+        "pt-http-idle" => role_http_idle(),
         "pt-tls-sni-mismatch" => {
             let hello = build_client_hello(Some(EVIL), &[]);
             role_expect_close(TEST3, 443, Some(&hello))
@@ -3255,11 +3727,13 @@ fn scenario_explicit_connect_80_inspected() -> Result<(), String> {
     let received = read_to_eof(&mut stream)?;
     let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
     let finished = explicit.finish()?;
-    let text = String::from_utf8_lossy(&upstream).into_owned();
-    if !text.starts_with("GET /x HTTP/1.1\r\nHost: allowed.test\r\n")
-        || !text.contains("Connection: close\r\n")
-    {
-        return Err(format!("upstream request: {text:?}"));
+    // Issue #29: a bodyless keep-alive request is not last, so its head goes
+    // upstream byte-identical (no close token inserted).
+    if upstream != b"GET /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n" {
+        return Err(format!(
+            "upstream request: {:?}",
+            String::from_utf8_lossy(&upstream)
+        ));
     }
     if received.len() < EXPLICIT_200.len() || &received[..EXPLICIT_200.len()] != EXPLICIT_200 {
         return Err("the client must see the 200 first".to_owned());
@@ -3269,6 +3743,75 @@ fn scenario_explicit_connect_80_inspected() -> Result<(), String> {
     }
     if finished.dials != [format!("{ALLOWED}:80")] {
         return Err(format!("connector log: {:?}", finished.dials));
+    }
+    Ok(())
+}
+
+/// Issue #29, C2: explicit forward is one request per connection. Two
+/// absolute-form requests in ONE write: only the first reaches the upstream
+/// (rebuilt, with `Connection: close`); the pipelined follow-up, for another
+/// authority, is never forwarded.
+fn scenario_explicit_forward_pipelined_follow_up() -> Result<(), String> {
+    let (echo, explicit, _target) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(
+            b"GET http://allowed.test/p HTTP/1.1\r\nHost: allowed.test\r\n\r\nGET http://other.test/q HTTP/1.1\r\nHost: other.test\r\n\r\n",
+        )
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let _ = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let _finished = explicit.finish()?;
+    let want = b"GET /p HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+    if upstream != want {
+        return Err(format!(
+            "upstream bytes: {:?}",
+            String::from_utf8_lossy(&upstream)
+        ));
+    }
+    Ok(())
+}
+
+/// Issue #29, B12's host-netns twin: a CONNECT-80 tunnel keeps the bound
+/// name. The first request (keep-alive) reaches the upstream verbatim; a
+/// pipelined follow-up with a foreign Host is torn down silently after the
+/// `200`, with the pinned teardown detail, and never forwarded.
+fn scenario_explicit_connect_80_followup_foreign_host() -> Result<(), String> {
+    let (echo, explicit, _target) = echo_explicit(EchoMode::Immediate, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    let req1 = b"GET /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+    let req2 = b"GET /y HTTP/1.1\r\nHost: other.test\r\n\r\n";
+    stream
+        .write_all(
+            &[
+                connect_head("allowed.test:80"),
+                req1.to_vec(),
+                req2.to_vec(),
+            ]
+            .concat(),
+        )
+        .map_err(|e| format!("write: {e}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|e| format!("shutdown: {e}"))?;
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let finished = explicit.finish()?;
+    if received.len() < EXPLICIT_200.len() || &received[..EXPLICIT_200.len()] != EXPLICIT_200 {
+        return Err("the client must see the 200 first".to_owned());
+    }
+    if upstream != req1 {
+        return Err(format!(
+            "upstream saw {:?}, must be exactly request 1",
+            String::from_utf8_lossy(&upstream)
+        ));
+    }
+    let want = "relay torn down: HTTP request 2 denied: HTTP Host other.test does not match the CONNECT target name allowed.test";
+    if !finished.teardowns.iter().any(|t| t == want) {
+        return Err(format!("teardown hook: {:?}", finished.teardowns));
     }
     Ok(())
 }

@@ -62,8 +62,7 @@
 //!    documented worst case and make `Failed::ConnectTimeout`'s `secs`
 //!    untruthful — owned by [`GuardedConnector`]), and a 1 ms→100 ms
 //!    bounded accept backoff. The two timeout scopes never nest, so the
-//!    pinned reasons never compete. No relay idle timeout and no
-//!    concurrency cap in v1 (Q7 — revisit with #10 via [`Limits`]).
+//!    pinned reasons never compete. A relay idle timeout (issue #29, C4: [`Limits::relay_idle_timeout`], 300 s, `--relay-idle-timeout`) closes every relay that moves no payload byte in either direction; there is still no concurrency cap (#43).
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
 //!    must not pass (Q1). TLS is PASSED THROUGH, never terminated (no CA in
@@ -95,11 +94,7 @@
 //!    pipelined bytes the acceptor internally buffers therefore survive in
 //!    the replay buffer (`inspect_tls_replays_pipelined_bytes` pins it),
 //!    and the upstream sees the client's byte stream verbatim — with ONE
-//!    documented deviation (round-2 review fix): on port 80 the validated
-//!    head is replayed with an inserted `Connection: close` (http.rs module
-//!    docs point 6 — the name binding's connection-lifetime enforcement;
-//!    request line, client headers, and every body byte stay
-//!    byte-identical).
+//!    documented deviation (issue #29, F3): on port 80 a LAST request's head (HTTP/1.0, `close`, `Upgrade`, or a body) is replayed with an inserted `Connection: close` (http.rs module docs points 6 and 8); a bodyless keep-alive request is byte-identical, and nothing after a last request is forwarded.
 //! 10. **Accept-loop resilience** — proxy death = sandbox death (fdpass),
 //!     so transient accept errors (EMFILE/ENFILE/ECONNABORTED/ENOBUFS/
 //!     ENOMEM …) get bounded exponential backoff and NEVER an exit; only a
@@ -186,10 +181,22 @@
 //!     The strict framing table applies on transparent :80 as well (F2).
 //!     Residuals, documented: a CONNECT dial failure after the `200` is a
 //!     silent close; body framing beyond the strict table is deferred (F3);
-//!     pipelined second requests on one connection are not inspected (the
-//!     vhost-confusion class, #14; see the `explicit` module docs point 10).
+//!     pipelined second requests on one connection are not inspected (the vhost-confusion class, #14; see the `explicit` module docs point 10). Issue
+//!     #29 (F3): body framing is strict and streamed, and every pipelined request
+//!     on a port-80 connection (transparent or CONNECT-80) is inspected before its
+//!     bytes are forwarded. Explicit forward is one request per connection
+//!     (explicit module docs point 12).
+//! 14. **HTTP/1 per-request relay (issue #29, F3)** — port 80 (transparent),
+//!     CONNECT-80 and absolute-form forward run [`relay::relay_http`]. Request 1
+//!     is inspected in the decision phase (`http::inspect_http`); every later head
+//!     is inspected before its bytes are written (`http::inspect_head`, http module
+//!     docs point 7), and bodies are framed by `h1::RequestStream` and streamed. A
+//!     denied later request is a silent teardown on transparent and CONNECT-80
+//!     (`relay::Teardown::Request`, relay module docs point 9). The name, port, DNS
+//!     map, allow list and dial are fixed per connection and not re-run.
 
 pub(crate) mod explicit;
+pub(crate) mod h1;
 pub mod hello;
 pub(crate) mod http;
 pub(crate) mod relay;
@@ -209,6 +216,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::egress;
 use crate::init::consts;
 use crate::policy::{self, Domain, DomainRule};
+use relay::{HttpBinding, HttpEnd, HttpFlavor, HttpStart, RelayEnd};
 
 /// The ports with a v1 protocol inspector (module docs point 7): 443 is
 /// inspected as TLS ([`hello`]), 80 as HTTP/1 ([`http`]). Any other
@@ -260,6 +268,11 @@ pub struct Limits {
     pub connect_timeout: Duration,
     /// Upper bound of the transient-accept-error backoff (1 ms doubling).
     pub accept_backoff_max: Duration,
+    /// Inactivity bound on every relay (issue #29, C4): a relay that moves no
+    /// payload byte in either direction for this long is closed, with the
+    /// `close` row carrying `reason: "idle_timeout"` (module docs point 6).
+    /// The decision phase is bounded by [`Self::decision_timeout`] instead.
+    pub relay_idle_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -271,6 +284,31 @@ impl Default for Limits {
             decision_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             accept_backoff_max: Duration::from_millis(100),
+            relay_idle_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Why a relay ended, for the `close` audit row (issue #29, C4). `Ended` is
+/// every natural end (EOF, reset, scanner teardown); `IdleTimeout` is the
+/// inactivity watchdog ([`Limits::relay_idle_timeout`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The relay ended on its own.
+    Ended,
+    /// No payload byte moved for [`Limits::relay_idle_timeout`].
+    IdleTimeout,
+}
+
+/// The audit `reason` of an idle-timeout close (pinned golden string).
+pub const IDLE_TIMEOUT_REASON: &str = "idle_timeout";
+
+impl CloseReason {
+    /// The `close` row's `reason` (`None` for a natural end).
+    pub fn audit_reason(&self) -> Option<&'static str> {
+        match self {
+            CloseReason::Ended => None,
+            CloseReason::IdleTimeout => Some(IDLE_TIMEOUT_REASON),
         }
     }
 }
@@ -751,7 +789,7 @@ pub trait DecisionSink: Send + Sync + 'static {
     /// called for Denied/Error, nor for a relay still running at runtime stop.
     /// Default: no-op. SYNC + CHEAP + NON-BLOCKING + must-not-panic. NOT a
     /// second `record`.
-    fn closed(&self, _decision: &Decision, _up: u64, _down: u64) {}
+    fn closed(&self, _decision: &Decision, _up: u64, _down: u64, _end: CloseReason) {}
 }
 
 /// A bidirectional byte stream usable as an upstream (relay endpoint).
@@ -1004,8 +1042,8 @@ impl Proxy {
         dns_map: Arc<dyn DnsMap>,
         sink: Arc<dyn DecisionSink>,
         host_addrs: egress::HostAddrs,
+        limits: Limits,
     ) -> Arc<Self> {
-        let limits = Limits::default();
         let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
         Self::new(network, dns_map, sink, connector, limits)
     }
@@ -1101,9 +1139,13 @@ pub(crate) struct ConnCtx {
 /// the inspected ClientHello record; `None` on the unscanned HTTP path).
 pub(crate) struct RelayStart<S> {
     pub client: S,
+    /// The bytes written upstream first: the full inspected ClientHello
+    /// buffer on 443 ([`RelayMode::Scanned`]), or the request-1 head as it
+    /// goes upstream on the HTTP paths ([`RelayMode::Http`]; the pending
+    /// bytes travel in the mode).
     pub replay: Vec<u8>,
     pub connected: Connected,
-    pub scan_from: Option<usize>,
+    pub mode: RelayMode,
 }
 
 /// One accepted connection: decide → record (exactly once) → replay →
@@ -1150,13 +1192,9 @@ pub(crate) async fn handle_connection(
         client,
         replay,
         mut connected,
-        scan_from,
+        mode,
     }) = relay
     {
-        let mode = match scan_from {
-            Some(scan_from) => RelayMode::Scanned { scan_from },
-            None => RelayMode::Plain,
-        };
         relay_tail(
             &proxy,
             &decision,
@@ -1169,25 +1207,26 @@ pub(crate) async fn handle_connection(
     }
 }
 
-/// How the relay phase runs (issue #8 seam): the 443 second-hello scanner
-/// starting at `scan_from`, or the plain bidirectional copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the relay phase runs. 443 keeps the second-hello scanner from
+/// `scan_from` (module docs point 12 of relay.rs); every HTTP/1 path runs the
+/// per-request relay (issue #29, F3; module docs point 14).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RelayMode {
     /// 443 — client→upstream runs through the scanner from this offset.
     Scanned { scan_from: usize },
-    /// 80 (transparent) — plain `copy_bidirectional`.
-    Plain,
-    /// Explicit CONNECT-80 tunnel and absolute-form forward (issue #8): the
-    /// request carries `Connection: close`, so upstream EOF ends the
-    /// exchange (`relay::relay_until_upstream_eof`).
-    CloseOnUpstreamEof,
+    /// Port 80 (transparent), CONNECT-80 and absolute-form forward: the
+    /// per-request relay with its binding, first-request facts and pending
+    /// client bytes.
+    Http(HttpStart),
 }
 
-/// The shared relay tail (issue #8 seam): replay the FULL buffer upstream
-/// (module docs point 9 — inspection consumed those bytes FROM the client),
-/// relay, and report a scanner teardown to the sink (a blocked attack must
-/// not be audit-invisible behind its `allowed …` line). Errors are normal
-/// lifecycle — swallowed; the caller's drop closes both sockets.
+/// The shared relay tail (issue #8 seam): replay the head or ClientHello
+/// buffer upstream (module docs point 9 — inspection consumed those bytes FROM
+/// the client), relay under the idle watchdog (module docs point 6), report a
+/// teardown to the sink (a blocked attack must not be audit-invisible behind
+/// its `allowed …` line), and close the segment exactly once with its
+/// reason. Errors are normal lifecycle — swallowed; the caller's drop closes
+/// both sockets.
 pub(crate) async fn relay_tail<C>(
     proxy: &Proxy,
     decision: &Decision,
@@ -1198,27 +1237,40 @@ pub(crate) async fn relay_tail<C>(
 ) where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut counted = relay::Counted::new(&mut *upstream);
-    match mode {
-        // Explicit-only; the transparent relay never sees this mode.
-        // Clean end or transport error: normal relay lifecycle — swallowed.
-        RelayMode::CloseOnUpstreamEof => {
-            let _ = relay::relay_until_upstream_eof(client, replay, &mut counted).await;
-        }
-        RelayMode::Scanned { .. } | RelayMode::Plain => {
-            let scan_from = match mode {
-                RelayMode::Scanned { scan_from } => Some(scan_from),
-                _ => None,
-            };
-            match relay::relay(client, replay, scan_from, &mut counted).await {
-                Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
-                // Clean end or transport error (EOF/RST/broken pipe): normal relay
-                // lifecycle — swallowed.
-                Ok(relay::RelayEnd::Finished) | Err(_) => {}
+    let limits = &proxy.limits;
+    let act = relay::Activity::new();
+    let client = relay::Watched::new(client, act.clone());
+    let mut counted = relay::Counted::new(relay::Watched::new(&mut *upstream, act.clone()));
+    let relayed = relay::until_idle(&act, limits.relay_idle_timeout, async {
+        match mode {
+            RelayMode::Scanned { scan_from } => {
+                match relay::relay(client, replay, Some(scan_from), &mut counted).await {
+                    Ok(RelayEnd::TornDown(teardown)) => {
+                        proxy.sink.teardown(decision, &teardown.detail());
+                    }
+                    // Clean end or transport error (EOF/RST/broken pipe):
+                    // normal relay lifecycle — swallowed.
+                    Ok(RelayEnd::Finished) | Err(_) => {}
+                }
+            }
+            RelayMode::Http(start) => {
+                match relay::relay_http(client, replay, start, &mut counted, limits).await {
+                    Ok(HttpEnd::TornDown(teardown)) => {
+                        proxy.sink.teardown(decision, &teardown.detail());
+                    }
+                    Ok(HttpEnd::Finished) | Err(_) => {}
+                }
             }
         }
-    }
-    proxy.sink.closed(decision, counted.up(), counted.down());
+    })
+    .await;
+    let end = match relayed {
+        Some(()) => CloseReason::Ended,
+        None => CloseReason::IdleTimeout,
+    };
+    proxy
+        .sink
+        .closed(decision, counted.up(), counted.down(), end);
 }
 
 /// `getsockopt(SO_ORIGINAL_DST)` on an ACCEPTED socket of the redirected
@@ -1316,21 +1368,19 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     // 4. Protocol branch under the decision timeout — ONE scope around the
     //    whole inspection (elapsed ⇒ future dropped mid-read, buffered
     //    bytes discarded — fail-closed; module docs point 6).
-    let inspected = match port {
-        TLS_PORT => {
-            tokio::time::timeout(
-                proxy.limits.decision_timeout,
-                hello::inspect_tls(&mut client, &name, &proxy.limits),
-            )
-            .await
-        }
-        HTTP_PORT => {
-            tokio::time::timeout(
-                proxy.limits.decision_timeout,
-                http::inspect_http(&mut client, &name, port, &proxy.limits),
-            )
-            .await
-        }
+    let preamble = match port {
+        TLS_PORT => tokio::time::timeout(
+            proxy.limits.decision_timeout,
+            hello::inspect_tls(&mut client, &name, &proxy.limits),
+        )
+        .await
+        .map(|inspected| inspected.map(Preamble::Tls)),
+        HTTP_PORT => tokio::time::timeout(
+            proxy.limits.decision_timeout,
+            http::inspect_http(&mut client, &name, port, &proxy.limits),
+        )
+        .await
+        .map(|inspected| inspected.map(Preamble::Http)),
         // Q1: policy-listed but uninspectable ⇒ deny, immediate (no
         // timeout needed — nothing is read).
         other => {
@@ -1344,8 +1394,8 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             );
         }
     };
-    let replay = match inspected {
-        Ok(Ok(replay)) => replay,
+    let preamble = match preamble {
+        Ok(Ok(preamble)) => preamble,
         Ok(Err(rejected)) => {
             return (decision(&ctx, Some(name), Verdict::Denied(rejected)), None);
         }
@@ -1371,25 +1421,46 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
     // 6. Allowed — the decision carries the guarded peer actually
     //    connected; the relay state carries the FULL replay buffer and,
     //    on 443, the scanner handoff offset (module docs point 12).
-    let scan_from = if port == TLS_PORT {
-        // Unreachable None (inspect_tls walked the record — the ECH
-        // walker requires it fully present); fail closed anyway (house
-        // rule: no panics).
-        let Some(hello_end) = hello::first_record_end(&replay) else {
-            return (
-                decision(
-                    &ctx,
-                    Some(name),
-                    Verdict::Denied(Rejected::HelloMalformed {
-                        detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
-                    }),
-                ),
-                None,
-            );
-        };
-        Some(hello_end)
-    } else {
-        None
+    let (replay, mode) = match preamble {
+        Preamble::Tls(replay) => {
+            // Unreachable None (inspect_tls walked the record — the ECH
+            // walker requires it fully present); fail closed anyway (house
+            // rule: no panics).
+            let Some(hello_end) = hello::first_record_end(&replay) else {
+                return (
+                    decision(
+                        &ctx,
+                        Some(name),
+                        Verdict::Denied(Rejected::HelloMalformed {
+                            detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
+                        }),
+                    ),
+                    None,
+                );
+            };
+            (
+                replay,
+                RelayMode::Scanned {
+                    scan_from: hello_end,
+                },
+            )
+        }
+        Preamble::Http(inspected) => {
+            // Request 1 goes upstream with the same `Connection: close` rule
+            // as every later request (module docs point 6 of http.rs); the
+            // pending bytes stay in order behind it.
+            let replay = http::upstream_head(inspected.head, &inspected.meta);
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: name.clone(),
+                    port,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first: inspected.meta,
+                pending: inspected.pending,
+            };
+            (replay, RelayMode::Http(start))
+        }
     };
     (
         decision(
@@ -1404,9 +1475,18 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             client,
             replay,
             connected,
-            scan_from,
+            mode,
         }),
     )
+}
+
+/// What a protocol inspection hands the relay (the decide-local twin of the
+/// two inspectors' outputs).
+enum Preamble {
+    /// 443: the inspected ClientHello buffer.
+    Tls(Vec<u8>),
+    /// 80: request 1's head and pending bytes.
+    Http(http::Inspected),
 }
 
 /// Step 5 of the pipeline, shared by the transparent and explicit paths:
@@ -1492,6 +1572,7 @@ fn accept_error_is_fatal(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::h1::RequestMeta;
     use std::collections::HashMap;
     use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1605,28 +1686,31 @@ mod tests {
                 .expect("events lock")
                 .push(format!("teardown:{detail}"));
         }
-        fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+        fn closed(&self, _decision: &Decision, up: u64, down: u64, end: CloseReason) {
+            // The idle-timeout close is tagged; a natural end keeps the old shape.
+            let tag = match end {
+                CloseReason::Ended => "",
+                CloseReason::IdleTimeout => ":idle",
+            };
             self.events
                 .lock()
                 .expect("events lock")
-                .push(format!("closed:{up}:{down}"));
+                .push(format!("closed:{up}:{down}{tag}"));
         }
     }
 
     fn order_proxy(sink: Arc<OrderSink>) -> Arc<Proxy> {
+        order_proxy_with(sink, Limits::default())
+    }
+
+    fn order_proxy_with(sink: Arc<OrderSink>, limits: Limits) -> Arc<Proxy> {
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
             ports: vec![TLS_PORT, HTTP_PORT],
         };
         let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
-        Proxy::new(
-            &network,
-            Arc::new(map),
-            sink,
-            never_connector().0,
-            Limits::default(),
-        )
+        Proxy::new(&network, Arc::new(map), sink, never_connector().0, limits)
     }
 
     fn allowed_decision() -> Decision {
@@ -1645,15 +1729,31 @@ mod tests {
 
     #[test]
     fn closed_once_with_bytes_after_plain_relay() {
-        // Issue #10, T9: `up` = replay + client body (as the upstream accepted),
-        // `down` = upstream bytes read; exactly one `closed`, after the relay.
+        // Issue #10, T9: `up` = the head + the client body (as the upstream
+        // accepted), `down` = upstream bytes read; exactly one `closed`, after
+        // the relay. The body makes the request last, so the body is the last
+        // client bytes forwarded (issue #29).
         let sink = Arc::new(OrderSink::default());
         let proxy = order_proxy(sink.clone());
         let decision = allowed_decision();
         let (up_near, mut up_far) = duplex(4096);
         let mut upstream: Upstream = Box::new(up_near);
         let (mut client_far, client) = duplex(4096);
-        let replay: &[u8] = b"HEAD\r\n\r\n";
+        let replay: &[u8] = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 5\r\n\r\n";
+        let mode = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::Length(5),
+                minor_version: 1,
+                close: false,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
         block_on(async {
             let far = tokio::spawn(async move {
                 let mut got = vec![0u8; replay.len() + 5];
@@ -1667,20 +1767,17 @@ mod tests {
             });
             client_far.write_all(b"BODY!").await.expect("client write");
             client_far.shutdown().await.expect("client shutdown");
-            relay_tail(
-                &proxy,
-                &decision,
-                client,
-                replay,
-                RelayMode::Plain,
-                &mut upstream,
-            )
-            .await;
+            relay_tail(&proxy, &decision, client, replay, mode, &mut upstream).await;
             let got = far.await.expect("far task");
-            assert_eq!(got, b"HEAD\r\n\r\nBODY!");
+            let mut want = replay.to_vec();
+            want.extend_from_slice(b"BODY!");
+            assert_eq!(got, want);
         });
         // down = the 10 upstream bytes ("BYE!!!!!!!").
-        assert_eq!(sink.events(), vec!["closed:13:10".to_owned()]);
+        assert_eq!(
+            sink.events(),
+            vec![format!("closed:{}:10", replay.len() + 5)]
+        );
     }
 
     #[test]
@@ -1750,7 +1847,20 @@ mod tests {
                 &decision,
                 client,
                 head,
-                RelayMode::CloseOnUpstreamEof,
+                RelayMode::Http(relay::HttpStart {
+                    binding: relay::HttpBinding {
+                        name: dom("allowed.test"),
+                        port: 80,
+                        flavor: relay::HttpFlavor::Forward,
+                    },
+                    first: RequestMeta {
+                        framing: http::Framing::None,
+                        minor_version: 1,
+                        close: true,
+                        upgrade: false,
+                    },
+                    pending: Vec::new(),
+                }),
                 &mut upstream,
             )
             .await;
@@ -1782,7 +1892,7 @@ mod tests {
             fn record(&self, _decision: &Decision) {}
         }
         let decision = allowed_decision();
-        MinimalSink.closed(&decision, 1, 2);
+        MinimalSink.closed(&decision, 1, 2, CloseReason::Ended);
     }
 
     #[test]
@@ -2246,6 +2356,63 @@ mod tests {
         assert_eq!(limits.decision_timeout, Duration::from_secs(10));
         assert_eq!(limits.connect_timeout, Duration::from_secs(10));
         assert_eq!(limits.accept_backoff_max, Duration::from_millis(100));
+        assert_eq!(limits.relay_idle_timeout, Duration::from_secs(300));
+    }
+
+    /// Issue #29, C4: an idle relay closes with `IdleTimeout` and the sink
+    /// hears it exactly once; a silent HTTP relay (keep-alive, no bytes) and a
+    /// silent scanned TLS relay both trip the watchdog.
+    #[test]
+    fn idle_timeout_fires_with_reason() {
+        let limits = Limits {
+            relay_idle_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        };
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        let http = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::None,
+                minor_version: 1,
+                close: false,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
+        let hello = tls_hello("allowed.test");
+        for (replay, mode) in [
+            (head.to_vec(), http),
+            (
+                hello.clone(),
+                RelayMode::Scanned {
+                    scan_from: hello.len(),
+                },
+            ),
+        ] {
+            let sink = Arc::new(OrderSink::default());
+            let proxy = order_proxy_with(sink.clone(), limits.clone());
+            let decision = allowed_decision();
+            let (up_near, _up_far) = duplex(4096);
+            let mut upstream: Upstream = Box::new(up_near);
+            let (_client_far, client) = duplex(4096);
+            block_on(relay_tail(
+                &proxy,
+                &decision,
+                client,
+                &replay,
+                mode,
+                &mut upstream,
+            ));
+            // `up` is the replay the upstream accepted; nothing came back.
+            assert_eq!(
+                sink.events(),
+                vec![format!("closed:{}:0:idle", replay.len())]
+            );
+        }
     }
 
     // ---- the pipeline order + AC denials ----------------------------------
@@ -2478,14 +2645,19 @@ mod tests {
         let RelayStart {
             replay,
             connected,
-            scan_from,
+            mode,
             ..
         } = relay.expect("the allowed path returns the relay state");
         assert_eq!(replay, hello);
         assert_eq!(connected.peer, sock(PUBLIC));
         // The 443 relay is SCANNED (module docs point 12): the handoff is
         // the end of the single-record fixture hello.
-        assert_eq!(scan_from, Some(hello.len()));
+        assert_eq!(
+            mode,
+            RelayMode::Scanned {
+                scan_from: hello.len()
+            }
+        );
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), TLS_PORT)]);
     }
 
@@ -2508,19 +2680,16 @@ mod tests {
                 upstream: sock("93.184.216.34:80"),
             }
         );
-        let RelayStart {
-            replay, scan_from, ..
-        } = relay.expect("the allowed path returns the relay state");
-        // The validated head carries the inserted `Connection: close`
-        // (http.rs module docs point 6 — the name binding's
-        // connection-lifetime enforcement); everything else is
-        // byte-identical.
-        assert_eq!(
-            replay,
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
-        );
-        // The HTTP relay is UNSCANNED (module docs point 12: 443 only).
-        assert_eq!(scan_from, None);
+        let RelayStart { replay, mode, .. } =
+            relay.expect("the allowed path returns the relay state");
+        // A bodyless keep-alive request is not last: its head goes upstream
+        // byte-identical (http.rs module docs points 6 and 8).
+        assert_eq!(replay, head.to_vec());
+        let RelayMode::Http(start) = mode else {
+            panic!("port 80 runs the per-request relay: {mode:?}");
+        };
+        assert!(!start.first.is_last(), "{:?}", start.first);
+        assert!(start.pending.is_empty());
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), HTTP_PORT)]);
     }
 

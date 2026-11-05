@@ -70,6 +70,10 @@ pub struct HttpRec {
     pub connection_close: bool,
     /// How many Host header lines the request carried (B05b counts them).
     pub host_headers: usize,
+    /// Bytes the client pipelined after a `Connection: close` request (issue
+    /// #29, B11): drained after the response until EOF or 2 s, `0` otherwise.
+    #[serde(default)]
+    pub post_close_bytes: u64,
 }
 
 /// One query the lab DNS received (lowercase name, no root dot).
@@ -345,6 +349,7 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
                     host: host.clone(),
                     connection_close: close,
                     host_headers,
+                    post_close_bytes: 0,
                 });
                 let body = format!("FIXTURE-HTTP {}", host.as_deref().unwrap_or("none"));
                 let mut resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n", body.len());
@@ -358,6 +363,23 @@ fn serve_http(logs: &Logs, mut s: TcpStream, conn: u64) {
                 }
                 buf.drain(..n);
                 if close {
+                    // Issue #29 (B11): half-close, then drain whatever the client
+                    // still sends (bytes already buffered count too) until EOF or
+                    // 2 s, and record it on this connection's request. Without the
+                    // drain an early return would make "nothing was forwarded"
+                    // vacuous.
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                    let mut extra = buf.len() as u64;
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                    loop {
+                        match s.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(k) => extra += k as u64,
+                        }
+                    }
+                    if let Some(rec) = lock(&logs.http).iter_mut().rev().find(|r| r.conn == conn) {
+                        rec.post_close_bytes = extra;
+                    }
                     return;
                 }
             }
