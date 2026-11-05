@@ -669,9 +669,10 @@ sbx stop --session-dir S
   session's policy (rc 125, the reason on stderr). Nothing runs in that case.
 - **Each call is a sandbox.** Every attached call gets its own bwrap, with its
   own pid namespace, mounts and seccomp filter, built as for `sbx run`. Calls
-  and the resident share the session's network namespace and its localhost
-  ports. That sharing is what makes a dev server reachable, and it is a documented
-  exception to isolation (S19, R31).
+  and the resident share the session's network namespace, its localhost ports
+  and its abstract unix sockets (their namespace is the network namespace). That
+  sharing is what makes a dev server reachable, and it is a documented exception
+  to isolation (S19, R31).
 - **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
   run for that long. `--max-lifetime` (default 8h) ends it after that long
   regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
