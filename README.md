@@ -153,7 +153,8 @@ Prefer `=name` when one host is enough. A broad entry also allows every
 subdomain, including user-content subdomains on a shared platform (residual R3
 in the [threat model](docs/threat-model.md)). `sbx check --policy` rejects `=`
 alone, `==name`, `=*.name`, `= name` and `=1.2.3.4` with the same messages as
-any other invalid domain.
+any other invalid domain, and any entry whose name normalises to start with `=`
+(for example a fullwidth `＝name`, which is not read as the marker).
 
 ## Host check
 

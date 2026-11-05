@@ -77,9 +77,10 @@ pub struct RuleMatch<'a> {
 }
 
 impl<'a> RuleMatch<'a> {
-    /// The matched policy entry — the audit trail's "which rule allowed
-    /// this" (#10 logs its canonical text, `rule().as_str()`, which keeps
-    /// the `=` marker of an exact-only rule).
+    /// The matched policy entry, for a caller that wants to say which rule
+    /// allowed a host; its canonical text, `rule().as_str()`, keeps the `=`
+    /// marker of an exact-only rule. (The current dns and proxy callers only
+    /// test for a match; no audit row records the rule yet.)
     pub fn rule(&self) -> &'a DomainRule {
         self.rule
     }

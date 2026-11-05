@@ -369,10 +369,14 @@ impl DomainRule {
     /// exact-only marker), then parse the rest with [`Domain::parse`].
     ///
     /// Anything the marker does not cover is rejected with the pinned
-    /// message: `=` alone and `=*.a.com`, `= a.com`, `=1.2.3.4` come from
-    /// the Domain pipeline, and a second marker (`==a.com`) is rejected
-    /// here, quoting the whole entry — the URL deny-list accepts `=` as an
-    /// ordinary character, so the pipeline alone would take it as a name.
+    /// message, always quoting the whole entry as written: `=` alone,
+    /// `=*.a.com`, `= a.com` and `=1.2.3.4` fail in the Domain pipeline. A
+    /// normalized name that starts with `=` is rejected too: the URL
+    /// deny-list accepts `=` as an ordinary character, and UTS #46 folds
+    /// compatibility forms (fullwidth `＝`, `﹦`, `⁼`) and drops ignored code
+    /// points (soft hyphen, U+200B) in front of it, so without this check
+    /// `==a.com`, `＝a.com` or `=\u{AD}=a.com` would parse to a rule whose
+    /// canonical text re-parses differently (or not at all).
     /// Runtime hosts never go through this: they use [`Domain::parse`]
     /// directly, so `=` cannot be a marker there.
     pub fn parse(raw: &str) -> Result<Self, DomainError> {
@@ -380,15 +384,22 @@ impl DomainRule {
             Some(name) => (true, name),
             None => (false, raw),
         };
-        if name.starts_with('=') {
+        let domain = Domain::parse(name).map_err(|err| {
+            if exact {
+                DomainError(
+                    err.0
+                        .replace(&format!("(got {name:?})"), &format!("(got {raw:?})")),
+                )
+            } else {
+                err
+            }
+        })?;
+        if domain.as_str().starts_with('=') {
             return Err(DomainError(format!(
                 "not a valid domain name (got {raw:?})"
             )));
         }
-        Ok(Self {
-            domain: Domain::parse(name)?,
-            exact,
-        })
+        Ok(Self { domain, exact })
     }
 
     /// The normalized domain this rule names, without any `=` marker.
@@ -1458,7 +1469,7 @@ mod tests {
         let err = DomainRule::parse("=example.com.").unwrap_err();
         assert_eq!(
             err.to_string(),
-            format!("not a valid domain name (got {:?})", "example.com.")
+            format!("not a valid domain name (got {:?})", "=example.com.")
         );
     }
 
@@ -1470,12 +1481,23 @@ mod tests {
         let wildcard = |raw: &str| format!("wildcard domains are not allowed (got {raw:?})");
         let ip =
             |raw: &str| format!("IP literals are not allowed; use a domain name (got {raw:?})");
+        // Every message quotes the entry exactly as written.
         let cases = [
-            ("=", not_valid("")),
+            ("=", not_valid("=")),
             ("==a.com", not_valid("==a.com")),
-            ("=*.a.com", wildcard("*.a.com")),
-            ("= a.com", not_valid(" a.com")),
-            ("=1.2.3.4", ip("1.2.3.4")),
+            ("=*.a.com", wildcard("=*.a.com")),
+            ("= a.com", not_valid("= a.com")),
+            ("=1.2.3.4", ip("=1.2.3.4")),
+            // Compatibility forms of `=` and ignored code points in front of
+            // it fold to a leading `=` under UTS #46 (review #44 M1).
+            ("\u{FF1D}a.com", not_valid("\u{FF1D}a.com")),
+            ("\u{FE66}a.com", not_valid("\u{FE66}a.com")),
+            ("\u{207C}a.com", not_valid("\u{207C}a.com")),
+            ("\u{AD}=a.com", not_valid("\u{AD}=a.com")),
+            ("\u{200B}=a.com", not_valid("\u{200B}=a.com")),
+            ("=\u{FF1D}a.com", not_valid("=\u{FF1D}a.com")),
+            ("=\u{AD}=a.com", not_valid("=\u{AD}=a.com")),
+            ("=\u{FF1D}", not_valid("=\u{FF1D}")),
         ];
         for (input, expected) in cases {
             let err = DomainRule::parse(input).unwrap_err();
@@ -1499,6 +1521,17 @@ mod tests {
             assert_eq!(json, json_str(&text), "{input:?}");
             let back: DomainRule = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(back, rule, "{input:?}");
+        }
+        // Whatever parses, its canonical text re-parses to the same rule
+        // (review #44 M1: no spelling may turn into a different rule).
+        for input in ["a=b.com", "=a=b.com", "=\u{FF41}.com", "\u{FF41}.com"] {
+            if let Ok(rule) = DomainRule::parse(input) {
+                assert_eq!(
+                    DomainRule::parse(&rule.to_string()),
+                    Ok(rule.clone()),
+                    "{input:?}"
+                );
+            }
         }
         assert_eq!(DomainRule::parse("=A.com").unwrap().to_string(), "=a.com");
         assert_eq!(DomainRule::parse("A.com").unwrap().to_string(), "a.com");
