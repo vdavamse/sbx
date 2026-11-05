@@ -537,3 +537,50 @@ fn keep_alive_refuses_a_non_transparent_policy_at_startup_rc125() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn stop_returns_after_the_exit_row_is_written_and_the_lock_released() {
+    // Review 2: `sbx stop` is answered only after the resident's exit row is in the
+    // audit file and the session directory is free. Both are checked with no wait.
+    let dir = scratch("stop-order");
+    let Some(shim) = skip_or(&dir, "stop-returns-after-exit-row") else {
+        return;
+    };
+    let session = dir.join("s");
+    let audit = dir.join("audit.jsonl");
+    let out = keep_alive(
+        &shim,
+        &session,
+        &["--idle-timeout", "60s", "--audit", audit.to_str().unwrap()],
+        &["sleep", "300"],
+    );
+    assert!(out.status.success(), "launch: {}", text(&out.stderr));
+    assert!(stop(&shim, &session).status.success());
+
+    let rows = fs::read_to_string(&audit).expect("audit file");
+    let last: serde_json::Value =
+        serde_json::from_str(rows.lines().last().expect("a row")).expect("JSON");
+    assert_eq!(
+        last["event"], "exit",
+        "the exit row is already written: {rows}"
+    );
+    assert_eq!(
+        last["call_id"], 0,
+        "the resident's exit row carries call_id 0"
+    );
+
+    // The lock is free and the socket is gone: a new holder starts at once.
+    let again = keep_alive(
+        &shim,
+        &session,
+        &["--idle-timeout", "60s"],
+        &["sleep", "300"],
+    );
+    assert!(
+        again.status.success(),
+        "a new session on the same dir: {}",
+        text(&again.stderr)
+    );
+    assert!(stop(&shim, &session).status.success());
+    let _ = fs::remove_dir_all(&dir);
+}

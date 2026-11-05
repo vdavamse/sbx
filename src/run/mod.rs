@@ -313,7 +313,19 @@ struct Conclusion {
 /// The final step of every run that got past S5: M1 (an audit write failure
 /// anywhere in the run is a failure, never a silent success), the exit row,
 /// the diagnostics (after the pumps are done, m8), then `process::exit`.
-fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: Conclusion) -> ! {
+fn conclude(outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: Conclusion) -> ! {
+    std::process::exit(conclude_prepare(outcome, audit, t0, facts))
+}
+
+/// The run's last writes (the exit row and sbx's diagnostics); returns the exit
+/// code without exiting, so the caller can release its locks and answer its
+/// peers first.
+fn conclude_prepare(
+    mut outcome: Outcome,
+    audit: Option<&AuditLog>,
+    t0: Instant,
+    facts: Conclusion,
+) -> i32 {
     if let Some(audit) = audit {
         mark_audit_failure(&mut outcome, audit);
         audit.finish(&exit_row_for(
@@ -341,7 +353,7 @@ fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: 
         lines.push("sbx run: sandbox did not exit within 5s of SIGKILL".to_owned());
     }
     write_diagnostics(facts.stderr_partial, &lines);
-    std::process::exit(exit_code(&outcome))
+    exit_code(&outcome)
 }
 
 /// Writes sbx's own stderr lines, best effort (review 4): a closed or broken stderr
@@ -970,11 +982,11 @@ fn execute(
             }
         }
     }
-    if let Some(h) = holder.take() {
-        h.finish();
-    }
     let _ = lock.touch();
-    conclude(
+    // The exit row is written before the lock is released and before a `sbx stop`
+    // is answered (issue #18, review 2): a stop that returns has left the audit
+    // file complete and the directory free for the next holder.
+    let code = conclude_prepare(
         outcome,
         Some(&audit),
         t0,
@@ -987,7 +999,12 @@ fn execute(
             cap: policy.limits.output_bytes,
             net_mode,
         },
-    )
+    );
+    drop(lock);
+    if let Some(h) = holder.take() {
+        h.finish();
+    }
+    std::process::exit(code)
 }
 
 /// Reads the shim's status pipe without blocking (issue #19 M1): the bytes there
