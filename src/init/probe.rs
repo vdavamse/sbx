@@ -23,7 +23,16 @@
 //! [`crate::run::keepalive::join::join_namespaces`] on them. Both children are
 //! bounded by [`KEEP_ALIVE_PROBE_TIMEOUT`] and reaped on every path.
 //!
-//! Output: exactly one JSON line on stdout (`ProbeReport`, `version` 1).
+//! Budget: the parent (`host::facts`) bounds the whole probe at `PROBE_TIMEOUT`
+//! (20 s). The bounded steps add up to `BWRAP_PROBE_LAUNCHES` x 5 s for the
+//! nested bwrap launches plus `KEEP_ALIVE_PROBE_TIMEOUT` (2 s) for keep-alive,
+//! 17 s in all. Three 5 s bwrap bounds already use 15 s, so a 5 s cap on the
+//! whole probe cannot hold; the keep-alive step gets the tight bound instead,
+//! and a unit test pins the sum below `PROBE_TIMEOUT` with at least 3 s to
+//! spare. The steps without a timeout (namespaces, nft) run in this process
+//! and are not bounded separately.
+//!
+//! Output: exactly one JSON line on stdout (`ProbeReport`, `version` 3).
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -60,13 +69,18 @@ pub const PROBE_STEPS: [&str; 13] = [
     "keep-alive",
 ];
 
-/// Bound on each nested bwrap launch (the parent's whole probe is bounded
-/// separately; see `host::facts::PROBE_TIMEOUT`).
+/// Bound on each nested bwrap launch (the parent bounds the whole probe
+/// separately, at `host::facts::PROBE_TIMEOUT`; see the module docs, "Budget").
 pub const BWRAP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bound on each child of the keep-alive step: the holder stand-in's readiness
-/// message, and the joiner's exit (issue #18).
-pub const KEEP_ALIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The whole keep-alive step's bound, one deadline shared by its two children
+/// (the holder's readiness and the joiner's answer). Tight on purpose: the
+/// step runs inside the parent's probe budget (module docs, "Budget").
+pub const KEEP_ALIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The nested bwrap launches the probe makes: `bwrap-run`, `bwrap-proc` and
+/// `bwrap-seccomp`, each bounded by [`BWRAP_PROBE_TIMEOUT`].
+pub const BWRAP_PROBE_LAUNCHES: u32 = 3;
 
 /// The probe's JSON output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
