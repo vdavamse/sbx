@@ -11,10 +11,11 @@
 //!    the only one inside the fd window (S9–S11); the network runtime is first
 //!    polled and reported ready before the go byte is sent (S16–S17). S8a
 //!    (#39/#40) runs after the argv is built and before the spawn: the
-//!    pre-launch guard verifies every path bwrap resolves under a writable
-//!    bind (`bwrap::guard`), and refuses with rc 125 if any is a symlink,
+//!    pre-launch guard verifies every path bwrap resolves under a bind
+//!    cover, rw or ro (`bwrap::guard`), and refuses with rc 125 if any is a symlink,
 //!    is missing or has the wrong type, or if a deny is reachable through a
-//!    host symlink alias. Nothing is spawned, and nothing is created.
+//!    host symlink alias. Nothing is spawned, and nothing is created outside the session
+//!    directory and the audit log.
 //! 3. **Teardown and pid-1 identity.** Pid 1 of the sandbox is learned from
 //!    bwrap's `--info-fd` (`child-pid`), verified (`PPid == bwrap`, `NSpid` last
 //!    `== 1`), and killed through its pidfd. Waiting on that pidfd proves the whole
@@ -575,9 +576,10 @@ fn execute(
     .map_err(|err| RunError::new(err.to_string()))?;
 
     // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
-    // will resolve under a writable bind (fd-relative, no symlinks, nothing
-    // missing), and that no deny mask is reachable through a host symlink.
-    // Refusal is 125 with nothing created.
+    // will resolve under a bind cover, rw or ro (fd-relative, no symlinks,
+    // nothing missing under rw), and that no deny mask is reachable through a
+    // host symlink. Refusal is 125; nothing is created outside the session
+    // directory and the audit log (S5/S7 ran already).
     for check in launch.path_checks() {
         crate::bwrap::guard::verify(check).map_err(|err| RunError::new(err.to_string()))?;
     }

@@ -134,12 +134,13 @@
 //!     rename or rmdir of it is EBUSY (EXDEV across the pin). This covers
 //!     nested writable binds too (C1: a rename of a nested bind's parent would
 //!     move the bind). Session-leaf covers get no pins. The same plan lists every path bwrap
-//!     resolves under a writable cover ([`PathCheck`]) and every deny that a
+//!     resolves under a policy, session or infra cover, rw or ro ([`PathCheck`]) and every deny that a
 //!     host symlink alias reaches ([`AliasCheck`]). [`guard`] verifies both
 //!     fd-relative (`openat` with `O_NOFOLLOW`, then `fstat`), and `run`
 //!     refuses with rc 125 before the spawn (S8a). `sbx check` runs the same
 //!     code as `mount-chains`. Residual: a concurrent writer outside the
-//!     same policy can race the check on bwrap before 0.12.0 (R26).
+//!     same policy can race the check (R26): dests and sources on bwrap
+//!     before 0.12.0, bind sources on every version.
 
 pub mod etc;
 pub mod guard;
@@ -238,7 +239,7 @@ impl Launch {
     }
 
     /// The pre-launch path checks (#39/#40): every bwrap-resolved path under
-    /// a writable cover, verified fd-relative before spawn.
+    /// a policy, session or infra cover (rw or ro), verified fd-relative before spawn.
     pub fn path_checks(&self) -> &[PathCheck] {
         &self.plan.checks
     }

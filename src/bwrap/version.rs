@@ -37,6 +37,9 @@ pub const BWRAP_MIN: (u32, u32, u32) = (0, 8, 0);
 /// version string cannot show that, so `sbx check` WARNS below this version
 /// when the policy has mount paths under its binds, and never refuses on it.
 /// sbx's own pre-launch guard (#39) covers the same shapes on every version.
+/// The upstream fix is dest-side only: bind sources are host paths bwrap
+/// still follows, so a concurrent source swap by another policy or a host
+/// writer (R26) stays open on 0.12.0 and later.
 pub const BWRAP_CVE_FIXED: (u32, u32, u32) = (0, 12, 0);
 
 /// Parse `bwrap --version` output — strict grammar, fail-closed.

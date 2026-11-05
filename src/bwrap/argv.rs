@@ -510,7 +510,8 @@ fn with_pins(mounts: &[Mount], denies: &[&str]) -> Vec<Mount> {
 }
 
 /// The checks: one per target (every mount dest, pins included, and every
-/// outer deny) whose nearest cover is a policy or session mount. Covers are
+/// outer deny) that has a nearest cover: a policy, session or infra mount
+/// (infra covers are ro, so they only refuse links and wrong types). Covers are
 /// looked up in the pre-pin list; pins are then ordinary intermediate
 /// targets, so the walk visits parents first, and the first failure names the
 /// shallowest bad component.
