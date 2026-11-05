@@ -21,10 +21,12 @@ for, what was tested, and what breaks without it. The `kubernetes` CI job runs t
   (checked by `derive.py`).
 - Changes, for a container that drops ALL capabilities: the capability conditions are resolved
   for an empty capability set, and one rule allows `clone`, `mount`, `pivot_root`, `sethostname`,
-  `setns`, `umount2` and `unshare` (`setns` for `run --keep-alive` and `attach`). The reasons and the observations behind each are in `derive.py` and in
+  `setns`, `umount2` and `unshare` (`setns` for `run --keep-alive` and `attach`). The reasons
+  and the observations behind each are in `derive.py` and in
   [docs/kubernetes.md, "Seccomp"](../../docs/kubernetes.md#seccomp).
-- Use it only for containers that drop ALL capabilities: with capabilities, Docker's own file would
-  allow more, and this one does not reflect that.
+- Use it only for containers that drop ALL capabilities and run with `hostUsers: false`: with
+  capabilities, Docker's own file would allow more, and this one does not reflect that; and the
+  `setns` bound in the guide relies on the pod's own user namespace.
 
 Regenerate and compare. `.gitattributes` keeps the profile LF on every checkout, and the
 comparison is against the committed blob (`git show`), so it also works in a checkout that converts

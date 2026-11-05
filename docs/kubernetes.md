@@ -110,7 +110,7 @@ a second uid and is an opt-in skip on every host. A plain
 ... -- /usr/bin/sleep 300`, then `sbx attach ... -- /usr/bin/sh -c 'echo attached'` and `sbx stop`
 all returned 0. It needs `setns`, which the example's seccomp profile allows for that reason (see
 [Seccomp](#seccomp)); without it the `keep-alive` item is a report-only `warn` and plain `sbx run`
-is unaffected. The Landlock layer worked too: `sbx run --landlock require ...` returned 0, and a
+is unaffected. CI gates only on the `keep-alive` item being ok; it does not run a session. The Landlock layer worked too: `sbx run --landlock require ...` returned 0, and a
 `touch /usr/x` inside it failed with `Read-only file system`. The `landlock_*` syscalls are in
 Docker's base allow list, so the derived profile allows them unchanged.
 
@@ -189,10 +189,17 @@ only on amd64 (the pod started and the results above hold); aarch64 was not test
 What the added syscalls mean for the pod: `clone` and `unshare` are allowed with any flags, so the
 sbx container can create a new user namespace and, inside it, namespaces of every other type
 (mount, network, PID, IPC, UTS, cgroup, time), and mount, `pivot_root` and set the hostname there.
-`setns` lets it join namespaces; per [setns(2)](https://man7.org/linux/man-pages/man2/setns.2.html)
-that needs CAP_SYS_ADMIN in the user namespace that owns the target, which a process without
-capabilities in the pod has only for namespaces it created itself. It is still bounded: the capabilities a process gets in a user namespace it creates apply only to
-that namespace and the namespaces it owns, never to the pod's or the node's resources, and the pod
+`setns` lets it join namespaces. Per [setns(2)](https://man7.org/linux/man-pages/man2/setns.2.html)
+and [user_namespaces(7)](https://man7.org/linux/man-pages/man7/user_namespaces.7.html), that
+needs CAP_SYS_ADMIN over the target. A process without capabilities in the pod has that only in
+user namespaces created by a process with its own uid in the pod's user namespace, and in the
+namespaces those own; this is how `sbx attach` joins a session's holder. So, given a file
+descriptor, it can join the namespaces of any same-uid sbx session in the pod (same-uid access is
+out of model, R24). It cannot join the pod's own namespaces, the node's, or another uid's (read
+from the man pages; not tested by sbx). This bound relies on `hostUsers: false`: with the host
+user namespace, the same rule would apply to user namespaces created by any container on the node
+running as the same host uid. It is still bounded: the capabilities a process gets in a user
+namespace it creates apply only to that namespace and the namespaces it owns, never to the pod's or the node's resources, and the pod
 itself holds no capabilities. This is the same surface any host with unprivileged user namespaces
 exposes (threat model section 4, "Host kernel: trusted and shared"; R15, R16). The
 payload does not get these abilities: bwrap runs it with `--disable-userns` and `--cap-drop ALL`
@@ -350,9 +357,10 @@ resolver").
 
 ## What changes in Kubernetes
 
-The threat model's "host" is the sbx container. The guarantees S1 to S16 are implemented by the
+The threat model's "host" is the sbx container. The guarantees S1 to S24 are implemented by the
 same code paths in a pod. What was shown in the pod: the offline conformance tiers (host, lab and
-init) passed. What was not: the network tier `E01` to `E06` was skipped, so S15 and the `E06` part
+init) passed; for the keep-alive and Landlock guarantees (S17 to S24) only the smoke runs under
+"Optional features" above were observed. What was not: the network tier `E01` to `E06` was skipped, so S15 and the `E06` part
 of S8 were not shown in a pod, and the unit and integration tests that threat model section 6 cites
 were not run in a pod. What differs:
 
@@ -360,8 +368,8 @@ were not run in a pod. What differs:
   the node (R15). Same-uid processes in the sbx container, such as the agent that calls `sbx run`,
   are out of model and can reach the sandbox from outside (R24).
 - **`hostAliases` and the pod's `/etc/hosts`.** The sandbox gets a generated `/etc/hosts` with
-  only `localhost` and the sandbox hostname (R5, closed; observed in the pod), so the kubelet-managed file is not
-  disclosed. The proxy resolves allowed names on the pod side, where `hostAliases` entries
+  only `localhost` and the sandbox hostname (R5, closed; observed in the pod), so the
+  kubelet-managed file is not disclosed. The proxy resolves allowed names on the pod side, where `hostAliases` entries
   apply. Per the README section [Running commands](../README.md#running-commands) (`/etc/hosts`),
   such a name works only when it maps to a public address; private, link-local and other
   special-purpose addresses stay denied by the resolved-address guard (S7). Not tested in a pod.
