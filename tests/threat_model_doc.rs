@@ -40,7 +40,7 @@ fn read_repo_file(rel: &str) -> String {
 
 /// True for a check-id shape: one uppercase ASCII letter, then two digits.
 /// Shape only: whether the id exists is checked against the catalog, so a
-/// made-up id such as `Z99` or `A13` is reported as unknown.
+/// made-up id such as `Z99` or `Z98` is reported as unknown.
 fn is_check_id(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.len() == 3 && b[0].is_ascii_uppercase() && b[1].is_ascii_digit() && b[2].is_ascii_digit()
