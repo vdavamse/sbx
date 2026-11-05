@@ -25,7 +25,8 @@ Not tested by sbx: nodes with AppArmor enabled (including Ubuntu 24.04 nodes wit
 restriction), SELinux-enforcing nodes, CRI-O, GKE, EKS, AKS and GKE Autopilot. What this guide says
 about them comes from vendor documentation (linked) or from the text `sbx check` prints, and is
 labelled as such. The CI job runs on a GitHub-hosted Ubuntu runner, which has AppArmor; it records
-the AppArmor results as report-only steps (see [CI](#ci)).
+the runner's AppArmor state and the pod without `appArmorProfile` as report-only steps, but its kind
+node does not enforce AppArmor on pods (see [CI](#ci)).
 
 ## Quick start (kind)
 
@@ -38,6 +39,12 @@ cp target/x86_64-unknown-linux-musl/release/sbx examples/default.json "$ctx"/
 docker build -f examples/kubernetes/Dockerfile -t sbx-k8s-example:dev "$ctx"
 
 kind create cluster --name sbx --config examples/kubernetes/kind-config.yaml
+# On hosts with DMI (most Linux VMs and bare metal; not WSL), kind bind-mounts files under
+# /sys/devices/virtual/dmi/id/ in the node, and the pod sandbox then fails with a sysfs
+# EPERM (see "Node requirements"). Remove them in this single-node cluster (observed in CI):
+for _ in 1 2 3 4; do
+  docker exec sbx-control-plane sh -c 'for m in $(awk "\$5 ~ \"^/sys/devices/virtual/dmi/id/\" {print \$5}" /proc/self/mountinfo); do umount "$m" || true; done'
+done
 kind load docker-image sbx-k8s-example:dev --name sbx
 kubectl apply -f examples/kubernetes/pod.yaml
 kubectl wait --for=condition=Ready pod/sbx-example
@@ -106,7 +113,7 @@ what `sbx check` reported. Every other setting stayed as in the example.
 | `hostUsers: false` | Gives the pod its own user namespace; Kubernetes accepts `procMount: Unmasked` only with it. | The API server rejected the pod: ``spec.containers[0].securityContext.procMount: Invalid value: "Unmasked": `hostUsers` must be false to use `Unmasked` ``. With `procMount` also removed, the pod ran in the host user namespace (`uid_map` `0 0 4294967295`) and failed exactly like the `procMount` row. |
 | `procMount: Unmasked` | `sbx __init` writes `disable_ipv6` under `/proc/sys/net` in its own network namespace (`src/init/netns.rs:disable_ipv6`), and bwrap needs a writable `/proc/sys` for `--disable-userns`. With the default `/proc` the runtime makes `/proc/sys` read-only and masks paths. | `netns-ipv6` FAIL: `cannot disable IPv6 in the sandbox network namespace: /proc/sys is read-only (EROFS; typical inside containers)`, evidence `ipv6: write disable_ipv6 failed: Read-only file system (os error 30)`. `bwrap-run` FAIL: `bwrap cannot apply --disable-userns: /proc/sys is read-only`, evidence `bwrap: cannot open /proc/sys/user/max_user_namespaces: Read-only file system`. `bwrap-proc` and `seccomp` were skipped. Network mode `unavailable`, rc 1. |
 | `seccompProfile: Localhost` (the derived profile) | The runtime default profile does not let a process without capabilities create namespaces, mount or `pivot_root`. | With `RuntimeDefault`: `userns` FAIL: `unshare(CLONE_NEWUSER\|CLONE_NEWNET) is blocked by a seccomp filter (EPERM; typical inside containers)`; every probe-derived item was skipped. Network mode `unavailable`, rc 1. |
-| `appArmorProfile: Unconfined` | On nodes with AppArmor, the runtime's default profile applies otherwise (see [AppArmor](#apparmor)). | **Not observable here**: AppArmor was not enabled on the test host, so removing the setting changed nothing (all items ok). In CI on an AppArmor runner the pod without it was still `unconfined` (`/proc/self/attr/current`) and all items were ok, because the kind node container itself runs AppArmor-unconfined; that is not a test of an AppArmor-enforcing node either. |
+| `appArmorProfile: Unconfined` | On nodes with AppArmor, the runtime's default profile applies otherwise (see [AppArmor](#apparmor)). | **Not observable here**: AppArmor was not enabled on the test host, so removing the setting changed nothing (all items ok). In CI on an AppArmor runner the pod without it was still `unconfined` (`/proc/self/attr/current`) and all items were ok, most likely because containerd in the kind node does not detect AppArmor (the node has no securityfs mounted; inferred, not verified), so it applies no default profile; that is not a test of an AppArmor-enforcing node either. |
 
 The fix lines `sbx check` printed for these failures match the README
 [fix hints](../README.md#host-check) table: `procMount: Unmasked` for `netns-ipv6` and `bwrap-run`
@@ -258,8 +265,9 @@ rule, or hold CAP_SYS_ADMIN
 ([Ubuntu blog, "Restricted unprivileged user namespaces"](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces)).
 By that description, `appArmorProfile: Unconfined` alone would not lift the restriction, although
 the `sbx check` fix text lists it, so that part of the fix text is likely wrong. On such nodes, set
-the sysctl to 0 on the node, or load a Localhost AppArmor profile with the `userns,` rule. The CI
-job records what `sbx check` reports in the pod under the runner's defaults before it relaxes them.
+the sysctl to 0 on the node, or load a Localhost AppArmor profile with the `userns,` rule. CI does not answer
+this: it relaxes the runner's restriction before creating the cluster, and its kind node does not
+enforce AppArmor on pods.
 
 ## Pod Security Admission
 
@@ -288,8 +296,9 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
   `kubernetes_feature_enabled` metric).
 - **A fully visible `/sys` on the node.** The runtime mounts a fresh sysfs for a `hostUsers: false`
   pod, and the kernel allows that inside a user namespace only when an existing sysfs mount is
-  fully visible: anything mounted below it must sit on an empty directory. A file bind-mounted
-  over a path under `/sys` breaks this, and the pod sandbox fails with `error mounting "sysfs" to
+  fully visible: every mount inherited below it (locked) must sit on a directory that sysfs itself
+  keeps empty for mounts, such as `/sys/fs/cgroup` or `/sys/kernel/debug` (the kernel's
+  `mnt_already_visible` check). A file bind-mounted over a path under `/sys` never qualifies, and the pod sandbox fails with `error mounting "sysfs" to
   rootfs at "/sys": ... operation not permitted`. Observed in CI: kind bind-mounts files over
   `/sys/devices/virtual/dmi/id/product_name` and `product_uuid` on hosts with DMI (GitHub runners;
   not WSL), and the example pod could not start until the job removed those mounts. On a real node,
@@ -311,8 +320,8 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
   seccomp profile, `sbx check` reports it as the seccomp row (`U_SECCOMP`), not as the generic
   "not permitted" row that names SELinux (see [AppArmor](#apparmor) for the rule). A denial at a
   later stage is reported for that stage (for example `userns` "cannot write the user namespace id
-  maps" at `idmap`), unless the AppArmor sysctl is 1, in which case an EPERM or EACCES there is
-  reported as the AppArmor row.
+  maps" at `idmap`), unless the AppArmor sysctl is 1, in which case an EPERM or EACCES at `idmap`, `netns`,
+  `listeners` or `ipv6` is reported as the AppArmor row.
 
 ## Network modes in a pod
 
@@ -410,8 +419,9 @@ above. It validates `pod.yaml` with kubeconform v0.8.0 (strict, Kubernetes 1.37.
 `yannh/kubernetes-json-schema` at a pinned commit), re-derives the seccomp profile, builds the
 image, creates the kind cluster, and checks that `uid_map` is not the host map. Then:
 
-- report-only: the runner's AppArmor state (on ubuntu-24.04 runners: AppArmor enabled,
-  `kernel.apparmor_restrict_unprivileged_userns = 1`, `bwrap` and `unpriv_bwrap` profiles loaded);
+- report-only: the runner's AppArmor state (observed on `ubuntu-latest`, which was ubuntu-26.04,
+  image 20261101.186: AppArmor enabled, `kernel.apparmor_restrict_unprivileged_userns = 1`, and the
+  profiles `:glycin:bwrap`, `bwrap`, `unpriv_bwrap` and `unprivileged_userns` loaded);
 - the runner's AppArmor is relaxed the same two ways the test job relaxes it, before the cluster
   is created: `kernel.apparmor_restrict_unprivileged_userns=0`, and unloading the
   `bwrap-userns-restrict` profile. (Relaxing it was not what made the pod start; see the next item.)
@@ -426,6 +436,6 @@ image, creates the kind cluster, and checks that `uid_map` is not the host map. 
   `bwrap-run`; `userns` errno 1);
 - report-only: the pod without `appArmorProfile`.
 
-The job passes on the GitHub `ubuntu-24.04` runner (kernel 7.0, containerd 2.3.4, runc 1.4.3 in
+The job passes on the GitHub `ubuntu-latest` runner (ubuntu-26.04, kernel 7.0, containerd 2.3.4, runc 1.4.3 in
 the kind node) and with the same steps locally. On failure it prints diagnostics: the runner and
 node kernel, the node's mounts under `/sys` and `/proc`, and the runtime versions.

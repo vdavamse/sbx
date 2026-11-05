@@ -667,9 +667,10 @@ jobs:
   # without it" rows by removing procMount and the seccomp profile.
   # Runner uncertainty (not verifiable locally, where the guide was tested on WSL2
   # with AppArmor off): the runner's AppArmor userns restriction and its
-  # bwrap-userns-restrict profile. Their effect inside the pod is recorded first
-  # (report-only), then they are relaxed exactly as the test job relaxes them
-  # before the gating steps. Removing appArmorProfile is report-only too.
+  # bwrap-userns-restrict profile. Their state is recorded (report-only), then
+  # they are relaxed exactly as the test job relaxes them, before the cluster is
+  # created. Removing appArmorProfile is report-only too (the kind node does not
+  # enforce AppArmor on pods, so it is not an AppArmor-node test).
   kubernetes:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -744,10 +745,8 @@ jobs:
 
       # Report-only: the runner's AppArmor state before the relaxation below
       # (evidence for docs/kubernetes.md, "AppArmor"; never fails the job). The
-      # relaxation must come before the cluster: under the runner's defaults
-      # (kernel.apparmor_restrict_unprivileged_userns = 1) runc cannot mount
-      # sysfs for a hostUsers: false pod sandbox (EPERM), so the pod never
-      # starts (observed on the first CI run of this job).
+      # relaxation is not what lets the pod start (a run that relaxed first still
+      # failed); kind's DMI overmounts were the cause, see the next step.
       - name: "Report: the runner's AppArmor state"
         continue-on-error: true
         run: |
@@ -776,8 +775,8 @@ jobs:
           # kind bind-mounts files over /sys/devices/virtual/dmi/id/product_{name,uuid}
           # in the node when the host has DMI (GitHub runners do; WSL does not). The
           # kernel lets a user namespace mount a fresh sysfs only when an existing
-          # sysfs mount is fully visible, with child mounts only on empty
-          # directories, so runc's sysfs mount for a hostUsers: false sandbox fails
+          # sysfs mount is fully visible (mnt_already_visible: locked child mounts
+          # only on directories sysfs keeps empty for mounts), so runc's sysfs mount for a hostUsers: false sandbox fails
           # with EPERM (observed here). Drop those file overmounts in this
           # single-node CI cluster; the unique product_uuid only matters with
           # several nodes.
@@ -785,8 +784,8 @@ jobs:
           for _ in 1 2 3 4; do
             docker exec "$NODE" sh -c 'for m in $(awk "\$5 ~ \"^/sys/devices/virtual/dmi/id/\" {print \$5}" /proc/self/mountinfo); do umount "$m" || true; done'
           done
-          docker exec "$NODE" sh -c 'awk "\$5 ~ \"^/sys/devices/virtual/dmi/\"" /proc/self/mountinfo' | tee dmi-left.txt
-          [ ! -s dmi-left.txt ] || { echo "FAIL: DMI overmounts are still present in the kind node"; exit 1; }
+          LEFT=$(docker exec "$NODE" sh -c 'awk "\$5 ~ \"^/sys/devices/virtual/dmi/\"" /proc/self/mountinfo')
+          [ -z "$LEFT" ] || { echo "$LEFT"; echo "FAIL: DMI overmounts are still present in the kind node"; exit 1; }
           kubectl get --raw /metrics | grep -E 'kubernetes_feature_enabled\{name="(UserNamespacesSupport|ProcMountType)"' || true
           kind load docker-image "$IMAGE" --name "$CLUSTER"
           kubectl apply -f examples/kubernetes/pod.yaml
