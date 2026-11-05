@@ -136,6 +136,21 @@ const L_DISABLED: (&str, &str) = (
     "add landlock to the lsm= kernel boot parameter",
 );
 
+/// `keep-alive` (issue #18): the pidfd the attach and the holder watch, and the
+/// unprivileged `setns` pair the attach joins the session with. Report-only.
+const KA_PIDFD: (&str, &str) = (
+    "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)",
+    "run sbx on Linux 5.3 or newer, or give it an outer seccomp profile that allows pidfd_open (Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined)",
+);
+const KA_SETNS: (&str, &str) = (
+    "an unprivileged setns into a fresh user and network namespace is refused (EPERM or EACCES; keep-alive attaches to a session this way)",
+    "allow setns(CLONE_NEWUSER) and setns(CLONE_NEWNET) for this user (a container seccomp profile often blocks setns; Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined; Docker: --security-opt seccomp=unconfined or an equivalent profile), or do not use run --keep-alive",
+);
+const KA_OTHER: (&str, &str) = (
+    "keep-alive cannot start its holder stand-in or join a fresh user and network namespace",
+    "allow unprivileged user and network namespaces and setns for this user, or do not use run --keep-alive; plain sbx run does not need them",
+);
+
 const OK_USERNS: &str = "unprivileged user + network namespaces work";
 const OK_NETNS: &str = "sandbox loopback network configured";
 const OK_IPV6: &str = "IPv6 disabled inside the sandbox network namespace";
@@ -145,6 +160,7 @@ const OK_BWRAP_RUN: &str = "bwrap starts a sandbox inside the sbx namespaces";
 const OK_BWRAP_PROC: &str = "bwrap mounts a fresh /proc";
 const OK_SECCOMP: &str =
     "bwrap installs sbx's socket-family filter (installation only; denials not probed)";
+const OK_KEEP_ALIVE: &str = "pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)";
 
 const SKIP_USERNS: &str = "not probed: user namespaces are unavailable";
 const SKIP_NETNS: &str = "not probed: the sandbox network could not be configured";
@@ -423,6 +439,28 @@ fn ok_row(id: CapId, detail: &str) -> Capability {
     }
 }
 
+/// Keep-alive is report-only, as Landlock is: its rows never limit the network
+/// mode, so a host that runs plain sandboxes still reports as able to.
+fn report_only(mut cap: Capability) -> Capability {
+    if cap.id == CapId::KeepAlive {
+        cap.impact = None;
+    }
+    cap
+}
+
+/// A keep-alive row that failed: `Warn` (report-only, with its fix).
+fn keep_alive_fail(pinned: (&str, &str), evidence: &str, errno: Option<i32>) -> Capability {
+    Capability {
+        id: CapId::KeepAlive,
+        status: Status::Warn,
+        detail: pinned.0.to_owned(),
+        evidence: Some(evidence.to_owned()),
+        errno,
+        impact: None,
+        fix: Some(pinned.1.to_owned()),
+    }
+}
+
 fn skip_row(id: CapId, detail: &str) -> Capability {
     Capability {
         id,
@@ -438,7 +476,7 @@ fn skip_row(id: CapId, detail: &str) -> Capability {
 }
 
 /// The probe steps that feed each probe-derived item, and the ok detail.
-const PROBE_SLOTS: [(CapId, &[&str], &str); 8] = [
+const PROBE_SLOTS: [(CapId, &[&str], &str); 9] = [
     (CapId::Userns, &["unshare", "idmap"], OK_USERNS),
     (CapId::Netns, &["netns", "listeners"], OK_NETNS),
     (CapId::NetnsIpv6, &["ipv6"], OK_IPV6),
@@ -447,6 +485,11 @@ const PROBE_SLOTS: [(CapId, &[&str], &str); 8] = [
     (CapId::BwrapRun, &["bwrap-run"], OK_BWRAP_RUN),
     (CapId::BwrapProc, &["bwrap-proc"], OK_BWRAP_PROC),
     (CapId::Seccomp, &["bwrap-seccomp"], OK_SECCOMP),
+    (
+        CapId::KeepAlive,
+        &["pidfd-open", "keep-alive"],
+        OK_KEEP_ALIVE,
+    ),
 ];
 
 fn stage_of(step: &str) -> Option<Stage> {
@@ -479,7 +522,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
         ProbeOutcome::Failed(err) => {
             probe_error = Some(err.clone());
             for (id, _, _) in PROBE_SLOTS {
-                slots[index(id)] = Some(skip_row(id, SKIP_PROBE));
+                slots[index(id)] = Some(report_only(skip_row(id, SKIP_PROBE)));
             }
         }
         ProbeOutcome::Ran(report) => {
@@ -491,6 +534,16 @@ pub fn assemble(facts: &HostFacts) -> Report {
                     "bwrap-run" => bwrap_step(CapId::BwrapRun, &reason),
                     "bwrap-proc" => bwrap_step(CapId::BwrapProc, &reason),
                     "bwrap-seccomp" => seccomp_step(&reason),
+                    "pidfd-open" => keep_alive_fail(KA_PIDFD, &reason, step.errno),
+                    "keep-alive" => keep_alive_fail(
+                        if is_permission(step.errno) {
+                            KA_SETNS
+                        } else {
+                            KA_OTHER
+                        },
+                        &reason,
+                        step.errno,
+                    ),
                     name => {
                         let Some(stage) = stage_of(name) else {
                             continue;
@@ -547,7 +600,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
                 } else {
                     SKIP_PROBE
                 };
-                slots[index(id)] = Some(skip_row(id, detail));
+                slots[index(id)] = Some(report_only(skip_row(id, detail)));
             }
 
             // 3. The fallback item is warn-only while the full firewall works
@@ -572,7 +625,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
         .map(|id| {
             slots[index(*id)]
                 .take()
-                .unwrap_or_else(|| skip_row(*id, SKIP_PROBE))
+                .unwrap_or_else(|| report_only(skip_row(*id, SKIP_PROBE)))
         })
         .collect();
 
@@ -1452,7 +1505,7 @@ mod tests {
         let report = assemble(&ok_host());
         assert_eq!(report.network_mode, EffectiveMode::Transparent);
         assert_eq!(report.probe_error, None);
-        assert_eq!(report.capabilities.len(), 10);
+        assert_eq!(report.capabilities.len(), 11);
         assert!(report.capabilities.iter().all(|c| c.status == Status::Ok));
         let ids: Vec<CapId> = report.capabilities.iter().map(|c| c.id).collect();
         assert_eq!(ids, CapId::ALL);
@@ -2119,5 +2172,122 @@ mod tests {
             &no_sockets,
         );
         assert!(r.runnable);
+    }
+
+    fn keep_alive_of(report: &Report) -> &Capability {
+        report
+            .capabilities
+            .iter()
+            .find(|c| c.id == CapId::KeepAlive)
+            .expect("the keep-alive item")
+    }
+
+    #[test]
+    fn keep_alive_pidfd_refusal_warns_and_never_limits_the_mode() {
+        // ENOSYS on pidfd_open (Linux below 5.3): report-only, the mode stays transparent.
+        let probe = with_step(
+            ok_steps(),
+            "pidfd-open",
+            StepStatus::Fail,
+            Some(libc::ENOSYS),
+            Some("pidfd_open of this process failed: Function not implemented (os error 38)"),
+        );
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Warn);
+        assert_eq!(ka.detail, KA_PIDFD.0);
+        assert_eq!(ka.errno, Some(libc::ENOSYS));
+        assert_eq!(ka.impact, None);
+        assert_eq!(ka.fix.as_deref(), Some(KA_PIDFD.1));
+        assert_eq!(report.network_mode, EffectiveMode::Transparent);
+        assert_eq!(super::super::report::exit_code(&report), 0);
+        assert!(super::super::report::stderr_lines(&report).is_empty());
+    }
+
+    #[test]
+    fn keep_alive_join_refusal_is_split_by_errno() {
+        let refused = |errno: i32, reason: &str| {
+            let probe = with_step(
+                ok_steps(),
+                "keep-alive",
+                StepStatus::Fail,
+                Some(errno),
+                Some(reason),
+            );
+            let report = assemble(&host(
+                ProbeOutcome::Ran(probe),
+                bwrap_ok(),
+                RunFacts::default(),
+            ));
+            keep_alive_of(&report).clone()
+        };
+        let eperm = refused(libc::EPERM, "setns into the holder stand-in failed: EPERM");
+        assert_eq!(eperm.status, Status::Warn);
+        assert_eq!(eperm.detail, KA_SETNS.0);
+        assert_eq!(
+            eperm.evidence.as_deref(),
+            Some("setns into the holder stand-in failed: EPERM")
+        );
+        assert_eq!(eperm.fix.as_deref(), Some(KA_SETNS.1));
+        assert_eq!(eperm.impact, None);
+        let other = refused(libc::ENOSPC, "unshare failed: No space left on device");
+        assert_eq!(other.detail, KA_OTHER.0);
+        assert_eq!(other.fix.as_deref(), Some(KA_OTHER.1));
+        let timed_out = refused(0, "the joiner did not answer within 5s");
+        assert_eq!(timed_out.detail, KA_OTHER.0, "no errno is not a permission");
+    }
+
+    #[test]
+    fn keep_alive_skips_are_explained_and_report_only() {
+        // Userns unavailable: the cascade skips keep-alive, explained, no mode limit.
+        let probe = failed_at(
+            "unshare",
+            Some(libc::ENOSPC),
+            "unshare failed",
+            "skipped: unshare failed",
+        );
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None);
+
+        // The probe itself failed: unexplained, but report-only for keep-alive.
+        let report = assemble(&host(
+            ProbeOutcome::Failed("timed out after 20s".into()),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_PROBE);
+        assert_eq!(ka.impact, None);
+        assert_eq!(
+            report.network_mode,
+            EffectiveMode::Unavailable,
+            "the probe failure, not keep-alive"
+        );
+    }
+
+    #[test]
+    fn keep_alive_pinned_texts() {
+        assert_eq!(
+            OK_KEEP_ALIVE,
+            "pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)"
+        );
+        assert_eq!(
+            KA_PIDFD.0,
+            "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)"
+        );
+        assert_eq!(CapId::KeepAlive.as_str(), "keep-alive");
+        assert_eq!(CapId::ALL.last(), Some(&CapId::KeepAlive));
     }
 }

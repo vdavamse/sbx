@@ -243,10 +243,19 @@ impl SessionLandlock {
     }
 
     /// Encodes the settings: mode code (1 byte), port count (2 bytes), ports (2
-    /// bytes each).
+    /// bytes each). The count is checked, never wrapped: a list longer than the
+    /// cap is a caller bug (debug builds assert), and in a release build the
+    /// count saturates, so the peer sees a count that no port list matches and
+    /// refuses the frame.
     fn encode_into(&self, out: &mut Vec<u8>) {
+        debug_assert!(
+            self.bind_tcp.len() <= MAX_BIND_TCP,
+            "a session names at most {MAX_BIND_TCP} bind ports (got {})",
+            self.bind_tcp.len()
+        );
         out.push(self.mode_code());
-        out.extend_from_slice(&(self.bind_tcp.len() as u16).to_be_bytes());
+        let count = u16::try_from(self.bind_tcp.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_be_bytes());
         for port in &self.bind_tcp {
             out.extend_from_slice(&port.to_be_bytes());
         }
@@ -592,6 +601,34 @@ mod tests {
         assert_eq!(payload, [0, 0, 0, 9, 1, 0, 3, 1, 187, 0, 0, 31, 144]);
         let frame = Frame { op, payload };
         assert_eq!(Reply::decode(frame).unwrap(), Reply::Accepted(9, settings));
+    }
+
+    #[test]
+    fn accepted_reply_carries_the_full_port_cap() {
+        // The largest list the cap admits round-trips, with its count intact.
+        let ports: Vec<u16> = (0..MAX_BIND_TCP as u16).collect();
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::Require,
+            bind_tcp: ports,
+        };
+        let (op, payload) = Reply::Accepted(3, settings.clone()).encode();
+        assert_eq!(&payload[4..7], &[2, 1, 0], "mode 2, count 256 (big-endian)");
+        assert_eq!(
+            Reply::decode(Frame { op, payload }).unwrap(),
+            Reply::Accepted(3, settings)
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a session names at most 256 bind ports (got 257)")]
+    fn encode_refuses_more_ports_than_the_cap_in_debug_builds() {
+        // A count that does not fit the cap is a caller bug: never a silent wrap.
+        let settings = SessionLandlock {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: vec![1; MAX_BIND_TCP + 1],
+        };
+        let _ = Reply::Accepted(1, settings).encode();
     }
 
     #[test]
