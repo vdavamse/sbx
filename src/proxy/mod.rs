@@ -1246,12 +1246,12 @@ pub(crate) struct ConnCtx {
 }
 
 /// The relay hand-off state returned by [`decide`] on the allowed path:
-/// the client stream, the FULL replay buffer (preamble + any pipelined
-/// bytes), the guarded upstream, and — on 443 only — the replay offset
-/// where the relay scanner takes over (module docs point 12: the end of
-/// the inspected ClientHello record; `None` on the unscanned HTTP path).
-pub(crate) struct RelayStart<S> {
-    pub client: S,
+/// the FULL replay buffer (preamble + any pipelined bytes), the guarded
+/// upstream, and — on 443 only — the replay offset where the relay scanner
+/// takes over (module docs point 12: the end of the inspected ClientHello
+/// record; `None` on the unscanned HTTP path). The client stream stays with
+/// the caller ([`decide`] only borrows it).
+pub(crate) struct RelayStart {
     pub replay: Vec<u8>,
     pub connected: Connected,
     pub scan_from: Option<usize>,
@@ -1261,8 +1261,13 @@ pub(crate) struct RelayStart<S> {
 /// relay. Relay errors are normal lifecycle (EOF/RST) and swallowed; there
 /// is no idle timeout in v1 (module docs point 6). Drop closes both
 /// sockets.
+///
+/// The client socket stays open until its decision row is recorded: a deny
+/// closes it only after `record`, so the payload cannot see the close, exit,
+/// and let `sbx run` write the exit row (which ends the log) before the deny
+/// row lands (S16; this race dropped deny rows from the log).
 pub(crate) async fn handle_connection(
-    client: TcpStream,
+    mut client: TcpStream,
     client_addr: SocketAddr,
     proxy: Arc<Proxy>,
 ) {
@@ -1271,7 +1276,7 @@ pub(crate) async fn handle_connection(
     let (decision, relay) = match original_dst(client.as_raw_fd()) {
         Ok(orig_dst) => {
             decide(
-                client,
+                &mut client,
                 ConnCtx {
                     client_addr,
                     orig_dst,
@@ -1298,7 +1303,6 @@ pub(crate) async fn handle_connection(
     // (`exactly_one_decision_per_connection` pins it).
     proxy.sink.record(&decision);
     if let Some(RelayStart {
-        client,
         replay,
         mut connected,
         scan_from,
@@ -1425,12 +1429,13 @@ pub(crate) fn original_dst(fd: RawFd) -> io::Result<SocketAddrV4> {
 /// The locked per-connection pipeline (module docs point 2). Returns the
 /// terminal [`Decision`] plus, on the allowed path only, the [`RelayStart`]
 /// hand-off state. Generic over the client stream so unit tests drive it
-/// over `tokio::io::duplex` without sockets.
+/// over `tokio::io::duplex` without sockets. The client is BORROWED: the
+/// caller records the decision before it drops (closes) the stream.
 pub(crate) async fn decide<S: AsyncRead + Unpin>(
-    mut client: S,
+    client: &mut S,
     ctx: ConnCtx,
     proxy: &Proxy,
-) -> (Decision, Option<RelayStart<S>>) {
+) -> (Decision, Option<RelayStart>) {
     // 1. Port policy — the original destination port must be listed.
     let port = ctx.orig_dst.port();
     if !proxy.ports.contains(&port) {
@@ -1471,14 +1476,14 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
         TLS_PORT => {
             tokio::time::timeout(
                 proxy.limits.decision_timeout,
-                hello::inspect_tls(&mut client, &name, &proxy.limits),
+                hello::inspect_tls(client, &name, &proxy.limits),
             )
             .await
         }
         HTTP_PORT => {
             tokio::time::timeout(
                 proxy.limits.decision_timeout,
-                http::inspect_http(&mut client, &name, port, &proxy.limits),
+                http::inspect_http(client, &name, port, &proxy.limits),
             )
             .await
         }
@@ -1552,7 +1557,6 @@ pub(crate) async fn decide<S: AsyncRead + Unpin>(
             },
         ),
         Some(RelayStart {
-            client,
             replay,
             connected,
             scan_from,
@@ -1655,7 +1659,7 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-    use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
+    use tokio::io::{AsyncWriteExt, duplex};
 
     /// Every wait in these tests is bounded by this deadline.
     const BOUND: Duration = Duration::from_secs(5);
@@ -2150,15 +2154,15 @@ mod tests {
         proxy: &Proxy,
         orig_dst: &str,
         client_bytes: &[u8],
-    ) -> (Decision, Option<RelayStart<DuplexStream>>) {
-        let (client, mut peer) = duplex(64 * 1024);
+    ) -> (Decision, Option<RelayStart>) {
+        let (mut client, mut peer) = duplex(64 * 1024);
         block_on(async {
             if !client_bytes.is_empty() {
                 peer.write_all(client_bytes)
                     .await
                     .expect("fixture write fits the duplex buffer");
             }
-            let outcome = decide(client, ctx(orig_dst), proxy).await;
+            let outcome = decide(&mut client, ctx(orig_dst), proxy).await;
             drop(peer);
             outcome
         })
