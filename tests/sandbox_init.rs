@@ -1560,7 +1560,7 @@ fn run_probe_child(extra: &[&str]) -> Result<(i32, String, String), String> {
     ))
 }
 
-const PROBE_NAMES: [&str; 11] = [
+const PROBE_NAMES: [&str; 13] = [
     "unshare",
     "idmap",
     "netns",
@@ -1572,11 +1572,13 @@ const PROBE_NAMES: [&str; 11] = [
     "bwrap-run",
     "bwrap-proc",
     "bwrap-seccomp",
+    "pidfd-open",
+    "keep-alive",
 ];
 
 /// AC (issue #11, T3): `__init --probe` runs the real stages, prints one JSON
-/// line with the eleven steps in order, and exits 0; without `--bwrap` the
-/// bwrap steps are skipped.
+/// line with the thirteen steps in order (issue #18 adds `pidfd-open` and
+/// `keep-alive`), and exits 0; without `--bwrap` the bwrap steps are skipped.
 fn scenario_probe_json() -> Result<(), String> {
     let (rc, stdout, stderr) = run_probe_child(&[])?;
     if rc != 0 {
