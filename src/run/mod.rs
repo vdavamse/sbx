@@ -89,6 +89,7 @@
 //!     [`crate::landlock`] module docs point 9.
 
 mod audit;
+mod keepalive;
 mod lifecycle;
 mod mode;
 mod plan;
