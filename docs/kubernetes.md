@@ -106,7 +106,7 @@ what `sbx check` reported. Every other setting stayed as in the example.
 | `hostUsers: false` | Gives the pod its own user namespace; Kubernetes accepts `procMount: Unmasked` only with it. | The API server rejected the pod: ``spec.containers[0].securityContext.procMount: Invalid value: "Unmasked": `hostUsers` must be false to use `Unmasked` ``. With `procMount` also removed, the pod ran in the host user namespace (`uid_map` `0 0 4294967295`) and failed exactly like the `procMount` row. |
 | `procMount: Unmasked` | `sbx __init` writes `disable_ipv6` under `/proc/sys/net` in its own network namespace (`src/init/netns.rs:disable_ipv6`), and bwrap needs a writable `/proc/sys` for `--disable-userns`. With the default `/proc` the runtime makes `/proc/sys` read-only and masks paths. | `netns-ipv6` FAIL: `cannot disable IPv6 in the sandbox network namespace: /proc/sys is read-only (EROFS; typical inside containers)`, evidence `ipv6: write disable_ipv6 failed: Read-only file system (os error 30)`. `bwrap-run` FAIL: `bwrap cannot apply --disable-userns: /proc/sys is read-only`, evidence `bwrap: cannot open /proc/sys/user/max_user_namespaces: Read-only file system`. `bwrap-proc` and `seccomp` were skipped. Network mode `unavailable`, rc 1. |
 | `seccompProfile: Localhost` (the derived profile) | The runtime default profile does not let a process without capabilities create namespaces, mount or `pivot_root`. | With `RuntimeDefault`: `userns` FAIL: `unshare(CLONE_NEWUSER\|CLONE_NEWNET) is blocked by a seccomp filter (EPERM; typical inside containers)`; every probe-derived item was skipped. Network mode `unavailable`, rc 1. |
-| `appArmorProfile: Unconfined` | On nodes with AppArmor, the runtime's default profile applies otherwise (see [AppArmor](#apparmor)). | **Not observable here**: AppArmor was not enabled on the test host, so removing the setting changed nothing (all items ok). The CI job records this case on an AppArmor runner as report-only. |
+| `appArmorProfile: Unconfined` | On nodes with AppArmor, the runtime's default profile applies otherwise (see [AppArmor](#apparmor)). | **Not observable here**: AppArmor was not enabled on the test host, so removing the setting changed nothing (all items ok). In CI on an AppArmor runner the pod without it was still `unconfined` (`/proc/self/attr/current`) and all items were ok, because the kind node container itself runs AppArmor-unconfined; that is not a test of an AppArmor-enforcing node either. |
 
 The fix lines `sbx check` printed for these failures match the README
 [fix hints](../README.md#host-check) table: `procMount: Unmasked` for `netns-ipv6` and `bwrap-run`
@@ -286,6 +286,14 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
   `hostNetwork`, `hostIPC` or `hostPID`. In the kind cluster the API server reported the
   `UserNamespacesSupport` and `ProcMountType` gates enabled with an empty stage label (observed,
   `kubernetes_feature_enabled` metric).
+- **A fully visible `/sys` on the node.** The runtime mounts a fresh sysfs for a `hostUsers: false`
+  pod, and the kernel allows that inside a user namespace only when an existing sysfs mount is
+  fully visible: anything mounted below it must sit on an empty directory. A file bind-mounted
+  over a path under `/sys` breaks this, and the pod sandbox fails with `error mounting "sysfs" to
+  rootfs at "/sys": ... operation not permitted`. Observed in CI: kind bind-mounts files over
+  `/sys/devices/virtual/dmi/id/product_name` and `product_uuid` on hosts with DMI (GitHub runners;
+  not WSL), and the example pod could not start until the job removed those mounts. On a real node,
+  check for file overmounts under `/sys` if you see that error (not tested by sbx beyond kind).
 - **Unprivileged user namespaces in the kernel.** sbx creates its own user and network namespaces
   inside the pod. The `userns` item names the sysctl or policy that blocks them
   (`user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, the AppArmor restriction above,
@@ -402,10 +410,14 @@ above. It validates `pod.yaml` with kubeconform v0.8.0 (strict, Kubernetes 1.37.
 `yannh/kubernetes-json-schema` at a pinned commit), re-derives the seccomp profile, builds the
 image, creates the kind cluster, and checks that `uid_map` is not the host map. Then:
 
-- report-only: `sbx check` in the pod under the runner's AppArmor defaults;
-- the runner's AppArmor is relaxed the same two ways the test job relaxes it:
-  `kernel.apparmor_restrict_unprivileged_userns=0`, and unloading the `bwrap-userns-restrict`
-  profile;
+- report-only: the runner's AppArmor state (on ubuntu-24.04 runners: AppArmor enabled,
+  `kernel.apparmor_restrict_unprivileged_userns = 1`, `bwrap` and `unpriv_bwrap` profiles loaded);
+- the runner's AppArmor is relaxed the same two ways the test job relaxes it, before the cluster
+  is created: `kernel.apparmor_restrict_unprivileged_userns=0`, and unloading the
+  `bwrap-userns-restrict` profile. (Relaxing it was not what made the pod start; see the next item.)
+- kind's DMI file overmounts under `/sys` are removed in the node (see
+  [Node requirements](#node-requirements)); without that, the pod sandbox fails to start on
+  GitHub runners;
 - gating: `sbx check` (every item except `landlock` ok, network mode `transparent`),
   `sbx check --policy /etc/sbx/default.json --host` (rc 0) and `sbx check --conformance` (the same
   `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 66 offline checks ok or
@@ -414,6 +426,6 @@ image, creates the kind cluster, and checks that `uid_map` is not the host map. 
   `bwrap-run`; `userns` errno 1);
 - report-only: the pod without `appArmorProfile`.
 
-The job was run locally with the same steps against the kind cluster described above, and every
-step passed there. Its behaviour on the GitHub runner, where AppArmor is enabled, is known only
-once CI has run it.
+The job passes on the GitHub `ubuntu-24.04` runner (kernel 7.0, containerd 2.3.4, runc 1.4.3 in
+the kind node) and with the same steps locally. On failure it prints diagnostics: the runner and
+node kernel, the node's mounts under `/sys` and `/proc`, and the runtime versions.
