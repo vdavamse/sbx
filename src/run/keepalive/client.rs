@@ -29,7 +29,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use super::ctl;
-use super::proto::{CallEnd, Reply, Request, SessionLandlock};
+use super::proto::{CallEnd, ProtoError, Reply, Request, SessionLandlock};
 use crate::bwrap::seccomp;
 use crate::bwrap::version::{BwrapStatus, find_bwrap};
 use crate::bwrap::{Build, Launch, build};
@@ -158,8 +158,12 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
     let self_pidfd = sys::pidfd_open(std::process::id() as libc::pid_t)
         .map_err(|err| RunError::new(format!("cannot open the attach pidfd: {err}")))?;
     let (op, payload) = Request::Attach(policy_bytes).encode();
-    ctl::send_frame(&stream, op, &payload, &[self_pidfd.as_raw_fd()])
-        .map_err(|err| RunError::new(format!("cannot send the attach request: {err:?}")))?;
+    if let Err(err) = ctl::send_frame(&stream, op, &payload, &[self_pidfd.as_raw_fd()]) {
+        if let Some(reason) = early_refusal(&stream, &err) {
+            return Err(RunError::new(format!("session refused the call: {reason}")).into());
+        }
+        return Err(RunError::new(format!("cannot send the attach request: {err:?}")).into());
+    }
     let (frame, fds) = ctl::recv_frame(&stream)
         .map_err(|err| RunError::new(format!("the session did not answer: {err:?}")))?;
     let (id, landlock, mut fds) = match Reply::decode(frame) {
@@ -489,6 +493,9 @@ fn stop_session(session_dir: PathBuf, answer_wait: Duration) -> Result<(), Strin
         &[],
         Instant::now() + Duration::from_secs(5),
     ) {
+        if let Some(reason) = early_refusal(&stream, &err) {
+            return Err(reason);
+        }
         return Err(format!("cannot send the stop request: {err:?}"));
     }
     // The holder answers after its teardown, which can take a few seconds: the
@@ -500,6 +507,33 @@ fn stop_session(session_dir: PathBuf, answer_wait: Duration) -> Result<(), Strin
         Ok(Reply::Accepted(_, _)) | Err(_) => {
             Err("the session did not confirm the stop".to_owned())
         }
+    }
+}
+
+/// How long a client looks for an early refusal after its send failed.
+pub(crate) const EARLY_REFUSAL_WAIT: Duration = Duration::from_secs(1);
+
+/// The holder may answer and close BEFORE reading the request: a peer of
+/// another uid is refused ("not the session owner") before its frame is read.
+/// The client's send then fails with EPIPE or ECONNRESET, but the refusal is
+/// already queued on the AF_UNIX socket (a peer's close never discards data it
+/// sent), so read it: the caller sees the holder's reason, not a transport
+/// error. Anything else (no frame, not a refusal) is `None`, and the send
+/// error stands.
+fn early_refusal(stream: &UnixStream, err: &ProtoError) -> Option<String> {
+    let ProtoError::Io(io) = err else {
+        return None;
+    };
+    if !matches!(
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    ) {
+        return None;
+    }
+    let (frame, _) = ctl::recv_frame_until(stream, Instant::now() + EARLY_REFUSAL_WAIT).ok()?;
+    match Reply::decode(frame) {
+        Ok(Reply::Refused(reason)) => Some(reason),
+        _ => None,
     }
 }
 
@@ -580,6 +614,73 @@ mod tests {
         holder.join().expect("the fake holder ends");
         assert_eq!(outcome, Err("session is stopping".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A holder that refuses and closes WITHOUT reading the request (as the
+    /// real holder does for a foreign uid): the client's send hits EPIPE, and
+    /// the queued refusal is still reported, for stop and for the helper.
+    #[test]
+    fn a_refusal_before_the_request_is_read_survives_epipe() {
+        let dir = scratch_session("early");
+        let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
+        let holder = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().expect("a client connects");
+                let (op, payload) = Reply::Refused("not the session owner".into()).encode();
+                ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
+                // Close without reading anything.
+            }
+        });
+
+        // The helper, deterministically: wait until the holder has closed,
+        // then send — the send must fail, and the refusal must be recovered.
+        let client = ctl::connect_ctl(dirfd.as_fd()).expect("connect");
+        let mut peer_closed = false;
+        let mut probe = [0u8; 1];
+        for _ in 0..200 {
+            // MSG_PEEK reads the queued refusal without consuming it.
+            let n = unsafe {
+                libc::recv(
+                    client.as_raw_fd(),
+                    probe.as_mut_ptr().cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if n > 0 {
+                peer_closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(peer_closed, "the refusal never arrived");
+        std::thread::sleep(Duration::from_millis(50));
+        let big = vec![0u8; 200 * 1024];
+        let err =
+            ctl::send_frame(&client, b'A', &big, &[]).expect_err("a send to a closed peer fails");
+        assert_eq!(
+            early_refusal(&client, &err).as_deref(),
+            Some("not the session owner")
+        );
+
+        // And end to end through stop.
+        assert_eq!(
+            stop_session(dir.clone(), Duration::from_secs(10)),
+            Err("not the session owner".to_owned())
+        );
+        holder.join().expect("the fake holder ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Other send errors are not mistaken for a refusal.
+    #[test]
+    fn early_refusal_ignores_other_errors() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        assert_eq!(early_refusal(&a, &ProtoError::TooLarge(1)), None);
+        assert_eq!(early_refusal(&a, &ProtoError::Eof), None);
+        let refused = ProtoError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(early_refusal(&a, &refused), None);
     }
 
     /// No socket at all is a session that is not running: rc 0.
