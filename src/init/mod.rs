@@ -1792,6 +1792,13 @@ mod tests {
             msg(998),
             "sbx __init: control: --status-fd 998 is not a valid file descriptor (EBADF)"
         );
+        // Plain mode names its control flag `--fd`; the pinned text says so.
+        assert_eq!(
+            validate_status_fd(999, ControlFd::plain(999), None, None, None)
+                .expect_err("status equals --fd")
+                .to_string(),
+            "sbx __init: control: --status-fd 999 must differ from --fd"
+        );
         let mut p = [0 as RawFd; 2];
         // SAFETY: pipe2 into a 2-element array; both ends are closed below.
         assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
