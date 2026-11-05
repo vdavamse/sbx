@@ -475,14 +475,35 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
     }
     if let Some(keep) = args.keep_fd {
         validate_keep_fd(keep, user)?;
+        if keep == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--keep-fd must differ from --join-net",
+            ));
+        }
     }
     if let Some(seccomp) = args.seccomp_fd {
         validate_seccomp_fd(seccomp, user, args.keep_fd)?;
+        if seccomp == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--seccomp-fd must differ from --join-net",
+            ));
+        }
     }
     crate::run::keepalive::join::join_namespaces(user, net).map_err(|err| {
         InitError::new(Stage::Netns, format!("join the session namespaces: {err}"))
             .with_errno(err.raw_os_error())
     })?;
+    // Review 4: the namespace descriptors have served their purpose. Close them
+    // here, rather than leaving it to the hygiene scan. They were validated as
+    // distinct from the kept fds above, so no kept descriptor is closed.
+    // SAFETY: both are open descriptors this process received for the join and
+    // does not use again.
+    unsafe {
+        libc::close(user);
+        libc::close(net);
+    }
     let mut sock = NetlinkSocket::new();
     rules::verify_dump(&mut sock)?; // Stage::NftVerify: the session's rules, now
     drop(sock);
