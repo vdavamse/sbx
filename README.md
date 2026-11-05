@@ -43,7 +43,8 @@ to the name; AAAA gets an empty answer, every other name NXDOMAIN, and nothing
 is ever forwarded upstream (TCP DNS is not served).
 Every `run` installs a seccomp filter that allow-lists four socket families
 (issue #34: `AF_VSOCK` and the other families outside the list fail with
-`EAFNOSUPPORT`; see [Running commands](#running-commands)).
+`EAFNOSUPPORT`) and refuses a short list of kernel-surface syscalls with `EPERM`
+(issue #42; see [Running commands](#running-commands)).
 The internal `__init` helper is
 real (issue #5): `sbx run` (#10) will re-exec it with one end of a
 control socketpair, and it unshares user + network namespaces, brings
@@ -437,9 +438,28 @@ The filter also closes the other ways to reach those families:
   entry and its `socketcall(2)` path) and an x32-ABI syscall are killed with
   `SIGSYS`: `sbx run` exits 159 (128+31). Run 64-bit binaries only.
 
+**Syscall deny-list (issue #42).** A conservative set of syscalls fails with
+`EPERM` (errno 1, the answer Docker's default profile gives): the kernel keyring
+(`keyctl`, `add_key`, `request_key`), `bpf`, `perf_event_open`, `userfaultfd`,
+`kexec_load`, `kexec_file_load`, kernel modules (`init_module`, `finit_module`,
+`delete_module`), `open_by_handle_at`, the mount APIs (`mount`, `umount2`,
+`pivot_root`, `open_tree`, `open_tree_attr`, `move_mount`, `fsopen`, `fsconfig`,
+`fsmount`, `fspick`, `mount_setattr`), `quotactl`, `quotactl_fd`, `syslog`,
+`swapon`, `swapoff`, `reboot`, `acct` and, on x86_64, `iopl`, `ioperm` and
+`uselib`. `personality(2)` accepts only Docker's personas
+(`PER_LINUX`, `PER_LINUX32`, `UNAME26` and the query); `ADDR_NO_RANDOMIZE`
+fails, so `setarch -R` fails, gdb warns that it cannot disable address
+randomization (`set disable-randomization off` silences it), and lldb cannot
+launch a process until `settings set target.disable-aslr false` is set. A payload started with a non-default personality (for example
+`sbx run` itself launched under `setarch -R`) cannot write that personality back.
+Behaviour changes: `perf`, `rr`, `bpftool`, `bpftrace`, `dmesg` and `keyctl` fail
+inside the sandbox, and tools that cache credentials in the kernel keyring
+(some Kerberos and `ecryptfs` setups) fall back or fail. `ptrace` stays allowed,
+so `gdb` and `strace` work on processes inside the sandbox.
+
 Netlink sockets are allowed for every protocol (they live in the sandbox's own
-network namespace). Other syscalls are not filtered: this is a family allow-list,
-not a syscall allow-list. If bwrap cannot install the filter, the payload never
+network namespace). Every syscall not named above is allowed: this is a
+deny-list, not a syscall allow-list. If bwrap cannot install the filter, the payload never
 starts and `run` reports bwrap's own failure (rc 1, like any other bwrap setup
 failure), not 125. `run` refuses with rc 125 only when sbx itself cannot prepare
 the filter, for example on an architecture without a program (sbx ships

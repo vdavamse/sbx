@@ -77,9 +77,9 @@
 //!    `--disable-userns --cap-drop ALL --die-with-parent --new-session
 //!    --hostname sandbox [--info-fd N]` (`--info-fd` only when
 //!    `Build::info_fd` is set — issue #10's pid-1 discovery, Q13) and
-//!    `--seccomp S` ALWAYS (issue #34: the socket-family filter, see
-//!    [`seccomp`]; bwrap installs it as the last step before exec in both
-//!    pid 1 and the payload).
+//!    `--seccomp S` ALWAYS (issues #34/#42: the socket-family filter and
+//!    syscall deny-list, see [`seccomp`]; bwrap installs it as the last step
+//!    before exec in both pid 1 and the payload).
 //!    `--disable-userns` needs bwrap ≥ 0.8
 //!    ([`version::BWRAP_MIN`]); it works because `--unshare-user` is
 //!    present (the kernel rejects disable-userns without a private userns).
