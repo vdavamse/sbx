@@ -3782,8 +3782,10 @@ fn scenario_netns_explicit_sni_mismatch() -> Result<(), String> {
 // ---- network tier (opt-in: SBX_PT_NETWORK=1) -------------------------------
 
 fn network_proxy(allow: &[&str]) -> Result<Explicit, String> {
-    let system: Arc<dyn Connector> =
-        Arc::new(GuardedConnector::system(Limits::default().connect_timeout));
+    let system: Arc<dyn Connector> = Arc::new(GuardedConnector::system(
+        Limits::default().connect_timeout,
+        sbx::egress::HostAddrs::default(),
+    ));
     start_explicit(allow, &[443], system)
 }
 

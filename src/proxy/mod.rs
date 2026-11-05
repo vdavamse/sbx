@@ -768,7 +768,7 @@ pub type Upstream = Box<dyn ByteStream>;
 pub struct Connected {
     /// The upstream byte stream.
     pub stream: Upstream,
-    /// The connected peer — already re-checked against [`egress::guard`]
+    /// The connected peer — already re-checked against [`egress::guard_host`]
     /// by [`GuardedConnector`] (the rebinding backstop).
     pub peer: SocketAddr,
 }
@@ -777,7 +777,7 @@ pub struct Connected {
 /// in [`decide`] (Q6 split: only `DialDenied` is a policy denial).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectError {
-    /// A resolved address or the connected peer failed [`egress::guard`].
+    /// A resolved address or the connected peer failed [`egress::guard_host`].
     DialDenied {
         addr: SocketAddr,
         denied: egress::Denied,
@@ -841,6 +841,10 @@ pub struct GuardedConnector {
     resolve: ResolveFn,
     dial: DialFn,
     connect_timeout: Duration,
+    // The host's own interface addresses (issue #41): every guard in the
+    // flow is egress::guard_host over this set. Empty unless the caller
+    // supplies it via `with_host_addrs` (production: `Proxy::system`).
+    host_addrs: egress::HostAddrs,
 }
 
 impl GuardedConnector {
@@ -848,7 +852,9 @@ impl GuardedConnector {
     /// (getaddrinfo on the blocking pool — fine on a single-threaded
     /// runtime), `dial` = `TcpStream::connect((name, port))` BY NAME +
     /// `set_nodelay(true)` + `peer_addr()`.
-    pub fn system(connect_timeout: Duration) -> Self {
+    /// `host_addrs` is required (issue #41): a production connector must
+    /// never silently run without the host's own addresses.
+    pub fn system(connect_timeout: Duration, host_addrs: egress::HostAddrs) -> Self {
         let resolve: ResolveFn = Arc::new(|name: &str, port: u16| {
             let name = name.to_owned();
             Box::pin(async move {
@@ -877,6 +883,7 @@ impl GuardedConnector {
             resolve,
             dial,
             connect_timeout,
+            host_addrs,
         }
     }
 
@@ -887,7 +894,16 @@ impl GuardedConnector {
             resolve,
             dial,
             connect_timeout,
+            host_addrs: egress::HostAddrs::default(),
         }
+    }
+
+    /// Also deny the host's own interface addresses (issue #41): every
+    /// resolved address and the connected peer go through
+    /// [`egress::guard_host`] over `host_addrs`.
+    pub fn with_host_addrs(mut self, host_addrs: egress::HostAddrs) -> Self {
+        self.host_addrs = host_addrs;
+        self
     }
 
     // The guarded flow under ONE deadline (review fix — resolve and dial
@@ -930,7 +946,7 @@ impl GuardedConnector {
             return Err(ConnectError::EmptyResolve);
         }
         for addr in &addrs {
-            if let Err(denied) = egress::guard(addr.ip()) {
+            if let Err(denied) = egress::guard_host(addr.ip(), &self.host_addrs) {
                 return Err(ConnectError::DialDenied {
                     addr: *addr,
                     denied,
@@ -945,7 +961,7 @@ impl GuardedConnector {
                 });
             }
         };
-        if let Err(denied) = egress::guard(peer.ip()) {
+        if let Err(denied) = egress::guard_host(peer.ip(), &self.host_addrs) {
             return Err(ConnectError::DialDenied { addr: peer, denied });
         }
         Ok(Connected { stream, peer })
@@ -981,14 +997,16 @@ pub struct Proxy {
 
 impl Proxy {
     /// Production shape for #10: [`GuardedConnector::system`] with default
-    /// limits, built from a validated policy's network section.
+    /// limits, built from a validated policy's network section, denying
+    /// the host's own interface addresses `host_addrs` (issue #41).
     pub fn system(
         network: &policy::Network,
         dns_map: Arc<dyn DnsMap>,
         sink: Arc<dyn DecisionSink>,
+        host_addrs: egress::HostAddrs,
     ) -> Arc<Self> {
         let limits = Limits::default();
-        let connector = Arc::new(GuardedConnector::system(limits.connect_timeout));
+        let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
         Self::new(network, dns_map, sink, connector, limits)
     }
 
@@ -2734,6 +2752,66 @@ mod tests {
             [("allowed.test".to_owned(), TLS_PORT)],
             "the dial DID run — the recheck is what caught it"
         );
+    }
+
+    /// Issue #41: a connector that also denies the host's own address
+    /// `HOST_PUBLIC` (a public address `egress::guard` alone passes).
+    const HOST_PUBLIC: &str = "198.51.99.10:443";
+
+    fn guarded_host(resolve: ResolveFn, dial: DialFn) -> Arc<dyn Connector> {
+        let host = egress::HostAddrs::new([sock(HOST_PUBLIC).ip()]);
+        Arc::new(
+            GuardedConnector::new(resolve, dial, Duration::from_secs(10)).with_host_addrs(host),
+        )
+    }
+
+    #[test]
+    fn host_address_denied_at_resolve() {
+        // An allowed name resolving to the host's own public address is
+        // denied before the dial (the proxy dials from the host netns).
+        assert!(egress::guard(sock(HOST_PUBLIC).ip()).is_ok());
+        let log = call_log();
+        let connector = guarded_host(
+            resolve_addrs(vec![sock(HOST_PUBLIC)]),
+            dial_duplex(sock(HOST_PUBLIC), Arc::clone(&log)),
+        );
+        let proxy = allowed_proxy(connector, Limits::default());
+        let (decision, relay) = run_decide(&proxy, "203.0.113.7:443", &tls_hello("allowed.test"));
+        assert!(relay.is_none());
+        assert_eq!(
+            decision.verdict,
+            Verdict::Denied(Rejected::DialDenied {
+                addr: sock(HOST_PUBLIC),
+                denied: egress::Denied::HostAddress,
+            })
+        );
+        assert_eq!(
+            decision.reason(),
+            "denied dial to 198.51.99.10:443: one of the host's own interface addresses"
+        );
+        assert!(log_of(&log).is_empty(), "the dial must never run");
+    }
+
+    #[test]
+    fn host_address_denied_on_peer_recheck() {
+        // Rebinding backstop: the guarded resolve was public, the connected
+        // peer is the host itself ⇒ denied before any byte is forwarded.
+        let log = call_log();
+        let connector = guarded_host(
+            resolve_addrs(vec![sock(PUBLIC)]),
+            dial_duplex(sock(HOST_PUBLIC), Arc::clone(&log)),
+        );
+        let proxy = allowed_proxy(connector, Limits::default());
+        let (decision, relay) = run_decide(&proxy, "203.0.113.7:443", &tls_hello("allowed.test"));
+        assert!(relay.is_none());
+        assert_eq!(
+            decision.verdict,
+            Verdict::Denied(Rejected::DialDenied {
+                addr: sock(HOST_PUBLIC),
+                denied: egress::Denied::HostAddress,
+            })
+        );
+        assert_eq!(log_of(&log).len(), 1, "the dial DID run");
     }
 
     #[test]
