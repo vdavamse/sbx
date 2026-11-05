@@ -136,6 +136,27 @@ jobs:
           unshare -Urn true
           echo "unprivileged userns smoke OK"
           bwrap --version
+          # Ubuntu 26.04 runner images (2026-11) load AppArmor's
+          # bwrap-userns-restrict profile: everything bwrap runs is confined
+          # to `unpriv_bwrap`, which denies nested user namespaces. The
+          # sandbox_check ro-proc-sys scenario probes `sbx check` INSIDE a
+          # bwrap user namespace and needs exactly that nesting. Unload the
+          # profile (runner-only; same intent as the sysctl above) instead of
+          # weakening the test.
+          sudo aa-status 2>/dev/null | grep -iE 'bwrap' || true
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            if sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict; then
+              echo "unloaded AppArmor bwrap-userns-restrict"
+            else
+              echo "::warning::could not unload AppArmor bwrap-userns-restrict"
+            fi
+          fi
+          sudo aa-status 2>/dev/null | grep -iE 'bwrap' || echo "no bwrap AppArmor profiles loaded"
+          # Smoke test: a user+net namespace nested inside bwrap's user
+          # namespace must work, or the prep fails here with a clear message.
+          bwrap --unshare-user --dev-bind / / -- unshare -Urn true \
+            || { echo "::error::nested userns inside bwrap is unavailable on this runner"; exit 1; }
+          echo "nested userns (inside bwrap) smoke OK"
 
       - name: cargo test
         run: cargo test --locked
@@ -681,6 +702,12 @@ jobs:
       - name: Prepare environment (userns, bubblewrap, tools)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          # Same runner-image fix as the test job: unload AppArmor's
+          # bwrap-userns-restrict so nested user namespaces work under bwrap.
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict \
+              || echo "::warning::could not unload AppArmor bwrap-userns-restrict"
+          fi
           sudo apt-get update
           sudo apt-get install -y nftables bubblewrap curl git openssl
           sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
