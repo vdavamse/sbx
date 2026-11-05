@@ -118,6 +118,7 @@ pub fn group_of(name: &str) -> &'static str {
         "S11a" | "S11b" => "S11",
         "S14" => "S14",
         "S15" => "S15",
+        "SS-pid" | "SS-kill" | "SS-policy" | "SS-idle" | "SS-life" => "SS",
         _ => "?",
     }
 }
@@ -139,6 +140,7 @@ pub fn run_group(env: &Env, group: &str) -> Vec<Scn> {
         "S9" => vec![s9(env)],
         "S10" => vec![s10(env)],
         "S11" => s11(env),
+        "SS" => super::session_tier::run(env),
         _ => vec![],
     }
 }

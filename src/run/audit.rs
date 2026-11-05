@@ -36,6 +36,11 @@ pub(crate) struct ExitFields {
     /// Issue #11: the achieved network mode (`transparent` | `explicit`), or
     /// null when setup never completed. Additive; the last key of the row.
     net_mode: Option<&'static str>,
+    /// Issue #18: the attached call this exit row ends (`0` = the resident).
+    /// Written only in persistent-session rows; absent (and not serialized)
+    /// everywhere else, so plain-run rows keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<u32>,
 }
 
 /// One audit row. Field order IS the schema (§5 rows 1–12, then the exit-only
@@ -165,7 +170,8 @@ pub(crate) fn dns_row(ts: String, d: &DnsDecision) -> Row {
     row
 }
 
-/// exit: always the last row of a run.
+/// exit: always the last row of a run (the golden-row tests pin its shape).
+#[cfg(test)]
 pub(crate) fn exit_row(
     ts: String,
     o: &Outcome,
@@ -173,6 +179,20 @@ pub(crate) fn exit_row(
     truncated: bool,
     poisoned: bool,
     net_mode: Option<&'static str>,
+) -> Row {
+    exit_row_for(ts, o, duration, truncated, poisoned, net_mode, None)
+}
+
+/// [`exit_row`] for a persistent session (issue #18): `call_id` is `Some(0)` for
+/// the resident and `Some(n)` for an attached call.
+pub(crate) fn exit_row_for(
+    ts: String,
+    o: &Outcome,
+    duration: Duration,
+    truncated: bool,
+    poisoned: bool,
+    net_mode: Option<&'static str>,
+    call_id: Option<u32>,
 ) -> Row {
     let mut row = Row::blank(ts, "exit");
     row.reason = Some(exit_reason(o));
@@ -184,6 +204,41 @@ pub(crate) fn exit_row(
         output_truncated: truncated,
         dns_poisoned: poisoned,
         net_mode,
+        call_id,
+    });
+    row
+}
+
+/// The fields of an attached call's exit row (issue #18).
+pub(crate) struct CallExit<'a> {
+    pub(crate) call_id: u32,
+    pub(crate) code: i32,
+    /// One of the pinned call outcomes (`protocol::OUTCOMES`).
+    pub(crate) outcome: &'static str,
+    pub(crate) duration_ms: u64,
+    pub(crate) net_mode: Option<&'static str>,
+    pub(crate) truncated: bool,
+    /// The session's fake-IP map was poisoned (the exit row's `dns_poisoned`).
+    pub(crate) dns_poisoned: bool,
+    pub(crate) reason: &'a str,
+}
+
+/// The exit row of an attached call, built from the call end its attach
+/// process reported (issue #18). Written like [`exit_row_for`].
+pub(crate) fn call_exit_row(ts: String, call: &CallExit<'_>) -> Row {
+    let mut row = Row::blank(ts, "exit");
+    row.reason = Some(call.reason.to_owned());
+    row.exit = Some(ExitFields {
+        code: call.code,
+        outcome: call.outcome,
+        // The same rule as a plain run's `outcome_signal`: a signalled or
+        // terminated outcome carries its signal (`code - 128`).
+        signal: matches!(call.outcome, "signaled" | "terminated").then(|| call.code - 128),
+        duration_ms: call.duration_ms,
+        output_truncated: call.truncated,
+        dns_poisoned: call.dns_poisoned,
+        net_mode: call.net_mode,
+        call_id: Some(call.call_id),
     });
     row
 }
@@ -350,6 +405,12 @@ impl AuditLog {
             self.latch.trip(Fault::Audit(text.clone()));
             state.failure = Some(text);
         }
+    }
+
+    /// Appends a row that is not an exit row (a persistent session's call
+    /// rows). Refused once the exit row was written, so the exit row stays last.
+    pub(crate) fn append_row(&self, row: &Row) {
+        self.write(row);
     }
 
     /// Writes the exit row (unless the log already failed) and closes the log for
@@ -964,5 +1025,77 @@ mod tests {
             ))
             .ends_with(",\"net_mode\":\"explicit\"}\n")
         );
+    }
+
+    /// Review 2 of #57: a call row and a plain run's exit row agree on every key
+    /// and on every fact they share, for every outcome.
+    #[test]
+    fn call_exit_row_matches_the_plain_exit_row_for_every_outcome() {
+        use crate::run::plan::{exit_code, exit_reason, outcome_label};
+        let ts = "2026-11-05T00:00:00.000Z".to_owned();
+        let duration = Duration::from_millis(1234);
+        let outcomes = [
+            Outcome::Exited(3),
+            Outcome::Signaled(9),
+            Outcome::TimedOut(Duration::from_secs(2)),
+            Outcome::Terminated(15),
+            Outcome::Failed("boom".to_owned()),
+        ];
+        for o in outcomes {
+            let plain = serde_json::to_value(exit_row_for(
+                ts.clone(),
+                &o,
+                duration,
+                false,
+                false,
+                Some("transparent"),
+                Some(7),
+            ))
+            .unwrap();
+            let reason = exit_reason(&o);
+            let call = serde_json::to_value(call_exit_row(
+                ts.clone(),
+                &CallExit {
+                    call_id: 7,
+                    code: exit_code(&o),
+                    outcome: outcome_label(&o),
+                    duration_ms: 1234,
+                    net_mode: Some("transparent"),
+                    truncated: false,
+                    dns_poisoned: false,
+                    reason: &reason,
+                },
+            ))
+            .unwrap();
+            let keys = |v: &serde_json::Value| -> Vec<String> {
+                v.as_object().unwrap().keys().cloned().collect()
+            };
+            assert_eq!(
+                keys(&plain),
+                keys(&call),
+                "{o:?}: same keys in the same order"
+            );
+            assert_eq!(plain, call, "{o:?}: the shared facts agree");
+        }
+    }
+
+    #[test]
+    fn terminated_call_rows_carry_their_signal_like_plain_rows() {
+        let row = call_exit_row(
+            "t".to_owned(),
+            &CallExit {
+                call_id: 1,
+                code: 143,
+                outcome: "terminated",
+                duration_ms: 0,
+                net_mode: None,
+                truncated: false,
+                dns_poisoned: false,
+                reason: "stopped",
+            },
+        );
+        let v = serde_json::to_value(row).unwrap();
+        assert_eq!(v["signal"], 15);
+        assert_eq!(v["outcome"], "terminated");
     }
 }

@@ -109,7 +109,14 @@ allow-listed mounts, an empty environment, and the sandboxed command.
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] [--relay-idle-timeout DURATION] [--audit FILE]
+        [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
         -- COMMAND [ARGS...]
+sbx run --keep-alive --policy policy.json --session-dir DIR
+        [--idle-timeout DURATION] [--max-lifetime DURATION]
+        [--relay-idle-timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
+sbx attach --policy policy.json --session-dir DIR [--cwd PATH]
+        [--timeout DURATION] -- COMMAND [ARGS...]
+sbx stop --session-dir DIR
 sbx check [--json]
 sbx check --conformance [--network] [--only ID|GROUP,...] [--list] [--json]
 sbx check --policy policy.json --host [--json]
@@ -191,7 +198,7 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 7 (report-only)
+  ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
@@ -204,8 +211,9 @@ sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
 (bwrap can start a sandbox here, and mount a fresh `/proc`), `seccomp` (bwrap
 installs sbx's socket-family filter, see [Running commands](#running-commands):
 a failure here makes the network mode `unavailable`, because the sandbox cannot
-start without the filter), and `landlock` (report only; sbx does not use Landlock
-yet). An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
+start without the filter), and `landlock` (report only: the Landlock ABI and which
+parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)).
+An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
 **Network modes.** The host provides one of three modes, from strongest to
@@ -292,7 +300,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-74 checks in eight groups, the same code that `cargo test --test conformance`
+80 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -311,6 +319,10 @@ checks that prove it, and lists what they do not prove.
   no path open; a broken nftables load or audit log ends the run with rc 125.
 - **G: cleanup** (`cleanup`): background processes die on exit, timeout and
   signals; the sandbox network namespace is empty afterwards.
+- **I: persistent sessions** (`session`): an attached call cannot see or signal
+  the resident or another call; a holder SIGKILL ends the resident and the calls;
+  a different policy is refused; a foreign-uid connection is refused (an opt-in
+  skip here, see the threat model); the idle and max-lifetime ends. Needs bwrap.
 - **H: secrets** (`secrets`): the caller's environment, `/proc` environments,
   inherited descriptors, HOME and processes are not visible to the payload.
 
@@ -386,6 +398,8 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 | an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
 | the host cannot provide the policy's network mode, or cannot run sandboxes (issue #11) | 125 | `failed` | `sbx run: policy requires network mode <mode> but this host provides only explicit: <reason>; fix: <fix>; run \`sbx check\` for a full host report` (or `… but this host cannot run sandboxes: …`); the staged line of `__init` comes first |
 | the explicit fallback ran (the nft redirect is unavailable, the policy is `explicit` or `none`) | the command's own | the command's | `sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (<reason>); run \`sbx check\` for details` |
+| a Landlock shim failure under `--landlock` (the shim could not apply the rules, could not check the host ABI, or could not exec the payload; issue #19) | 125 | `failed` | `sbx run: landlock: <reason>`. The shim starts with a marker on the status pipe and adds its reason after it, so a payload's own 125 (marker only) is never reported as this one, and a shim that never started is reported by the row above |
+| the Landlock shim did not start under `--landlock` (bwrap could not exec `/proc/self/fd/N`, or the dynamic loader failed before the shim's first act, so the status pipe holds no start marker) | 125 | `failed` | `sbx run: landlock: the shim did not start (rc N)`, where N is bwrap's own rc (1 for bwrap's exec failure, 127 for the loader) |
 | a usage error | 2 | — | clap's message |
 
 The audit row's `outcome` is one of: `exited` (the command ended by itself, or
@@ -591,6 +605,50 @@ cases. The integration
 suite (`tests/sandbox_run.rs`, scenarios `seccomp-*`) and the CI musl smoke pin
 these results.
 
+**Landlock layer (issue #19).** `--landlock` adds a Linux Landlock ruleset on top
+of the bwrap sandbox. It is off by default, and with `--landlock off` the bwrap
+command is the same as before. The mode is one of:
+
+- `best-effort`: apply the rules the kernel supports. A kernel without Landlock,
+  or with an older ABI, runs with the subset it has, silently.
+- `require`: apply the full set or refuse. The set needs Landlock ABI 6 (Linux
+  6.12 or later). On an older kernel `run` exits 125 before it starts anything,
+  with `sbx run: landlock require: …` on stderr.
+
+The rules follow the bwrap mount list. Read-only binds, the infra `/etc` set and
+the generated files can be read and executed. Read-write binds, the session
+`work`, `home` and `tmp` leaves, `/proc` and `/dev` can be written. The root
+directory can be listed, but nothing can be created in it. `--landlock-bind-tcp PORT`
+(repeatable; `0` is the kernel's ephemeral range) allows a TCP bind on that port.
+Without a port, binds are denied. The layer also stops the payload from signalling
+processes outside its domain, including bwrap's pid 1 (signal scope, ABI 6).
+
+The layer is a second check on top of the mounts and the network namespace. It
+does not restrict `connect(2)`: egress stays with the network namespace and the
+proxies. It also does not handle abstract-socket scope or `RESOLVE_UNIX`
+(see [threat model](docs/threat-model.md), R6). The shim is sbx's own executable,
+opened by `run` and exec'd inside the sandbox through `/proc/self/fd`. A
+dynamically linked sbx build needs its shared libraries visible inside the sandbox
+when `--landlock` is on. The static musl release does not. This is not checked
+before the run.
+
+Three limits of the layer that operators hit in practice:
+
+- **Deny masks and new directories.** A `deny` entry is a tmpfs over the path and
+  gets no Landlock rule of its own. Under a read-only mount, or outside every
+  mount, the masked directory is therefore not writable (`EACCES`). The same holds
+  for intermediate directories that bwrap creates on the root tmpfs: they are
+  reached only through the root's list-only rule, so they take no entries.
+- **ABI 1 (Linux 5.13 to 5.18).** `LANDLOCK_ACCESS_FS_REFER` is an ABI 2 right and
+  is not handled there, so with `best-effort` on an ABI 1 kernel a rename or hard
+  link across directories fails with `EXDEV`, even inside `/work`. The kernel does
+  this for any ruleset without REFER, and `sbx` does not work around it.
+- **Shim failures are not silent.** The shim writes its reason to a status pipe
+  before it exits 125, and `run` reports it as `failed` (exit-code table above).
+  `best-effort` fails closed when the kernel reports the ruleset as not enforced
+  while the host has Landlock (for example an outer seccomp profile refuses
+  `landlock_*`), instead of running the payload unrestricted.
+
 **Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
 discovery), and unprivileged user namespaces. Run `sbx check` to see what this
 host provides and what to fix ([Host check](#host-check)). The integration suite
@@ -614,6 +672,84 @@ about 14 ms to every exec of the binary (the same build measured there:
 binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
 build is not the cost. CI runs on ext4 and reports the number on every run
 (report-only, with a warning at ≥ 25 ms).
+
+## Persistent sessions
+
+`sbx run --keep-alive` starts a session. The command after `--` is its
+resident, and a holder process stays alive with the session's namespaces, proxies
+and audit writer, so later commands can join it. `sbx attach` runs a command in a
+running session, and `sbx stop` ends it. Use this when a process from one call
+(a dev server, say) must stay reachable from the next. No daemon is needed.
+
+```
+sbx run --keep-alive --policy P --session-dir S -- npm run dev   # returns once the session is up
+sbx attach --policy P --session-dir S -- curl -s http://127.0.0.1:3000/
+sbx stop --session-dir S
+```
+
+- **Opt in.** Plain `sbx run` is unchanged. `--keep-alive` is the only way to
+  create a session.
+- **Same policy.** Attach refuses a policy that is not byte-identical to the
+  session's policy (rc 125, the reason on stderr). Nothing runs in that case.
+- **Each call is a sandbox.** Every attached call gets its own bwrap, with its
+  own pid namespace, mounts and seccomp filter, built as for `sbx run`. Calls
+  and the resident share the session's network namespace, its localhost ports
+  and its abstract unix sockets (their namespace is the network namespace). That
+  sharing is what makes a dev server reachable, and it is a documented exception
+  to isolation (S19, R31).
+- **Landlock.** `run --keep-alive --landlock MODE [--landlock-bind-tcp PORT]…`
+  sets the optional Landlock layer for the resident and for every attached call,
+  through the same code path as `run --landlock`. The settings are the session's:
+  the holder pins them at start, and an attach applies exactly those. `sbx attach`
+  takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
+  layer. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
+  ABI 6), the signal scope adds a second barrier behind the per-call pid namespace
+  (S19): a call cannot signal the resident or another call. The holder can still
+  end a call (on stop, or when the holder dies), because the
+  holder and the attach sit outside every call's Landlock domain (S24).
+- **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
+  run for that long. `--max-lifetime` (default 8h) ends it after that long
+  regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
+  exit ends the session too. Each end kills the resident and every running call,
+  writes their exit rows, and removes the control socket. The clock starts when
+  `run --keep-alive` starts, so setup counts toward `--max-lifetime`.
+- **Policy timeout.** The resident is not bound by the policy's `limits.timeout`.
+  Only the session lifetime (`--max-lifetime`) bounds it. Each attached call is
+  bounded by its own `--timeout`, or by `limits.timeout` when that is absent.
+- **Output.** The holder's output (the resident's stdout and stderr) goes to
+  `S/holder.log`, not to the caller, and it is bounded by `limits.output_bytes`.
+  Attached calls print to the caller as in `sbx run`.
+- **Death.** If the holder is killed, the resident and every attached call die
+  too (S20). A later `sbx run --keep-alive` on the same directory starts a new
+  session.
+- **Transparent mode only.** `run --keep-alive` refuses to start a session whose
+  policy is not `transparent` (rc 125, before anything runs). It also refuses a
+  host that falls back to explicit mode, because then no nftables rules exist for
+  an attach to join. Attach keeps its own refusal for a session in that state.
+- **Control socket.** `sbx.ctl` lives in the session directory and is reachable
+  only by the same uid on the host. The sandbox cannot reach it: the session root
+  is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
+  path that is or contains the session directory is refused, lexically by the
+  launch builder and through a symlink by the pre-launch guard, for `run` and for
+  every attach call (R35, closed). A same-uid
+  client can hold the control loop for up to 2 s per connection, in batches of
+  8 connections per wake (R34). Each connection has one 2 s deadline for its
+  request and its reply.
+- **Audit.** With `--audit`, the session writes one file. Each call's exit row
+  carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
+  rows carry no `call_id` (R30).
+
+**Exit codes**
+
+| command | rc | meaning |
+|---|---|---|
+| `run --keep-alive` | 0 | the session is up (the holder keeps running) |
+| `run --keep-alive` | 125 | the session could not start; the reason is on stderr |
+| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h) |
+| `attach` | the call's own rc | as in `sbx run`: 124 on `--timeout`, 128+N on a signal |
+| `attach` | 125 | refused or failed: no session, a different policy, an explicit-mode session, or the holder exited |
+| `stop` | 0 | the session is stopped, or nothing was running |
+| `stop` | 125 | the holder refused the stop or could not be reached |
 
 ## Garbage collection
 

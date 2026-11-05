@@ -343,10 +343,40 @@ pub fn bwrap(status: &BwrapStatus) -> Capability {
     }
 }
 
+/// The detail text of an available Landlock ABI `n` (issue #19): which parts of
+/// the `--landlock` layer the kernel provides (`crate::landlock` module docs
+/// point 5), and the ABI each missing part needs. Pure.
+pub fn landlock_detail(n: u32) -> String {
+    const PARTS: [(u32, &str); 3] = [(1, "filesystem"), (4, "TCP bind"), (6, "signal scope")];
+    let available: Vec<&str> = PARTS
+        .iter()
+        .filter(|(need, _)| n >= *need)
+        .map(|(_, name)| *name)
+        .collect();
+    let missing: Vec<String> = PARTS
+        .iter()
+        .filter(|(need, _)| n < *need)
+        .map(|(need, name)| format!("{name} needs ABI {need}"))
+        .collect();
+    let mut text = format!(
+        "Landlock ABI {n} (report-only): available: {}",
+        if available.is_empty() {
+            "none".to_owned()
+        } else {
+            available.join(", ")
+        }
+    );
+    if !missing.is_empty() {
+        text.push_str("; ");
+        text.push_str(&missing.join("; "));
+    }
+    text
+}
+
 /// The report-only `landlock` item (never limits the network mode).
 pub fn landlock(l: &Landlock) -> Capability {
     let (status, detail, fix) = match l {
-        Landlock::Abi(n) => (Status::Ok, format!("Landlock ABI {n} (report-only)"), None),
+        Landlock::Abi(n) => (Status::Ok, landlock_detail(*n), None),
         Landlock::Errno(libc::ENOSYS) => (
             Status::Warn,
             L_ENOSYS.0.to_owned(),
@@ -1283,7 +1313,18 @@ mod tests {
     fn landlock_rows() {
         let abi = landlock(&Landlock::Abi(7));
         assert_eq!(abi.status, Status::Ok);
-        assert_eq!(abi.detail, "Landlock ABI 7 (report-only)");
+        assert_eq!(
+            abi.detail,
+            "Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope"
+        );
+        assert_eq!(
+            landlock_detail(4),
+            "Landlock ABI 4 (report-only): available: filesystem, TCP bind; signal scope needs ABI 6"
+        );
+        assert_eq!(
+            landlock_detail(1),
+            "Landlock ABI 1 (report-only): available: filesystem; TCP bind needs ABI 4; signal scope needs ABI 6"
+        );
         assert_eq!(abi.impact, None);
         let enosys = landlock(&Landlock::Errno(libc::ENOSYS));
         assert_eq!(enosys.status, Status::Warn);

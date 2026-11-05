@@ -58,8 +58,13 @@
 //!    `run` hands through) survives hygiene, and it is validated before any
 //!    namespace work. Issue #34 adds the hidden `--seccomp-fd N` (the sealed
 //!    socket-family program memfd bwrap reads as `--seccomp`), validated the
-//!    same way and content-checked against this binary's own program. The only
-//!    fds above 2 that survive hygiene are `--keep-fd` and `--seccomp-fd`. The signal mask is reset
+//!    same way and content-checked against this binary's own program. Issue #19
+//!    adds the hidden `--exe-fd N` (sbx's own executable, opened by `run` for the
+//!    Landlock shim; passed only under `--landlock`), validated as the same file
+//!    as `/proc/self/exe`. Round 3 adds the hidden `--status-fd S` (the shim's
+//!    status pipe write end, `run --landlock` only). The only fds above 2 that
+//!    survive hygiene are `--keep-fd`, `--seccomp-fd`, `--exe-fd` and
+//!    `--status-fd`. The signal mask is reset
 //!    first thing: std does not reset the blocked mask across spawn, and
 //!    `run` blocks TERM/INT/HUP/QUIT for its signalfd.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
@@ -327,7 +332,7 @@ pub fn run_init(args: InitArgs) -> ExitCode {
             // message (no stderr parsing). Best effort — the staged stderr
             // line below is printed regardless, so standalone use is
             // unchanged.
-            if err.stage().reports_to_parent() {
+            if err.stage().reports_to_parent() && args.fd >= 0 {
                 fdpass::send_failure(args.fd, &err);
             }
             eprintln!("{err}");
@@ -351,6 +356,12 @@ pub struct InitArgs {
     /// The sealed seccomp-program memfd to keep for bwrap (`--seccomp-fd`,
     /// issue #34). Optional for direct `__init` callers; `run` always passes it.
     pub seccomp_fd: Option<RawFd>,
+    /// sbx's own executable, kept for the Landlock shim (`--exe-fd`, issue
+    /// #19). `Some` only when `run --landlock` is on.
+    pub exe_fd: Option<RawFd>,
+    /// The shim's status pipe write end (`--status-fd`, issue #19 M1). `Some`
+    /// only when `run --landlock` is on.
+    pub status_fd: Option<RawFd>,
     /// Expected parent pid (`--parent-pid`, m6).
     pub parent_pid: Option<i32>,
     /// The weakest network mode the caller accepts — the policy's own mode
@@ -359,6 +370,10 @@ pub struct InitArgs {
     pub min_mode: NetworkMode,
     /// Hidden fail-only test driver (`--test-break-rules`).
     pub test_break_rules: bool,
+    /// Issue #18: `Some((user, net))` selects the join pipeline. The two fds
+    /// are namespace descriptors of a live session (`--join-user`, `--join-net`);
+    /// `fd` is unused (pass -1).
+    pub join: Option<(RawFd, RawFd)>,
     /// The payload argv, exec'd last.
     pub cmd: Vec<OsString>,
 }
@@ -374,6 +389,9 @@ pub(crate) fn fallback_allowed(min_mode: NetworkMode) -> bool {
 /// sequences them. Returns `Err(exec_payload(..))` when exec fails; `Ok`
 /// would mean execvp returned success, which is impossible.
 fn pipeline(args: &InitArgs) -> Result<(), InitError> {
+    if let Some((user, net)) = args.join {
+        return join_pipeline(args, user, net);
+    }
     let fd = args.fd;
     arm_parent_death(args.parent_pid)?; // m6: first, so a dying parent takes us with it
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
@@ -383,6 +401,14 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     if let Some(seccomp) = args.seccomp_fd {
         validate_seccomp_fd(seccomp, fd, args.keep_fd)?; // Stage::Control (issue #34)
     }
+    if let Some(exe) = args.exe_fd {
+        validate_exe_fd(exe, fd, args.keep_fd, args.seccomp_fd)?; // Stage::Control (issue #19)
+    }
+    if let Some(status) = args.status_fd {
+        validate_status_fd(status, fd, args.keep_fd, args.seccomp_fd, args.exe_fd)?; // Stage::Control (issue #19 M1)
+    }
+    // m4: the exe and status fds are only meaningful inside the shim's own argv.
+    validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?; // Stage::Control
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
     netns::write_id_maps(ids)?; // Stage::Idmap
     netns::configure_netns()?; // Stage::Netns
@@ -428,11 +454,122 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
 }
 
-/// The fds that survive [`fd_hygiene`] on purpose (issue #10 and #34): the
-/// bwrap info pipe and the seccomp program memfd. Both are consumed by bwrap
-/// before the payload runs; both were validated in the control stage.
+/// The join pipeline of a persistent-session call (issue #18, design point 4).
+///
+/// Stages, in order: arm the parent-death signal; validate the namespace and
+/// kept descriptors; join the session's user namespace and then its network
+/// namespace; re-verify the session's nftables ruleset from inside the joined
+/// namespace (fail closed before any payload runs); hygiene; exec the call's
+/// bwrap. The join reports failures under the existing `netns` stage and the
+/// re-verification under `nft-verify`: the stage vocabulary is pinned on the
+/// wire, so no new stage is added (issue #18 deviation).
+fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitError> {
+    arm_parent_death(args.parent_pid)?;
+    validate_ns_fd(user, "user")?;
+    validate_ns_fd(net, "net")?;
+    if net == user {
+        return Err(InitError::new(
+            Stage::Control,
+            "--join-net must differ from --join-user",
+        ));
+    }
+    if let Some(keep) = args.keep_fd {
+        validate_keep_fd(keep, user)?;
+        if keep == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--keep-fd must differ from --join-net",
+            ));
+        }
+    }
+    if let Some(seccomp) = args.seccomp_fd {
+        validate_seccomp_fd(seccomp, user, args.keep_fd)?;
+        if seccomp == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--seccomp-fd must differ from --join-net",
+            ));
+        }
+    }
+    // The Landlock shim's descriptors (issue #56), validated as the plain pipeline
+    // validates them: a call under the session's layer needs them as the resident
+    // does.
+    if let Some(exe) = args.exe_fd {
+        validate_exe_fd(exe, user, args.keep_fd, args.seccomp_fd)?;
+        if exe == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--exe-fd must differ from --join-net",
+            ));
+        }
+    }
+    if let Some(status) = args.status_fd {
+        validate_status_fd(status, user, args.keep_fd, args.seccomp_fd, args.exe_fd)?;
+        if status == net {
+            return Err(InitError::new(
+                Stage::Control,
+                "--status-fd must differ from --join-net",
+            ));
+        }
+    }
+    validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?;
+    crate::run::keepalive::join::join_namespaces(user, net).map_err(|err| {
+        InitError::new(Stage::Netns, format!("join the session namespaces: {err}"))
+            .with_errno(err.raw_os_error())
+    })?;
+    // Review 4: the namespace descriptors have served their purpose. Close them
+    // here, rather than leaving it to the hygiene scan. They were validated as
+    // distinct from the kept fds above, so no kept descriptor is closed.
+    // SAFETY: both are open descriptors this process received for the join and
+    // does not use again.
+    unsafe {
+        libc::close(user);
+        libc::close(net);
+    }
+    let mut sock = NetlinkSocket::new();
+    rules::verify_dump(&mut sock)?; // Stage::NftVerify: the session's rules, now
+    drop(sock);
+    fd_hygiene(-1, &keep_set(args));
+    Err(exec_payload(&args.cmd))
+}
+
+/// `--join-user` / `--join-net` must be open namespace descriptors of the
+/// matching kind (`user:[…]` / `net:[…]`), checked before any setns.
+fn validate_ns_fd(fd: RawFd, kind: &str) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if fd <= 2 {
+        return Err(fail(format!("--join-{kind} {fd} must be greater than 2")));
+    }
+    // SAFETY: F_GETFD takes no pointers and only reads the descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(fail(format!(
+            "--join-{kind} {fd} is not an open descriptor: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map_err(|err| fail(format!("--join-{kind} {fd} cannot be inspected: {err}")))?;
+    let text = link.to_string_lossy();
+    if !text.starts_with(&format!("{kind}:[")) {
+        return Err(fail(format!(
+            "--join-{kind} {fd} is not a {kind} namespace ({text})"
+        )));
+    }
+    Ok(())
+}
+
+/// The fds that survive [`fd_hygiene`] on purpose (issue #10, #34 and #19): the
+/// bwrap info pipe, the seccomp program memfd and, with `--landlock`, sbx's own
+/// executable for the shim. The first two are consumed by bwrap before the
+/// payload runs; the executable is closed by the shim itself. All were
+/// validated in the control stage.
 fn keep_set(args: &InitArgs) -> Vec<RawFd> {
-    args.keep_fd.into_iter().chain(args.seccomp_fd).collect()
+    args.keep_fd
+        .into_iter()
+        .chain(args.seccomp_fd)
+        .chain(args.exe_fd)
+        .chain(args.status_fd)
+        .collect()
 }
 
 /// Validate `--fd` before any namespace work: a bad control fd fails fast
@@ -629,6 +766,189 @@ fn validate_seccomp_fd(
     Ok(())
 }
 
+/// Issue #19: `--exe-fd` is sbx's own executable, opened by `run` so the
+/// Landlock shim can be exec'd through `/proc/self/fd/N` inside the sandbox.
+/// Validated before any namespace work: above stdio, distinct from the other
+/// inherited fds, a regular file, and the same file (`st_dev` and `st_ino`) as
+/// `/proc/self/exe` in this process, so a substituted file cannot be the shim.
+fn validate_exe_fd(
+    exe: RawFd,
+    control: RawFd,
+    keep: Option<RawFd>,
+    seccomp: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if exe <= 2 {
+        return Err(fail(format!("--exe-fd {exe} must be greater than 2")));
+    }
+    if exe == control {
+        return Err(fail(format!("--exe-fd {exe} must differ from --fd")));
+    }
+    if keep == Some(exe) {
+        return Err(fail(format!("--exe-fd {exe} must differ from --keep-fd")));
+    }
+    if seccomp == Some(exe) {
+        return Err(fail(format!(
+            "--exe-fd {exe} must differ from --seccomp-fd"
+        )));
+    }
+    // SAFETY: fstat on a number we were handed; the result is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(exe, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--exe-fd {exe} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(fail(format!("--exe-fd {exe} is not a regular file")));
+    }
+    // SAFETY: stat on the fixed path /proc/self/exe; the result is only read.
+    let mut me: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(c"/proc/self/exe".as_ptr(), &mut me) } != 0 {
+        return Err(fail(format!(
+            "cannot stat /proc/self/exe: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if st.st_dev != me.st_dev || st.st_ino != me.st_ino {
+        return Err(fail(format!(
+            "--exe-fd {exe} is not this sbx executable (/proc/self/exe)"
+        )));
+    }
+    Ok(())
+}
+
+/// Issue #19 M1: `--status-fd` is the write end of the shim's status pipe. It must
+/// be a pipe open for writing, distinct from every other inherited descriptor, so
+/// a shim failure reason can only reach the run that created the pipe.
+fn validate_status_fd(
+    status: RawFd,
+    control: RawFd,
+    keep: Option<RawFd>,
+    seccomp: Option<RawFd>,
+    exe: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if status <= 2 {
+        return Err(fail(format!("--status-fd {status} must be greater than 2")));
+    }
+    if status == control {
+        return Err(fail(format!("--status-fd {status} must differ from --fd")));
+    }
+    if keep == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --keep-fd"
+        )));
+    }
+    if seccomp == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --seccomp-fd"
+        )));
+    }
+    if exe == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --exe-fd"
+        )));
+    }
+    // SAFETY: fstat/fcntl on a number we were handed; the results are only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(status, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--status-fd {status} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(fail(format!("--status-fd {status} is not a pipe")));
+    }
+    let flags = unsafe { libc::fcntl(status, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(fail(format!(
+            "--status-fd {status} is not open for writing"
+        )));
+    }
+    Ok(())
+}
+
+/// Issue #19 m4 (round 3, item 1): the bwrap argv's own `--`, the separator
+/// bwrap's layout emits before the payload (argv.rs element 14). Found by walking
+/// bwrap's flags with their arities, never by searching: a payload argument that
+/// is `--`, or a `--setenv` value that is `--`, is never taken for the separator.
+/// `None` when a flag is not one the layout emits (fail closed).
+fn bwrap_separator(argv: &[OsString]) -> Option<usize> {
+    let mut i = 1;
+    while i < argv.len() {
+        let arity = match argv[i].to_str()? {
+            "--" => return Some(i),
+            "--unshare-user"
+            | "--unshare-pid"
+            | "--unshare-ipc"
+            | "--unshare-uts"
+            | "--unshare-cgroup-try"
+            | "--disable-userns"
+            | "--die-with-parent"
+            | "--new-session"
+            | "--clearenv" => 0,
+            "--cap-drop" | "--hostname" | "--info-fd" | "--seccomp" | "--proc" | "--dev"
+            | "--tmpfs" | "--chdir" => 1,
+            "--ro-bind" | "--bind" | "--symlink" | "--setenv" => 2,
+            _ => return None,
+        };
+        i += 1 + arity;
+    }
+    None
+}
+
+/// Issue #19 m4 (round 3, item 1): an exe or status fd is only meaningful in the
+/// Landlock shim's own argv. `--exe-fd E` needs the shim right after bwrap's own
+/// `--`: `/proc/self/fd/E __landlock`. `--status-fd S` needs `--exe-fd` and must
+/// appear in the shim head, between `__landlock` and the shim's own `--`. A shim
+/// pair that appears only in the payload's arguments does not count.
+pub(crate) fn validate_shim_command(
+    cmd: &[OsString],
+    exe: Option<RawFd>,
+    status: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    let Some(exe) = exe else {
+        if let Some(status) = status {
+            return Err(fail(format!(
+                "--status-fd {status} is given without --exe-fd"
+            )));
+        }
+        return Ok(());
+    };
+    let not_shim = || {
+        fail(format!(
+            "--exe-fd {exe} is given but the command is not the Landlock shim (/proc/self/fd/{exe} __landlock)"
+        ))
+    };
+    let separator = bwrap_separator(cmd).ok_or_else(not_shim)?;
+    let head = format!("/proc/self/fd/{exe}");
+    let shim_program = cmd.get(separator + 1).and_then(|w| w.to_str());
+    let shim_name = cmd.get(separator + 2).and_then(|w| w.to_str());
+    if shim_program != Some(head.as_str()) || shim_name != Some("__landlock") {
+        return Err(not_shim());
+    }
+    if let Some(status) = status {
+        // The shim's own argv runs from its name to its own `--` (or the end).
+        let shim_args = &cmd[separator + 3..];
+        let end = shim_args
+            .iter()
+            .position(|w| w.to_str() == Some("--"))
+            .unwrap_or(shim_args.len());
+        let text = status.to_string();
+        let found = shim_args[..end]
+            .windows(2)
+            .any(|w| w[0].to_str() == Some("--status-fd") && w[1].to_str() == Some(text.as_str()));
+        if !found {
+            return Err(fail(format!(
+                "--status-fd {status} is given but the shim head has no `--status-fd {status}` argument"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Issue #10 (Q13): `--keep-fd` is the bwrap info pipe `run` hands through.
 /// Validated in the control stage so a bad value fails before any namespace
 /// work. The write end must be a pipe open for writing (bwrap writes the
@@ -662,7 +982,7 @@ fn validate_keep_fd(keep: RawFd, control: RawFd) -> Result<(), InitError> {
 
 /// Pure core of [`fd_hygiene`]'s close set: the scanned fds minus `keep`
 /// (the one fd that survives the re-exec on purpose; issue #10).
-fn fds_to_close(scan: Vec<RawFd>, keep: &[RawFd]) -> Vec<RawFd> {
+pub(crate) fn fds_to_close(scan: Vec<RawFd>, keep: &[RawFd]) -> Vec<RawFd> {
     scan.into_iter().filter(|fd| !keep.contains(fd)).collect()
 }
 
@@ -722,7 +1042,7 @@ fn arm_parent_death(expected_parent: Option<i32>) -> Result<(), InitError> {
 /// Pure collector for [`fd_hygiene`] (unit-testable without closing
 /// anything): the sorted, deduped open fds above stdio (> 2), or `None`
 /// when `/proc/self/fd` is unreadable (the documented degrade path).
-fn scan_fds_above_stdio() -> Option<Vec<RawFd>> {
+pub(crate) fn scan_fds_above_stdio() -> Option<Vec<RawFd>> {
     let dir = std::fs::read_dir("/proc/self/fd").ok()?;
     let mut fds: Vec<RawFd> = dir
         .filter_map(|entry| entry.ok())
@@ -830,9 +1150,12 @@ mod tests {
 
     fn args(fd: RawFd, keep_fd: Option<RawFd>, parent_pid: Option<i32>) -> InitArgs {
         InitArgs {
+            join: None,
             fd,
             keep_fd,
             seccomp_fd: None,
+            exe_fd: None,
+            status_fd: None,
             parent_pid,
             min_mode: NetworkMode::Transparent,
             test_break_rules: false,
@@ -1192,6 +1515,259 @@ mod tests {
         // everything else in the scan is closed.
         assert_eq!(fds_to_close(vec![3, 5, 9, 12], &[5, 9]), vec![3, 12]);
         assert_eq!(fds_to_close(vec![4, 5], &[5, 9]), vec![4]);
+    }
+
+    #[test]
+    fn validate_exe_fd_table() {
+        // Issue #19: the shim's executable fd. Stage Control, pinned reasons.
+        let msg = |e: RawFd, c: RawFd, k: Option<RawFd>, s: Option<RawFd>| {
+            validate_exe_fd(e, c, k, s)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2, 999, None, None),
+            "sbx __init: control: --exe-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(7, 7, None, None),
+            "sbx __init: control: --exe-fd 7 must differ from --fd"
+        );
+        assert_eq!(
+            msg(7, 999, Some(7), None),
+            "sbx __init: control: --exe-fd 7 must differ from --keep-fd"
+        );
+        assert_eq!(
+            msg(7, 999, None, Some(7)),
+            "sbx __init: control: --exe-fd 7 must differ from --seccomp-fd"
+        );
+        assert_eq!(
+            msg(998, 999, None, None),
+            "sbx __init: control: --exe-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        // A pipe is open but not a regular file.
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-element array; both ends are closed below.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(
+            msg(p[1], 999, None, None),
+            format!(
+                "sbx __init: control: --exe-fd {} is not a regular file",
+                p[1]
+            )
+        );
+        // SAFETY: closing the pipe ends created above.
+        unsafe {
+            libc::close(p[0]);
+            libc::close(p[1]);
+        }
+        // A regular file that is not this executable is refused; this
+        // process's own executable (the same inode as /proc/self/exe) is not.
+        let other = std::fs::File::open("/proc/self/status").expect("open");
+        let raw = other.as_raw_fd();
+        assert_eq!(
+            msg(raw, 999, None, None),
+            format!(
+                "sbx __init: control: --exe-fd {raw} is not this sbx executable (/proc/self/exe)"
+            )
+        );
+        let me = std::fs::File::open("/proc/self/exe").expect("open self");
+        assert!(validate_exe_fd(me.as_raw_fd(), 999, None, None).is_ok());
+    }
+
+    #[test]
+    fn validate_shim_command_table() {
+        // Issue #19 m4 (round 3, item 1): the shim pair must sit right after bwrap's
+        // own `--`, and `--status-fd` only in the shim head. Pinned reasons.
+        let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let plain = words(&["/bin/bwrap", "--chdir", "/work", "--", "/bin/true"]);
+        assert!(validate_shim_command(&plain, None, None).is_ok());
+        let not_shim = "sbx __init: control: --exe-fd 9 is given but the command is not the Landlock shim (/proc/self/fd/9 __landlock)";
+        assert_eq!(
+            validate_shim_command(&plain, Some(9), None)
+                .expect_err("no shim")
+                .to_string(),
+            not_shim
+        );
+        // The shim pair only inside the payload's own arguments: not the shim.
+        let payload_only = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/bin/sh",
+            "-c",
+            "/proc/self/fd/9",
+            "__landlock",
+        ]);
+        assert_eq!(
+            validate_shim_command(&payload_only, Some(9), None)
+                .expect_err("payload args")
+                .to_string(),
+            not_shim
+        );
+        // A `--setenv` value of `--` is not the separator (the walk knows arities).
+        let setenv_dash = words(&[
+            "/bin/bwrap",
+            "--setenv",
+            "X",
+            "--",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(validate_shim_command(&setenv_dash, Some(9), None).is_ok());
+        // A flag the layout never emits: fail closed.
+        let unknown = words(&[
+            "/bin/bwrap",
+            "--weird",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+        ]);
+        assert_eq!(
+            validate_shim_command(&unknown, Some(9), None)
+                .expect_err("unknown flag")
+                .to_string(),
+            not_shim
+        );
+        // The right shim, wrong number.
+        let head = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(validate_shim_command(&head, Some(9), None).is_ok());
+        assert!(validate_shim_command(&head, Some(8), None).is_err());
+        // The status fd: needs --exe-fd, and must be in the shim head.
+        assert_eq!(
+            validate_shim_command(&plain, None, Some(13))
+                .expect_err("status without exe")
+                .to_string(),
+            "sbx __init: control: --status-fd 13 is given without --exe-fd"
+        );
+        let with_status = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--status-fd",
+            "13",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(validate_shim_command(&with_status, Some(9), Some(13)).is_ok());
+        assert_eq!(
+            validate_shim_command(&with_status, Some(9), Some(14))
+                .expect_err("wrong status fd")
+                .to_string(),
+            "sbx __init: control: --status-fd 14 is given but the shim head has no `--status-fd 14` argument"
+        );
+        // A `--status-fd` only in the payload's arguments is not the shim head.
+        let status_in_payload = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+            "--status-fd",
+            "13",
+        ]);
+        assert_eq!(
+            validate_shim_command(&status_in_payload, Some(9), Some(13))
+                .expect_err("status in payload")
+                .to_string(),
+            "sbx __init: control: --status-fd 13 is given but the shim head has no `--status-fd 13` argument"
+        );
+    }
+
+    #[test]
+    fn validate_status_fd_table() {
+        // M1: a pipe open for writing, distinct from every other inherited fd.
+        let msg = |st: RawFd| {
+            validate_status_fd(st, 999, None, None, None)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2),
+            "sbx __init: control: --status-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(998),
+            "sbx __init: control: --status-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-element array; both ends are closed below.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (rd, wr) = (p[0], p[1]);
+        assert_eq!(
+            validate_status_fd(wr, 999, Some(wr), None, None)
+                .expect_err("keep")
+                .to_string(),
+            format!("sbx __init: control: --status-fd {wr} must differ from --keep-fd")
+        );
+        assert_eq!(
+            validate_status_fd(rd, 999, None, None, None)
+                .expect_err("read end")
+                .to_string(),
+            format!("sbx __init: control: --status-fd {rd} is not open for writing")
+        );
+        assert!(validate_status_fd(wr, 999, None, None, None).is_ok());
+        // SAFETY: closing the pipe ends created above.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        let file = std::fs::File::open("/dev/null").expect("open");
+        assert_eq!(
+            validate_status_fd(file.as_raw_fd(), 999, None, None, None)
+                .expect_err("not a pipe")
+                .to_string(),
+            format!(
+                "sbx __init: control: --status-fd {} is not a pipe",
+                file.as_raw_fd()
+            )
+        );
+    }
+
+    #[test]
+    fn keep_set_includes_exe_fd() {
+        let mut all = args(7, Some(5), None);
+        all.seccomp_fd = Some(9);
+        all.exe_fd = Some(11);
+        assert_eq!(keep_set(&all), vec![5, 9, 11]);
+        all.status_fd = Some(13);
+        assert_eq!(keep_set(&all), vec![5, 9, 11, 13]);
+        let mut exe_only = args(7, None, None);
+        exe_only.exe_fd = Some(11);
+        assert_eq!(keep_set(&exe_only), vec![11]);
     }
 
     #[test]
