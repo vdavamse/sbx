@@ -395,7 +395,6 @@ pub fn landlock_detail(n: u32) -> String {
     text
 }
 
-/// The report-only `landlock` item (never limits the network mode).
 /// The `conntrack` row (issue #43): report-only, never a mode limit. The
 /// sandbox's nat REDIRECT needs conntrack; its entries live in the sandbox's
 /// own network namespace but cost host kernel memory, and `nf_conntrack_max`
@@ -428,6 +427,7 @@ pub fn conntrack(c: &Conntrack) -> Capability {
     }
 }
 
+/// The report-only `landlock` item (never limits the network mode).
 pub fn landlock(l: &Landlock) -> Capability {
     let (status, detail, fix) = match l {
         Landlock::Abi(n) => (Status::Ok, landlock_detail(*n), None),

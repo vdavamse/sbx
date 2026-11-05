@@ -238,8 +238,10 @@ pub struct Build<'a> {
 }
 
 /// Size of each deny `--tmpfs` mask (issue #43): a mask only hides a path,
-/// so 1 MiB bounds what a payload can store there (an unsized tmpfs holds up
-/// to half of RAM).
+/// so 1 MiB bounds the file DATA a payload can store there (an unsized tmpfs
+/// holds up to half of RAM). It does not bound the inode count (`nr_inodes`
+/// keeps its default; bwrap has no flag for it), so many empty files still
+/// cost kernel memory.
 pub const DENY_TMPFS_BYTES: u64 = 1 << 20;
 
 /// The first bwrap version with `--size` (0.10.0).

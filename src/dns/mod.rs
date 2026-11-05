@@ -459,6 +459,15 @@ impl DnsServer {
                 None,
             );
         }
+        // Issue #43: past the run's name cap an unmapped name is NXDOMAIN for
+        // every qtype, so an AAAA (NODATA otherwise) cannot contradict the A.
+        if self.map.capped_out(&name) {
+            return (
+                DnsVerdict::Error(DnsFailed::PoolExhausted),
+                ResponseCode::NXDomain,
+                None,
+            );
+        }
         if !wire::is_a_query(&parsed.query) {
             let qtype = question.qtype;
             return (
@@ -1173,6 +1182,26 @@ mod tests {
         let (again, _) = handle(&server, &a_query(23, names[0]));
         assert_eq!(again.verdict, a.verdict, "existing mapping keeps answering");
         assert!(matches!(b.verdict, DnsVerdict::Answered { .. }));
+    }
+
+    /// Review of #65: past the cap, every qtype of an unmapped name is
+    /// NXDOMAIN (an AAAA must not answer NODATA while the A says the name
+    /// does not exist); a mapped name's AAAA stays NODATA.
+    #[test]
+    fn name_cap_nxdomain_for_every_qtype() {
+        let limits = DnsLimits { max_names: 1 };
+        let (server, _map, _sink) = server_with(&["allowed.test"], limits);
+        let (first, _) = handle(&server, &a_query(30, "a.allowed.test"));
+        assert!(matches!(first.verdict, DnsVerdict::Answered { .. }));
+        let (aaaa, reply) = handle(&server, &query(31, &dotted("b.allowed.test"), 28, 1, None));
+        assert_eq!(aaaa.verdict, DnsVerdict::Error(DnsFailed::PoolExhausted));
+        assert_eq!(rcode_of(&reply.expect("reply")), 3);
+        let (mapped, reply) = handle(&server, &query(32, &dotted("a.allowed.test"), 28, 1, None));
+        assert!(
+            matches!(mapped.verdict, DnsVerdict::NoData { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(rcode_of(&reply.expect("reply")), 0);
     }
 
     #[test]

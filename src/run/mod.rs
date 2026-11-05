@@ -527,13 +527,11 @@ fn check_bwrap_version(
     // The usable version is returned: the argv depends on it (issue #43,
     // deny-mask `--size` from bwrap 0.10).
     let classified = classify_version_output(bwrap, status.success(), status.code(), &text);
-    match (&classified, classified.run_reason()) {
-        (BwrapStatus::Ok { version, .. }, None) => Ok(*version),
-        (_, reason) => Err(RunError::new(
-            reason.unwrap_or_else(|| "unsupported bwrap version".to_owned()),
-        )
-        .into()),
-    }
+    let BwrapStatus::Ok { version, .. } = classified else {
+        // run_reason() is Some for every non-Ok status.
+        return Err(RunError::new(classified.run_reason().unwrap_or_default()).into());
+    };
+    Ok(version)
 }
 
 /// stdin policy (§8): inherit when not a tty; pump when the tty is ours in the

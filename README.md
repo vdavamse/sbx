@@ -508,18 +508,21 @@ processes, tmpfs sizes or the total disk use. See
 policy field:
 
 - **Deny masks are sized.** With bubblewrap 0.10 or later, each `deny` tmpfs is
-  capped at 1 MiB (`--size`), so a payload cannot fill RAM through a writable
-  mask. Older bubblewrap has no `--size`: the masks stay unsized, and
+  capped at 1 MiB of file data (`--size`), so a payload cannot fill RAM with
+  file contents through a writable mask (the inode count is not capped). A
+  tool that writes more than 1 MiB into a denied directory now gets `ENOSPC`.
+  Older bubblewrap has no `--size`: the masks stay unsized, and
   `sbx check --policy P --host` warns (`deny-tmpfs-size`).
 - **Concurrent proxy connections.** At most 256 connections are open through the
   proxies at once (both listeners together); set another value with
   `sbx run --max-connections N` (1 to 65536). A connection over the cap is
   closed unread and gets one `deny` audit row whose reason starts with
-  `conn_limit:`.
+  `conn_limit:` (these rows have no budget, unlike `dns` rows). A
+  `--keep-alive` session shares the cap across its calls.
 - **Fake-IP names.** A run maps at most 4096 distinct names (a `--keep-alive`
   session shares one map across its calls). A new name past that gets
-  NXDOMAIN, with a `dns` audit row under the run's DNS row budget; names
-  already mapped keep answering.
+  NXDOMAIN for every query type, with a `dns` audit row under the run's DNS
+  row budget; names already mapped keep answering.
 
 `sbx check` also reports the host's conntrack table (`conntrack`, report-only).
 The nat redirect in the sandbox needs conntrack; on current kernels each network
