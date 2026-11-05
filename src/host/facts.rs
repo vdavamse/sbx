@@ -141,6 +141,32 @@ pub struct HostFacts {
     pub landlock: Landlock,
     pub bwrap: BwrapStatus,
     pub probe: ProbeOutcome,
+    pub conntrack: Conntrack,
+}
+
+const SYSCTL_CONNTRACK_COUNT: &str = "/proc/sys/net/netfilter/nf_conntrack_count";
+const SYSCTL_CONNTRACK_MAX: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
+
+/// The conntrack table as this process's network namespace sees it (issue
+/// #43, report-only). `None` = unreadable (the `nf_conntrack` module is not
+/// loaded, or `/proc/sys/net/netfilter` is hidden).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Conntrack {
+    /// `nf_conntrack_count`: entries in this network namespace.
+    pub count: Option<i64>,
+    /// `nf_conntrack_max`: the limit each network namespace is checked against.
+    pub max: Option<i64>,
+}
+
+impl Conntrack {
+    /// Read both sysctls.
+    pub fn read() -> Self {
+        let get = |path: &str| fs::read_to_string(path).ok().and_then(|t| parse_sysctl(&t));
+        Self {
+            count: get(SYSCTL_CONNTRACK_COUNT),
+            max: get(SYSCTL_CONNTRACK_MAX),
+        }
+    }
 }
 
 /// Gathering options (CLI hidden flag, Q6 precedent).
@@ -165,6 +191,7 @@ pub fn gather(opts: &GatherOptions) -> HostFacts {
         landlock,
         bwrap,
         probe,
+        conntrack: Conntrack::read(),
     }
 }
 

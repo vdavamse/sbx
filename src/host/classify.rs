@@ -17,7 +17,7 @@ use crate::init::fdpass::StagedFailure;
 use crate::init::probe::{KeepAlivePhase, ProbeReport, ProbeStep, StepStatus};
 use crate::policy::{NetworkMode, Policy};
 
-use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
+use super::facts::{Conntrack, HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
 use super::{
     CapId, Capability, EffectiveMode, PolicyCheck, PolicyItem, REPORT_VERSION, Report, Status,
 };
@@ -396,6 +396,38 @@ pub fn landlock_detail(n: u32) -> String {
 }
 
 /// The report-only `landlock` item (never limits the network mode).
+/// The `conntrack` row (issue #43): report-only, never a mode limit. The
+/// sandbox's nat REDIRECT needs conntrack; its entries live in the sandbox's
+/// own network namespace but cost host kernel memory, and `nf_conntrack_max`
+/// is the limit each namespace's count is checked against (R14).
+pub fn conntrack(c: &Conntrack) -> Capability {
+    let (status, detail) = match (c.count, c.max) {
+        (Some(count), Some(max)) => (
+            Status::Ok,
+            format!(
+                "conntrack table: {count} of {max} entries in use in this network namespace (report-only; each sandbox namespace may grow to {max}, using host kernel memory)"
+            ),
+        ),
+        (None, Some(max)) => (
+            Status::Ok,
+            format!("conntrack limit {max} entries per network namespace (report-only; the count is not readable)"),
+        ),
+        _ => (
+            Status::Skip,
+            "conntrack table not readable (nf_conntrack not loaded or /proc/sys/net/netfilter hidden; report-only)".to_owned(),
+        ),
+    };
+    Capability {
+        id: CapId::Conntrack,
+        status,
+        detail,
+        evidence: None,
+        errno: None,
+        impact: None,
+        fix: None,
+    }
+}
+
 pub fn landlock(l: &Landlock) -> Capability {
     let (status, detail, fix) = match l {
         Landlock::Abi(n) => (Status::Ok, landlock_detail(*n), None),
@@ -635,6 +667,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
 
     slots[index(CapId::Bwrap)] = Some(bwrap(&facts.bwrap));
     slots[index(CapId::Landlock)] = Some(landlock(&facts.landlock));
+    slots[index(CapId::Conntrack)] = Some(conntrack(&facts.conntrack));
 
     let capabilities: Vec<Capability> = CapId::ALL
         .iter()
@@ -1593,12 +1626,37 @@ mod tests {
         assert_eq!(apparmor_only.detail, U_APPARMOR.0);
     }
 
+    /// Issue #43: the conntrack row is report-only (no impact, no fix) in
+    /// every state.
+    #[test]
+    fn conntrack_rows() {
+        let both = conntrack(&Conntrack {
+            count: Some(10),
+            max: Some(65_536),
+        });
+        assert_eq!(both.status, Status::Ok);
+        assert!(
+            both.detail
+                .starts_with("conntrack table: 10 of 65536 entries in use")
+        );
+        let max_only = conntrack(&Conntrack {
+            count: None,
+            max: Some(65_536),
+        });
+        assert_eq!(max_only.status, Status::Ok);
+        let none = conntrack(&Conntrack::default());
+        assert_eq!(none.status, Status::Skip);
+        for row in [both, max_only, none] {
+            assert_eq!((row.impact, row.fix), (None, None));
+        }
+    }
+
     #[test]
     fn assemble_all_ok() {
         let report = assemble(&ok_host());
         assert_eq!(report.network_mode, EffectiveMode::Transparent);
         assert_eq!(report.probe_error, None);
-        assert_eq!(report.capabilities.len(), 11);
+        assert_eq!(report.capabilities.len(), 12);
         assert!(report.capabilities.iter().all(|c| c.status == Status::Ok));
         let ids: Vec<CapId> = report.capabilities.iter().map(|c| c.id).collect();
         assert_eq!(ids, CapId::ALL);
@@ -2600,6 +2658,7 @@ mod tests {
             "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)"
         );
         assert_eq!(CapId::KeepAlive.as_str(), "keep-alive");
-        assert_eq!(CapId::ALL.last(), Some(&CapId::KeepAlive));
+        assert_eq!(CapId::ALL[CapId::ALL.len() - 2], CapId::KeepAlive);
+        assert_eq!(CapId::ALL.last(), Some(&CapId::Conntrack));
     }
 }
