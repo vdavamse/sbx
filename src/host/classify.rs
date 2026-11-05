@@ -145,7 +145,7 @@ const KA_PIDFD: (&str, &str) = (
 /// The holder stand-in's `unshare(CLONE_NEWUSER|CLONE_NEWNET)` is refused with
 /// EPERM or EACCES: nested namespace creation, not the join.
 const KA_UNSHARE: (&str, &str) = (
-    "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in; an outer seccomp or container profile, or an AppArmor profile, can deny it)",
+    "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)",
     "allow unshare(CLONE_NEWUSER|CLONE_NEWNET) for this user (a seccomp or container profile that blocks it; Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined; Docker: --security-opt seccomp=unconfined or an equivalent profile), or do not use run --keep-alive",
 );
 const KA_SETNS: (&str, &str) = (
@@ -2532,7 +2532,7 @@ mod tests {
         );
         assert_eq!(
             KA_UNSHARE.0,
-            "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in; an outer seccomp or container profile, or an AppArmor profile, can deny it)"
+            "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)"
         );
         assert_eq!(CapId::KeepAlive.as_str(), "keep-alive");
         assert_eq!(CapId::ALL.last(), Some(&CapId::KeepAlive));
