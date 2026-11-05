@@ -153,8 +153,6 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
             RunError::new(format!("cannot reach the session: {err}"))
         }
     })?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
 
     // Rule 2 of the handshake: our own pidfd travels with the Attach request.
     let self_pidfd = sys::pidfd_open(std::process::id() as libc::pid_t)
@@ -382,15 +380,21 @@ pub(crate) fn stop(session_dir: PathBuf) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE as u8);
         }
     };
-    // The holder answers after its teardown, which can take a few seconds.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
     let (op, payload) = Request::Stop.encode();
-    if let Err(err) = ctl::send_frame(&stream, op, &payload, &[]) {
+    if let Err(err) = ctl::send_frame_until(
+        &stream,
+        op,
+        &payload,
+        &[],
+        Instant::now() + Duration::from_secs(5),
+    ) {
         eprintln!("sbx stop: cannot send the stop request: {err:?}");
         return ExitCode::from(EXIT_FAILURE as u8);
     }
-    match ctl::recv_frame(&stream).and_then(|(frame, _)| Reply::decode(frame)) {
+    // The holder answers after its teardown, which can take a few seconds: the
+    // whole wait has a 120 s deadline (the client's own budget is 30 s).
+    let answer = ctl::recv_frame_until(&stream, Instant::now() + Duration::from_secs(120));
+    match answer.and_then(|(frame, _)| Reply::decode(frame)) {
         Ok(Reply::Done) => ExitCode::SUCCESS,
         Ok(Reply::Refused(reason)) => {
             eprintln!("sbx stop: {reason}");
