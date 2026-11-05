@@ -62,8 +62,10 @@
 //!    documented worst case and make `Failed::ConnectTimeout`'s `secs`
 //!    untruthful — owned by [`GuardedConnector`]), and a 1 ms→100 ms
 //!    bounded accept backoff. The two timeout scopes never nest, so the
-//!    pinned reasons never compete. No relay idle timeout and no
-//!    concurrency cap in v1 (Q7 — revisit with #10 via [`Limits`]).
+//!    pinned reasons never compete. A per-run concurrency cap
+//!    ([`Limits::max_connections`], issue #43) covers both listeners: an
+//!    accept over it is closed unread with one [`Rejected::ConnLimit`]
+//!    decision. No relay idle timeout in v1 (#29).
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
 //!    must not pass (Q1). TLS is PASSED THROUGH, never terminated (no CA in
@@ -260,7 +262,15 @@ pub struct Limits {
     pub connect_timeout: Duration,
     /// Upper bound of the transient-accept-error backoff (1 ms doubling).
     pub accept_backoff_max: Duration,
+    /// Concurrent proxied connections per run, both listeners together
+    /// (issue #43). An accept over the cap is closed at once with one
+    /// [`Rejected::ConnLimit`] decision; its slot frees when a connection
+    /// task ends. `sbx run --max-connections` sets it.
+    pub max_connections: usize,
 }
+
+/// Default of [`Limits::max_connections`] (issue #43).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -271,6 +281,7 @@ impl Default for Limits {
             decision_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             accept_backoff_max: Duration::from_millis(100),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 }
@@ -313,6 +324,9 @@ pub enum Rejected {
     OriginalDst { detail: String },
     /// The original destination port is not in `network.ports`.
     PortNotAllowed { port: u16 },
+    /// The run already holds [`Limits::max_connections`] proxied
+    /// connections (issue #43): the new one is closed unread.
+    ConnLimit { max: usize },
     /// The port IS policy-listed but has no v1 inspector (Q1) — neither
     /// 443 nor 80.
     NoInspector { port: u16 },
@@ -429,6 +443,9 @@ impl Rejected {
             }
             Rejected::PortNotAllowed { port } => {
                 format!("port {port} is not in the policy port list")
+            }
+            Rejected::ConnLimit { max } => {
+                format!("conn_limit: {max} concurrent proxy connections already open")
             }
             Rejected::NoInspector { port } => {
                 format!("no protocol inspector for port {port} in v1")
@@ -1050,6 +1067,43 @@ pub struct Proxy {
     pub connector: Arc<dyn Connector>,
     /// Caps + timeouts (module docs point 6).
     pub limits: Limits,
+    /// Connections currently held, against [`Limits::max_connections`].
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One held connection slot; dropping it frees the slot (issue #43).
+struct ConnSlot(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Proxy {
+    /// Take a connection slot, or `None` at [`Limits::max_connections`].
+    fn try_slot(&self) -> Option<ConnSlot> {
+        use std::sync::atomic::Ordering;
+        let max = self.limits.max_connections;
+        let mut n = self.active.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match self
+                .active
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(ConnSlot(Arc::clone(&self.active))),
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// Connections currently held (tests, diagnostics).
+    pub fn active_connections(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Proxy {
@@ -1061,8 +1115,12 @@ impl Proxy {
         dns_map: Arc<dyn DnsMap>,
         sink: Arc<dyn DecisionSink>,
         host_addrs: egress::HostAddrs,
+        max_connections: usize,
     ) -> Arc<Self> {
-        let limits = Limits::default();
+        let limits = Limits {
+            max_connections,
+            ..Limits::default()
+        };
         let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
         Self::new(network, dns_map, sink, connector, limits)
     }
@@ -1082,6 +1140,7 @@ impl Proxy {
             sink,
             connector,
             limits,
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 }
@@ -1097,7 +1156,23 @@ impl Proxy {
 /// transient errors (module docs point 10) and never panics. Must run on a
 /// runtime with the IO + time drivers enabled.
 pub async fn serve(listener: std::net::TcpListener, proxy: Arc<Proxy>) -> io::Result<Infallible> {
-    accept_loop(listener, proxy, handle_connection).await
+    accept_loop(listener, proxy, handle_connection, transparent_via).await
+}
+
+/// The `via` of a transparent connection refused before inspection (issue
+/// #43): the original destination when the lookup works.
+fn transparent_via(client: &TcpStream) -> Via {
+    Via::Transparent {
+        orig_dst: original_dst(client.as_raw_fd()).ok(),
+    }
+}
+
+/// The `via` of an explicit connection refused before its head was read.
+fn explicit_via(_client: &TcpStream) -> Via {
+    Via::Explicit {
+        kind: ExplicitKind::Unknown,
+        port: None,
+    }
 }
 
 /// The shared accept loop (issue #8 seam): flips the listener non-blocking
@@ -1109,6 +1184,7 @@ pub(crate) async fn accept_loop<H, Fut>(
     listener: std::net::TcpListener,
     proxy: Arc<Proxy>,
     handler: H,
+    refused_via: fn(&TcpStream) -> Via,
 ) -> io::Result<Infallible>
 where
     H: Fn(TcpStream, SocketAddr, Arc<Proxy>) -> Fut,
@@ -1121,7 +1197,25 @@ where
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 backoff = ACCEPT_BACKOFF_START;
-                tokio::spawn(handler(stream, client_addr, Arc::clone(&proxy)));
+                // Issue #43: the per-run connection cap. Over it, the
+                // connection gets its one decision row and is closed unread
+                // (dropping the stream), without spawning a task.
+                let Some(slot) = proxy.try_slot() else {
+                    proxy.sink.record(&Decision {
+                        client: client_addr,
+                        via: refused_via(&stream),
+                        name: None,
+                        verdict: Verdict::Denied(Rejected::ConnLimit {
+                            max: proxy.limits.max_connections,
+                        }),
+                    });
+                    continue;
+                };
+                let task = handler(stream, client_addr, Arc::clone(&proxy));
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    task.await;
+                });
             }
             Err(err) if accept_error_is_fatal(&err) => return Err(err),
             Err(_err) => {
@@ -1532,7 +1626,13 @@ pub async fn serve_explicit(
     listener: std::net::TcpListener,
     proxy: Arc<Proxy>,
 ) -> io::Result<Infallible> {
-    accept_loop(listener, proxy, explicit::handle_explicit_connection).await
+    accept_loop(
+        listener,
+        proxy,
+        explicit::handle_explicit_connection,
+        explicit_via,
+    )
+    .await
 }
 
 /// The fatal-accept-error classifier (module docs point 10): only a
@@ -3386,5 +3486,83 @@ mod tests {
             assert!(!redact_for_audit(raw).contains("SECRET"), "{raw}");
             assert!(!redact_opaque(raw).contains("SECRET"), "{raw}");
         }
+    }
+
+    /// Issue #43: the per-run connection cap. With room for one, a second
+    /// concurrent connection is closed unread with exactly one ConnLimit
+    /// decision; when the first ends its slot is freed and a third is
+    /// accepted.
+    #[test]
+    fn connection_cap_refuses_excess_and_frees_slots() {
+        let limits = Limits {
+            max_connections: 1,
+            ..Limits::default()
+        };
+        let connector = guarded(
+            resolve_addrs(vec![]),
+            dial_fail(io::ErrorKind::ConnectionRefused, "unused"),
+            Duration::from_secs(1),
+        );
+        let (proxy, sink) = proxy_with(&[], &[], StaticMap::new(&[]), connector, limits);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // A handler that holds its connection until the client closes it.
+        let hold = |mut stream: TcpStream, _: SocketAddr, _: Arc<Proxy>| async move {
+            let mut buf = [0u8; 16];
+            while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+        };
+        block_on(async move {
+            let serve_proxy = Arc::clone(&proxy);
+            tokio::spawn(async move {
+                let _ = accept_loop(listener, serve_proxy, hold, explicit_via).await;
+            });
+            let wait_for = |want: usize| {
+                let proxy = Arc::clone(&proxy);
+                async move {
+                    for _ in 0..500 {
+                        if proxy.active_connections() == want {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    panic!("active connections never reached {want}");
+                }
+            };
+            let first = TcpStream::connect(addr).await.expect("connect 1");
+            wait_for(1).await;
+            let mut second = TcpStream::connect(addr).await.expect("connect 2");
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(5), second.read(&mut buf))
+                .await
+                .expect("the refused connection is closed promptly");
+            assert!(
+                matches!(n, Ok(0) | Err(_)),
+                "refused connection got data: {n:?}"
+            );
+            let refused: Vec<Decision> = sink
+                .recorded()
+                .into_iter()
+                .filter(|d| matches!(d.verdict, Verdict::Denied(Rejected::ConnLimit { max: 1 })))
+                .collect();
+            assert_eq!(refused.len(), 1, "{:?}", sink.recorded());
+            assert!(
+                refused[0].reason().starts_with("conn_limit: "),
+                "{}",
+                refused[0].reason()
+            );
+            assert_eq!(proxy.active_connections(), 1);
+            drop(first);
+            wait_for(0).await;
+            let _third = TcpStream::connect(addr).await.expect("connect 3");
+            wait_for(1).await;
+            assert_eq!(
+                sink.recorded()
+                    .iter()
+                    .filter(|d| matches!(d.verdict, Verdict::Denied(Rejected::ConnLimit { .. })))
+                    .count(),
+                1,
+                "the third connection must be accepted"
+            );
+        });
     }
 }
