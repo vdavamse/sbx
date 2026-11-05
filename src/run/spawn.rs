@@ -19,6 +19,7 @@ use super::sys::Signals;
 use super::sys::{self, pollfd, ready};
 use crate::bwrap::Launch;
 use crate::init::fdpass::{AchievedMode, ListenerFds, SetupMsg, StagedFailure, recv_setup};
+use crate::init::rlimit::Rlimit;
 use crate::policy::NetworkMode;
 
 /// The descriptors `run` hands `__init`, each inherited across the one spawn:
@@ -34,18 +35,28 @@ pub(crate) struct ChildFds {
     pub status: Option<RawFd>,
 }
 
+/// The policy-derived `__init` flags (grouped to keep the spawn signatures short).
+pub(crate) struct InitFlags<'a> {
+    /// The policy's network mode: the weakest mode `__init` may fall back to.
+    pub(crate) min_mode: NetworkMode,
+    /// The hidden fail-only `--test-break-rules` driver.
+    pub(crate) test_break_rules: bool,
+    /// The policy's resource limits (issue #43), one `--rlimit` each.
+    pub(crate) rlimits: &'a [Rlimit],
+}
+
 /// The re-exec argv after the program:
 /// `__init --fd C --keep-fd I --seccomp-fd S [--exe-fd E] [--status-fd T]
-/// --parent-pid P --min-mode M [--test-break-rules] -- <argv…>` (issue #11: `M`
-/// is the policy's mode — the weakest mode `__init` may fall back to; issue #34:
-/// `S` is the sealed seccomp-program memfd `__init` verifies and hands to bwrap;
-/// issue #19: `E` is sbx's own executable, and round 3 adds `T`, the shim's
-/// status pipe write end; both are passed only under `--landlock`).
+/// --parent-pid P --min-mode M [--rlimit NAME=VALUE]… [--test-break-rules] --
+/// <argv…>` (issue #11: `M` is the policy's mode — the weakest mode `__init` may
+/// fall back to; issue #34: `S` is the sealed seccomp-program memfd `__init`
+/// verifies and hands to bwrap; issue #19: `E` is sbx's own executable, and
+/// round 3 adds `T`, the shim's status pipe write end; both are passed only
+/// under `--landlock`; issue #43: one `--rlimit` per policy resource limit).
 pub(crate) fn init_argv(
     fds: ChildFds,
     parent_pid: u32,
-    min_mode: NetworkMode,
-    test_break_rules: bool,
+    flags: &InitFlags<'_>,
     launch: &Launch,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
@@ -68,8 +79,12 @@ pub(crate) fn init_argv(
     argv.push("--parent-pid".into());
     argv.push(parent_pid.to_string().into());
     argv.push("--min-mode".into());
-    argv.push(mode_word(min_mode).into());
-    if test_break_rules {
+    argv.push(mode_word(flags.min_mode).into());
+    for limit in flags.rlimits {
+        argv.push("--rlimit".into());
+        argv.push(limit.to_string().into());
+    }
+    if flags.test_break_rules {
         argv.push("--test-break-rules".into());
     }
     argv.push("--".into());
@@ -91,25 +106,18 @@ fn mode_word(mode: NetworkMode) -> &'static str {
 /// stderr piped for the pumps, and its own process group.
 pub(crate) fn init_command(
     fds: ChildFds,
-    min_mode: NetworkMode,
-    test_break_rules: bool,
+    flags: &InitFlags<'_>,
     launch: &Launch,
     stdin: Stdio,
 ) -> Command {
     let mut cmd = Command::new("/proc/self/exe");
     // m6: __init arms PDEATHSIG and verifies this pid as its parent.
-    cmd.args(init_argv(
-        fds,
-        std::process::id(),
-        min_mode,
-        test_break_rules,
-        launch,
-    ))
-    .env_clear()
-    .stdin(stdin)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .process_group(0);
+    cmd.args(init_argv(fds, std::process::id(), flags, launch))
+        .env_clear()
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     cmd
 }
 
@@ -382,7 +390,17 @@ mod tests {
             exe: None,
             status: None,
         };
-        let argv = init_argv(fds, 4242, NetworkMode::Explicit, false, &launch);
+        let flags = |min_mode, test_break_rules, rlimits| InitFlags {
+            min_mode,
+            test_break_rules,
+            rlimits,
+        };
+        let argv = init_argv(
+            fds,
+            4242,
+            &flags(NetworkMode::Explicit, false, &[]),
+            &launch,
+        );
         assert_eq!(
             &argv[..12],
             [
@@ -402,11 +420,55 @@ mod tests {
             .map(OsString::from)
         );
         assert_eq!(&argv[12..], launch.argv());
-        let with_break = init_argv(fds, 4242, NetworkMode::Transparent, true, &launch);
+        let with_break = init_argv(
+            fds,
+            4242,
+            &flags(NetworkMode::Transparent, true, &[]),
+            &launch,
+        );
         assert_eq!(
             with_break[10..13],
             ["transparent", "--test-break-rules", "--"].map(OsString::from)
         );
+        // Issue #43: one `--rlimit NAME=VALUE` per limit, after `--min-mode`.
+        let limits = [
+            Rlimit {
+                resource: crate::init::rlimit::Resource::Nproc,
+                value: 64,
+            },
+            Rlimit {
+                resource: crate::init::rlimit::Resource::As,
+                value: 1 << 30,
+            },
+        ];
+        let with_limits = init_argv(
+            fds,
+            4242,
+            &flags(NetworkMode::Transparent, true, &limits),
+            &launch,
+        );
+        assert_eq!(
+            with_limits[10..17],
+            [
+                "transparent",
+                "--rlimit",
+                "nproc=64",
+                "--rlimit",
+                "as=1073741824",
+                "--test-break-rules",
+                "--"
+            ]
+            .map(OsString::from)
+        );
+        assert_eq!(&with_limits[17..], launch.argv());
+    }
+
+    fn none_flags() -> InitFlags<'static> {
+        InitFlags {
+            min_mode: NetworkMode::None,
+            test_break_rules: false,
+            rlimits: &[],
+        }
     }
 
     #[test]
@@ -436,7 +498,7 @@ mod tests {
             exe: Some(12),
             status: None,
         };
-        let argv = init_argv(fds, 4242, NetworkMode::None, false, &launch);
+        let argv = init_argv(fds, 4242, &none_flags(), &launch);
         assert_eq!(
             &argv[..14],
             [
@@ -462,7 +524,7 @@ mod tests {
             status: Some(13),
             ..fds
         };
-        let argv = init_argv(with_status, 4242, NetworkMode::None, false, &launch);
+        let argv = init_argv(with_status, 4242, &none_flags(), &launch);
         assert_eq!(
             &argv[7..11],
             ["--exe-fd", "12", "--status-fd", "13"].map(OsString::from)

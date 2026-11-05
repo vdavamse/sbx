@@ -381,11 +381,18 @@ pub enum Cmd {
         #[arg(long, value_name = "MODE", hide = true, value_parser = parse_network_mode)]
         min_mode: Option<NetworkMode>,
 
+        /// (hidden) A resource limit to apply right before the exec, `NAME=VALUE`
+        /// (repeatable; NAME is nproc, nofile, fsize or as).
+        //
+        // Issue #43: `run` forwards the policy's optional `limits` fields here.
+        #[arg(long, value_name = "NAME=VALUE", hide = true, value_parser = crate::init::rlimit::parse)]
+        rlimit: Vec<crate::init::rlimit::Rlimit>,
+
         /// (hidden) Host capability probe for `sbx check`: run the setup stages
         /// and the nested bwrap launches, print one JSON line, exit 0.
         //
         // Issue #11 (T3/T4). Conflicts with every pipeline argument.
-        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "cmd"])]
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "rlimit", "cmd"])]
         probe: bool,
 
         /// (hidden, with --probe) The bwrap binary the probe launches.
@@ -686,6 +693,7 @@ pub fn run() -> ExitCode {
             parent_pid,
             min_mode,
             test_break_rules,
+            rlimit,
             probe,
             bwrap,
             cmd,
@@ -708,6 +716,7 @@ pub fn run() -> ExitCode {
                 parent_pid,
                 min_mode: min_mode.unwrap_or(NetworkMode::Transparent),
                 test_break_rules,
+                rlimits: rlimit,
                 cmd,
             })
         }

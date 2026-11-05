@@ -291,6 +291,7 @@ fn run_call(
             },
         },
         std::process::id(),
+        &crate::init::rlimit::from_limits(&policy.limits),
         &launch,
         stdin,
     )
@@ -359,9 +360,16 @@ struct JoinShim {
     status: Option<RawFd>,
 }
 
-/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, and
-/// the call's bwrap argv after `--`.
-fn join_command(fds: JoinFds, parent_pid: u32, launch: &Launch, stdin: Stdio) -> Command {
+/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, the
+/// policy's resource limits (issue #43: a call is limited as the resident is),
+/// and the call's bwrap argv after `--`.
+fn join_command(
+    fds: JoinFds,
+    parent_pid: u32,
+    rlimits: &[crate::init::rlimit::Rlimit],
+    launch: &Launch,
+    stdin: Stdio,
+) -> Command {
     let JoinFds {
         user,
         net,
@@ -389,6 +397,10 @@ fn join_command(fds: JoinFds, parent_pid: u32, launch: &Launch, stdin: Stdio) ->
     if let Some(status) = shim.status {
         argv.push("--status-fd".into());
         argv.push(status.to_string().into());
+    }
+    for limit in rlimits {
+        argv.push("--rlimit".into());
+        argv.push(limit.to_string().into());
     }
     argv.push("--".into());
     argv.extend(launch.argv().iter().cloned());
