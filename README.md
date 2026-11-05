@@ -688,7 +688,9 @@ sbx stop --session-dir S
   through the same code path as `run --landlock`. The settings are the session's:
   the holder pins them at start, and an attach applies exactly those. `sbx attach`
   takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
-  layer. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
+  layer. With `--keep-alive`, at most 256 `--landlock-bind-tcp` ports are
+  accepted (rc 2 above that, before anything runs), because the session's
+  settings travel in one control frame. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
   ABI 6), the signal scope adds a second barrier behind the per-call pid namespace
   (S19): a call cannot signal the resident or another call. The holder can still
   end a call (on stop, or when the holder dies), because the
@@ -731,7 +733,7 @@ sbx stop --session-dir S
 |---|---|---|
 | `run --keep-alive` | 0 | the session is up (the holder keeps running) |
 | `run --keep-alive` | 125 | the session could not start; the reason is on stderr |
-| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h) |
+| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h, or more than 256 `--landlock-bind-tcp` ports with `--keep-alive`) |
 | `attach` | the call's own rc | as in `sbx run`: 124 on `--timeout`, 128+N on a signal |
 | `attach` | 125 | refused or failed: no session, a different policy, an explicit-mode session, or the holder exited |
 | `stop` | 0 | the session is stopped, or nothing was running |
