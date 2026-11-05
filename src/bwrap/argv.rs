@@ -741,6 +741,68 @@ mod tests {
         json
     }
 
+    /// Review r2 #4: the plan's classification of each check, without bwrap.
+    #[test]
+    fn path_plan_classifies_checks_by_cover() {
+        let policy = policy_of(&base_with(&[
+            (r#""ro": []"#, r#""ro": ["/srv/proj/vendor/lib"]"#),
+            (r#""rw": []"#, r#""rw": ["/srv/proj"]"#),
+            (
+                r#""deny": []"#,
+                r#""deny": ["/srv/proj/a/secret", "/srv/proj/a/secret/inner", "/srv/proj/vendor/lib/x/key", "/etc/ssl/private", "/tmp/x/deny"]"#,
+            ),
+        ]));
+        let plan = path_plan(&policy, Some(Path::new(SESSION_DIR)));
+        let mut got: Vec<(&str, &str, bool, bool, bool, Kind)> = plan
+            .checks
+            .iter()
+            .map(|c| {
+                let t = (c.target.as_str(), c.origin.as_str());
+                (
+                    t.0,
+                    t.1,
+                    c.allow_missing,
+                    c.writable,
+                    c.pinned,
+                    c.kind.clone(),
+                )
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(b.0));
+        let dir = || Kind::Dir;
+        let mut want: Vec<(&str, &str, bool, bool, bool, Kind)> = vec![
+            // rw policy cover: pins and targets must exist, nothing missing.
+            ("/srv/proj/a", "/srv/proj", false, true, true, dir()),
+            ("/srv/proj/vendor", "/srv/proj", false, true, true, dir()),
+            (
+                "/srv/proj/vendor/lib",
+                "/srv/proj",
+                false,
+                true,
+                false,
+                Kind::LikeSource(PathBuf::from("/srv/proj/vendor/lib")),
+            ),
+            ("/srv/proj/a/secret", "/srv/proj", false, true, false, dir()),
+            // ro policy cover nested in rw: missing tolerated (EROFS).
+            (
+                "/srv/proj/vendor/lib/x/key",
+                "/srv/proj/vendor/lib",
+                true,
+                false,
+                false,
+                dir(),
+            ),
+            // infra (ro) cover.
+            ("/etc/ssl/private", "/etc/ssl", true, false, false, dir()),
+            // session leaf cover: missing tolerated, bwrap creates it.
+            ("/tmp/x/deny", "/tmp", true, true, false, dir()),
+        ];
+        want.sort_by(|a, b| a.0.cmp(b.0));
+        // The inner deny (/srv/proj/a/secret/inner) resolves inside the
+        // outer tmpfs: no check for it.
+        assert_eq!(got, want);
+    }
+
     fn policy_of(json: &str) -> Policy {
         Policy::from_json_str(json).unwrap_or_else(|err| panic!("fixture must parse: {err}"))
     }

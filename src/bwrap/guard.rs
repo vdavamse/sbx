@@ -326,12 +326,20 @@ pub fn verify_binds(binds: &[BindSpec]) -> Result<(), GuardError> {
 /// deny path before the scan stops and says so (Q6; a run never scans).
 pub const LINK_SCAN_BUDGET: usize = 10_000;
 
-/// Regular files under `dir` (a deny path) that have another hard link, so
-/// the mask hides only one of their names. Bounded by [`LINK_SCAN_BUDGET`];
-/// symlinks are not followed. A non-directory yields nothing.
+/// Regular files under `dir` (a deny path) that have a hard link outside it,
+/// so the mask hides only some of their names. A file whose extra names are
+/// all inside `dir` (e.g. `git clone --local` objects under a denied `.git`)
+/// is not reported: its link count equals the names found in the scan.
+/// Bounded by [`LINK_SCAN_BUDGET`]; past it, files seen so far are judged on
+/// the names found so far. Symlinks are not followed. A non-directory yields
+/// nothing.
 pub fn hard_links_under(dir: &Path) -> Vec<String> {
+    use std::collections::HashMap;
     use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
+    // (dev, ino) -> (nlink, names of it found under `dir`), in scan order.
+    let mut inodes: HashMap<(u64, u64), (u64, Vec<String>)> = HashMap::new();
+    let mut order: Vec<(u64, u64)> = Vec::new();
     // lstat the root first: a symlink root is not scanned (read_dir would
     // follow it into the host tree it names).
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
@@ -346,6 +354,7 @@ pub fn hard_links_under(dir: &Path) -> Vec<String> {
         for entry in entries.flatten() {
             seen += 1;
             if seen > LINK_SCAN_BUDGET {
+                out.extend(linked_outside(&order, &mut inodes));
                 out.push(format!(
                     "{} (not fully scanned: more than {LINK_SCAN_BUDGET} entries)",
                     dir.display()
@@ -357,7 +366,29 @@ pub fn hard_links_under(dir: &Path) -> Vec<String> {
             if meta.is_dir() {
                 stack.push(entry.path());
             } else if meta.is_file() && meta.nlink() > 1 {
-                out.push(entry.path().display().to_string());
+                let key = (meta.dev(), meta.ino());
+                let slot = inodes.entry(key).or_insert_with(|| {
+                    order.push(key);
+                    (meta.nlink(), Vec::new())
+                });
+                slot.1.push(entry.path().display().to_string());
+            }
+        }
+    }
+    out.extend(linked_outside(&order, &mut inodes));
+    out
+}
+
+/// The names of every scanned inode whose link count exceeds the names found.
+fn linked_outside(
+    order: &[(u64, u64)],
+    inodes: &mut std::collections::HashMap<(u64, u64), (u64, Vec<String>)>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in order {
+        if let Some((nlink, names)) = inodes.remove(key) {
+            if nlink > names.len() as u64 {
+                out.extend(names);
             }
         }
     }
@@ -561,6 +592,7 @@ mod tests {
         std::fs::create_dir_all(d.join("real")).unwrap();
         std::fs::write(d.join("real/f"), b"f").unwrap();
         std::fs::hard_link(d.join("real/f"), d.join("real/g")).unwrap();
+        std::fs::hard_link(d.join("real/f"), d.join("outside")).unwrap();
         std::os::unix::fs::symlink(d.join("real"), d.join("link")).unwrap();
         assert!(hard_links_under(&d.join("link")).is_empty());
         assert_eq!(hard_links_under(&d.join("real")).len(), 2);
@@ -579,6 +611,20 @@ mod tests {
         // A non-directory and a missing path yield nothing.
         assert!(hard_links_under(&d.join("deny/lone")).is_empty());
         assert!(hard_links_under(&d.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn hard_links_wholly_inside_the_deny_dir_are_not_reported() {
+        // Review r2 #5: extra names inside the same deny tree hide nothing.
+        let d = tmp("links-inside");
+        std::fs::create_dir_all(d.join("deny/a")).unwrap();
+        std::fs::create_dir_all(d.join("deny/b")).unwrap();
+        std::fs::write(d.join("deny/a/obj"), b"O").unwrap();
+        std::fs::hard_link(d.join("deny/a/obj"), d.join("deny/b/obj")).unwrap();
+        assert!(hard_links_under(&d.join("deny")).is_empty());
+        // One more name outside: both inside names are now reported.
+        std::fs::hard_link(d.join("deny/a/obj"), d.join("out")).unwrap();
+        assert_eq!(hard_links_under(&d.join("deny")).len(), 2);
     }
 
     #[test]
