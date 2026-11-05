@@ -689,8 +689,9 @@ sbx stop --session-dir S
   an attach to join. Attach keeps its own refusal for a session in that state.
 - **Control socket.** `sbx.ctl` lives in the session directory and is reachable
   only by the same uid on the host. The sandbox cannot reach it: the session root
-  is not bound (only `work`, `home`, `tmp` and the `etc` files are). A policy that
-  binds the session directory or an ancestor would expose it (R35). A same-uid
+  is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
+  path that is or contains the session directory is refused. Only a policy path
+  that reaches it through a symlink is not caught (R35). A same-uid
   client can hold the control loop for up to 2 s per connection (R34).
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
