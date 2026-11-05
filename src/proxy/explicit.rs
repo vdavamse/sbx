@@ -190,6 +190,16 @@ pub(crate) fn parse_proxy_request(
     head_end: usize,
     max_headers: usize,
 ) -> Result<ProxyRequest, ParseFail> {
+    // The bare-LF rule of http::parse_head_with, for the explicit head
+    // (issue #29 review, item 6).
+    if http::head_has_bare_lf(&buf[..head_end.min(buf.len())]) {
+        return Err(fail(
+            ExplicitKind::Unknown,
+            Rejected::AmbiguousFraming {
+                detail: http::FRAMING_BARE_LF,
+            },
+        ));
+    }
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
     let mut request = httparse::Request::new(&mut headers);
     let consumed = match request.parse(buf) {
@@ -1136,13 +1146,7 @@ mod tests {
 
     impl DecisionSink for ClosedSink {
         fn record(&self, _decision: &Decision) {}
-        fn closed(
-            &self,
-            _decision: &Decision,
-            up: u64,
-            down: u64,
-            _end: crate::proxy::CloseReason,
-        ) {
+        fn closed(&self, _decision: &Decision, up: u64, down: u64) {
             self.0.lock().expect("closed lock").push((up, down));
         }
     }
@@ -1819,7 +1823,7 @@ mod tests {
         // as its rewritten head; the upstream's EOF ends the exchange and the
         // client sees a clean EOF after the response.
         block_on(async {
-            let (client, mut client_peer) = duplex(4096);
+            let (mut client, mut client_peer) = duplex(4096);
             let (mut upstream, mut up_peer) = duplex(4096);
             up_peer
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -1841,9 +1845,15 @@ mod tests {
                 },
                 pending: Vec::new(),
             };
-            let ended = relay_http(client, replay, start, &mut upstream, &Limits::default())
-                .await
-                .expect("relay");
+            let ended = relay_http(
+                &mut client,
+                replay,
+                start,
+                &mut upstream,
+                &Limits::default(),
+            )
+            .await
+            .expect("relay");
             assert!(matches!(ended, HttpEnd::Finished), "{ended:?}");
             // The replay reached the upstream intact (first bytes it read).
             let mut seen = vec![0u8; replay.len()];
@@ -2069,7 +2079,7 @@ mod tests {
         // observed (a last request stops reading the client; see relay.rs).
         block_on(async {
             let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
-            let (client, mut client_peer) = duplex(4096);
+            let (mut client, mut client_peer) = duplex(4096);
             let (mut upstream, up_peer) = duplex(4096);
             client_peer.shutdown().await.expect("client half-close");
             let server = tokio::spawn(async move {
@@ -2097,7 +2107,7 @@ mod tests {
                 },
                 pending: Vec::new(),
             };
-            let ended = relay_http(client, head, start, &mut upstream, &Limits::default())
+            let ended = relay_http(&mut client, head, start, &mut upstream, &Limits::default())
                 .await
                 .expect("relay");
             assert!(matches!(ended, HttpEnd::Finished), "{ended:?}");

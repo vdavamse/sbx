@@ -9,6 +9,11 @@
 //!    the lenient rule of `http::read_head` (a complete head beats its cap; the
 //!    worst case is cap + one read chunk). Request 1 is read by that same code
 //!    in the decision phase, so request 1 and requests 2+ share one accumulator.
+//!    The accumulator does not look at line endings: a bare LF inside a head is
+//!    denied by `http::parse_head_with` (and `explicit::parse_proxy_request`)
+//!    before httparse runs, with `FRAMING_BARE_LF` (issue #29 review, item 6).
+//!    That is the head's "no bare LF" rule; the chunk and trailer rules below
+//!    are this module's own.
 //! 2. **Content-Length** — [`BodyFramer::Length`] streams exactly `n` bytes.
 //!    `Length(0)` never enters a body.
 //! 3. **Chunked (RFC 9112 §7.1, strict profile)** — [`BodyFramer::Chunked`]:

@@ -291,8 +291,10 @@ impl Default for Limits {
 
 /// Why a relay ended, for the `close` audit row (issue #29, C4). `Ended` is
 /// every natural end (EOF, reset, scanner teardown); `IdleTimeout` is the
-/// inactivity watchdog ([`Limits::relay_idle_timeout`]).
+/// inactivity watchdog ([`Limits::relay_idle_timeout`]). Non-exhaustive, so a
+/// later end reason is not a breaking change for external sinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
     /// The relay ended on its own.
     Ended,
@@ -788,8 +790,18 @@ pub trait DecisionSink: Send + Sync + 'static {
     /// connection, AFTER `teardown` (if it fired), on EVERY relay end. Never
     /// called for Denied/Error, nor for a relay still running at runtime stop.
     /// Default: no-op. SYNC + CHEAP + NON-BLOCKING + must-not-panic. NOT a
-    /// second `record`.
-    fn closed(&self, _decision: &Decision, _up: u64, _down: u64, _end: CloseReason) {}
+    /// second `record`. Kept with main's signature (issue #29 review): the
+    /// relay calls [`Self::closed_with_reason`], whose default forwards here.
+    fn closed(&self, _decision: &Decision, _up: u64, _down: u64) {}
+
+    /// [`Self::closed`] with the reason the relay segment ended (issue #29, C4):
+    /// `IdleTimeout` when the relay idle watchdog closed it. The relay calls only
+    /// this method. The default forwards to [`Self::closed`], so an external
+    /// sink that implements only `closed` keeps working and does not see the
+    /// reason. The sinks sbx ships (the JSONL audit log) override this.
+    fn closed_with_reason(&self, decision: &Decision, up: u64, down: u64, _end: CloseReason) {
+        self.closed(decision, up, down);
+    }
 }
 
 /// A bidirectional byte stream usable as an upstream (relay endpoint).
@@ -1239,12 +1251,17 @@ pub(crate) async fn relay_tail<C>(
 {
     let limits = &proxy.limits;
     let act = relay::Activity::new();
-    let client = relay::Watched::new(client, act.clone());
+    let mut client = relay::Watched::new(client, act.clone());
     let mut counted = relay::Counted::new(relay::Watched::new(&mut *upstream, act.clone()));
+    // Set when a per-request relay ended naturally and the client still owes
+    // its close (the linger below). Issue #29 review: the linger runs AFTER
+    // the idle watchdog has been raced, so a natural end is never labelled
+    // `idle_timeout` by a quiet linger.
+    let mut linger = false;
     let relayed = relay::until_idle(&act, limits.relay_idle_timeout, async {
         match mode {
             RelayMode::Scanned { scan_from } => {
-                match relay::relay(client, replay, Some(scan_from), &mut counted).await {
+                match relay::relay(&mut client, replay, Some(scan_from), &mut counted).await {
                     Ok(RelayEnd::TornDown(teardown)) => {
                         proxy.sink.teardown(decision, &teardown.detail());
                     }
@@ -1254,11 +1271,12 @@ pub(crate) async fn relay_tail<C>(
                 }
             }
             RelayMode::Http(start) => {
-                match relay::relay_http(client, replay, start, &mut counted, limits).await {
+                match relay::relay_http(&mut client, replay, start, &mut counted, limits).await {
                     Ok(HttpEnd::TornDown(teardown)) => {
                         proxy.sink.teardown(decision, &teardown.detail());
                     }
-                    Ok(HttpEnd::Finished) | Err(_) => {}
+                    Ok(HttpEnd::Finished) => linger = true,
+                    Err(_) => {}
                 }
             }
         }
@@ -1268,9 +1286,12 @@ pub(crate) async fn relay_tail<C>(
         Some(()) => CloseReason::Ended,
         None => CloseReason::IdleTimeout,
     };
+    if linger && end == CloseReason::Ended {
+        relay::linger_close(&mut client).await;
+    }
     proxy
         .sink
-        .closed(decision, counted.up(), counted.down(), end);
+        .closed_with_reason(decision, counted.up(), counted.down(), end);
 }
 
 /// `getsockopt(SO_ORIGINAL_DST)` on an ACCEPTED socket of the redirected
@@ -1686,7 +1707,7 @@ mod tests {
                 .expect("events lock")
                 .push(format!("teardown:{detail}"));
         }
-        fn closed(&self, _decision: &Decision, up: u64, down: u64, end: CloseReason) {
+        fn closed_with_reason(&self, _decision: &Decision, up: u64, down: u64, end: CloseReason) {
             // The idle-timeout close is tagged; a natural end keeps the old shape.
             let tag = match end {
                 CloseReason::Ended => "",
@@ -1777,6 +1798,57 @@ mod tests {
         assert_eq!(
             sink.events(),
             vec![format!("closed:{}:10", replay.len() + 5)]
+        );
+    }
+
+    /// Issue #29 review, item 5: the linger after a natural end runs outside
+    /// the idle watchdog. The upstream ends the segment at once; the client
+    /// keeps its side open, so the linger runs to its own bound. The close must
+    /// stay `Ended`: a quiet linger longer than the idle bound must not label it
+    /// `idle_timeout`.
+    #[test]
+    fn natural_end_is_not_labelled_idle_during_the_linger() {
+        let sink = Arc::new(OrderSink::default());
+        let limits = Limits {
+            relay_idle_timeout: Duration::from_millis(100),
+            ..Limits::default()
+        };
+        let proxy = order_proxy_with(sink.clone(), limits);
+        let decision = allowed_decision();
+        let (up_near, mut up_far) = duplex(4096);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (client_far, client) = duplex(4096);
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+        let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mode = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::None,
+                minor_version: 1,
+                close: true,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
+        block_on(async {
+            let far = tokio::spawn(async move {
+                let mut got = vec![0u8; head.len()];
+                up_far.read_exact(&mut got).await.expect("upstream read");
+                up_far.write_all(response).await.expect("upstream write");
+                up_far.shutdown().await.expect("upstream shutdown");
+            });
+            relay_tail(&proxy, &decision, client, head, mode, &mut upstream).await;
+            far.await.expect("far task");
+        });
+        drop(client_far);
+        assert_eq!(
+            sink.events(),
+            vec![format!("closed:{}:{}", head.len(), response.len())],
+            "a natural end must not be tagged idle"
         );
     }
 
@@ -1892,7 +1964,27 @@ mod tests {
             fn record(&self, _decision: &Decision) {}
         }
         let decision = allowed_decision();
-        MinimalSink.closed(&decision, 1, 2, CloseReason::Ended);
+        MinimalSink.closed(&decision, 1, 2);
+    }
+
+    /// Issue #29 review, item 8: an external sink that implements only the
+    /// main-branch `closed` keeps receiving every segment end. The relay calls
+    /// `closed_with_reason`; its default forwards to `closed` and drops the reason.
+    #[test]
+    fn closed_with_reason_default_forwards_to_closed() {
+        #[derive(Default)]
+        struct ClosedOnly(Mutex<Vec<(u64, u64)>>);
+        impl DecisionSink for ClosedOnly {
+            fn record(&self, _decision: &Decision) {}
+            fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+                self.0.lock().expect("closed lock").push((up, down));
+            }
+        }
+        let sink = ClosedOnly::default();
+        let decision = allowed_decision();
+        sink.closed_with_reason(&decision, 3, 4, CloseReason::IdleTimeout);
+        sink.closed_with_reason(&decision, 5, 6, CloseReason::Ended);
+        assert_eq!(*sink.0.lock().expect("closed lock"), vec![(3, 4), (5, 6)]);
     }
 
     #[test]

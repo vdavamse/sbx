@@ -280,6 +280,11 @@ fn scenarios() -> Vec<Scenario> {
             run: scenario_explicit_forward_pipelined_follow_up,
         },
         Scenario {
+            name: "explicit-forward-upstream-not-half-closed",
+            gate: Gate::Always,
+            run: scenario_explicit_forward_upstream_not_half_closed,
+        },
+        Scenario {
             name: "explicit-connect-80-followup-foreign-host",
             gate: Gate::Always,
             run: scenario_explicit_connect_80_followup_foreign_host,
@@ -915,7 +920,7 @@ impl DecisionSink for RecordingSink {
             .expect("sink lock")
             .push(detail.to_owned());
     }
-    fn closed(&self, _decision: &Decision, _up: u64, _down: u64, end: CloseReason) {
+    fn closed_with_reason(&self, _decision: &Decision, _up: u64, _down: u64, end: CloseReason) {
         self.closes.lock().expect("sink lock").push(end);
     }
 }
@@ -1018,9 +1023,8 @@ enum EchoOutcome {
     StoppedClean,
     /// No connection within BOUND.
     Deadline,
-    /// `EchoMode::Http`: one entry per connection, each the requests (head +
-    /// body, exact bytes) received on it, in order.
-    Http(Vec<Vec<Vec<u8>>>),
+    /// `EchoMode::Http`: one entry per upstream connection (see [`HttpConn`]).
+    Http(Vec<HttpConn>),
     Failed(String),
 }
 
@@ -1077,12 +1081,41 @@ fn content_length_of(head: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+/// Reads until one complete request (head + Content-Length body) is in `buf`
+/// or the client closes. Bytes past the request stay in `buf`.
+fn read_one_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Result<(), String> {
+    loop {
+        if let Some(end) = head_end_of(buf) {
+            if buf.len() >= end + content_length_of(&buf[..end]) {
+                return Ok(());
+            }
+        }
+        let mut chunk = [0u8; 4096];
+        let n = stream
+            .read(&mut chunk)
+            .map_err(|e| format!("echo read: {e}"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// One upstream connection as the keep-alive responder saw it (issue #29
+/// review): the framed requests, and every byte the proxy sent AFTER a `close`
+/// request (left in the buffer, or drained from the socket).
+#[derive(Debug, Clone)]
+struct HttpConn {
+    requests: Vec<Vec<u8>>,
+    trailing: Vec<u8>,
+}
+
 /// The keep-alive responder for one upstream connection (issue #29, EchoMode::Http):
 /// frames each request by its head and Content-Length, records the exact
 /// request bytes, and answers `200` with a body naming the request's index on
 /// this connection. It closes after a request that carries `Connection: close`,
 /// or when the proxy closes (EOF) or goes quiet for 2 s.
-fn serve_http_connection(stream: &mut TcpStream) -> Vec<Vec<u8>> {
+fn serve_http_connection(stream: &mut TcpStream) -> HttpConn {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut requests: Vec<Vec<u8>> = Vec::new();
     let mut buf: Vec<u8> = Vec::new();
@@ -1093,7 +1126,12 @@ fn serve_http_connection(stream: &mut TcpStream) -> Vec<Vec<u8>> {
             }
             let mut chunk = [0u8; 4096];
             match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return requests,
+                Ok(0) | Err(_) => {
+                    return HttpConn {
+                        requests,
+                        trailing: buf,
+                    };
+                }
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
         };
@@ -1101,7 +1139,12 @@ fn serve_http_connection(stream: &mut TcpStream) -> Vec<Vec<u8>> {
         while buf.len() < total {
             let mut chunk = [0u8; 4096];
             match stream.read(&mut chunk) {
-                Ok(0) | Err(_) => return requests,
+                Ok(0) | Err(_) => {
+                    return HttpConn {
+                        requests,
+                        trailing: buf,
+                    };
+                }
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
         }
@@ -1116,8 +1159,27 @@ fn serve_http_connection(stream: &mut TcpStream) -> Vec<Vec<u8>> {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         );
-        if stream.write_all(response.as_bytes()).is_err() || close {
-            return requests;
+        if stream.write_all(response.as_bytes()).is_err() {
+            return HttpConn {
+                requests,
+                trailing: buf,
+            };
+        }
+        if close {
+            // Issue #29 review: whatever the proxy still sends after a close
+            // request is the trailing record: bytes already buffered, then the
+            // socket until EOF or 1 s of quiet. A relay that forwards nothing
+            // after the body records nothing here.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+            let mut trailing = buf;
+            loop {
+                let mut chunk = [0u8; 4096];
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => trailing.extend_from_slice(&chunk[..n]),
+                }
+            }
+            return HttpConn { requests, trailing };
         }
     }
 }
@@ -1136,7 +1198,7 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
     let handle = std::thread::spawn(move || {
         let deadline = Instant::now() + BOUND;
         let http = matches!(mode, EchoMode::Http);
-        let mut conns: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut conns: Vec<HttpConn> = Vec::new();
         loop {
             match listener.accept() {
                 Ok((mut stream, _peer)) if http => {
@@ -1161,6 +1223,24 @@ fn spawn_echo_server(mode: EchoMode) -> Result<EchoServer, String> {
                                 stream
                                     .write_all(&buf)
                                     .map_err(|e| format!("echo write_all: {e}"))?;
+                            }
+                            EchoMode::OnRequest => {
+                                read_one_request(&mut stream, &mut buf)?;
+                                stream
+                                    .write_all(&buf)
+                                    .map_err(|e| format!("echo write_all: {e}"))?;
+                            }
+                            EchoMode::AnswerUnlessEof => {
+                                read_one_request(&mut stream, &mut buf)?;
+                                // An EOF within 300 ms: the proxy half-closed
+                                // before the response. Drop without answering.
+                                let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                                let mut probe = [0u8; 64];
+                                let eof = matches!(stream.read(&mut probe), Ok(0));
+                                if !eof {
+                                    let _ = stream
+                                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                                }
                             }
                             EchoMode::Immediate => {
                                 let mut chunk = [0u8; 4096];
@@ -1251,6 +1331,10 @@ enum ConnectorSpec {
 enum EchoSpec {
     None,
     ExpectHit,
+    /// Like `ExpectHit`, but the echo answers one framed HTTP request and does
+    /// not wait for the client's EOF (issue #29 review: a last request is not
+    /// half-closed, so an EOF-waiting echo would never answer).
+    ExpectHitRequest,
     ExpectMiss,
     /// Like `ExpectHit`, but the server echoes every chunk IMMEDIATELY
     /// (not after read-to-end) — the second-hello role needs the CH1 echo
@@ -1277,6 +1361,16 @@ enum EchoMode {
     /// answers each request with a Content-Length response naming its index on
     /// that connection, and records each request (`EchoOutcome::Http`).
     Http,
+    /// Issue #29 review: a single HTTP request. Reads until one complete
+    /// request (head + Content-Length body) is buffered, then writes back exactly
+    /// the bytes read and closes. It does NOT wait for the client's EOF: the
+    /// relay no longer half-closes after a last request.
+    OnRequest,
+    /// Issue #29 review: reads one complete request, then waits 300 ms for an
+    /// EOF. An EOF in that window (the proxy half-closed before the response)
+    /// makes it drop WITHOUT answering; otherwise it answers `200` and closes.
+    /// The recorded bytes are what it received.
+    AnswerUnlessEof,
 }
 
 /// One serve thread on its own current-thread runtime; the result travels
@@ -1408,6 +1502,7 @@ fn run_netns_limits(
     let echo_server = match echo {
         EchoSpec::None => None,
         EchoSpec::ExpectHit | EchoSpec::ExpectMiss => Some(spawn_echo_server(EchoMode::OnEof)?),
+        EchoSpec::ExpectHitRequest => Some(spawn_echo_server(EchoMode::OnRequest)?),
         EchoSpec::ExpectHitEchoing => Some(spawn_echo_server(EchoMode::Immediate)?),
         EchoSpec::ExpectHttp => Some(spawn_echo_server(EchoMode::Http)?),
     };
@@ -2401,14 +2496,17 @@ fn role_http_keepalive() -> Result<(), String> {
     Ok(())
 }
 
-/// A request WITH a body is the last on its connection (issue #29, FLAG-3):
-/// the proxy forwards it with `Connection: close`, and a pipelined-after
-/// follow-up is never forwarded.
+/// A request WITH a body is the last on its connection (issue #29, FLAG-3).
+/// The body and a fully valid same-Host GET are written in ONE write, so the
+/// GET sits in the proxy's buffer right behind the body. It must never reach
+/// the upstream: the proxy forwards the POST with `Connection: close`, then
+/// stops reading the client.
 fn role_http_keepalive_body() -> Result<(), String> {
     let mut stream = connect_http80()?;
+    let post = b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\nbody";
     stream
-        .write_all(b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\n\r\nbody")
-        .map_err(|e| format!("write the POST: {e}"))?;
+        .write_all(&[post.as_slice(), KEEPALIVE_REQ2].concat())
+        .map_err(|e| format!("write the POST and the follow-up: {e}"))?;
     let first = read_framed_response(&mut stream)?;
     if !first.ends_with(b"ECHO 1") {
         return Err(format!(
@@ -2416,9 +2514,6 @@ fn role_http_keepalive_body() -> Result<(), String> {
             String::from_utf8_lossy(&first)
         ));
     }
-    // The follow-up goes out after the last request's response. The proxy
-    // no longer reads the client, so these bytes never reach the upstream.
-    let _ = stream.write_all(KEEPALIVE_REQ2);
     let _ = stream.shutdown(Shutdown::Write);
     expect_no_more_bytes(&mut stream, "after the body-ended request")?;
     marker("relay ok body-ended connection");
@@ -2494,19 +2589,19 @@ fn scenario_http_keepalive_two_requests_80() -> Result<(), String> {
     )?;
     assert_payload_success(&run.payload, &["relay ok keep-alive two responses"])?;
     let conns = expect_http_echo(&run.echo)?;
-    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
+    let shape: Vec<usize> = conns.iter().map(|c| c.requests.len()).collect();
     if shape != [2] {
         return Err(format!(
             "the upstream must see exactly two requests on ONE connection, saw {shape:?}"
         ));
     }
-    if conns[0][0] != KEEPALIVE_REQ1 || conns[0][1] != KEEPALIVE_REQ2 {
+    let requests = &conns[0].requests;
+    if requests[0] != KEEPALIVE_REQ1 || requests[1] != KEEPALIVE_REQ2 {
         return Err(format!(
-            "forwarded heads must be byte-identical: {:?}",
-            conns[0]
+            "forwarded heads must be byte-identical: {requests:?}"
         ));
     }
-    if conns[0]
+    if requests
         .iter()
         .any(|head| head.windows(17).any(|w| w == b"Connection: close"))
     {
@@ -2517,7 +2612,9 @@ fn scenario_http_keepalive_two_requests_80() -> Result<(), String> {
 
 /// Issue #29, FLAG-3: request 1 with a Content-Length body is the last request
 /// on its connection. It is forwarded with `Connection: close` (body
-/// byte-identical), and the request after it is never forwarded.
+/// byte-identical), and a same-Host GET pipelined right behind the body is
+/// never forwarded. The echo records anything it is sent after the close
+/// request (buffered or drained), so a forwarded GET would be seen.
 fn scenario_http_keepalive_body_last_80() -> Result<(), String> {
     let run = run_netns(
         "pt-http-keepalive-body",
@@ -2530,11 +2627,18 @@ fn scenario_http_keepalive_body_last_80() -> Result<(), String> {
     assert_payload_success(&run.payload, &["relay ok body-ended connection"])?;
     let conns = expect_http_echo(&run.echo)?;
     let want: &[u8] = b"POST /p HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
-    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
-    if shape != [1] || conns[0][0] != want {
+    let shape: Vec<usize> = conns.iter().map(|c| c.requests.len()).collect();
+    if shape != [1] || conns[0].requests[0] != want {
         return Err(format!(
             "the body request must be the only request, with Connection: close: {shape:?} {:?}",
             conns.first()
+        ));
+    }
+    if !conns[0].trailing.is_empty() {
+        return Err(format!(
+            "{} bytes after the body reached the upstream (must be none): {:?}",
+            conns[0].trailing.len(),
+            String::from_utf8_lossy(&conns[0].trailing)
         ));
     }
     expect_clean_allowed(&run)
@@ -2555,8 +2659,8 @@ fn scenario_http_keepalive_foreign_host_torn_down_80() -> Result<(), String> {
     )?;
     assert_payload_success(&run.payload, &["relay ok foreign Host torn down"])?;
     let conns = expect_http_echo(&run.echo)?;
-    let shape: Vec<usize> = conns.iter().map(Vec::len).collect();
-    if shape != [1] || conns[0][0] != KEEPALIVE_REQ1 {
+    let shape: Vec<usize> = conns.iter().map(|c| c.requests.len()).collect();
+    if shape != [1] || conns[0].requests[0] != KEEPALIVE_REQ1 {
         return Err(format!(
             "the upstream must see request 1 only: {shape:?} {:?}",
             conns.first()
@@ -2607,8 +2711,8 @@ fn scenario_relay_idle_timeout_closes() -> Result<(), String> {
     Ok(())
 }
 
-/// The echo's per-connection request record, or a precise failure.
-fn expect_http_echo(echo: &Option<EchoOutcome>) -> Result<Vec<Vec<Vec<u8>>>, String> {
+/// The echo's per-connection record, or a precise failure.
+fn expect_http_echo(echo: &Option<EchoOutcome>) -> Result<Vec<HttpConn>, String> {
     match echo {
         Some(EchoOutcome::Http(conns)) => Ok(conns.clone()),
         other => Err(format!("the keep-alive upstream must be hit: {other:?}")),
@@ -2638,7 +2742,7 @@ fn scenario_http_allowed_relay_80() -> Result<(), String> {
         &[ALLOWED],
         &[443, 80],
         ConnectorSpec::Echo,
-        EchoSpec::ExpectHit,
+        EchoSpec::ExpectHitRequest,
     )?;
     assert_payload_success(&run.payload, &["relay ok"])?;
     let expected = http_relay_expected();
@@ -3752,7 +3856,7 @@ fn scenario_explicit_connect_80_inspected() -> Result<(), String> {
 /// (rebuilt, with `Connection: close`); the pipelined follow-up, for another
 /// authority, is never forwarded.
 fn scenario_explicit_forward_pipelined_follow_up() -> Result<(), String> {
-    let (echo, explicit, _target) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let (echo, explicit, _target) = echo_explicit(EchoMode::OnRequest, &[443, 80])?;
     let mut stream = client_to(explicit.addr)?;
     stream
         .write_all(
@@ -3770,6 +3874,36 @@ fn scenario_explicit_forward_pipelined_follow_up() -> Result<(), String> {
         return Err(format!(
             "upstream bytes: {:?}",
             String::from_utf8_lossy(&upstream)
+        ));
+    }
+    Ok(())
+}
+
+/// Issue #29 review, item 1: the explicit forward's upstream gets NO FIN after
+/// the request (a last request must not half-close). The echo answers only if
+/// no EOF arrives first, so an early FIN would leave the client with nothing.
+fn scenario_explicit_forward_upstream_not_half_closed() -> Result<(), String> {
+    let (echo, explicit, _target) = echo_explicit(EchoMode::AnswerUnlessEof, &[443, 80])?;
+    let mut stream = client_to(explicit.addr)?;
+    stream
+        .write_all(b"GET http://allowed.test/p HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+        .map_err(|e| format!("write: {e}"))?;
+    // No client EOF: the request is complete; the proxy must answer its
+    // upstream's response through to the client.
+    let received = read_to_eof(&mut stream)?;
+    let upstream = expect_echo(Some(echo.into_outcome(false)?))?;
+    let _ = explicit.finish()?;
+    let want = b"GET /p HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+    if upstream != want {
+        return Err(format!(
+            "upstream bytes: {:?}",
+            String::from_utf8_lossy(&upstream)
+        ));
+    }
+    if received != b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" {
+        return Err(format!(
+            "the upstream dropped the request on an early EOF; the client got {:?}",
+            String::from_utf8_lossy(&received)
         ));
     }
     Ok(())
@@ -3819,7 +3953,7 @@ fn scenario_explicit_connect_80_followup_foreign_host() -> Result<(), String> {
 /// Absolute-form GET: the upstream receives the rebuilt origin-form head
 /// with `Connection: close` and no `Proxy-*` (design 8, exact bytes).
 fn scenario_explicit_forward_get_rewritten() -> Result<(), String> {
-    let (echo, explicit, target) = echo_explicit(EchoMode::OnEof, &[443, 80])?;
+    let (echo, explicit, target) = echo_explicit(EchoMode::OnRequest, &[443, 80])?;
     let mut stream = client_to(explicit.addr)?;
     stream
         .write_all(

@@ -284,6 +284,14 @@ pub(crate) fn parse_head_with(
     check: &HeadCheck<'_>,
     max_headers: usize,
 ) -> Result<ParsedHead, Rejected> {
+    // A bare LF inside the head is denied before httparse runs: httparse
+    // accepts it mid-head, and the differential check below sees it only at
+    // the end of the head (issue #29 review, item 6).
+    if head_has_bare_lf(head) {
+        return Err(Rejected::AmbiguousFraming {
+            detail: FRAMING_BARE_LF,
+        });
+    }
     // httparse's Header is Copy; a runtime-sized slot count needs the Vec
     // (the array form the design sketch shows cannot take a runtime len).
     // Exceeding it yields TooHeaders ⇒ HttpMalformed — fail-closed, never a
@@ -516,6 +524,13 @@ pub(crate) const FRAMING_INVALID_CL: &str = "Content-Length is not a single deci
 pub(crate) const FRAMING_TE_NOT_CHUNKED: &str =
     "Transfer-Encoding does not end in a single final chunked coding";
 pub(crate) const FRAMING_TE_HTTP10: &str = "Transfer-Encoding in an HTTP/1.0 request";
+/// A `\n` not preceded by `\r` inside the request head (issue #29 review,
+/// item 6): httparse accepts it, so the head is denied before parsing.
+pub(crate) const FRAMING_BARE_LF: &str = "bare LF line ending in the request head";
+/// A framing header name spelled with `_` (for example `Content_Length`): some
+/// servers normalise `_` to `-` and read the body the proxy never saw (R8).
+pub(crate) const FRAMING_UNDERSCORE_NAME: &str =
+    "a framing header name uses an underscore (Content_Length or Transfer_Encoding)";
 pub(crate) const FRAMING_CHUNK_SIZE: &str = "invalid chunk-size line";
 pub(crate) const FRAMING_CHUNK_LINE_TOO_LONG: &str = "chunk-size line exceeds the 4096-byte cap";
 pub(crate) const FRAMING_CHUNK_DATA_CRLF: &str = "chunk data is not followed by CRLF";
@@ -530,6 +545,21 @@ pub(crate) fn check_framing(
     headers: &[httparse::Header<'_>],
     minor_version: u8,
 ) -> Result<Framing, Rejected> {
+    // Issue #29 review, item 7: a framing name with `_` is denied. It is not
+    // the framing header the table below reads, but a server that normalises
+    // `_` to `-` would read a body the proxy never saw.
+    for header in headers {
+        if header.name.contains('_') {
+            let normalised = header.name.replace('_', "-");
+            if normalised.eq_ignore_ascii_case("content-length")
+                || normalised.eq_ignore_ascii_case("transfer-encoding")
+            {
+                return Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_UNDERSCORE_NAME,
+                });
+            }
+        }
+    }
     let mut cl = headers
         .iter()
         .filter(|h| h.name.eq_ignore_ascii_case("content-length"));
@@ -595,6 +625,21 @@ pub(crate) fn check_framing(
         Some(n) => Framing::Length(n),
         None => Framing::None,
     })
+}
+
+/// True when the request head (through its first CRLFCRLF, or the whole
+/// buffer when none) holds a `\n` that is not preceded by `\r` (issue #29
+/// review, item 6). One pass. Bytes past the head's terminator are not part of
+/// the head and are not scanned.
+pub(crate) fn head_has_bare_lf(buf: &[u8]) -> bool {
+    let end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(buf.len(), |at| at + 2);
+    let head = &buf[..end];
+    head.iter()
+        .enumerate()
+        .any(|(at, byte)| *byte == b'\n' && (at == 0 || head[at - 1] != b'\r'))
 }
 
 /// Trim optional whitespace (SP / HTAB) from both ends of a header value.
@@ -1181,10 +1226,13 @@ mod tests {
         let mut bytes = Vec::from(b"GET / HTTP/1.1\nHost: allowed.test\n\n".as_slice());
         bytes.extend_from_slice(b"POST /x HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
         let result = inspect_with(&bytes, Limits::default(), false);
+        // Issue #29 review, item 6: the bare LF is caught before httparse, so the
+        // pinned reason is the bare-LF one (the differential check still backs
+        // it up for shapes the scan does not see).
         assert_eq!(
             result.expect_err("the parser differential must deny"),
-            Rejected::HttpMalformed {
-                detail: HEAD_TERMINATOR_MISMATCH.to_owned(),
+            Rejected::AmbiguousFraming {
+                detail: FRAMING_BARE_LF,
             }
         );
         // The accepted side: a normal CRLF head parses to exactly the
@@ -1415,6 +1463,68 @@ mod tests {
             let mut request = httparse::Request::new(&mut headers);
             assert!(request.parse(head).is_err(), "{head:?} must not parse");
         }
+    }
+
+    /// Issue #29 review, item 6: a bare LF anywhere in the request head is
+    /// denied with `FRAMING_BARE_LF`, on request 1 (the decision-phase parse)
+    /// and on requests 2+ (`inspect_head`). Bytes past the terminator are not
+    /// part of the head and never trigger it.
+    #[test]
+    fn bare_lf_in_the_head_is_denied_before_parsing() {
+        let rows: &[&[u8]] = &[
+            b"GET / HTTP/1.1\nHost: allowed.test\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\nX: y\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nX: a\n b\r\n\r\n",
+        ];
+        let expected = Rejected::AmbiguousFraming {
+            detail: FRAMING_BARE_LF,
+        };
+        let check_expected = dom("allowed.test");
+        let check = check_allowed(&check_expected);
+        for head in rows {
+            assert_eq!(parse(head), Err(expected.clone()), "parse {head:?}");
+            assert_eq!(
+                inspect_head(head, &check, 64),
+                Err(expected.clone()),
+                "inspect_head {head:?}"
+            );
+        }
+        // A bare LF AFTER the head (in the pipelined bytes) is not part of it.
+        let mut pipelined = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n".to_vec();
+        let head_len = pipelined.len();
+        pipelined.extend_from_slice(b"GET /b HTTP/1.1\nHost: x\n\n");
+        assert_eq!(parse(&pipelined), Ok(head_len));
+        assert!(!head_has_bare_lf(&pipelined));
+    }
+
+    /// Issue #29 review, item 7: a framing header whose name spells `_` is
+    /// denied (`Content_Length` is read by some servers as `Content-Length`).
+    /// Names that merely contain the framing words are not affected.
+    #[test]
+    fn underscore_framing_names_are_denied() {
+        let denied: &[&[u8]] = &[
+            b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent_Length: 5\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: allowed.test\r\ncontent_length: 5\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer_Encoding: chunked\r\n\r\n",
+        ];
+        for head in denied {
+            assert_eq!(
+                parse(head),
+                Err(Rejected::AmbiguousFraming {
+                    detail: FRAMING_UNDERSCORE_NAME,
+                }),
+                "{head:?}"
+            );
+        }
+        // Neighbouring names are untouched, and so is a plain Content-Length.
+        let ok = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nX_Content-Length: 5\r\nContent-Length: 0\r\n\r\n";
+        assert!(parse(ok).is_ok(), "{ok:?}");
+        assert_eq!(FRAMING_BARE_LF, "bare LF line ending in the request head");
+        assert_eq!(
+            FRAMING_UNDERSCORE_NAME,
+            "a framing header name uses an underscore (Content_Length or Transfer_Encoding)"
+        );
     }
 
     // ---- the pure-parser table ----------------------------------------------

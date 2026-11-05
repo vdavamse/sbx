@@ -255,9 +255,12 @@ fn l1_ops(nonce: &str) -> Vec<Op> {
         &b("b11"),
         80,
         vec![
+            // Issue #29 review (item 2): the follow-up is a fully valid,
+            // bodyless GET with the SAME Host, so per-request Host checks cannot
+            // stop it. Only "a body ends the connection" can.
             text(&format!(
                 "POST / HTTP/1.1\r\nHost: {0}\r\nContent-Length: 4\r\n\r\nbody\
-                 GET / HTTP/1.1\r\nHost: other-b11.conformance.test\r\n\r\n",
+                 GET / HTTP/1.1\r\nHost: {0}\r\n\r\n",
                 b("b11")
             )),
             read_to_end(),
@@ -338,8 +341,11 @@ fn l2(env: &Env) -> Scn {
             "b12",
             vec![
                 text(&format!(
+                    // Issue #29 review (item 3): an identical, fully valid
+                    // follow-up to the SAME authority, so only "one request per
+                    // connection" can stop it.
                     "GET http://{0}/x HTTP/1.1\r\nHost: {0}\r\n\r\n\
-                     GET http://{0}/x HTTP/1.1\r\nHost: other-b12.conformance.test\r\n\r\n",
+                     GET http://{0}/x HTTP/1.1\r\nHost: {0}\r\n\r\n",
                     a("b12")
                 )),
                 read_to_end(),
@@ -1079,18 +1085,19 @@ fn b11(ev: &Ev<'_>) -> R {
             on_conn.len()
         ),
     )?;
+    // One request on the connection (the follow-up is never forwarded), and no
+    // byte after the body reached the fixture.
+    let on_connection = ev.http.iter().filter(|h| h.conn == on_conn[0].conn).count();
+    need(
+        on_connection == 1,
+        format!("b11: {on_connection} requests on the connection, expected 1"),
+    )?;
     need(
         on_conn[0].post_close_bytes == 0,
         format!(
             "b11: {} bytes after the body were forwarded",
             on_conn[0].post_close_bytes
         ),
-    )?;
-    need(
-        !ev.http
-            .iter()
-            .any(|h| h.host.as_deref() == Some("other-b11.conformance.test")),
-        "b11: the fixture saw the pipelined foreign Host",
     )?;
     Ok("bytes after a request body are not forwarded".to_owned())
 }
@@ -1124,9 +1131,7 @@ fn b12(ev: &Ev<'_>) -> R {
         ),
     )?;
     need(
-        !ev.http
-            .iter()
-            .any(|h| h.host.as_deref() == Some("other-b12.conformance.test")),
+        on_conn.len() == 1,
         "b12: the fixture saw the pipelined follow-up",
     )?;
     Ok("explicit: a pipelined follow-up request is not forwarded".to_owned())

@@ -189,8 +189,11 @@
 //!    decision phase's and N counts up from there. [`relay_http`] writes every
 //!    validated byte before a request's outcome is acted on, so a denied element
 //!    never reaches the upstream and the bytes before it do. Upstream EOF ends the
-//!    segment (client half-close, then linger). A last request's framed end, or a
-//!    client EOF, half-closes the upstream write half.
+//!    segment (client half-close, then linger). A client EOF half-closes the
+//!    upstream write half. A last request's framed end does NOT: a FIN there
+//!    makes nginx answer 499 and Go reverse proxies cancel the request. The
+//!    write half stays open, and the inserted `Connection: close`, the upstream's
+//!    EOF and the idle watchdog end the segment (issue #29 review, item 1).
 
 use std::future::{Future, poll_fn};
 use std::io;
@@ -998,17 +1001,6 @@ async fn forward_input<W: AsyncWrite + Unpin>(
     })
 }
 
-/// The client→upstream side's exit: a last request's framed end (or a client
-/// EOF) half-closes the upstream write half, so the server sees the end of
-/// the request stream. Nothing else is ever sent after it. A denial is
-/// returned as is: the caller drops the sockets.
-async fn finish_up<W: AsyncWrite + Unpin>(up_w: &mut W, flow: Flow) -> io::Result<Flow> {
-    if matches!(flow, Flow::AfterLast) {
-        up_w.shutdown().await?;
-    }
-    Ok(flow)
-}
-
 /// Inspect one later request head (module docs point 7). Forward never
 /// reaches here: its only request is LAST, so the stream never yields a
 /// second head (the arm is a fail-closed backstop).
@@ -1035,10 +1027,11 @@ fn admit_next(
 /// inspecting and admitting every later head before its bytes are written.
 /// Upstream bytes flow back unparsed (`copy`). Upstream EOF ends the relay
 /// (client half-closed, linger as before); a client EOF shuts the upstream
-/// write half; a last request's end stops reading the client. Every outcome
-/// is returned, never swallowed.
+/// write half; a last request's end stops reading the client and does NOT
+/// shut the upstream write half (issue #29 review, item 1). Every outcome is
+/// returned, never swallowed.
 pub(crate) async fn relay_http<C, U>(
-    client: C,
+    client: &mut C,
     head: &[u8],
     start: HttpStart,
     upstream: &mut U,
@@ -1069,7 +1062,7 @@ where
     }
     let up = async {
         if !matches!(first, Flow::Continue) {
-            return finish_up(&mut up_w, first).await;
+            return Ok(first);
         }
         let mut chunk = [0u8; READ_CHUNK];
         // (request number, instant the head's first byte was seen): the
@@ -1124,7 +1117,7 @@ where
             )
             .await?;
             if !matches!(flow, Flow::Continue) {
-                return finish_up(&mut up_w, flow).await;
+                return Ok(flow);
             }
         }
     };
@@ -1156,10 +1149,9 @@ where
     match race {
         Race::Down(Ok(_)) => {
             // Upstream EOF ends the segment (module docs point 4): half-close
-            // the client, then linger as relay_until_upstream_eof did.
+            // the client. The linger happens in the caller, outside the idle
+            // watchdog (relay_tail), so a natural end is never labelled idle.
             let _ = client_w.shutdown().await;
-            let mut client = client_r.unsplit(client_w);
-            linger_close(&mut client).await;
             Ok(HttpEnd::Finished)
         }
         Race::Down(Err(err)) => Err(err),
@@ -1302,7 +1294,7 @@ mod tests {
             // The request-1 head is written upstream first; a counted relay must
             // report it as `up` (issue #10, T9). Upstream EOF ends the relay.
             let (mut far, near) = tokio::io::duplex(4096);
-            let (client, _client_far) = tokio::io::duplex(4096);
+            let (mut client, _client_far) = tokio::io::duplex(4096);
             let mut counted = Counted::new(near);
             let head = b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n";
             let far_task = tokio::spawn(async move {
@@ -1324,7 +1316,7 @@ mod tests {
                 },
                 pending: Vec::new(),
             };
-            let r = relay_http(client, head, start, &mut counted, &Limits::default()).await;
+            let r = relay_http(&mut client, head, start, &mut counted, &Limits::default()).await;
             far_task.await.expect("far task");
             assert!(matches!(r, Ok(HttpEnd::Finished)), "{r:?}");
             assert_eq!(counted.up(), head.len() as u64);
@@ -2348,7 +2340,7 @@ mod tests {
         half_close: bool,
         limits: Limits,
     ) -> Harness {
-        let (server_side, mut client_peer) = tokio::io::duplex(64 * 1024);
+        let (mut server_side, mut client_peer) = tokio::io::duplex(64 * 1024);
         let (mut upstream, mut up_peer) = tokio::io::duplex(64 * 1024);
         let up_task = tokio::spawn(async move {
             let mut seen = Vec::new();
@@ -2380,7 +2372,7 @@ mod tests {
                 first,
                 pending,
             };
-            relay_http(server_side, &head, start, &mut upstream, &limits).await
+            relay_http(&mut server_side, &head, start, &mut upstream, &limits).await
         });
         let client_task = tokio::spawn(async move {
             for (delay_ms, bytes) in steps {
@@ -2648,6 +2640,75 @@ mod tests {
             let got = run_http(close_head, close, GET2, vec![], false, small_limits()).await;
             assert_eq!(got.upstream_received, close_head.to_vec());
             assert!(matches!(got.end, Ok(HttpEnd::Finished)), "{:?}", got.end);
+        });
+    }
+
+    /// Issue #29 review, item 1: a last request's framed end must NOT
+    /// half-close the upstream (a FIN before the response makes nginx answer
+    /// 499 and Go reverse proxies cancel). The upstream here answers only when
+    /// no EOF reaches it before the response: it reads the head, then waits
+    /// 300 ms; an EOF in that window makes it drop WITHOUT answering.
+    #[test]
+    fn last_request_keeps_the_upstream_open_for_its_response() {
+        block_on(async {
+            let head = b"GET /a HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+            let close = RequestMeta {
+                close: true,
+                ..keep_alive()
+            };
+            let (mut server_side, mut client_peer) = tokio::io::duplex(64 * 1024);
+            let (mut upstream, mut up_peer) = tokio::io::duplex(64 * 1024);
+            let up_task = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match up_peer.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                match tokio::time::timeout(Duration::from_millis(300), up_peer.read(&mut chunk))
+                    .await
+                {
+                    // An EOF before the response: drop without answering.
+                    Ok(Ok(0)) | Ok(Err(_)) => return false,
+                    _ => {}
+                }
+                let _ = up_peer
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                let _ = up_peer.shutdown().await;
+                true
+            });
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: Domain::parse("allowed.test").expect("name"),
+                    port: 80,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first: close,
+                pending: Vec::new(),
+            };
+            let relay_task = tokio::spawn(async move {
+                relay_http(
+                    &mut server_side,
+                    head,
+                    start,
+                    &mut upstream,
+                    &small_limits(),
+                )
+                .await
+            });
+            let mut got = Vec::new();
+            client_peer
+                .read_to_end(&mut got)
+                .await
+                .expect("client read");
+            let answered = up_task.await.expect("upstream task");
+            let end = relay_task.await.expect("relay task");
+            assert!(answered, "the upstream saw EOF before its response");
+            assert!(matches!(end, Ok(HttpEnd::Finished)), "{end:?}");
+            assert!(got.starts_with(b"HTTP/1.1 200 OK"), "{got:?}");
         });
     }
 

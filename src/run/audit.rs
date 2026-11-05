@@ -441,7 +441,7 @@ impl DecisionSink for AuditLog {
         self.write(&teardown_row(ts(SystemTime::now()), decision, detail));
     }
 
-    fn closed(&self, decision: &Decision, up: u64, down: u64, end: CloseReason) {
+    fn closed_with_reason(&self, decision: &Decision, up: u64, down: u64, end: CloseReason) {
         self.write(&close_row(ts(SystemTime::now()), decision, up, down, end));
     }
 }
