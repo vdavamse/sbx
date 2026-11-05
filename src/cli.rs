@@ -471,18 +471,16 @@ pub fn run() -> ExitCode {
     // The shim (issue #19 m6) reports every parse error as its own failure: rc 125
     // with `sbx __landlock:` on stderr, never clap's rc 2, because the payload's
     // rc space and the status pipe belong to the shim's contract.
-    let cli = if std::env::args_os()
-        .nth(1)
-        .is_some_and(|a| a == "__landlock")
-    {
-        match Cli::try_parse() {
+    // Issue #19 round 3: the shim's start marker is the first thing it does, before
+    // any parsing, so `run` can tell a shim that never started from one that failed.
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    crate::landlock::announce_start(&argv);
+    let cli = if argv.get(1).is_some_and(|a| a == "__landlock") {
+        match Cli::try_parse_from(argv.clone()) {
             Ok(cli) => cli,
             Err(err) => {
-                use std::io::Write;
                 if err.use_stderr() {
-                    let text = err.to_string();
-                    let _ = writeln!(std::io::stderr(), "sbx __landlock: {}", text.trim_end());
-                    return ExitCode::from(crate::run::EXIT_FAILURE as u8);
+                    return crate::landlock::parse_failure(&argv, err.to_string().trim_end());
                 }
                 err.exit();
             }

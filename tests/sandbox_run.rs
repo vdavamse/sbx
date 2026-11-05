@@ -1119,6 +1119,11 @@ fn scenarios() -> Vec<Scenario> {
             gate: Bwrap,
             run: landlock_payload_not_found_125,
         },
+        Scenario {
+            name: "landlock-payload-own-125",
+            gate: Bwrap,
+            run: landlock_payload_own_125,
+        },
     ]
 }
 
@@ -1334,6 +1339,53 @@ fn landlock_payload_not_found_125() -> Result<(), String> {
             } else {
                 Err(format!(
                     "exit row outcome is {}, want failed",
+                    exit["outcome"]
+                ))
+            }
+        });
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// #19 round 3 (item 3): the payload's own exit 125 is not a shim failure. Under
+/// `--landlock best-effort` the `exit` role with arg 125 ends with rc 125, the
+/// audit outcome `exited`, and no `sbx run: landlock:` line: the status pipe
+/// carries the start marker only.
+fn landlock_payload_own_125() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 1 {
+        println!("SKIP landlock-payload-own-125: the kernel has no Landlock");
+        return Ok(());
+    }
+    let dir = scratch("landlock-own-125");
+    let policy = Pol::new("exit").write(&dir);
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.to_string_lossy().into_owned();
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--landlock", "best-effort", "--audit", audit_arg.as_str()],
+        &payload(&["125"]),
+    );
+    let done = run_sbx(&args)?;
+    let result = expect_rc(&done, 125)
+        .and_then(|()| {
+            if done.stderr.contains("sbx run: landlock:") {
+                Err(format!(
+                    "the payload's own 125 must not report landlock: {:?}",
+                    done.stderr
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .and_then(|()| {
+            let rows = read_audit(&audit)?;
+            let exit = rows.last().ok_or("the audit log has no rows")?;
+            if exit["outcome"] == "exited" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "exit row outcome is {}, want exited",
                     exit["outcome"]
                 ))
             }

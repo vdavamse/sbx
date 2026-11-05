@@ -45,8 +45,9 @@
 //! 13  --chdir {cwd | /work}
 //! 14  --
 //!     with `--landlock` on (issue #19, `Build::landlock`), the shim head
-//!     `/proc/self/fd/N __landlock --exe-fd N --mode M [--bind-tcp P]…
-//!     [--rule GRANT:PATH]…` and a second `--` (see `crate::landlock`)
+//!     `/proc/self/fd/N __landlock --exe-fd N --status-fd S --mode M
+//!     --host-abi A [--bind-tcp P]… [--rule GRANT:PATH]…` and a second `--`
+//!     (see `crate::landlock`)
 //! 15  the command elements verbatim (byte-preserving OsString copies)
 //! ```
 //!

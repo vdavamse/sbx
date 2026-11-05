@@ -35,11 +35,12 @@ pub(crate) struct ChildFds {
 }
 
 /// The re-exec argv after the program:
-/// `__init --fd C --keep-fd I --seccomp-fd S [--exe-fd E] --parent-pid P
-/// --min-mode M [--test-break-rules] -- <argv…>` (issue #11: `M` is the policy's
-/// mode — the weakest mode `__init` may fall back to; issue #34: `S` is the
-/// sealed seccomp-program memfd `__init` verifies and hands to bwrap; issue
-/// #19: `E` is sbx's own executable, passed only under `--landlock`).
+/// `__init --fd C --keep-fd I --seccomp-fd S [--exe-fd E] [--status-fd T]
+/// --parent-pid P --min-mode M [--test-break-rules] -- <argv…>` (issue #11: `M`
+/// is the policy's mode — the weakest mode `__init` may fall back to; issue #34:
+/// `S` is the sealed seccomp-program memfd `__init` verifies and hands to bwrap;
+/// issue #19: `E` is sbx's own executable, and round 3 adds `T`, the shim's
+/// status pipe write end; both are passed only under `--landlock`).
 pub(crate) fn init_argv(
     fds: ChildFds,
     parent_pid: u32,

@@ -36,11 +36,13 @@
 //!    `tmp/` leaves), and there is no *filesystem* fd-passing
 //!    (`--ro-bind-data` is impossible: #5's `fd_hygiene` closes every fd
 //!    not explicitly kept before exec — hence on-disk synthetic files, Q6).
-//!    The only fds bwrap receives are the info pipe (`--info-fd`) and the
-//!    seccomp program memfd (`--seccomp`, issue #34), both consumed by
-//!    bwrap before the payload runs. With `--landlock` (issue #19) the
-//!    command is the Landlock shim, exec'd through sbx's own executable
-//!    fd; bwrap never reads that fd, and the shim closes it (argv.rs
+//!    The fds bwrap receives are the info pipe (`--info-fd`) and the seccomp
+//!    program memfd (`--seccomp`, issue #34), both consumed by bwrap before
+//!    the payload runs. With `--landlock` (issue #19) the command is the
+//!    Landlock shim, exec'd through sbx's own executable fd (`--exe-fd`) and
+//!    reporting through the status pipe (`--status-fd`). bwrap never reads
+//!    either: it only inherits them, and the shim closes the executable fd
+//!    and keeps the status fd for its reports until the exec (argv.rs
 //!    element 14).
 //! 4. **Order is semantics** — bwrap applies filesystem ops in argv order.
 //!    All mounts sort by (dest ascending byte order, priority ascending):

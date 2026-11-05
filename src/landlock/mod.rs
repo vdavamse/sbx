@@ -47,13 +47,18 @@
 //!    the ruleset. The status write end is close-on-exec from just before the
 //!    exec, so the payload has exactly fds 0, 1 and 2. An unreadable
 //!    `/proc/self/fd` is a shim failure (rc 125), not a silent continue.
-//! 9. **Status pipe (issue #19 round 2, M1).** `run` creates a pipe with the
+//! 9. **Status pipe (issue #19 round 2, M1; start marker, round 3 item 2).**
+//!    `run` creates a pipe with the
 //!    write end passed as `--status-fd` (validated by `__init`, kept through
 //!    hygiene, inherited by bwrap). On any shim failure the reason is written
 //!    there before rc 125, so the run can tell a shim failure from the payload's
 //!    own exit 125: the audit outcome is `failed` and the run prints `sbx run:
-//!    landlock: <reason>`. On success the exec closes the write end and the pipe
-//!    is empty.
+//!    landlock: <reason>`. The first thing the shim writes is [`STATUS_MARKER`],
+//!    before any argument parsing ([`announce_start`]), so a failure before
+//!    [`shim`] runs (a clap error, bwrap's exec of the shim failing, the dynamic
+//!    loader failing) leaves a pipe with no marker, which `run` reports as "the
+//!    shim did not start". On success the exec closes the write end, and the pipe
+//!    holds the marker only.
 //! 10. **Host ABI check (round 2, m1).** `--host-abi` is the ABI `run` saw
 //!     ([`host_abi`]). A best-effort ruleset that the kernel reports as NOT
 //!     enforced while the host has Landlock fails closed ([`enforcement_failure`]),
@@ -385,8 +390,71 @@ const STATUS_MAX_BYTES: usize = 512;
 fn report_failure(status_fd: RawFd, reason: &str) -> ExitCode {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "sbx __landlock: {reason}");
+    write_status(status_fd, reason.as_bytes());
+    ExitCode::from(crate::run::EXIT_FAILURE as u8)
+}
+
+/// The first bytes the shim writes to its status pipe (issue #19 round 3, item 2),
+/// before anything else. They prove the shim started, so a failure before
+/// [`shim`] runs (a clap error, bwrap's own exec of the shim failing, a dynamic
+/// loader failing) is told apart from a shim that started and failed.
+pub const STATUS_MARKER: &str = "sbx-shim: started\n";
+
+/// What the status pipe says, as `run` reads it (module docs point 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusReport {
+    /// No marker: the shim never started (or the pipe holds something else).
+    NotStarted,
+    /// The marker and nothing after it: the shim started and reported no failure.
+    Started,
+    /// The marker, then the shim's failure reason.
+    Failed(String),
+}
+
+/// Decodes the status pipe's bytes (module docs point 9). Pure: empty bytes and
+/// bytes without the marker are `NotStarted`, so only a shim that wrote its
+/// marker can report a clean start or a reason.
+pub fn decode_status(bytes: &[u8]) -> StatusReport {
+    let text = String::from_utf8_lossy(bytes);
+    match text.strip_prefix(STATUS_MARKER) {
+        None => StatusReport::NotStarted,
+        Some(rest) => {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                StatusReport::Started
+            } else {
+                StatusReport::Failed(rest.to_owned())
+            }
+        }
+    }
+}
+
+/// `--status-fd S` from the shim's RAW argv: a minimal scan that needs no clap, so
+/// it works even when clap would reject the arguments. Only the shim's own argv
+/// counts (`argv[1]` is `__landlock`), and only a flag before the shim's `--`.
+/// `None` unless the value is a descriptor above stdio.
+pub fn status_fd_in_argv(argv: &[OsString]) -> Option<RawFd> {
+    if argv.get(1).and_then(|a| a.to_str()) != Some("__landlock") {
+        return None;
+    }
+    let mut i = 2;
+    while let Some(word) = argv.get(i).and_then(|a| a.to_str()) {
+        if word == "--" {
+            return None;
+        }
+        if word == "--status-fd" {
+            let fd: RawFd = argv.get(i + 1)?.to_str()?.parse().ok()?;
+            return (fd > 2).then_some(fd);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Writes `bytes` to the status pipe, best effort: nothing is written unless the
+/// descriptor is above stdio, and errors (a closed pipe) are ignored.
+fn write_status(status_fd: RawFd, bytes: &[u8]) {
     if status_fd > 2 {
-        let bytes = reason.as_bytes();
         let bytes = &bytes[..bytes.len().min(STATUS_MAX_BYTES)];
         // SAFETY: a write from a live buffer to the status descriptor, which this
         // process keeps open for exactly this purpose; errors are ignored.
@@ -394,7 +462,23 @@ fn report_failure(status_fd: RawFd, reason: &str) -> ExitCode {
             libc::write(status_fd, bytes.as_ptr().cast(), bytes.len());
         }
     }
-    ExitCode::from(crate::run::EXIT_FAILURE as u8)
+}
+
+/// The shim's first act (issue #19 round 3, item 2), run before any argument
+/// parsing: writes [`STATUS_MARKER`] to the status pipe when the raw argv names
+/// one. A shim that never gets this far leaves the pipe empty, which `run` reads
+/// as "the shim did not start".
+pub fn announce_start(argv: &[OsString]) {
+    if let Some(fd) = status_fd_in_argv(argv) {
+        write_status(fd, STATUS_MARKER.as_bytes());
+    }
+}
+
+/// A clap parse error in the shim's argv (issue #19 round 3, item 2): the message
+/// goes to stderr and, after the marker `announce_start` already wrote, to the
+/// status pipe. rc 125, never clap's 2.
+pub fn parse_failure(argv: &[OsString], message: &str) -> ExitCode {
+    report_failure(status_fd_in_argv(argv).unwrap_or(0), message)
 }
 
 /// The shim (module docs points 5, 6, 9 and 10). It closes the executable fd and
@@ -830,6 +914,89 @@ mod tests {
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rc, 0, "a rule for a missing path must grant nothing");
+    }
+
+    #[test]
+    fn decode_status_table() {
+        // Round 3 item 2: empty, marker, marker+reason, garbage. Only a marker
+        // proves the shim started; the reason is what follows it.
+        assert_eq!(decode_status(b""), StatusReport::NotStarted);
+        assert_eq!(
+            decode_status(STATUS_MARKER.as_bytes()),
+            StatusReport::Started
+        );
+        assert_eq!(
+            decode_status(format!("{STATUS_MARKER}cannot exec \"/x\": not found\n").as_bytes()),
+            StatusReport::Failed("cannot exec \"/x\": not found".to_owned())
+        );
+        // A reason with the marker but no trailing newline still decodes.
+        assert_eq!(
+            decode_status(format!("{STATUS_MARKER}boom").as_bytes()),
+            StatusReport::Failed("boom".to_owned())
+        );
+        // Garbage, a partial marker, or a reason without the marker: not started.
+        assert_eq!(
+            decode_status(b"garbage without marker"),
+            StatusReport::NotStarted
+        );
+        assert_eq!(
+            decode_status(&STATUS_MARKER.as_bytes()[..5]),
+            StatusReport::NotStarted
+        );
+        assert_eq!(
+            decode_status(b"cannot exec: not found"),
+            StatusReport::NotStarted
+        );
+    }
+
+    #[test]
+    fn status_fd_in_argv_scans_only_the_shim_head() {
+        // Round 3 item 2: the minimal raw-argv scan that runs before clap.
+        let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let shim = words(&[
+            "sbx",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--status-fd",
+            "13",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+        ]);
+        assert_eq!(status_fd_in_argv(&shim), Some(13));
+        // Not the shim: another subcommand, or no argv[1].
+        assert_eq!(
+            status_fd_in_argv(&words(&["sbx", "run", "--status-fd", "13"])),
+            None
+        );
+        assert_eq!(status_fd_in_argv(&words(&["sbx"])), None);
+        // A `--status-fd` after the shim's own `--` is the payload's, not the shim's.
+        let payload = words(&[
+            "sbx",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--",
+            "/bin/true",
+            "--status-fd",
+            "13",
+        ]);
+        assert_eq!(status_fd_in_argv(&payload), None);
+        // Values that are not a descriptor above stdio.
+        assert_eq!(
+            status_fd_in_argv(&words(&["sbx", "__landlock", "--status-fd", "2"])),
+            None
+        );
+        assert_eq!(
+            status_fd_in_argv(&words(&["sbx", "__landlock", "--status-fd", "x"])),
+            None
+        );
+        assert_eq!(
+            status_fd_in_argv(&words(&["sbx", "__landlock", "--status-fd"])),
+            None
+        );
     }
 
     #[test]

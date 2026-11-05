@@ -61,13 +61,19 @@
 //!     With it on, `run` refuses `require` on a kernel below ABI 6 before anything
 //!     is spawned (rc 125, [`crate::landlock::require_refusal`], S5b), opens sbx's
 //!     own executable (S8b) and passes it to `__init` as `--exe-fd` (S9–S11), and
-//!     bwrap runs the shim, which applies the rules and execs the payload. Round 2
-//!     adds a status pipe (S8b, S9–S11): the shim writes its failure reason to it
-//!     and exits 125. After teardown, a non-empty pipe turns the outcome into
-//!     `failed` (the audit row says so) and prints `sbx run: landlock: <reason>`,
-//!     rc 125, so a shim failure is never mistaken for the payload's own 125. No
-//!     data leaves the outcome unchanged. See [`crate::landlock`] module docs
-//!     point 9.
+//!     bwrap runs the shim, which applies the rules and execs the payload. A status
+//!     pipe (S8b, S9–S11) carries the shim's news back. The shim first writes a
+//!     start marker, before any argument parsing. A failure adds its reason after
+//!     the marker, then exits 125. After teardown, `run` reads the pipe:
+//!     - no marker: the shim never started (bwrap's exec of it failed, or the
+//!       dynamic loader did), so the outcome is `failed` with `sbx run: landlock:
+//!       the shim did not start (rc N)`, rc 125;
+//!     - marker and reason: `failed` with `sbx run: landlock: <reason>`, rc 125;
+//!     - marker only: the shim started and nothing failed, so the outcome is
+//!       unchanged, whatever the payload did (its own 125 included).
+//!
+//!     Outcomes that are already `failed` keep their own reason. See
+//!     [`crate::landlock`] module docs point 9.
 
 mod audit;
 mod lifecycle;
@@ -802,12 +808,24 @@ fn execute(
         Err(cause) => cause,
     };
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
-    // M1 (issue #19 round 2): a shim failure is reported on the status pipe. It
-    // ends the run as `failed`, whatever the payload's own rc, so the payload's
-    // exit 125 is never mistaken for the shim's refusal.
-    if let Some(reason) = status_read.as_ref().and_then(read_status) {
-        if !matches!(outcome, Outcome::Failed(_)) {
-            outcome = Outcome::Failed(format!("landlock: {reason}"));
+    // M1 and round 3 item 2: the status pipe says whether the shim started and
+    // whether it failed (module docs point 11). It ends the run as `failed` only
+    // when the payload's own outcome is not already a failure.
+    if let Some(bytes) = status_read.as_ref().and_then(read_status) {
+        match crate::landlock::decode_status(&bytes) {
+            crate::landlock::StatusReport::Started => {}
+            crate::landlock::StatusReport::Failed(reason) => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    outcome = Outcome::Failed(format!("landlock: {reason}"));
+                }
+            }
+            crate::landlock::StatusReport::NotStarted => {
+                if !matches!(outcome, Outcome::Failed(_)) {
+                    let rc = exit_code(&outcome);
+                    outcome =
+                        Outcome::Failed(format!("landlock: the shim did not start (rc {rc})"));
+                }
+            }
         }
     }
     let _ = lock.touch();
@@ -826,11 +844,12 @@ fn execute(
     )
 }
 
-/// Reads the shim's status pipe without blocking (issue #19 M1): whatever is
-/// there, as text, or `None` when it is empty. The shim writes its reason
-/// before exiting 125, so the data is in the pipe by the time the payload is
-/// gone. A pipe still held by a dying bwrap reads as EAGAIN, which is "no data".
-fn read_status(fd: &OwnedFd) -> Option<String> {
+/// Reads the shim's status pipe without blocking (issue #19 M1): the bytes there
+/// (empty when nothing was written). The shim writes its marker first and any
+/// reason before exiting 125, so the data is in the pipe by the time the payload
+/// is gone. A pipe still held by a dying bwrap reads as EAGAIN, which ends the
+/// read with what is there. Decoding is `landlock::decode_status`.
+fn read_status(fd: &OwnedFd) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut file = std::fs::File::from(fd.try_clone().ok()?);
     let mut bytes = Vec::new();
@@ -842,8 +861,7 @@ fn read_status(fd: &OwnedFd) -> Option<String> {
             Err(_) => break,
         }
     }
-    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
-    (!text.is_empty()).then_some(text)
+    Some(bytes)
 }
 
 /// Which writable location an audit path collides with (for the pinned messages).

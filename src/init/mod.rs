@@ -61,8 +61,10 @@
 //!    same way and content-checked against this binary's own program. Issue #19
 //!    adds the hidden `--exe-fd N` (sbx's own executable, opened by `run` for the
 //!    Landlock shim; passed only under `--landlock`), validated as the same file
-//!    as `/proc/self/exe`. The only fds above 2 that survive hygiene are
-//!    `--keep-fd`, `--seccomp-fd` and `--exe-fd`. The signal mask is reset
+//!    as `/proc/self/exe`. Round 3 adds the hidden `--status-fd S` (the shim's
+//!    status pipe write end, `run --landlock` only). The only fds above 2 that
+//!    survive hygiene are `--keep-fd`, `--seccomp-fd`, `--exe-fd` and
+//!    `--status-fd`. The signal mask is reset
 //!    first thing: std does not reset the blocked mask across spawn, and
 //!    `run` blocks TERM/INT/HUP/QUIT for its signalfd.
 //! 7. **Consumers.** [`fdpass`] doubles as the parent-side API #10 drives
@@ -756,35 +758,80 @@ fn validate_status_fd(
     Ok(())
 }
 
-/// Issue #19 m4: an exe or status fd is only meaningful in the Landlock shim's
-/// own argv. The bwrap command must hold `/proc/self/fd/{exe} __landlock` (the
-/// shim head, as `run` builds it) and, for the status fd, a `--status-fd {status}`
-/// shim argument. Otherwise the descriptors would survive hygiene for nothing.
+/// Issue #19 m4 (round 3, item 1): the bwrap argv's own `--`, the separator
+/// bwrap's layout emits before the payload (argv.rs element 14). Found by walking
+/// bwrap's flags with their arities, never by searching: a payload argument that
+/// is `--`, or a `--setenv` value that is `--`, is never taken for the separator.
+/// `None` when a flag is not one the layout emits (fail closed).
+fn bwrap_separator(argv: &[OsString]) -> Option<usize> {
+    let mut i = 1;
+    while i < argv.len() {
+        let arity = match argv[i].to_str()? {
+            "--" => return Some(i),
+            "--unshare-user"
+            | "--unshare-pid"
+            | "--unshare-ipc"
+            | "--unshare-uts"
+            | "--unshare-cgroup-try"
+            | "--disable-userns"
+            | "--die-with-parent"
+            | "--new-session"
+            | "--clearenv" => 0,
+            "--cap-drop" | "--hostname" | "--info-fd" | "--seccomp" | "--proc" | "--dev"
+            | "--tmpfs" | "--chdir" => 1,
+            "--ro-bind" | "--bind" | "--symlink" | "--setenv" => 2,
+            _ => return None,
+        };
+        i += 1 + arity;
+    }
+    None
+}
+
+/// Issue #19 m4 (round 3, item 1): an exe or status fd is only meaningful in the
+/// Landlock shim's own argv. `--exe-fd E` needs the shim right after bwrap's own
+/// `--`: `/proc/self/fd/E __landlock`. `--status-fd S` needs `--exe-fd` and must
+/// appear in the shim head, between `__landlock` and the shim's own `--`. A shim
+/// pair that appears only in the payload's arguments does not count.
 fn validate_shim_command(
     cmd: &[OsString],
     exe: Option<RawFd>,
     status: Option<RawFd>,
 ) -> Result<(), InitError> {
     let fail = |reason: String| InitError::new(Stage::Control, reason);
-    if let Some(exe) = exe {
-        let head = format!("/proc/self/fd/{exe}");
-        let shim = cmd
-            .windows(2)
-            .any(|w| w[0].to_str() == Some(head.as_str()) && w[1].to_str() == Some("__landlock"));
-        if !shim {
+    let Some(exe) = exe else {
+        if let Some(status) = status {
             return Err(fail(format!(
-                "--exe-fd {exe} is given but the command is not the Landlock shim (/proc/self/fd/{exe} __landlock)"
+                "--status-fd {status} is given without --exe-fd"
             )));
         }
+        return Ok(());
+    };
+    let not_shim = || {
+        fail(format!(
+            "--exe-fd {exe} is given but the command is not the Landlock shim (/proc/self/fd/{exe} __landlock)"
+        ))
+    };
+    let separator = bwrap_separator(cmd).ok_or_else(not_shim)?;
+    let head = format!("/proc/self/fd/{exe}");
+    let shim_program = cmd.get(separator + 1).and_then(|w| w.to_str());
+    let shim_name = cmd.get(separator + 2).and_then(|w| w.to_str());
+    if shim_program != Some(head.as_str()) || shim_name != Some("__landlock") {
+        return Err(not_shim());
     }
     if let Some(status) = status {
+        // The shim's own argv runs from its name to its own `--` (or the end).
+        let shim_args = &cmd[separator + 3..];
+        let end = shim_args
+            .iter()
+            .position(|w| w.to_str() == Some("--"))
+            .unwrap_or(shim_args.len());
         let text = status.to_string();
-        let shim = cmd
+        let found = shim_args[..end]
             .windows(2)
             .any(|w| w[0].to_str() == Some("--status-fd") && w[1].to_str() == Some(text.as_str()));
-        if !shim {
+        if !found {
             return Err(fail(format!(
-                "--status-fd {status} is given but the command has no `--status-fd {status}` shim argument"
+                "--status-fd {status} is given but the shim head has no `--status-fd {status}` argument"
             )));
         }
     }
@@ -1418,26 +1465,133 @@ mod tests {
 
     #[test]
     fn validate_shim_command_table() {
-        // m4: the exe and status fds need the shim in the command, pinned reasons.
+        // Issue #19 m4 (round 3, item 1): the shim pair must sit right after bwrap's
+        // own `--`, and `--status-fd` only in the shim head. Pinned reasons.
         let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
-        let shim = words(&["/bin/true"]);
-        assert!(validate_shim_command(&shim, None, None).is_ok());
+        let plain = words(&["/bin/bwrap", "--chdir", "/work", "--", "/bin/true"]);
+        assert!(validate_shim_command(&plain, None, None).is_ok());
+        let not_shim = "sbx __init: control: --exe-fd 9 is given but the command is not the Landlock shim (/proc/self/fd/9 __landlock)";
         assert_eq!(
-            validate_shim_command(&shim, Some(9), None)
+            validate_shim_command(&plain, Some(9), None)
                 .expect_err("no shim")
                 .to_string(),
-            "sbx __init: control: --exe-fd 9 is given but the command is not the Landlock shim (/proc/self/fd/9 __landlock)"
+            not_shim
         );
-        let head = words(&["/proc/self/fd/9", "__landlock", "--mode", "off"]);
+        // The shim pair only inside the payload's own arguments: not the shim.
+        let payload_only = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/bin/sh",
+            "-c",
+            "/proc/self/fd/9",
+            "__landlock",
+        ]);
+        assert_eq!(
+            validate_shim_command(&payload_only, Some(9), None)
+                .expect_err("payload args")
+                .to_string(),
+            not_shim
+        );
+        // A `--setenv` value of `--` is not the separator (the walk knows arities).
+        let setenv_dash = words(&[
+            "/bin/bwrap",
+            "--setenv",
+            "X",
+            "--",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--",
+            "/bin/true",
+        ]);
+        assert!(validate_shim_command(&setenv_dash, Some(9), None).is_ok());
+        // A flag the layout never emits: fail closed.
+        let unknown = words(&[
+            "/bin/bwrap",
+            "--weird",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+        ]);
+        assert_eq!(
+            validate_shim_command(&unknown, Some(9), None)
+                .expect_err("unknown flag")
+                .to_string(),
+            not_shim
+        );
+        // The right shim, wrong number.
+        let head = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+        ]);
         assert!(validate_shim_command(&head, Some(9), None).is_ok());
         assert!(validate_shim_command(&head, Some(8), None).is_err());
-        let with_status = words(&["/proc/self/fd/9", "__landlock", "--status-fd", "13"]);
+        // The status fd: needs --exe-fd, and must be in the shim head.
+        assert_eq!(
+            validate_shim_command(&plain, None, Some(13))
+                .expect_err("status without exe")
+                .to_string(),
+            "sbx __init: control: --status-fd 13 is given without --exe-fd"
+        );
+        let with_status = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--status-fd",
+            "13",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+        ]);
         assert!(validate_shim_command(&with_status, Some(9), Some(13)).is_ok());
         assert_eq!(
             validate_shim_command(&with_status, Some(9), Some(14))
                 .expect_err("wrong status fd")
                 .to_string(),
-            "sbx __init: control: --status-fd 14 is given but the command has no `--status-fd 14` shim argument"
+            "sbx __init: control: --status-fd 14 is given but the shim head has no `--status-fd 14` argument"
+        );
+        // A `--status-fd` only in the payload's arguments is not the shim head.
+        let status_in_payload = words(&[
+            "/bin/bwrap",
+            "--chdir",
+            "/work",
+            "--",
+            "/proc/self/fd/9",
+            "__landlock",
+            "--exe-fd",
+            "9",
+            "--mode",
+            "off",
+            "--",
+            "/bin/true",
+            "--status-fd",
+            "13",
+        ]);
+        assert_eq!(
+            validate_shim_command(&status_in_payload, Some(9), Some(13))
+                .expect_err("status in payload")
+                .to_string(),
+            "sbx __init: control: --status-fd 13 is given but the shim head has no `--status-fd 13` argument"
         );
     }
 
