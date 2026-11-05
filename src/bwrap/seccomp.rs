@@ -545,6 +545,33 @@ fn write_all(fd: &OwnedFd, mut bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn landlock_syscalls_are_never_denied() {
+        // Round 2 (m1): the Landlock layer's three syscalls must stay reachable, or
+        // `--landlock` could never install its ruleset. They are 444, 445 and 446
+        // on both x86_64 and aarch64, so the deny-list must hold neither the names
+        // nor those numbers.
+        for name in [
+            "landlock_create_ruleset",
+            "landlock_add_rule",
+            "landlock_restrict_self",
+        ] {
+            assert!(
+                DENIED_SYSCALLS.iter().all(|s| s.name != name),
+                "{name} must not be in DENIED_SYSCALLS"
+            );
+        }
+        for entry in DENIED_SYSCALLS.iter() {
+            for number in [entry.x86_64, entry.aarch64].into_iter().flatten() {
+                assert!(
+                    !(444..=446).contains(&number),
+                    "{} uses number {number}, a Landlock syscall number",
+                    entry.name
+                );
+            }
+        }
+    }
+
     use super::*;
     use std::os::fd::AsRawFd;
 

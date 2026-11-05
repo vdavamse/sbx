@@ -334,6 +334,7 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 | an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
 | the host cannot provide the policy's network mode, or cannot run sandboxes (issue #11) | 125 | `failed` | `sbx run: policy requires network mode <mode> but this host provides only explicit: <reason>; fix: <fix>; run \`sbx check\` for a full host report` (or `… but this host cannot run sandboxes: …`); the staged line of `__init` comes first |
 | the explicit fallback ran (the nft redirect is unavailable, the policy is `explicit` or `none`) | the command's own | the command's | `sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (<reason>); run \`sbx check\` for details` |
+| a Landlock shim failure under `--landlock` (the shim could not apply the rules, could not check the host ABI, or could not exec the payload; issue #19) | 125 | `failed` | `sbx run: landlock: <reason>`. The payload did not run, or ran and exited 125 itself; the shim's reason on the status pipe decides, so the payload's own 125 is never reported as this one |
 | a usage error | 2 | — | clap's message |
 
 The audit row's `outcome` is one of: `exited` (the command ended by itself, or
@@ -497,6 +498,23 @@ opened by `run` and exec'd inside the sandbox through `/proc/self/fd`. A
 dynamically linked sbx build needs its shared libraries visible inside the sandbox
 when `--landlock` is on. The static musl release does not. This is not checked
 before the run.
+
+Three limits of the layer that operators hit in practice:
+
+- **Deny masks and new directories.** A `deny` entry is a tmpfs over the path and
+  gets no Landlock rule of its own. Under a read-only mount, or outside every
+  mount, the masked directory is therefore not writable (`EACCES`). The same holds
+  for intermediate directories that bwrap creates on the root tmpfs: they are
+  reached only through the root's list-only rule, so they take no entries.
+- **ABI 1 (Linux 5.13 to 5.18).** `LANDLOCK_ACCESS_FS_REFER` is an ABI 2 right and
+  is not handled there, so with `best-effort` on an ABI 1 kernel a rename or hard
+  link across directories fails with `EXDEV`, even inside `/work`. The kernel does
+  this for any ruleset without REFER, and `sbx` does not work around it.
+- **Shim failures are not silent.** The shim writes its reason to a status pipe
+  before it exits 125, and `run` reports it as `failed` (exit-code table above).
+  `best-effort` fails closed when the kernel reports the ruleset as not enforced
+  while the host has Landlock (for example an outer seccomp profile refuses
+  `landlock_*`), instead of running the payload unrestricted.
 
 **Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
 discovery), and unprivileged user namespaces. Run `sbx check` to see what this

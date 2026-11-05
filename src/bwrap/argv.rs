@@ -1372,13 +1372,29 @@ mod tests {
     /// like a flag can never confuse it.
     #[derive(Debug, PartialEq, Eq)]
     enum Event {
-        Bind { src: OsString, dest: String },
-        Symlink { dest: String },
-        Tmpfs { dest: String },
-        Proc { dest: String },
-        Dev { dest: String },
-        Setenv { name: String },
-        Chdir { dir: OsString },
+        Bind {
+            src: OsString,
+            dest: String,
+            rw: bool,
+        },
+        Symlink {
+            dest: String,
+        },
+        Tmpfs {
+            dest: String,
+        },
+        Proc {
+            dest: String,
+        },
+        Dev {
+            dest: String,
+        },
+        Setenv {
+            name: String,
+        },
+        Chdir {
+            dir: OsString,
+        },
         Flag(String),
     }
 
@@ -1397,6 +1413,7 @@ mod tests {
                     events.push(Event::Bind {
                         src: flags[i + 1].clone(),
                         dest: text(&flags[i + 2]),
+                        rw: flag == "--bind",
                     });
                     i += 3;
                 }
@@ -1500,6 +1517,8 @@ mod tests {
             mode: crate::landlock::Mode::Off,
             bind_tcp: vec![8080],
             exe_fd: 9,
+            status_fd: 8,
+            host_abi: 6,
         };
         assert_eq!(build_with(Some(off)), plain);
 
@@ -1507,6 +1526,8 @@ mod tests {
             mode: crate::landlock::Mode::BestEffort,
             bind_tcp: vec![8080],
             exe_fd: 9,
+            status_fd: 8,
+            host_abi: 6,
         };
         let argv = build_with(Some(layer));
         let cut = plain.len() - command.len() - 1; // the `--` before the payload
@@ -1535,8 +1556,12 @@ mod tests {
             "__landlock",
             "--exe-fd",
             "9",
+            "--status-fd",
+            "8",
             "--mode",
             "best-effort",
+            "--host-abi",
+            "6",
             "--bind-tcp",
             "8080",
         ]);
@@ -1571,6 +1596,8 @@ mod tests {
                     mode: crate::landlock::Mode::BestEffort,
                     bind_tcp: Vec::new(),
                     exe_fd: 9,
+                    status_fd: 8,
+                    host_abi: 6,
                 }),
             };
             let argv = build(&input).expect("generated inputs must build").argv().to_vec();
@@ -1591,14 +1618,50 @@ mod tests {
                 );
             }
             let events = parse_flags(&argv[..shim - 1]);
+            // (path, grant) of every emitted rule.
+            let granted: Vec<(String, &'static str)> = rules
+                .iter()
+                .map(|text| {
+                    let rule = crate::landlock::PathRule::parse(text).expect("parsed above");
+                    (rule.path, rule.grant.as_str())
+                })
+                .collect();
+            let bind_dests: BTreeSet<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Bind { dest, .. } => Some(dest.as_str()),
+                    _ => None,
+                })
+                .collect();
             for event in &events {
-                if let Event::Bind { dest, .. } = event {
-                    prop_assert!(
-                        rules.iter().any(|rule| rule.ends_with(&format!(":{dest}"))),
-                        "bind destination {:?} has no Landlock rule: {:?}",
-                        dest,
-                        rules
-                    );
+                match event {
+                    Event::Bind { dest, rw, .. } => {
+                        // m6: the grant matches the mount: read-write gets `all`,
+                        // read-only gets `read`.
+                        let want = if *rw { "all" } else { "read" };
+                        prop_assert!(
+                            granted.iter().any(|(path, grant)| path == dest && *grant == want),
+                            "bind {:?} (rw {}) has no `{}` rule: {:?}",
+                            dest,
+                            rw,
+                            want,
+                            granted
+                        );
+                    }
+                    Event::Tmpfs { dest } => {
+                        // m6: a deny mask gets no rule of its own, unless the path is
+                        // also a bind or one of the fixed `/`, `/proc`, `/dev` entries.
+                        let fixed = ["/", "/proc", "/dev"];
+                        if !bind_dests.contains(dest.as_str()) && !fixed.contains(&dest.as_str()) {
+                            prop_assert!(
+                                !granted.iter().any(|(path, _)| path == dest),
+                                "deny mask {:?} must get no rule: {:?}",
+                                dest,
+                                granted
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1777,7 +1840,7 @@ mod tests {
                 .map(PathBuf::into_os_string),
             );
             for event in &events {
-                if let Event::Bind { src, dest } = event {
+                if let Event::Bind { src, dest, .. } = event {
                     prop_assert!(
                         allowed.contains(src),
                         "bind src outside the allow-list union: {:?}",

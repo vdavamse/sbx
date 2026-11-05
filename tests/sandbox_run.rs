@@ -476,9 +476,16 @@ fn seccomp_status_role() -> u8 {
             .map_or("missing", str::trim);
         println!("STATUS {pid} {mode}");
     }
+    if print_open_fds() { 0 } else { 1 }
+}
+
+/// #34, #19: this process's open descriptors as `FD n` lines (sorted). The
+/// directory handle the listing itself opens is left out. False when
+/// `/proc/self/fd` cannot be read.
+fn print_open_fds() -> bool {
     let own_dir = PathBuf::from(format!("/proc/{}/fd", std::process::id()));
     let Ok(entries) = fs::read_dir("/proc/self/fd") else {
-        return 1;
+        return false;
     };
     let mut fds: Vec<i32> = Vec::new();
     for entry in entries.flatten() {
@@ -493,7 +500,7 @@ fn seccomp_status_role() -> u8 {
     for fd in fds {
         println!("FD {fd}");
     }
-    0
+    true
 }
 
 /// #42: one `SYS <label> <ok|errno=N>` line per probe. The probes pass
@@ -1107,6 +1114,11 @@ fn scenarios() -> Vec<Scenario> {
             gate: Bwrap,
             run: landlock_exe_fd_closed,
         },
+        Scenario {
+            name: "landlock-payload-not-found-125",
+            gate: Bwrap,
+            run: landlock_payload_not_found_125,
+        },
     ]
 }
 
@@ -1140,30 +1152,44 @@ fn landlock_probe_role(port: &str) -> u8 {
         "LL work {}",
         result(fs::write("/work/landlock-probe", b"probe"))
     );
+    // M2: the descriptor set rides along, so one run shows the layer and the fds.
+    print_open_fds();
     0
 }
 
-/// #19: one `landlock-probe` run under `extra` run flags: label → result.
-fn landlock_probes(
+/// #19: one `landlock-probe` run under `extra` run flags: label → result, and
+/// the payload's `FD n` lines in order.
+fn landlock_probe_run(
     tag: &str,
     extra: &[&str],
     port: &str,
-) -> Result<std::collections::BTreeMap<String, String>, String> {
+) -> Result<(std::collections::BTreeMap<String, String>, Vec<String>), String> {
     let (done, dir) = run_role_case(tag, "landlock-probe", &[port], |_| {}, extra)?;
     let _ = fs::remove_dir_all(&dir);
     expect_rc(&done, 0)?;
     let mut map = std::collections::BTreeMap::new();
+    let mut fds = Vec::new();
     for line in done.stdout.lines() {
         if let Some(rest) = line.strip_prefix("LL ") {
             let (label, value) = rest
                 .split_once(' ')
                 .ok_or_else(|| format!("malformed LL line {line:?}"))?;
             map.insert(label.to_owned(), value.to_owned());
+        } else if let Some(fd) = line.strip_prefix("FD ") {
+            fds.push(fd.to_owned());
         }
     }
-    Ok(map)
+    Ok((map, fds))
 }
 
+/// #19: the probe results of one `landlock-probe` run (see `landlock_probe_run`).
+fn landlock_probes(
+    tag: &str,
+    extra: &[&str],
+    port: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    landlock_probe_run(tag, extra, port).map(|(map, _)| map)
+}
 fn expect_ll(
     map: &std::collections::BTreeMap<String, String>,
     label: &str,
@@ -1215,7 +1241,8 @@ fn landlock_bind_tcp() -> Result<(), String> {
 }
 
 /// #19 AC: under signal scope (ABI 6) the payload cannot signal pid 1, which is
-/// outside its Landlock domain: `kill(1, 0)` is EPERM (errno 1).
+/// outside its Landlock domain: `kill(1, 0)` is EPERM (errno 1). The baseline
+/// without the layer shows the probe can succeed (`kill1 ok`).
 fn landlock_signal_scope() -> Result<(), String> {
     if sbx::landlock::kernel_abi() < 6 {
         println!(
@@ -1224,61 +1251,95 @@ fn landlock_signal_scope() -> Result<(), String> {
         );
         return Ok(());
     }
+    let base = landlock_probes("landlock-signal-base", &[], "8080")?;
+    expect_ll(&base, "kill1", "ok")?;
     let layered = landlock_probes("landlock-signal", &["--landlock", "best-effort"], "8080")?;
     expect_ll(&layered, "kill1", "errno=1")
 }
 
 /// #19 AC: `--landlock require` on a kernel below ABI 6 is refused with rc 125
 /// before anything is spawned, and the text names the ABI it needs. On ABI 6 or
-/// later the payload runs (when bwrap is available).
+/// later the probe runs under the full ruleset (M2): `/` takes no entry, a bind
+/// is denied without a port rule, and signal scope holds.
 fn landlock_require() -> Result<(), String> {
     let dir = scratch("landlock-require");
     let policy = Pol::new("exit").write(&dir);
-    let args = sbx_args(
-        &policy,
-        &dir.join("s"),
-        &["--landlock", "require"],
-        &payload(&["0"]),
-    );
     let abi = sbx::landlock::kernel_abi();
     let result = if abi < 6 {
+        let args = sbx_args(
+            &policy,
+            &dir.join("s"),
+            &["--landlock", "require"],
+            &payload(&["0"]),
+        );
         // Refused by the host-side pre-check: no bwrap is needed for this path.
         expect_refusal(&args, "Linux 6.12 or later")
     } else if !bwrap_available() {
         println!("SKIP landlock-require: {SKIP_REASON}");
         Ok(())
     } else {
-        run_sbx(&args).and_then(|done| expect_rc(&done, 0))
+        let _ = fs::remove_dir_all(&dir);
+        let probes = landlock_probes("landlock-require-run", &["--landlock", "require"], "8080")?;
+        expect_ll(&probes, "mkdir", "errno=13")?;
+        expect_ll(&probes, "bind", "errno=13")?;
+        expect_ll(&probes, "kill1", "errno=1")
     };
     let _ = fs::remove_dir_all(&dir);
     result
 }
 
-/// #19 AC: the payload's fds are exactly 0–2 with the shim in front of it: the
-/// shim closes sbx's own executable fd before it execs the payload.
+/// #19 AC: under the shim the payload has exactly fds 0–2 (the shim closed sbx's
+/// own executable fd, and the status pipe is close-on-exec). The same run shows a
+/// layer-only effect (M2): the root directory cannot take an entry (EACCES).
 fn landlock_exe_fd_closed() -> Result<(), String> {
     if sbx::landlock::kernel_abi() < 1 {
         println!("SKIP landlock-exe-fd-closed: the kernel has no Landlock");
         return Ok(());
     }
-    let (done, dir) = run_role_case(
-        "landlock-fds",
-        "seccomp-status",
-        &[],
-        |_| {},
-        &["--landlock", "best-effort"],
-    )?;
-    let _ = fs::remove_dir_all(&dir);
-    expect_rc(&done, 0)?;
-    let fds: Vec<&str> = done
-        .stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("FD "))
-        .collect();
+    let (probes, fds) = landlock_probe_run("landlock-fds", &["--landlock", "best-effort"], "8080")?;
+    expect_ll(&probes, "mkdir", "errno=13")?;
     if fds != ["0", "1", "2"] {
         return Err(format!("payload fds must be exactly 0-2, got {fds:?}"));
     }
     Ok(())
+}
+
+/// #19 round 2 (M1): a shim failure is not the payload's own exit 125. A missing
+/// payload under `--landlock` exits 125 with the `sbx run: landlock:` line, and
+/// the audit outcome is `failed` (the status pipe carries the reason).
+fn landlock_payload_not_found_125() -> Result<(), String> {
+    if sbx::landlock::kernel_abi() < 1 {
+        println!("SKIP landlock-payload-not-found-125: the kernel has no Landlock");
+        return Ok(());
+    }
+    let dir = scratch("landlock-missing");
+    let policy = Pol::new("exit").write(&dir);
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.to_string_lossy().into_owned();
+    let cmd = [OsString::from("/nonexistent-sbx-landlock-payload")];
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--landlock", "best-effort", "--audit", audit_arg.as_str()],
+        &cmd,
+    );
+    let done = run_sbx(&args)?;
+    let result = expect_rc(&done, 125)
+        .and_then(|()| expect_stderr(&done, "sbx run: landlock: cannot exec"))
+        .and_then(|()| {
+            let rows = read_audit(&audit)?;
+            let exit = rows.last().ok_or("the audit log has no rows")?;
+            if exit["outcome"] == "failed" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "exit row outcome is {}, want failed",
+                    exit["outcome"]
+                ))
+            }
+        });
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 /// A private scratch area per scenario (unique, under the system temp dir).

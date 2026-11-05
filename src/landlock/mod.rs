@@ -20,7 +20,8 @@
 //!    later). `sbx run` checks the ABI host-side ([`require_refusal`], rc 125
 //!    before anything is spawned), and the shim enforces again. A shim failure
 //!    of any other kind also fails closed: rc 125 with `sbx __landlock:
-//!    <reason>` on stderr, and the payload never runs.
+//!    <reason>` on stderr and in the status pipe (point 9), and the payload
+//!    never runs.
 //! 4. **Rules mirror the mount list (D5).** [`PathRule`]s are derived from the
 //!    same merged mount list `bwrap::build` emits (`bwrap::argv`), and they name
 //!    the paths the payload SEES, the sandbox-side destinations, because the
@@ -42,8 +43,21 @@
 //!    the same file `__init` re-execs), clears CLOEXEC in the spawn window and
 //!    passes it as `--exe-fd`. `__init` validates it and keeps it through fd
 //!    hygiene, and bwrap does not close it. The shim closes it, and every
-//!    other descriptor above stdio, before it applies the ruleset, so the
-//!    payload has exactly fds 0, 1 and 2.
+//!    other descriptor above stdio except the status pipe, before it applies
+//!    the ruleset. The status write end is close-on-exec from just before the
+//!    exec, so the payload has exactly fds 0, 1 and 2. An unreadable
+//!    `/proc/self/fd` is a shim failure (rc 125), not a silent continue.
+//! 9. **Status pipe (issue #19 round 2, M1).** `run` creates a pipe with the
+//!    write end passed as `--status-fd` (validated by `__init`, kept through
+//!    hygiene, inherited by bwrap). On any shim failure the reason is written
+//!    there before rc 125, so the run can tell a shim failure from the payload's
+//!    own exit 125: the audit outcome is `failed` and the run prints `sbx run:
+//!    landlock: <reason>`. On success the exec closes the write end and the pipe
+//!    is empty.
+//! 10. **Host ABI check (round 2, m1).** `--host-abi` is the ABI `run` saw
+//!     ([`host_abi`]). A best-effort ruleset that the kernel reports as NOT
+//!     enforced while the host has Landlock fails closed ([`enforcement_failure`]),
+//!     so an outer profile that refuses Landlock cannot pass as "no Landlock".
 //! 7. **Irreversibility (test rule).** `restrict_self` is irreversible for the
 //!    calling thread. Unit tests that apply a ruleset do it in a forked child
 //!    and build the ruleset in the parent first (see [`prepare`]).
@@ -52,14 +66,15 @@
 //!    libraries visible inside the sandbox when `--landlock` is on. This is
 //!    documented, not pre-checked.
 
-use std::ffi::{CString, OsString};
+use std::ffi::{CString, OsStr, OsString};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ::landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, Ruleset, RulesetAttr,
-    RulesetCreated, RulesetCreatedAttr, RulesetError, Scope, path_beneath_rules,
+    RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus, Scope, path_beneath_rules,
 };
 
 use crate::host::facts::{Landlock as Probe, landlock as probe};
@@ -177,8 +192,9 @@ impl PathRule {
     }
 }
 
-/// The layer as `build` receives it: the mode, the TCP bind ports and the
-/// descriptor of sbx's own executable that the shim is exec'd through.
+/// The layer as `build` receives it (module docs points 6, 9 and 10): the mode,
+/// the TCP bind ports, sbx's own executable's fd, the status pipe's write end
+/// and the host's Landlock ABI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layer {
     pub mode: Mode,
@@ -186,21 +202,33 @@ pub struct Layer {
     pub bind_tcp: Vec<u16>,
     /// The sbx executable's fd (`--exe-fd`, module docs point 6).
     pub exe_fd: RawFd,
+    /// The status pipe's write end (`--status-fd`, module docs point 9).
+    pub status_fd: RawFd,
+    /// The host's Landlock ABI as `run` saw it ([`host_abi`]; module docs point 10).
+    pub host_abi: u32,
 }
 
 /// The shim argv elements from the `/proc/self/fd/N` program up to, but not
 /// including, the `--` that separates the shim's flags from the payload:
-/// `/proc/self/fd/N __landlock --exe-fd N --mode M [--bind-tcp P]… [--rule R]…`.
-/// The rules come from [`PathRule`]s the caller derived from the mount list.
+/// `/proc/self/fd/N __landlock --exe-fd N --status-fd S --mode M --host-abi A
+/// [--bind-tcp P]… [--rule R]…`. The rules come from [`PathRule`]s the caller
+/// derived from the mount list.
 pub fn shim_head(layer: &Layer, rules: &[PathRule]) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![
-        OsString::from(format!("/proc/self/fd/{}", layer.exe_fd)),
-        OsString::from("__landlock"),
-        OsString::from("--exe-fd"),
-        OsString::from(layer.exe_fd.to_string()),
-        OsString::from("--mode"),
-        OsString::from(layer.mode.as_str()),
-    ];
+    let mut argv: Vec<OsString> = [
+        format!("/proc/self/fd/{}", layer.exe_fd),
+        "__landlock".to_owned(),
+        "--exe-fd".to_owned(),
+        layer.exe_fd.to_string(),
+        "--status-fd".to_owned(),
+        layer.status_fd.to_string(),
+        "--mode".to_owned(),
+        layer.mode.as_str().to_owned(),
+        "--host-abi".to_owned(),
+        layer.host_abi.to_string(),
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
     for port in &layer.bind_tcp {
         argv.push(OsString::from("--bind-tcp"));
         argv.push(OsString::from(port.to_string()));
@@ -218,6 +246,19 @@ pub fn kernel_abi() -> u32 {
     match probe() {
         Probe::Abi(n) => n,
         Probe::Errno(_) => 0,
+    }
+}
+
+/// The ABI the shim is told the host has (`--host-abi`, module docs point 10).
+/// A probe refused with ENOSYS or EOPNOTSUPP means no Landlock (0). Any other
+/// errno means Landlock is present but refused, for example by an outer
+/// seccomp profile, so the value is 1: the shim must then enforce at least
+/// the filesystem rules or fail closed.
+pub fn host_abi() -> u32 {
+    match probe() {
+        Probe::Abi(n) => n,
+        Probe::Errno(errno) if errno == libc::ENOSYS || errno == libc::EOPNOTSUPP => 0,
+        Probe::Errno(_) => 1,
     }
 }
 
@@ -278,27 +319,55 @@ pub fn prepare(
     Ok(created)
 }
 
-/// Apply the ruleset to the calling thread (irreversible; module docs point 7).
-pub fn apply(mode: Mode, bind_tcp: &[u16], rules: &[PathRule]) -> Result<(), RulesetError> {
-    prepare(mode, bind_tcp, rules)?.restrict_self()?;
-    Ok(())
+/// Apply the ruleset to the calling thread (irreversible; module docs point 7)
+/// and report what the kernel enforced.
+pub fn apply(
+    mode: Mode,
+    bind_tcp: &[u16],
+    rules: &[PathRule],
+) -> Result<RulesetStatus, RulesetError> {
+    Ok(prepare(mode, bind_tcp, rules)?.restrict_self()?.ruleset)
+}
+
+/// Module docs point 10: `Some(reason)` when the host has Landlock (ABI 1 or
+/// later, see [`host_abi`]) but the ruleset was not enforced at all. That is
+/// the outer-profile case, which best-effort must not mistake for "no Landlock".
+pub fn enforcement_failure(host_abi: u32, status: RulesetStatus) -> Option<String> {
+    (host_abi >= 1 && status == RulesetStatus::NotEnforced).then(|| {
+        format!("Landlock is present (host ABI {host_abi}) but the ruleset was not enforced")
+    })
 }
 
 /// The shim's parsed argv.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShimArgs {
     pub exe_fd: RawFd,
+    pub status_fd: RawFd,
     pub mode: Mode,
+    pub host_abi: u32,
     pub bind_tcp: Vec<u16>,
     pub rules: Vec<PathRule>,
     pub cmd: Vec<OsString>,
 }
 
-/// The shim's own checks, before any descriptor is touched. An `--exe-fd` at or
-/// below 2 would make the shim close stdio, so it is refused.
+/// The shim's own checks, before any descriptor is touched. An `--exe-fd` or
+/// `--status-fd` at or below 2 would make the shim close or write stdio, so both
+/// are refused, and they must differ.
 pub fn check_shim_args(args: &ShimArgs) -> Result<(), String> {
     if args.exe_fd <= 2 {
         return Err(format!("--exe-fd {} must be greater than 2", args.exe_fd));
+    }
+    if args.status_fd <= 2 {
+        return Err(format!(
+            "--status-fd {} must be greater than 2",
+            args.status_fd
+        ));
+    }
+    if args.status_fd == args.exe_fd {
+        return Err(format!(
+            "--status-fd {} must differ from --exe-fd",
+            args.status_fd
+        ));
     }
     if args.cmd.is_empty() {
         return Err("no payload command given".to_owned());
@@ -306,55 +375,119 @@ pub fn check_shim_args(args: &ShimArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// The shim (module docs points 5 and 6). It closes the executable fd and
-/// every other descriptor above stdio, applies the ruleset (unless `off`), then
-/// `execvp`s the payload with SIGPIPE restored, the same as `__init`'s exec.
-/// Returns only on failure, with rc 125 and `sbx __landlock: <reason>`.
-pub fn shim(args: ShimArgs) -> ExitCode {
-    // Best effort, like `run`'s diagnostics: a closed stderr must not panic (rc 101)
-    // and must not change the rc.
-    let fail = |reason: String| {
-        use std::io::Write;
-        let _ = writeln!(std::io::stderr(), "sbx __landlock: {reason}");
-        ExitCode::from(crate::run::EXIT_FAILURE as u8)
-    };
-    if let Err(reason) = check_shim_args(&args) {
-        return fail(reason);
-    }
-    close_inherited_fds(args.exe_fd);
-    if args.mode != Mode::Off {
-        if let Err(err) = apply(args.mode, &args.bind_tcp, &args.rules) {
-            return fail(format!("cannot apply Landlock rules: {err}"));
+/// Longest reason written to the status pipe (module docs point 9).
+const STATUS_MAX_BYTES: usize = 512;
+
+/// The shim's failure path (module docs points 3 and 9): the reason goes to
+/// stderr and to the status pipe, then rc 125. Best effort on both: a closed
+/// stderr or pipe must not panic (rc 101) or change the rc. The status write end
+/// is written only when it is above stdio.
+fn report_failure(status_fd: RawFd, reason: &str) -> ExitCode {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "sbx __landlock: {reason}");
+    if status_fd > 2 {
+        let bytes = reason.as_bytes();
+        let bytes = &bytes[..bytes.len().min(STATUS_MAX_BYTES)];
+        // SAFETY: a write from a live buffer to the status descriptor, which this
+        // process keeps open for exactly this purpose; errors are ignored.
+        unsafe {
+            libc::write(status_fd, bytes.as_ptr().cast(), bytes.len());
         }
+    }
+    ExitCode::from(crate::run::EXIT_FAILURE as u8)
+}
+
+/// The shim (module docs points 5, 6, 9 and 10). It closes the executable fd and
+/// every other descriptor above stdio except the status pipe, applies the
+/// ruleset (unless `off`) and checks enforcement against the host ABI, then
+/// `execvp`s the payload with SIGPIPE restored, the same as `__init`'s exec. The
+/// status write end is close-on-exec from just before the exec, so a successful
+/// exec closes it and the payload never holds it. Returns only on failure, with
+/// rc 125, the reason on stderr and in the status pipe.
+pub fn shim(args: ShimArgs) -> ExitCode {
+    if let Err(reason) = check_shim_args(&args) {
+        return report_failure(args.status_fd, &reason);
+    }
+    if let Err(reason) = close_inherited_fds(args.exe_fd, args.status_fd) {
+        return report_failure(args.status_fd, &reason);
+    }
+    if args.mode != Mode::Off {
+        match apply(args.mode, &args.bind_tcp, &args.rules) {
+            Err(err) => {
+                return report_failure(
+                    args.status_fd,
+                    &format!("cannot apply Landlock rules: {err}"),
+                );
+            }
+            Ok(status) => {
+                if let Some(reason) = enforcement_failure(args.host_abi, status) {
+                    return report_failure(args.status_fd, &reason);
+                }
+            }
+        }
+    }
+    // SAFETY: fcntl on the status descriptor the shim holds; a successful exec
+    // then closes it (CLOEXEC), and a failed exec still leaves it for the report.
+    unsafe {
+        libc::fcntl(args.status_fd, libc::F_SETFD, libc::FD_CLOEXEC);
     }
     match exec_command(&args.cmd) {
         Ok(never) => match never {},
-        Err(reason) => fail(reason),
+        Err(reason) => report_failure(args.status_fd, &reason),
     }
 }
 
 /// Closes the shim's executable fd, then every other descriptor above stdio
-/// (collect-then-close, the `__init` hygiene pattern). The shim is
-/// single-threaded, so no other thread can reuse a number in between.
-fn close_inherited_fds(exe_fd: RawFd) {
+/// except `status_fd` (collect-then-close, the `__init` hygiene pattern). The
+/// shim is single-threaded, so no other thread can reuse a number in between.
+/// A `/proc/self/fd` that cannot be listed is an error (module docs point 6): the
+/// shim does not continue with descriptors it could not account for.
+fn close_inherited_fds(exe_fd: RawFd, status_fd: RawFd) -> Result<(), String> {
     // SAFETY: closing a descriptor this process inherited for the shim; EBADF
     // (already closed) is ignored by design.
     unsafe {
         libc::close(exe_fd);
     }
-    let Some(fds) = crate::init::scan_fds_above_stdio() else {
-        return;
-    };
-    for fd in crate::init::fds_to_close(fds, &[]) {
+    let fds = crate::init::scan_fds_above_stdio()
+        .ok_or_else(|| "cannot list the open descriptors (/proc/self/fd)".to_owned())?;
+    for fd in crate::init::fds_to_close(fds, &[status_fd]) {
         // SAFETY: the number came from this process's own /proc/self/fd scan.
         unsafe {
             libc::close(fd);
         }
     }
+    Ok(())
+}
+
+/// The file `execvp` would run for `name`: a name with a slash is itself, a bare
+/// name is looked up on `PATH` (the shim's environment, which bwrap set to the
+/// infra PATH for the payload). `None` when no executable file is found.
+fn resolve_program(name: &OsStr) -> Option<PathBuf> {
+    if name.as_bytes().contains(&b'/') {
+        return Some(PathBuf::from(name));
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: access(2) on a NUL-terminated path; the result is only read.
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+        && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
 }
 
 /// `execvp` the payload argv (PATH search, like `__init`'s exec). Returns only
 /// on failure, as the reason text.
+///
+/// m3: glibc's `execvp` runs a file that has no shebang and is not a binary
+/// through `/bin/sh` (ENOEXEC fallback); musl's does not. The fallback is added
+/// here so both libcs behave alike: on ENOEXEC the shim execs `/bin/sh <path>
+/// <args…>`. The fallback lives in this exec path only.
 fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, String> {
     let argv0 = cmd
         .first()
@@ -380,7 +513,22 @@ fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, String> {
     // SAFETY: a NULL-terminated argv of valid C strings; the buffers outlive
     // the call, which returns only on failure.
     unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
-    let err = std::io::Error::last_os_error();
+    let mut err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ENOEXEC) {
+        if let Some(program) = resolve_program(argv0) {
+            // `/bin/sh <path> <args…>`: the same arguments the payload gets, with
+            // the program's path as the script.
+            let sh = CString::new("/bin/sh").expect("no NUL in a literal");
+            let script = CString::new(program.as_os_str().as_bytes())
+                .map_err(|_| format!("cannot exec {argv0:?}: interior NUL byte"))?;
+            let mut sh_argv: Vec<*const libc::c_char> = vec![sh.as_ptr(), script.as_ptr()];
+            sh_argv.extend(c_argv.iter().skip(1).map(|s| s.as_ptr()));
+            sh_argv.push(std::ptr::null());
+            // SAFETY: NULL-terminated argv built from the live CStrings above.
+            unsafe { libc::execv(sh.as_ptr(), sh_argv.as_ptr()) };
+            err = std::io::Error::last_os_error();
+        }
+    }
     Err(match err.raw_os_error() {
         Some(libc::ENOENT) => format!("cannot exec {argv0:?}: not found"),
         Some(libc::EACCES) => format!("cannot exec {argv0:?}: permission denied"),
@@ -462,6 +610,8 @@ mod tests {
             mode: Mode::Require,
             bind_tcp: vec![8080, 0],
             exe_fd: 9,
+            status_fd: 8,
+            host_abi: 6,
         };
         let rules = [
             PathRule::new("/", Grant::ReadDir),
@@ -474,7 +624,7 @@ mod tests {
             .collect();
         assert_eq!(
             text.join(" "),
-            "/proc/self/fd/9 __landlock --exe-fd 9 --mode require --bind-tcp 8080 --bind-tcp 0 --rule readdir:/ --rule read:/usr --rule all:/work"
+            "/proc/self/fd/9 __landlock --exe-fd 9 --status-fd 8 --mode require --host-abi 6 --bind-tcp 8080 --bind-tcp 0 --rule readdir:/ --rule read:/usr --rule all:/work"
         );
     }
 
@@ -482,7 +632,9 @@ mod tests {
     fn shim_args_checks() {
         let mut args = ShimArgs {
             exe_fd: 9,
+            status_fd: 8,
             mode: Mode::BestEffort,
+            host_abi: 6,
             bind_tcp: Vec::new(),
             rules: Vec::new(),
             cmd: vec![OsString::from("/bin/true")],
@@ -494,6 +646,17 @@ mod tests {
             Err("--exe-fd 2 must be greater than 2".to_owned())
         );
         args.exe_fd = 9;
+        args.status_fd = 1;
+        assert_eq!(
+            check_shim_args(&args),
+            Err("--status-fd 1 must be greater than 2".to_owned())
+        );
+        args.status_fd = 9;
+        assert_eq!(
+            check_shim_args(&args),
+            Err("--status-fd 9 must differ from --exe-fd".to_owned())
+        );
+        args.status_fd = 8;
         args.cmd.clear();
         assert_eq!(
             check_shim_args(&args),
@@ -638,13 +801,84 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_rule_paths_that_do_not_exist_grant_nothing() {
-        // path_beneath_rules skips a path it cannot open; the grant is absent,
-        // which is the fail-closed direction. Preparing must still succeed.
+    fn rule_paths_that_do_not_exist_grant_nothing() {
+        // `path_beneath_rules` skips a path it cannot open, so the ruleset holds
+        // no grant for it: a `mkdir` under the scratch directory (which the
+        // missing path would have granted, had it existed) must be EACCES.
+        if kernel_abi() < 1 {
+            eprintln!("skipped: the kernel has no Landlock");
+            return;
+        }
+        let dir = scratch("nothing");
+        let target = CString::new(dir.join("new").as_os_str().as_bytes()).expect("cstring");
         let rules = [PathRule::new(
             "/sbx-no-such-path-for-landlock-test",
             Grant::All,
         )];
-        assert!(prepare(Mode::BestEffort, &[], &rules).is_ok());
+        let created = prepare(Mode::BestEffort, &[], &rules).expect("prepare");
+        let rc = in_child(move || {
+            if created.restrict_self().is_err() {
+                return 90;
+            }
+            // SAFETY: mkdir on a prepared, NUL-terminated path; no syscall state is touched.
+            let made = unsafe { libc::mkdir(target.as_ptr(), 0o700) };
+            if made == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES) {
+                0
+            } else {
+                1
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc, 0, "a rule for a missing path must grant nothing");
+    }
+
+    #[test]
+    fn enforcement_failure_table() {
+        // m1: "not enforced" with no host Landlock (ABI 0) is the normal no-Landlock
+        // case; with Landlock present it must fail closed.
+        assert_eq!(enforcement_failure(0, RulesetStatus::NotEnforced), None);
+        assert_eq!(enforcement_failure(6, RulesetStatus::FullyEnforced), None);
+        assert_eq!(
+            enforcement_failure(1, RulesetStatus::PartiallyEnforced),
+            None
+        );
+        assert_eq!(
+            enforcement_failure(1, RulesetStatus::NotEnforced).as_deref(),
+            Some("Landlock is present (host ABI 1) but the ruleset was not enforced")
+        );
+    }
+
+    #[test]
+    fn resolve_program_finds_bare_names_on_path() {
+        // m3: a bare name resolves through PATH; a name with a slash is itself;
+        // a missing name resolves to nothing.
+        assert_eq!(
+            resolve_program(OsStr::new("/bin/sh")),
+            Some(PathBuf::from("/bin/sh"))
+        );
+        let found = resolve_program(OsStr::new("sh")).expect("sh is on PATH");
+        assert!(found.ends_with("sh") && found.is_file(), "{found:?}");
+        assert_eq!(resolve_program(OsStr::new("sbx-no-such-program-xyz")), None);
+    }
+
+    #[test]
+    fn exec_falls_back_to_sh_for_a_file_without_a_shebang() {
+        // m3: a file with the execute bit and no shebang runs through `/bin/sh`
+        // with the same arguments. glibc's execvp does this itself; musl's does
+        // not, and the shim's ENOEXEC step makes the two agree. The script's exit
+        // status proves that the shell ran it. The child reports 99 if exec fails.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("enoexec");
+        let script = dir.join("script");
+        std::fs::write(&script, "exit 7\n").expect("write script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+        let cmd = vec![OsString::from(script.as_os_str())];
+        let rc = in_child(move || match exec_command(&cmd) {
+            Ok(never) => match never {},
+            Err(_) => 99,
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc, 7, "the script must have run under the shell");
     }
 }

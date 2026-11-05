@@ -357,6 +357,9 @@ pub struct InitArgs {
     /// sbx's own executable, kept for the Landlock shim (`--exe-fd`, issue
     /// #19). `Some` only when `run --landlock` is on.
     pub exe_fd: Option<RawFd>,
+    /// The shim's status pipe write end (`--status-fd`, issue #19 M1). `Some`
+    /// only when `run --landlock` is on.
+    pub status_fd: Option<RawFd>,
     /// Expected parent pid (`--parent-pid`, m6).
     pub parent_pid: Option<i32>,
     /// The weakest network mode the caller accepts — the policy's own mode
@@ -392,6 +395,11 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     if let Some(exe) = args.exe_fd {
         validate_exe_fd(exe, fd, args.keep_fd, args.seccomp_fd)?; // Stage::Control (issue #19)
     }
+    if let Some(status) = args.status_fd {
+        validate_status_fd(status, fd, args.keep_fd, args.seccomp_fd, args.exe_fd)?; // Stage::Control (issue #19 M1)
+    }
+    // m4: the exe and status fds are only meaningful inside the shim's own argv.
+    validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?; // Stage::Control
     let ids = netns::unshare_namespaces()?; // Stage::Unshare
     netns::write_id_maps(ids)?; // Stage::Idmap
     netns::configure_netns()?; // Stage::Netns
@@ -447,6 +455,7 @@ fn keep_set(args: &InitArgs) -> Vec<RawFd> {
         .into_iter()
         .chain(args.seccomp_fd)
         .chain(args.exe_fd)
+        .chain(args.status_fd)
         .collect()
 }
 
@@ -696,6 +705,92 @@ fn validate_exe_fd(
     Ok(())
 }
 
+/// Issue #19 M1: `--status-fd` is the write end of the shim's status pipe. It must
+/// be a pipe open for writing, distinct from every other inherited descriptor, so
+/// a shim failure reason can only reach the run that created the pipe.
+fn validate_status_fd(
+    status: RawFd,
+    control: RawFd,
+    keep: Option<RawFd>,
+    seccomp: Option<RawFd>,
+    exe: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if status <= 2 {
+        return Err(fail(format!("--status-fd {status} must be greater than 2")));
+    }
+    if status == control {
+        return Err(fail(format!("--status-fd {status} must differ from --fd")));
+    }
+    if keep == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --keep-fd"
+        )));
+    }
+    if seccomp == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --seccomp-fd"
+        )));
+    }
+    if exe == Some(status) {
+        return Err(fail(format!(
+            "--status-fd {status} must differ from --exe-fd"
+        )));
+    }
+    // SAFETY: fstat/fcntl on a number we were handed; the results are only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(status, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--status-fd {status} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(fail(format!("--status-fd {status} is not a pipe")));
+    }
+    let flags = unsafe { libc::fcntl(status, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(fail(format!(
+            "--status-fd {status} is not open for writing"
+        )));
+    }
+    Ok(())
+}
+
+/// Issue #19 m4: an exe or status fd is only meaningful in the Landlock shim's
+/// own argv. The bwrap command must hold `/proc/self/fd/{exe} __landlock` (the
+/// shim head, as `run` builds it) and, for the status fd, a `--status-fd {status}`
+/// shim argument. Otherwise the descriptors would survive hygiene for nothing.
+fn validate_shim_command(
+    cmd: &[OsString],
+    exe: Option<RawFd>,
+    status: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if let Some(exe) = exe {
+        let head = format!("/proc/self/fd/{exe}");
+        let shim = cmd
+            .windows(2)
+            .any(|w| w[0].to_str() == Some(head.as_str()) && w[1].to_str() == Some("__landlock"));
+        if !shim {
+            return Err(fail(format!(
+                "--exe-fd {exe} is given but the command is not the Landlock shim (/proc/self/fd/{exe} __landlock)"
+            )));
+        }
+    }
+    if let Some(status) = status {
+        let text = status.to_string();
+        let shim = cmd
+            .windows(2)
+            .any(|w| w[0].to_str() == Some("--status-fd") && w[1].to_str() == Some(text.as_str()));
+        if !shim {
+            return Err(fail(format!(
+                "--status-fd {status} is given but the command has no `--status-fd {status}` shim argument"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Issue #10 (Q13): `--keep-fd` is the bwrap info pipe `run` hands through.
 /// Validated in the control stage so a bad value fails before any namespace
 /// work. The write end must be a pipe open for writing (bwrap writes the
@@ -901,6 +996,7 @@ mod tests {
             keep_fd,
             seccomp_fd: None,
             exe_fd: None,
+            status_fd: None,
             parent_pid,
             min_mode: NetworkMode::Transparent,
             test_break_rules: false,
@@ -1321,11 +1417,88 @@ mod tests {
     }
 
     #[test]
+    fn validate_shim_command_table() {
+        // m4: the exe and status fds need the shim in the command, pinned reasons.
+        let words = |w: &[&str]| w.iter().map(OsString::from).collect::<Vec<_>>();
+        let shim = words(&["/bin/true"]);
+        assert!(validate_shim_command(&shim, None, None).is_ok());
+        assert_eq!(
+            validate_shim_command(&shim, Some(9), None)
+                .expect_err("no shim")
+                .to_string(),
+            "sbx __init: control: --exe-fd 9 is given but the command is not the Landlock shim (/proc/self/fd/9 __landlock)"
+        );
+        let head = words(&["/proc/self/fd/9", "__landlock", "--mode", "off"]);
+        assert!(validate_shim_command(&head, Some(9), None).is_ok());
+        assert!(validate_shim_command(&head, Some(8), None).is_err());
+        let with_status = words(&["/proc/self/fd/9", "__landlock", "--status-fd", "13"]);
+        assert!(validate_shim_command(&with_status, Some(9), Some(13)).is_ok());
+        assert_eq!(
+            validate_shim_command(&with_status, Some(9), Some(14))
+                .expect_err("wrong status fd")
+                .to_string(),
+            "sbx __init: control: --status-fd 14 is given but the command has no `--status-fd 14` shim argument"
+        );
+    }
+
+    #[test]
+    fn validate_status_fd_table() {
+        // M1: a pipe open for writing, distinct from every other inherited fd.
+        let msg = |st: RawFd| {
+            validate_status_fd(st, 999, None, None, None)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2),
+            "sbx __init: control: --status-fd 2 must be greater than 2"
+        );
+        assert_eq!(
+            msg(998),
+            "sbx __init: control: --status-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        let mut p = [0 as RawFd; 2];
+        // SAFETY: pipe2 into a 2-element array; both ends are closed below.
+        assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (rd, wr) = (p[0], p[1]);
+        assert_eq!(
+            validate_status_fd(wr, 999, Some(wr), None, None)
+                .expect_err("keep")
+                .to_string(),
+            format!("sbx __init: control: --status-fd {wr} must differ from --keep-fd")
+        );
+        assert_eq!(
+            validate_status_fd(rd, 999, None, None, None)
+                .expect_err("read end")
+                .to_string(),
+            format!("sbx __init: control: --status-fd {rd} is not open for writing")
+        );
+        assert!(validate_status_fd(wr, 999, None, None, None).is_ok());
+        // SAFETY: closing the pipe ends created above.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        let file = std::fs::File::open("/dev/null").expect("open");
+        assert_eq!(
+            validate_status_fd(file.as_raw_fd(), 999, None, None, None)
+                .expect_err("not a pipe")
+                .to_string(),
+            format!(
+                "sbx __init: control: --status-fd {} is not a pipe",
+                file.as_raw_fd()
+            )
+        );
+    }
+
+    #[test]
     fn keep_set_includes_exe_fd() {
         let mut all = args(7, Some(5), None);
         all.seccomp_fd = Some(9);
         all.exe_fd = Some(11);
         assert_eq!(keep_set(&all), vec![5, 9, 11]);
+        all.status_fd = Some(13);
+        assert_eq!(keep_set(&all), vec![5, 9, 11, 13]);
         let mut exe_only = args(7, None, None);
         exe_only.exe_fd = Some(11);
         assert_eq!(keep_set(&exe_only), vec![11]);

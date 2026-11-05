@@ -61,9 +61,13 @@
 //!     With it on, `run` refuses `require` on a kernel below ABI 6 before anything
 //!     is spawned (rc 125, [`crate::landlock::require_refusal`], S5b), opens sbx's
 //!     own executable (S8b) and passes it to `__init` as `--exe-fd` (S9–S11), and
-//!     bwrap runs the shim, which applies the rules and execs the payload. The
-//!     layer changes neither the audit log, the exit codes nor the teardown; see
-//!     [`crate::landlock`].
+//!     bwrap runs the shim, which applies the rules and execs the payload. Round 2
+//!     adds a status pipe (S8b, S9–S11): the shim writes its failure reason to it
+//!     and exits 125. After teardown, a non-empty pipe turns the outcome into
+//!     `failed` (the audit row says so) and prints `sbx run: landlock: <reason>`,
+//!     rc 125, so a shim failure is never mistaken for the payload's own 125. No
+//!     data leaves the outcome unchanged. See [`crate::landlock`] module docs
+//!     point 9.
 
 mod audit;
 mod lifecycle;
@@ -80,7 +84,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -571,19 +575,30 @@ fn execute(
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     // S8b (issue #19): with the Landlock layer on, sbx's own executable is opened
-    // here (O_CLOEXEC, like every std open) and becomes the shim's program.
-    let exe_file = match args.landlock {
-        crate::landlock::Mode::Off => None,
-        _ => Some(
-            File::open("/proc/self/exe")
-                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?,
-        ),
+    // here (O_CLOEXEC, like every std open) and becomes the shim's program, and a
+    // status pipe carries the shim's failure reason back (M1). The read end is
+    // non-blocking; the write end is handed over in the spawn window.
+    let (exe_file, status_pipe) = match args.landlock {
+        crate::landlock::Mode::Off => (None, None),
+        _ => {
+            let exe = File::open("/proc/self/exe")
+                .map_err(|err| RunError::new(format!("cannot open the sbx executable: {err}")))?;
+            let pipe = sys::pipe_cloexec().map_err(|err| {
+                RunError::new(format!("cannot create the shim status pipe: {err}"))
+            })?;
+            (Some(exe), Some(pipe))
+        }
     };
-    let landlock_layer = exe_file.as_ref().map(|file| crate::landlock::Layer {
-        mode: args.landlock,
-        bind_tcp: args.landlock_bind_tcp.clone(),
-        exe_fd: file.as_raw_fd(),
-    });
+    let landlock_layer = match (&exe_file, &status_pipe) {
+        (Some(file), Some((_, status_write))) => Some(crate::landlock::Layer {
+            mode: args.landlock,
+            bind_tcp: args.landlock_bind_tcp.clone(),
+            exe_fd: file.as_raw_fd(),
+            status_fd: status_write.as_raw_fd(),
+            host_abi: crate::landlock::host_abi(),
+        }),
+        _ => None,
+    };
     let launch = build(&Build {
         policy: &policy,
         session_dir: &session,
@@ -613,6 +628,13 @@ fn execute(
         ),
         None => None,
     };
+    let status_fd = match &status_pipe {
+        Some((_, write)) => Some(
+            sys::clear_cloexec(write.as_fd())
+                .map_err(|err| RunError::new(format!("cannot prepare the shim status: {err}")))?,
+        ),
+        None => None,
+    };
     let (stdin, stdin_piped) = stdin_mode();
     let mut child = init_command(
         ChildFds {
@@ -620,6 +642,7 @@ fn execute(
             info: info_fd,
             seccomp: seccomp_fd,
             exe: exe_fd,
+            status: status_fd,
         },
         policy.network.mode,
         args.test_break_rules,
@@ -632,6 +655,13 @@ fn execute(
     drop(info_write);
     drop(seccomp_memfd);
     drop(exe_file);
+    // The write end lives on in __init, bwrap and the shim only; sbx keeps just the
+    // read end. Without this drop an empty pipe would never report EOF.
+    let (status_read, status_write) = match status_pipe {
+        Some((read, write)) => (Some(read), Some(write)),
+        None => (None, None),
+    };
+    drop(status_write);
 
     // S12: a pidfd for the child (unreaped, so its pid cannot be recycled).
     let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {
@@ -771,7 +801,15 @@ fn execute(
         Ok(()) => main_loop(&mut sb, &signals, &latch, deadline, timeout),
         Err(cause) => cause,
     };
-    let (outcome, end, stragglers) = teardown(sb, cause, pumps);
+    let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
+    // M1 (issue #19 round 2): a shim failure is reported on the status pipe. It
+    // ends the run as `failed`, whatever the payload's own rc, so the payload's
+    // exit 125 is never mistaken for the shim's refusal.
+    if let Some(reason) = status_read.as_ref().and_then(read_status) {
+        if !matches!(outcome, Outcome::Failed(_)) {
+            outcome = Outcome::Failed(format!("landlock: {reason}"));
+        }
+    }
     let _ = lock.touch();
     conclude(
         outcome,
@@ -786,6 +824,26 @@ fn execute(
             net_mode,
         },
     )
+}
+
+/// Reads the shim's status pipe without blocking (issue #19 M1): whatever is
+/// there, as text, or `None` when it is empty. The shim writes its reason
+/// before exiting 125, so the data is in the pipe by the time the payload is
+/// gone. A pipe still held by a dying bwrap reads as EAGAIN, which is "no data".
+fn read_status(fd: &OwnedFd) -> Option<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::from(fd.try_clone().ok()?);
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Which writable location an audit path collides with (for the pinned messages).

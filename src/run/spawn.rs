@@ -30,6 +30,8 @@ pub(crate) struct ChildFds {
     pub info: RawFd,
     pub seccomp: RawFd,
     pub exe: Option<RawFd>,
+    /// The shim's status pipe write end (issue #19 M1); with `exe`, only under `--landlock`.
+    pub status: Option<RawFd>,
 }
 
 /// The re-exec argv after the program:
@@ -57,6 +59,10 @@ pub(crate) fn init_argv(
     if let Some(exe) = fds.exe {
         argv.push("--exe-fd".into());
         argv.push(exe.to_string().into());
+    }
+    if let Some(status) = fds.status {
+        argv.push("--status-fd".into());
+        argv.push(status.to_string().into());
     }
     argv.push("--parent-pid".into());
     argv.push(parent_pid.to_string().into());
@@ -373,6 +379,7 @@ mod tests {
             info: 9,
             seccomp: 11,
             exe: None,
+            status: None,
         };
         let argv = init_argv(fds, 4242, NetworkMode::Explicit, false, &launch);
         assert_eq!(
@@ -426,6 +433,7 @@ mod tests {
             info: 9,
             seccomp: 11,
             exe: Some(12),
+            status: None,
         };
         let argv = init_argv(fds, 4242, NetworkMode::None, false, &launch);
         assert_eq!(
@@ -447,6 +455,16 @@ mod tests {
                 "--",
             ]
             .map(OsString::from)
+        );
+        // M1: `--status-fd S` follows `--exe-fd E` when the status pipe is present.
+        let with_status = ChildFds {
+            status: Some(13),
+            ..fds
+        };
+        let argv = init_argv(with_status, 4242, NetworkMode::None, false, &launch);
+        assert_eq!(
+            &argv[7..11],
+            ["--exe-fd", "12", "--status-fd", "13"].map(OsString::from)
         );
     }
 }

@@ -207,7 +207,7 @@ pub struct Build<'a> {
     /// The Landlock layer (issue #19, `run --landlock`). `Some` with a mode
     /// other than `off` makes the payload command the shim
     /// (`/proc/self/fd/N __landlock … -- CMD`, argv.rs element 14) and adds
-    /// rows 17–19. `None`, or a layer whose mode is `off`, leaves the argv
+    /// rows 17–23. `None`, or a layer whose mode is `off`, leaves the argv
     /// byte-identical to a run without the layer.
     pub landlock: Option<crate::landlock::Layer>,
 }
@@ -475,6 +475,31 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             return Err(BwrapError(format!(
                 "exe fd must differ from the seccomp fd (got {})",
                 layer.exe_fd
+            )));
+        }
+        // Rows 20–23 (issue #19 M1): the status pipe's write end, the same shape.
+        if layer.status_fd <= 2 {
+            return Err(BwrapError(format!(
+                "status fd must be greater than 2 (got {})",
+                layer.status_fd
+            )));
+        }
+        if input.info_fd == Some(layer.status_fd) {
+            return Err(BwrapError(format!(
+                "status fd must differ from the info fd (got {})",
+                layer.status_fd
+            )));
+        }
+        if layer.status_fd == input.seccomp_fd {
+            return Err(BwrapError(format!(
+                "status fd must differ from the seccomp fd (got {})",
+                layer.status_fd
+            )));
+        }
+        if layer.status_fd == layer.exe_fd {
+            return Err(BwrapError(format!(
+                "status fd must differ from the exe fd (got {})",
+                layer.status_fd
             )));
         }
     }
@@ -1019,6 +1044,8 @@ mod tests {
                 mode: crate::landlock::Mode::BestEffort,
                 bind_tcp: Vec::new(),
                 exe_fd,
+                status_fd: 12,
+                host_abi: 6,
             })
         };
         let mut input = base_input(&policy, &command, &no_env);
@@ -1035,11 +1062,58 @@ mod tests {
         assert_eq!(err(&input), "exe fd must differ from the info fd (got 11)");
         input.info_fd = None;
         assert!(build(&input).is_ok(), "a distinct exe fd must build");
+        // Rows 20–23: the status fd, with the same distinctness rules.
+        input.landlock = Some(crate::landlock::Layer {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: Vec::new(),
+            exe_fd: 11,
+            status_fd: 2,
+            host_abi: 6,
+        });
+        assert_eq!(err(&input), "status fd must be greater than 2 (got 2)");
+        input.landlock = Some(crate::landlock::Layer {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: Vec::new(),
+            exe_fd: 11,
+            status_fd: 10,
+            host_abi: 6,
+        });
+        assert_eq!(
+            err(&input),
+            "status fd must differ from the seccomp fd (got 10)"
+        );
+        input.landlock = Some(crate::landlock::Layer {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: Vec::new(),
+            exe_fd: 11,
+            status_fd: 11,
+            host_abi: 6,
+        });
+        assert_eq!(
+            err(&input),
+            "status fd must differ from the exe fd (got 11)"
+        );
+        input.info_fd = Some(12);
+        input.landlock = Some(crate::landlock::Layer {
+            mode: crate::landlock::Mode::BestEffort,
+            bind_tcp: Vec::new(),
+            exe_fd: 11,
+            status_fd: 12,
+            host_abi: 6,
+        });
+        assert_eq!(
+            err(&input),
+            "status fd must differ from the info fd (got 12)"
+        );
+        input.info_fd = None;
+        input.landlock = layer(11);
         // `off` is not a layer: no row applies, whatever the fd number.
         input.landlock = Some(crate::landlock::Layer {
             mode: crate::landlock::Mode::Off,
             bind_tcp: Vec::new(),
             exe_fd: 2,
+            status_fd: 2,
+            host_abi: 0,
         });
         assert!(build(&input).is_ok(), "mode off must not check the exe fd");
     }
