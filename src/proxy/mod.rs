@@ -368,7 +368,8 @@ pub enum Rejected {
     },
     /// The (port-stripped) `Host` value is not a bare hostname
     /// ([`Domain::parse`] rejected it: scheme, userinfo, brackets, IP
-    /// literal, junk).
+    /// literal, junk). `value` is [`redact_opaque`]d: its shape is kept,
+    /// userinfo and path/query content are not.
     HostInvalid { value: String },
     /// The canonicalized `Host` differs from the name.
     HostMismatch {
@@ -562,11 +563,12 @@ impl Failed {
 }
 
 /// Where a name in a [`Rejected`] reason came from (issue #8, Q4). The
-/// `DnsMap` rows are the #7 wording byte-for-byte; the other two sources
-/// phrase the same check against the explicit proxy's own inputs.
+/// `DnsMap` rows keep #7's phrasing; client strings in them are redacted on
+/// every path (issue #29, F1). The other two sources phrase the same check
+/// against the explicit proxy's own inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameSource {
-    /// The transparent path's fake-IP → policy-name map (#7 wording).
+    /// The transparent path's fake-IP → policy-name map (#7 phrasing).
     DnsMap,
     /// The name is the CONNECT request-target's host.
     ConnectTarget,
@@ -661,11 +663,39 @@ pub(crate) fn redact_for_audit(raw: &str) -> String {
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..authority_end];
-    let mut out = match authority.rfind('@') {
-        Some(at) => format!("{REDACTED_USERINFO}{}", &authority[at + 1..]),
-        None => authority.to_owned(),
+    redact_opaque(&after_scheme[..authority_end])
+}
+
+/// Replaces the content after the first `/`, `?` or `#` in
+/// [`redact_opaque`] (the delimiter itself is kept, to show the shape).
+const REDACTED_REST: &str = "<redacted>";
+
+/// Redact client text that is NOT a well-formed URL (a `Host` value, an
+/// unrecognized request-target) for an audit reason (review of #53). Unlike
+/// [`redact_for_audit`] it keeps the SHAPE that was sent: a scheme stays,
+/// and a path, query or fragment shows as its delimiter plus `<redacted>`
+/// (their content may carry secrets, issue #29 F1), so `Host:
+/// http://allowed.test` and `Host: allowed.test/x` never log as the bare,
+/// allowed `allowed.test`. Userinfo is replaced by `<redacted>@` and the
+/// [`AUDIT_TEXT_CAP`] cap applies.
+pub(crate) fn redact_opaque(raw: &str) -> String {
+    let start = raw.find("://").map_or(0, |at| at + 3);
+    let cut = raw[start..]
+        .find(['/', '?', '#'])
+        .map_or(raw.len(), |at| start + at);
+    let head = &raw[..cut];
+    let mut out = match head[start..].rfind('@') {
+        Some(at) => format!(
+            "{}{REDACTED_USERINFO}{}",
+            &head[..start],
+            &head[start + at + 1..]
+        ),
+        None => head.to_owned(),
     };
+    if cut < raw.len() {
+        out.push_str(&raw[cut..cut + 1]);
+        out.push_str(REDACTED_REST);
+    }
     if out.len() > AUDIT_TEXT_CAP {
         let mut cut = AUDIT_TEXT_CAP - TRUNCATION_MARK.len();
         while !out.is_char_boundary(cut) {
@@ -2107,9 +2137,9 @@ mod tests {
             ),
             (
                 Rejected::HostInvalid {
-                    value: "user@allowed.test".to_owned(),
+                    value: "<redacted>@allowed.test".to_owned(),
                 },
-                "Host header \"user@allowed.test\" is not a bare hostname",
+                "Host header \"<redacted>@allowed.test\" is not a bare hostname",
             ),
             (
                 Rejected::HostMismatch {
@@ -2121,11 +2151,11 @@ mod tests {
             ),
             (
                 Rejected::TargetMismatch {
-                    target: "http://evil.test/".to_owned(),
+                    target: "evil.test".to_owned(),
                     name: dom("allowed.test"),
                     source: NameSource::DnsMap,
                 },
-                "absolute-form request target \"http://evil.test/\" does not match the DNS-map name allowed.test",
+                "absolute-form request target \"evil.test\" does not match the DNS-map name allowed.test",
             ),
             (
                 Rejected::DialDenied {

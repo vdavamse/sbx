@@ -24,7 +24,9 @@
 //!    seen terminator is impossible but pinned to [`Rejected::HttpMalformed`]
 //!    anyway.
 //! 3. **Denial order** — CONNECT ⇒ [`Rejected::ConnectMethod`] (that is
-//!    #8) → request-target rules → `Host` rules. NO verb/path filtering in
+//!    #8) → request-target rules → `Host` rules → the strict framing table
+//!    ([`check_framing`] ⇒ [`Rejected::AmbiguousFraming`], issue #29 F2).
+//!    NO verb/path filtering in
 //!    v1 (#17 owns those): any non-CONNECT method passes if the names
 //!    verify; HTTP/0.9 (no version) fails in httparse ⇒ HttpMalformed (no
 //!    Host ⇒ unverifiable ⇒ fail-closed).
@@ -81,7 +83,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{Limits, NameSource, Rejected, canonicalize_host, redact_for_audit};
+use super::{Limits, NameSource, Rejected, canonicalize_host, redact_for_audit, redact_opaque};
 use crate::policy::Domain;
 
 /// The head terminator — the read loop stops after the first occurrence.
@@ -331,7 +333,7 @@ pub(crate) fn check_target(
         return Err(Rejected::HttpMalformed {
             detail: format!(
                 "unrecognized request-target form {:?}",
-                redact_for_audit(target)
+                redact_opaque(target)
             ),
         });
     };
@@ -404,7 +406,7 @@ pub(crate) fn check_host(
                 // Overflow (e.g. ":99999"): the full value is not a bare
                 // hostname either — fail-closed.
                 return Err(Rejected::HostInvalid {
-                    value: redact_for_audit(value),
+                    value: redact_opaque(value),
                 });
             };
             if got != port {
@@ -420,7 +422,7 @@ pub(crate) fn check_host(
     };
     let Some(host) = canonicalize_host(host_part) else {
         return Err(Rejected::HostInvalid {
-            value: redact_for_audit(host_part),
+            value: redact_opaque(host_part),
         });
     };
     if host != *expected {
@@ -433,7 +435,8 @@ pub(crate) fn check_host(
     Ok(())
 }
 
-/// The framing a request declares (issue #8, explicit paths).
+/// The framing a request declares (issue #8 on the explicit paths; issue
+/// #29 F2 applies the same table on transparent :80).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Framing {
     /// No body.
@@ -839,9 +842,10 @@ mod tests {
         assert_eq!(
             err,
             Rejected::HttpMalformed {
-                detail: "unrecognized request-target form \"<redacted>@x\"".to_owned(),
+                detail: "unrecognized request-target form \"<redacted>@x?<redacted>\"".to_owned(),
             }
         );
+        assert!(!err.reason().contains("token"), "{}", err.reason());
 
         let head = b"GET / HTTP/1.1\r\nHost: u:pw@allowed.test\r\n\r\n";
         let err = parse(head).expect_err("userinfo in Host must be denied");
@@ -852,15 +856,48 @@ mod tests {
             }
         );
         assert!(!err.reason().contains("pw"), "{}", err.reason());
+
+        // Review of #53: a Host value keeps its shape, so a scheme or a path
+        // never logs as the bare, allowed name.
+        for (host, logged) in [
+            ("http://allowed.test", "http://allowed.test"),
+            ("allowed.test/evil", "allowed.test/<redacted>"),
+            (
+                "http://u:pw@allowed.test/p?k=v",
+                "http://<redacted>@allowed.test/<redacted>",
+            ),
+        ] {
+            let head = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let err = parse(head.as_bytes()).expect_err("decorated Host must be denied");
+            assert_eq!(
+                err,
+                Rejected::HostInvalid {
+                    value: logged.to_owned(),
+                },
+                "{host}"
+            );
+            assert!(!err.reason().contains("pw") && !err.reason().contains("k=v"));
+        }
+        let head = request_with_line("GET ?x HTTP/1.1");
+        assert_eq!(
+            parse(&head).expect_err("query-only target"),
+            Rejected::HttpMalformed {
+                detail: "unrecognized request-target form \"?<redacted>\"".to_owned(),
+            }
+        );
     }
 
     /// Issue #29, F2: the strict framing table applies on transparent :80.
     #[test]
     fn transparent_strict_framing() {
-        let rows: [(&[u8], &str); 4] = [
+        let rows: [(&[u8], &str); 5] = [
             (
                 b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
                 FRAMING_CL_AND_TE,
+            ),
+            (
+                b"POST / HTTP/1.0\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+                FRAMING_TE_HTTP10,
             ),
             (
                 b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
@@ -882,8 +919,30 @@ mod tests {
                 "{head:?}"
             );
         }
+        // Accept rows (review of #53): the regression guard against
+        // rejecting legitimate requests on :80.
         let ok = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 3\r\n\r\nabc";
         assert_eq!(parse(ok), Ok(ok.len() - 3));
+        let accepted: [&[u8]; 3] = [
+            b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            b"GET / HTTP/1.0\r\nHost: allowed.test\r\n\r\n",
+        ];
+        for head in accepted {
+            assert_eq!(parse(head), Ok(head.len()), "{head:?}");
+        }
+    }
+
+    /// Review of #53: the production async entry applies the framing table.
+    #[test]
+    fn inspect_http_denies_cl_and_te() {
+        let head = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\nx";
+        assert_eq!(
+            inspect_with(head, Limits::default(), false),
+            Err(Rejected::AmbiguousFraming {
+                detail: FRAMING_CL_AND_TE
+            })
+        );
     }
 
     #[test]
