@@ -20,10 +20,11 @@ does). Two steps:
    profile means the same thing on a runtime that honours them and on one that
    ignores them.
 2. Add one unconditional ALLOW rule, right after the base allow list, for
-   ADDED_SYSCALLS. Upstream allows `unshare`, `mount`, `umount2` and `sethostname`
-   only with CAP_SYS_ADMIN, allows `clone` without it only when no namespace flag
+   ADDED_SYSCALLS. Upstream allows `unshare`, `mount`, `umount2`, `sethostname` and
+   `setns` only with CAP_SYS_ADMIN, allows `clone` without it only when no namespace flag
    is set, and does not list `pivot_root`. Each one was shown to be needed by
-   removing it and running `sbx check`.
+   removing it and running `sbx check` (`setns` is needed only by the report-only
+   `keep-alive` item: `run --keep-alive` and `attach`).
 
 Everything else is copied unchanged: the default action (EPERM), the architecture
 map and every other rule, including the one that makes `clone3` fail with ENOSYS
@@ -46,12 +47,13 @@ ADDED_SYSCALLS = [
     "mount",
     "pivot_root",
     "sethostname",
+    "setns",
     "umount2",
     "unshare",
 ]
 
 COMMENT = (
-    "sbx (docs/kubernetes.md): namespace creation, mount, pivot_root and sethostname "
+    "sbx (docs/kubernetes.md): namespace creation and joining, mount, pivot_root and sethostname "
     "without capabilities, for unprivileged user namespaces in a hostUsers: false pod"
 )
 

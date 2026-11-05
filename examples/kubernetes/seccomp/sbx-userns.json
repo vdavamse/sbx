@@ -431,11 +431,12 @@
 				"mount",
 				"pivot_root",
 				"sethostname",
+				"setns",
 				"umount2",
 				"unshare"
 			],
 			"action": "SCMP_ACT_ALLOW",
-			"comment": "sbx (docs/kubernetes.md): namespace creation, mount, pivot_root and sethostname without capabilities, for unprivileged user namespaces in a hostUsers: false pod"
+			"comment": "sbx (docs/kubernetes.md): namespace creation and joining, mount, pivot_root and sethostname without capabilities, for unprivileged user namespaces in a hostUsers: false pod"
 		},
 		{
 			"names": [

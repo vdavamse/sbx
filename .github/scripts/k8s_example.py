@@ -12,7 +12,7 @@ assert_conformance.py. Subcommands:
 
   assert-ok CHECK_JSON RC
       `sbx check --json` from the example pod: rc 0, network mode transparent, every
-      item ok except landlock (report-only).
+      item ok except landlock (report-only); keep-alive must be ok too.
 
   assert-fail CHECK_JSON RC ITEM ERRNO [ITEM ERRNO ...]
       `sbx check --json` from a variant pod: rc 1, network mode unavailable, and each
@@ -60,10 +60,12 @@ def load(path):
         sys.exit(f"FAIL: cannot read {path}: {err}")
 
 
-# The `sbx check` items (src/host/classify.rs CapId), all of which must be present.
+# The `sbx check` items (src/host/mod.rs CapId::ALL), all of which must be present.
+# keep-alive is report-only like landlock, but the example's seccomp profile allows
+# what it needs (pidfd_open, setns), so it must be ok in the pod, as on the runner.
 ITEMS = {
     "userns", "netns", "netns-ipv6", "nft", "fallback",
-    "bwrap", "bwrap-run", "bwrap-proc", "seccomp", "landlock",
+    "bwrap", "bwrap-run", "bwrap-proc", "seccomp", "landlock", "keep-alive",
 }
 
 

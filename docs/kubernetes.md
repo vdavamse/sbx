@@ -62,7 +62,7 @@ The kind config mounts `examples/kubernetes/seccomp/` at `/var/lib/kubelet/secco
 on the node, which is where the pod's `localhostProfile` points.
 
 **Observed results in the pod.** `uid_map` was `0 <host id> 65536`, with a different host id on
-each pod (for example `0 2526806016 65536`); in the host user namespace it is `0 0 4294967295`. So
+each pod (for example `0 3753443328 65536`); in the host user namespace it is `0 0 4294967295`. So
 `hostUsers: false` was in effect. `sbx check`:
 
 ```
@@ -75,7 +75,8 @@ each pod (for example `0 2526806016 65536`); in the host user namespace it is `0
   ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 7 (report-only)
+  ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
+  ok    keep-alive  pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
@@ -97,12 +98,21 @@ policy /etc/sbx/default.json (requires transparent):
 policy: can run on this host
 ```
 
-`sbx check --conformance` reported `72 checks: 66 ok, 0 FAIL, 0 warn, 6 skip (6 opt-in, 0
-capability, 0 not implemented)`, `result: conformant (opt-in skips only)`. The six skips are the
-network tier (`E01` to `E06`), which needs `--network` and was not run here. A plain
+`sbx check --conformance` reported `81 checks: 74 ok, 0 FAIL, 0 warn, 7 skip (7 opt-in, 0
+capability, 0 not implemented)`, `result: conformant (opt-in skips only)`. The seven skips are the
+network tier (`E01` to `E06`), which needs `--network` and was not run here, and `I04`, which needs
+a second uid and is an opt-in skip on every host. A plain
 `sbx run --policy /etc/sbx/default.json ... -- /usr/bin/sh -c 'echo hello-from-sandbox; cat
-/etc/hosts'` exited 0, printed only `127.0.0.1 localhost` and `::1 localhost` for the sandbox's
+/etc/hosts'` exited 0, printed only `127.0.0.1 localhost` and `127.0.1.1 sandbox` for the sandbox's
 `/etc/hosts`, and its audit exit row had `"net_mode":"transparent"`.
+
+**Optional features (observed in the pod).** A persistent session worked: `sbx run --keep-alive
+... -- /usr/bin/sleep 300`, then `sbx attach ... -- /usr/bin/sh -c 'echo attached'` and `sbx stop`
+all returned 0. It needs `setns`, which the example's seccomp profile allows for that reason (see
+[Seccomp](#seccomp)); without it the `keep-alive` item is a report-only `warn` and plain `sbx run`
+is unaffected. The Landlock layer worked too: `sbx run --landlock require ...` returned 0, and a
+`touch /usr/x` inside it failed with `Read-only file system`. The `landlock_*` syscalls are in
+Docker's base allow list, so the derived profile allows them unchanged.
 
 ## What sbx needs from the pod
 
@@ -149,9 +159,10 @@ changes, both for a container that drops ALL capabilities:
    capabilities dropped, `setns(-1, 0)` returned EBADF, `quotactl` returned EINVAL and `clone3`
    returned EINVAL, so the kernel saw them; under `RuntimeDefault`, and under Docker 28.2.2 with the
    same file, they returned EPERM, EPERM and ENOSYS. With the conditions resolved, the derived
-   profile returned EPERM, EPERM and ENOSYS in the pod too.
-2. **Add one rule** that allows `clone`, `mount`, `pivot_root`, `sethostname`, `umount2` and
-   `unshare` unconditionally.
+   profile returned EPERM for `quotactl` and ENOSYS for `clone3` in the pod too (`setns` returns
+   EBADF there because step 2 adds it on purpose).
+2. **Add one rule** that allows `clone`, `mount`, `pivot_root`, `sethostname`, `setns`, `umount2`
+   and `unshare` unconditionally.
 
 Each added syscall was removed once and `sbx check` run (observed):
 
@@ -163,6 +174,7 @@ Each added syscall was removed once and `sbx check` run (observed):
 | `pivot_root` | `bwrap-run` FAIL, evidence `bwrap: pivot_root: Operation not permitted` |
 | `umount2` | `bwrap-run` FAIL, evidence `bwrap: unmount old root: Operation not permitted` |
 | `sethostname` | `bwrap-run` FAIL, evidence `bwrap: Can't set hostname to sandbox: Operation not permitted` |
+| `setns` | `keep-alive` warn (report-only), evidence `setns into the holder stand-in's user and network namespaces failed: Operation not permitted (os error 1)`; every other item ok, network mode `transparent`. Only `run --keep-alive` and `attach` need it. |
 
 `clone3` is not added: sbx and bubblewrap did not need it, and Docker's rule that makes it fail
 with ENOSYS stays (C libraries fall back to `clone` on ENOSYS). The `U_SECCOMP` fix text in
@@ -177,7 +189,9 @@ only on amd64 (the pod started and the results above hold); aarch64 was not test
 What the added syscalls mean for the pod: `clone` and `unshare` are allowed with any flags, so the
 sbx container can create a new user namespace and, inside it, namespaces of every other type
 (mount, network, PID, IPC, UTS, cgroup, time), and mount, `pivot_root` and set the hostname there.
-It is still bounded: the capabilities a process gets in a user namespace it creates apply only to
+`setns` lets it join namespaces; per [setns(2)](https://man7.org/linux/man-pages/man2/setns.2.html)
+that needs CAP_SYS_ADMIN in the user namespace that owns the target, which a process without
+capabilities in the pod has only for namespaces it created itself. It is still bounded: the capabilities a process gets in a user namespace it creates apply only to
 that namespace and the namespaces it owns, never to the pod's or the node's resources, and the pod
 itself holds no capabilities. This is the same surface any host with unprivileged user namespaces
 exposes (threat model section 4, "Host kernel: trusted and shared"; R15, R16). The
@@ -193,7 +207,7 @@ runs under both the pod's profile and sbx's own filter (kernel documentation:
 separately.
 
 **`seccompProfile: Unconfined` instead.** This also worked (observed: `Seccomp: 0`, every item ok,
-conformance 66 ok). The pod then has no syscall filter of its own, and the payload is left with
+conformance 74 ok). The pod then has no syscall filter of its own, and the payload is left with
 sbx's own filter only: the socket-family allow list plus a deny list, not a syscall allow list
 (S2, R16). The sbx container itself, including the proxies that parse payload bytes (R28), then
 runs with no seccomp filter at all. Per the
@@ -346,7 +360,7 @@ were not run in a pod. What differs:
   the node (R15). Same-uid processes in the sbx container, such as the agent that calls `sbx run`,
   are out of model and can reach the sandbox from outside (R24).
 - **`hostAliases` and the pod's `/etc/hosts`.** The sandbox gets a generated `/etc/hosts` with
-  `localhost` entries only (R5, closed; observed in the pod), so the kubelet-managed file is not
+  only `localhost` and the sandbox hostname (R5, closed; observed in the pod), so the kubelet-managed file is not
   disclosed. The proxy resolves allowed names on the pod side, where `hostAliases` entries
   apply. Per the README section [Running commands](../README.md#running-commands) (`/etc/hosts`),
   such a name works only when it maps to a public address; private, link-local and other
@@ -431,10 +445,11 @@ image, creates the kind cluster, and checks that `uid_map` is not the host map. 
 - kind's DMI file overmounts under `/sys` are removed in the node (see
   [Node requirements](#node-requirements)); without that, the pod sandbox fails to start on
   GitHub runners;
-- gating: `sbx check` (every item except `landlock` ok, network mode `transparent`),
+- gating: `sbx check` (every item except the report-only `landlock` ok, including `keep-alive`;
+  network mode `transparent`),
   `sbx check --policy /etc/sbx/default.json --host` (rc 0) and `sbx check --conformance` (the same
-  `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 66 offline checks ok or
-  warn, `E01` to `E06` opt-in, rc 0);
+  `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 75 offline checks ok or
+  warn except `I04`, which is an opt-in skip like `E01` to `E06`, rc 0);
 - gating: the `procMount` and seccomp rows of the table above (`netns-ipv6` errno 30 and
   `bwrap-run`; `userns` errno 1);
 - report-only: the pod without `appArmorProfile`.

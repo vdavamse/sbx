@@ -37,7 +37,7 @@ spec:
         procMount: Unmasked
         # Without it (RuntimeDefault): userns FAIL (unshare blocked by seccomp).
         # Docker's default profile resolved for no capabilities, plus clone,
-        # mount, pivot_root, sethostname, umount2 and unshare
+        # mount, pivot_root, sethostname, setns, umount2 and unshare
         # (examples/kubernetes/README.md). Install it on every node.
         seccompProfile:
           type: Localhost
