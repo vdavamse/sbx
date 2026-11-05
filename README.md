@@ -209,12 +209,19 @@ A policy with `network.mode: transparent` cannot run on an `explicit` host:
 and it is never silent: `sbx run` prints one notice line with the nft error, and
 the audit exit row records the mode the run got (see [Running commands](#running-commands)).
 
-**Policy comparison.** `sbx check --policy P --host` adds four checks to the
+**Policy comparison.** `sbx check --policy P --host` adds nine checks to the
 host report: `network-mode` (the policy's mode against the host), `infra-etc`
 (the `/etc` files every sandbox binds), `policy-paths` (every `filesystem.ro` and
-`filesystem.rw` path exists) and `deny-paths` (a deny entry that is a file cannot
+`filesystem.rw` path exists), `deny-paths` (a deny entry that is a file cannot
 be masked, and one that sits under a bound path or an sbx-generated `/etc` file
-is flagged).
+is flagged), `bind-sockets` (a `warn` listing the unix socket files under
+`filesystem.ro` and `filesystem.rw`, outside `filesystem.deny`; see
+[Unix sockets under binds](#running-commands)), `mount-chains` (the pre-launch
+verification of `run` below, which fails the policy when `run` would refuse),
+`bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
+paths under its binds), `deny-links` (warns when a file under a deny path has a
+hard link outside it) and `pin-cost` (warns above 50 directory pins). A `warn`
+does not stop the policy from running.
 
 **JSON.** `sbx check --json` prints the same report as a JSON object with
 `"version": 1`: `network_mode`, `runnable_modes`, `probe_error` and one object per
@@ -250,6 +257,10 @@ platform, the Kubernetes and Docker forms are given:
 | `fallback` | the default route cannot be removed (the explicit mode is unavailable) | report a bug with the evidence line and `uname -r` |
 | `bwrap` | bwrap is not found | install bubblewrap 0.8 or newer (for example `apt-get install bubblewrap`), or set `SBX_BWRAP` |
 | `bwrap` | bwrap is older than 0.8, or unusable | install bubblewrap 0.8 or newer, or set `SBX_BWRAP` to one |
+| `mount-chains` | a path bwrap resolves under a policy bind is a symbolic link, is missing or has the wrong type, or a deny path is reachable through a host symlink alias | remove the symbolic link, create the directory on the host, or move the entry out of the `rw` path (the message names the component) |
+| `bwrap-cve` | bwrap is older than 0.12.0 and the policy has mount paths under its binds (a warning; the run still starts) | install bubblewrap 0.12.0 or later (CVE-2026-87766); a distribution backport is not visible in the version string |
+| `deny-links` | a regular file under a deny path has a hard link outside it (a warning) | remove the extra hard link, or deny the other name as well |
+| `pin-cost` | the policy needs more than 50 directory pins (a warning): each pin is an extra bind, and startup grows superlinearly with the count | keep the deny list short, or deny a parent directory instead of many nested entries |
 | `bwrap-run` | bwrap cannot apply `--disable-userns` because `/proc/sys` is read-only | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
@@ -267,7 +278,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-70 checks in eight groups, the same code that `cargo test --test conformance`
+72 checks in eight groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -317,7 +328,8 @@ temporary artifacts and prints their path on stderr. A full offline run takes a
 few seconds (the budget is 120 s).
 
 A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
-hazard, not a defect. It goes away when issue #35 lands.
+hazard, not a defect. Find the bind that holds it with
+`sbx check --policy P --host` (the `bind-sockets` item).
 
 **Lab tier.** The 19 lab checks (A02–A06, A12, B01–B09, C02, C07, F02, F04) run
 inside a child that unshares user, network and mount namespaces: no root, and
@@ -376,6 +388,39 @@ SIGKILL` and keeps the rc it computed. The diagnostic reports that teardown
 took longer than its 5-second budget; it does not change the exit status. A failure
 after the payload started (for example `execvp` of a missing binary, rc 1) keeps
 the status of the failing stage and is printed by that stage.
+
+**Filesystem policy.** `ro` and `rw` paths are bound at the same path inside the
+sandbox. A `deny` entry is an empty `tmpfs` over its path: it hides the path name,
+and only that name. Before the payload starts, `run` checks the host side of every
+path bwrap will resolve under a policy bind (read-only or writable, #39, #40):
+
+- A path that is a symbolic link, is missing, or has the wrong type on the way to
+  a bind dest or a deny entry is refused: rc 125, `sbx run: filesystem path … `,
+  with nothing created outside the session directory and the audit log. Each component is opened without following links, so
+  bwrap never sees one. A `deny` entry under `rw` must already exist as a
+  directory on the host; bwrap would otherwise create it, and its parents, there.
+- A `deny` path that the host reaches through a symbolic link alias of another
+  bind is refused, and so is a bind whose host source is a link into a deny path:
+  either way the mask would not cover that inode.
+- Every directory between an `rw` path and a `deny` entry, or a nested bind (read-only
+  or writable), is pinned with a self-bind, including the parents of nested writable binds. A payload cannot rename or remove a pinned directory
+  (EBUSY), so the mask stays where it was. A rename across a pinned boundary fails
+  with EXDEV: `mv` falls back to copy, but a tool that only calls `rename(2)` sees
+  the error. Pins cost startup time that grows superlinearly with their count: on
+  WSL2, 60 pins add about 17 ms, 300 pins about 180 ms and 900 pins about 1 s. `sbx check`
+  warns above 50 pins (`pin-cost`). Keep deny lists short, and deny a parent instead of
+  many nested entries.
+
+The check runs once, before the spawn. It does not stop a writer that is not a sandbox of
+this exact policy (another policy, an older sbx, a host process, a host bind-mount alias
+of the tree) from changing the tree during the window. That window is a known residual
+on every bwrap version (R26 in `docs/threat-model.md`, Medium when policies share a writable
+tree; bwrap 0.12.0 closes only the dest side, not a swapped bind source): **do not share an
+`rw` tree between policies**, and do not let
+host tools write into an `rw` tree while sandboxes run. A bind whose host source reaches
+another bind\'s tree through a symbolic link is refused (N19): bind the real path. Hard links made on the host to a denied
+file, and host bind-mount aliases, are not detected at run time; `sbx check` warns about
+hard links (`deny-links`).
 
 **Timeouts.** The clock starts when `run` starts, so sandbox setup counts.
 Setup itself is limited to 30 seconds. On timeout or on a signal sbx SIGKILLs
@@ -443,6 +488,30 @@ payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
 `NO_PROXY` and their lowercase twins) pointing at the explicit listener. The
 explicit proxy's response table is in the `proxy::explicit` module docs (200 for
 an allowed CONNECT; 400, 403, 502 and 504 otherwise).
+
+**Unix sockets under binds (issue #35).** A read-only bind does not block
+`connect(2)` on a unix socket file: `ro` only stops writes to the file itself.
+A policy that binds `/run`, `/var/run`, a directory under `/tmp` (such as
+`/tmp/.X11-unix`) or a home directory therefore hands the payload every socket
+under it, for example `docker.sock` (host root),
+the D-Bus buses, an ssh-agent, or nscd and systemd-resolved (a resolver that
+bypasses the fake-IP DNS). Keep socket directories out of `filesystem.ro` and
+`filesystem.rw`, or mask them with `filesystem.deny`. A bind at exactly `/tmp`,
+`/root`, `/work`, `/proc` or `/dev` is covered by sbx's own mount there, so the
+host sockets under it are not reachable. `sbx check --policy P --host` warns
+about each reachable socket file under a bind (`bind-sockets`), and the
+conformance check `D05` warns about any socket file visible inside the sandbox.
+
+**`/etc/hosts` (issue #35).** The sandbox's `/etc/hosts` is generated, like
+`resolv.conf`, `passwd` and `group`: it holds only `127.0.0.1 localhost` and
+`::1 localhost`. The host's file is never bound, so a host entry cannot pin an
+allowed name to a real address past the fake-IP resolver, and host entries are
+not disclosed. A policy that lists `/etc/hosts` in `filesystem.ro` gets the
+generated file (it mounts last). Names that a host's `/etc/hosts` or Kubernetes
+`hostAliases` define are resolved by the proxy on the host side. They work for
+allowed names only when they map to a public address: the resolved-address guard
+still denies loopback, private, link-local and other special-purpose addresses,
+which is where `hostAliases` usually point.
 
 **Socket families and syscalls (issue #34).** Every `sbx run` installs a seccomp
 filter through bwrap (`--seccomp`), and the payload can create sockets only in

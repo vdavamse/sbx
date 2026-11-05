@@ -172,14 +172,13 @@ fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
 }
 
 /// The per-request check inputs (issue #8, Q4): the name to match, the
-/// port, the [`NameSource`] for wording and redaction, and whether the
-/// strict framing rules apply (explicit paths only — transparent :80 keeps
-/// the #7 behaviour, follow-up F2).
+/// port and the [`NameSource`] for wording. The strict framing table
+/// ([`check_framing`]) applies on every path, transparent :80 included
+/// (issue #29, F2).
 pub(crate) struct HeadCheck<'a> {
     pub expected: &'a Domain,
     pub port: u16,
     pub source: NameSource,
-    pub strict_framing: bool,
 }
 
 /// Read + inspect the HTTP request head on 80 (module docs point 1).
@@ -196,7 +195,6 @@ pub(crate) async fn inspect_http<S: AsyncRead + Unpin>(
         expected,
         port: orig_port,
         source: NameSource::DnsMap,
-        strict_framing: false,
     };
     inspect_http_with(client, &check, limits).await
 }
@@ -231,7 +229,7 @@ pub(crate) async fn inspect_http_with<S: AsyncRead + Unpin>(
     Ok(buf)
 }
 
-/// The #7 entry point (DnsMap wording, lenient framing) — kept as a thin
+/// The #7 entry point (DnsMap wording) — kept as a thin
 /// wrapper so the #7 head pins are unchanged. Test-only: production goes
 /// through [`inspect_http_with`].
 #[cfg(test)]
@@ -245,7 +243,6 @@ pub(crate) fn parse_head(
         expected,
         port: orig_port,
         source: NameSource::DnsMap,
-        strict_framing: false,
     };
     parse_head_with(head, &check, max_headers)
 }
@@ -308,19 +305,8 @@ pub(crate) fn parse_head_with(
         check.source,
         true,
     )?;
-    if check.strict_framing {
-        check_framing(request.headers, request.version.unwrap_or(1))?;
-    }
+    check_framing(request.headers, request.version.unwrap_or(1))?;
     Ok(consumed)
-}
-
-/// Client text in a non-DnsMap reason goes through [`redact_for_audit`]
-/// (issue #8, D4); DnsMap rows keep #7's verbatim wording.
-pub(crate) fn for_source(source: NameSource, raw: &str) -> String {
-    match source {
-        NameSource::DnsMap => raw.to_owned(),
-        NameSource::ConnectTarget | NameSource::RequestTarget => redact_for_audit(raw),
-    }
 }
 
 pub(crate) fn check_target(
@@ -335,7 +321,7 @@ pub(crate) fn check_target(
         return Ok(());
     }
     let mismatch = || Rejected::TargetMismatch {
-        target: for_source(source, target),
+        target: redact_for_audit(target),
         name: expected.clone(),
         source,
     };
@@ -345,7 +331,7 @@ pub(crate) fn check_target(
         return Err(Rejected::HttpMalformed {
             detail: format!(
                 "unrecognized request-target form {:?}",
-                for_source(source, target)
+                redact_for_audit(target)
             ),
         });
     };
@@ -418,7 +404,7 @@ pub(crate) fn check_host(
                 // Overflow (e.g. ":99999"): the full value is not a bare
                 // hostname either — fail-closed.
                 return Err(Rejected::HostInvalid {
-                    value: for_source(source, value),
+                    value: redact_for_audit(value),
                 });
             };
             if got != port {
@@ -434,7 +420,7 @@ pub(crate) fn check_host(
     };
     let Some(host) = canonicalize_host(host_part) else {
         return Err(Rejected::HostInvalid {
-            value: for_source(source, host_part),
+            value: redact_for_audit(host_part),
         });
     };
     if host != *expected {
@@ -801,9 +787,11 @@ mod tests {
             assert_eq!(
                 err,
                 Rejected::TargetMismatch {
+                    // Redacted to the authority on the transparent path too
+                    // (issue #29, F1).
                     target: line
-                        .strip_prefix("GET ")
-                        .and_then(|rest| rest.split(' ').next())
+                        .strip_prefix("GET http://")
+                        .and_then(|rest| rest.split('/').next())
                         .expect("line shape")
                         .to_owned(),
                     name: dom("allowed.test"),
@@ -823,11 +811,79 @@ mod tests {
         assert_eq!(
             parse(&head),
             Err(Rejected::TargetMismatch {
-                target: "http://allowed.test:8080/".to_owned(),
+                target: "allowed.test:8080".to_owned(),
                 name: dom("allowed.test"),
                 source: NameSource::DnsMap,
             })
         );
+    }
+
+    /// Issue #29, F1: client strings in transparent-path reasons are
+    /// redacted like the explicit path's — no userinfo, path or query.
+    #[test]
+    fn transparent_reasons_redacted() {
+        let head = request_with_line("GET http://user:secret@evil.test/p?token=x HTTP/1.1");
+        let err = parse(&head).expect_err("mismatch must be denied");
+        assert_eq!(
+            err,
+            Rejected::TargetMismatch {
+                target: "<redacted>@evil.test".to_owned(),
+                name: dom("allowed.test"),
+                source: NameSource::DnsMap,
+            }
+        );
+        assert!(!err.reason().contains("secret"), "{}", err.reason());
+
+        let head = request_with_line("GET user:secret@x?token=y HTTP/1.1");
+        let err = parse(&head).expect_err("unrecognized form must be denied");
+        assert_eq!(
+            err,
+            Rejected::HttpMalformed {
+                detail: "unrecognized request-target form \"<redacted>@x\"".to_owned(),
+            }
+        );
+
+        let head = b"GET / HTTP/1.1\r\nHost: u:pw@allowed.test\r\n\r\n";
+        let err = parse(head).expect_err("userinfo in Host must be denied");
+        assert_eq!(
+            err,
+            Rejected::HostInvalid {
+                value: "<redacted>@allowed.test".to_owned(),
+            }
+        );
+        assert!(!err.reason().contains("pw"), "{}", err.reason());
+    }
+
+    /// Issue #29, F2: the strict framing table applies on transparent :80.
+    #[test]
+    fn transparent_strict_framing() {
+        let rows: [(&[u8], &str); 4] = [
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                FRAMING_CL_AND_TE,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+                FRAMING_DUPLICATE_CL,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: +1\r\n\r\n",
+                FRAMING_INVALID_CL,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+                FRAMING_TE_NOT_CHUNKED,
+            ),
+        ];
+        for (head, detail) in rows {
+            assert_eq!(
+                parse(head),
+                Err(Rejected::AmbiguousFraming { detail }),
+                "{head:?}"
+            );
+        }
+        let ok = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 3\r\n\r\nabc";
+        assert_eq!(parse(ok), Ok(ok.len() - 3));
     }
 
     #[test]
@@ -1169,7 +1225,7 @@ mod tests {
             (
                 b"GET http://evil.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n".as_slice(),
                 Rejected::TargetMismatch {
-                    target: "http://evil.test/".to_owned(),
+                    target: "evil.test".to_owned(),
                     name: dom("allowed.test"),
                     source: NameSource::DnsMap,
                 },

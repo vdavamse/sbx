@@ -48,7 +48,8 @@
 //!    follow all binds (any policy bind under `/proc`/`/dev` is silently
 //!    covered — documented limitation); deny `--tmpfs` masks come last so
 //!    deny always wins (Q5). Exact `(op, src, dest)` duplicates collapse
-//!    (max priority kept).
+//!    (max priority kept). Pins (#40, point 11) are extra self-binds in the
+//!    same sorted list.
 //! 5. **Environment contract** — `--clearenv` plus explicit `--setenv`
 //!    only; the SPAWNER must `env_clear()` ([`Launch::command`] encodes it
 //!    exactly once): bwrap itself is pid 1 in the sandbox, so its spawn
@@ -125,8 +126,24 @@
 //!     hardened (private 0700 dirs, the root-alias guard, `O_NOFOLLOW` +
 //!     fd-based-mode file writes, dir type/owner verification — the
 //!     CWE-59/TOCTOU class; see [`etc`]'s module docs).
+//! 11. **Writable covers: pins and the pre-launch guard (#39, #40).** The
+//!     argv plan (the `argv` module's `plan`) is derived from the same merged mount
+//!     list as the argv. For every read-only bind and deny mask under a
+//!     WRITABLE policy bind, each intermediate directory is pinned by a
+//!     self-bind (src == dest, emitted in dest order), so an in-sandbox
+//!     rename or rmdir of it is EBUSY (EXDEV across the pin). This covers
+//!     nested writable binds too (C1: a rename of a nested bind's parent would
+//!     move the bind). Session-leaf covers get no pins. The same plan lists every path bwrap
+//!     resolves under a policy, session or infra cover, rw or ro ([`PathCheck`]) and every deny that a
+//!     host symlink alias reaches ([`AliasCheck`]). [`guard`] verifies both
+//!     fd-relative (`openat` with `O_NOFOLLOW`, then `fstat`), and `run`
+//!     refuses with rc 125 before the spawn (S8a). `sbx check` runs the same
+//!     code as `mount-chains`. Residual: a concurrent writer outside the
+//!     same policy can race the check (R26): dests and sources on bwrap
+//!     before 0.12.0, bind sources on every version.
 
 pub mod etc;
+pub mod guard;
 pub mod seccomp;
 pub mod version;
 
@@ -134,6 +151,7 @@ pub mod version;
 // (below) is the public face together with `etc` (layout/materialization)
 // and `version` (discovery), mirroring `init`'s two-tier visibility.
 mod argv;
+pub use argv::{AliasCheck, BindSpec, Kind, PathCheck, Plan, path_plan};
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -210,6 +228,7 @@ pub struct Launch {
     // spawn contract stays encoded in exactly one place (module docs
     // point 5).
     argv: Vec<OsString>,
+    plan: argv::Plan,
 }
 
 impl Launch {
@@ -217,6 +236,22 @@ impl Launch {
     /// is `--` + the command verbatim.
     pub fn argv(&self) -> &[OsString] {
         &self.argv
+    }
+
+    /// The pre-launch path checks (#39/#40): every bwrap-resolved path under
+    /// a policy, session or infra cover (rw or ro), verified fd-relative before spawn.
+    pub fn path_checks(&self) -> &[PathCheck] {
+        &self.plan.checks
+    }
+
+    /// The pre-launch host-symlink alias checks (#40, Q5).
+    pub fn alias_checks(&self) -> &[AliasCheck] {
+        &self.plan.aliases
+    }
+
+    /// The policy and session binds for the host-alias overlap check (N19).
+    pub fn bind_specs(&self) -> &[BindSpec] {
+        &self.plan.binds
     }
 
     /// A [`std::process::Command`] for this launch, with the `env_clear()`
@@ -280,7 +315,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // TOCTOU-prone spellings like /etc/.. alias host directories through
     // the pure layout joins) and NOT the host root or an alias of it
     // ("/", "//"): with --session-dir /, materialize() would rewrite the
-    // host's OWN /etc/{resolv.conf,passwd,group} and the leaves would
+    // host's OWN /etc/{resolv.conf,hosts,passwd,group} and the leaves would
     // bind the host's /home and /tmp rw into the sandbox. One helper with
     // materialize()'s pre-I/O guard (etc::check_session_dir) so both
     // public seams reject identically — materialize is callable WITHOUT
@@ -342,7 +377,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // in either direction. Policy mounts use src == dest == the written
     // path, so an ancestor-or-equal bind (rw /var with the session at
     // /var/lib/sbx/s1, or the session dir itself) hands the payload
-    // host-side write access to <session>/etc/{resolv.conf,passwd,group}:
+    // host-side write access to <session>/etc/{resolv.conf,hosts,passwd,group}:
     // the SAME inodes the generated ro-binds expose at /etc/* — ro-ness
     // is per-mount, not per-file, and the read-only-synthetic-/etc-files
     // guarantee would be silently void (a payload-planted symlink there
@@ -364,8 +399,8 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     // each side is lexically canonical — AbsolutePath by the policy
     // validity invariant, session dir by rows 5–6; symlink-aliased host
     // paths are the documented lexical limitation, #11/#14). Deny paths
-    // are NOT checked: a --tmpfs mask covers a sandbox-side path and
-    // cannot alias host state.
+    // are not checked here: a --tmpfs mask covers a sandbox-side path, and
+    // the host-side checks of the pre-launch guard (point 11) cover them.
     for path in input
         .policy
         .filesystem
@@ -444,7 +479,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
     }
     // The argv layout itself has no failure modes (module docs point 1) —
     // but the assembly output gets one final sweep before it is trusted.
-    let argv = argv::assemble(input);
+    let (argv, plan) = argv::assemble(input);
     // Final whole-argv NUL sweep (defense in depth, review round 2): the
     // rows above cover every input the builder itself validates; policy
     // filesystem path BYTES ride on AbsolutePath's deserialize invariant
@@ -463,7 +498,7 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             "assembled bwrap argv contains a NUL byte".to_owned(),
         ));
     }
-    Ok(Launch { argv })
+    Ok(Launch { argv, plan })
 }
 
 // NUL cannot cross any C-string interface (execvp's argv/environ, bwrap's
@@ -534,8 +569,27 @@ pub fn infra_etc_paths() -> &'static [&'static str] {
 
 /// The `/etc` files sbx generates itself (`--host` pre-check: a deny entry
 /// equal to one of these masks a generated file).
-pub fn generated_etc_paths() -> [&'static str; 3] {
-    ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+pub fn generated_etc_paths() -> [&'static str; 4] {
+    [
+        "/etc/group",
+        "/etc/hosts",
+        "/etc/passwd",
+        "/etc/resolv.conf",
+    ]
+}
+
+/// Sandbox destinations sbx mounts over AFTER every policy bind (argv
+/// elements 6–7): the session leaves (`/root`, `/tmp`, `/work`, prio 2) and
+/// `--proc /proc --dev /dev`. A policy bind at one of these is not visible
+/// there (`sbx check --host` `bind-sockets`, issue #35).
+pub fn shadowed_dests() -> [&'static str; 5] {
+    [
+        "/dev",
+        "/proc",
+        etc::DEST_HOME,
+        etc::DEST_TMP,
+        etc::DEST_WORK,
+    ]
 }
 
 #[cfg(test)]
@@ -614,9 +668,19 @@ mod probe_argv_tests {
     fn etc_path_tables_pinned() {
         assert_eq!(
             generated_etc_paths(),
-            ["/etc/group", "/etc/passwd", "/etc/resolv.conf"]
+            [
+                "/etc/group",
+                "/etc/hosts",
+                "/etc/passwd",
+                "/etc/resolv.conf"
+            ]
         );
-        assert_eq!(infra_etc_paths().len(), 7);
+        assert_eq!(infra_etc_paths().len(), 6);
+        assert!(!infra_etc_paths().contains(&"/etc/hosts"));
+        assert_eq!(
+            shadowed_dests(),
+            ["/dev", "/proc", "/root", "/tmp", "/work"]
+        );
     }
 }
 

@@ -181,11 +181,11 @@
 //!     :80` inspects the tunnelled HTTP head; absolute-form is `http://`
 //!     port 80 only and is rebuilt as origin-form with `Connection: close`.
 //!     [`Via`] records the arrival path, [`NameSource`] selects the reason
-//!     wording (DnsMap rows stay byte-identical to #7), and every
-//!     client-derived string in a non-DnsMap reason is
-//!     redacted to authority-only (Q10). Residuals, documented: a CONNECT dial
-//!     failure after the `200` is a silent close; body framing beyond the
-//!     strict table is deferred (F3); transparent :80 keeps #7 framing (F2);
+//!     wording, and every client-derived string in a reason is redacted to
+//!     authority-only (Q10), on the transparent path too (issue #29, F1).
+//!     The strict framing table applies on transparent :80 as well (F2).
+//!     Residuals, documented: a CONNECT dial failure after the `200` is a
+//!     silent close; body framing beyond the strict table is deferred (F3);
 //!     pipelined second requests on one connection are not inspected (the
 //!     vhost-confusion class, #14; see the `explicit` module docs point 10).
 
@@ -377,8 +377,8 @@ pub enum Rejected {
         source: NameSource,
     },
     /// The absolute-form request-target's authority differs from the name
-    /// (or carries a foreign port/scheme shape). `target` is verbatim for
-    /// `DnsMap`, [`redact_for_audit`]ed otherwise.
+    /// (or carries a foreign port/scheme shape). `target` is
+    /// [`redact_for_audit`]ed on every path (issue #29, F1).
     TargetMismatch {
         target: String,
         name: Domain,

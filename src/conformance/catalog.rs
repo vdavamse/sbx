@@ -1,4 +1,4 @@
-//! The conformance catalog: all 70 checks, in report order (issue #13).
+//! The conformance catalog: all 72 checks, in report order (issue #13).
 //!
 //! Pure data plus the selector parser. The ids, group keys, titles and the
 //! `needs` lists are pinned by the `catalog_pinned` golden test; the
@@ -160,8 +160,8 @@ const fn c(
 use Group::{A, B, C, D, E, F, G, H};
 use Tier::{Host as Hs, Init as If, Lab as Lb, Network as Nw};
 
-/// The 70 checks, in report order (group, then id).
-pub const CATALOG: [CheckDef; 70] = [
+/// The 72 checks, in report order (group, then id).
+pub const CATALOG: [CheckDef; 72] = [
     c(
         "A01",
         A,
@@ -432,6 +432,20 @@ pub const CATALOG: [CheckDef; 70] = [
         S,
     ),
     c(
+        "D11",
+        D,
+        Hs,
+        "a deny mask under an rw path survives an ancestor rename",
+        S,
+    ),
+    c(
+        "D12",
+        D,
+        Hs,
+        "a symlink planted inside an rw path is refused before launch",
+        S,
+    ),
+    c(
         "E01",
         E,
         Nw,
@@ -627,10 +641,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_70_unique_ids_in_group_order() {
-        assert_eq!(CATALOG.len(), 70);
+    fn catalog_has_72_unique_ids_in_group_order() {
+        assert_eq!(CATALOG.len(), 72);
         let ids: BTreeSet<_> = CATALOG.iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 70);
+        assert_eq!(ids.len(), 72);
         let mut last = 0usize;
         for d in CATALOG.iter() {
             let g = GROUPS.iter().position(|g| *g == d.group).unwrap();
@@ -648,7 +662,7 @@ mod tests {
     #[test]
     fn tier_counts_match_the_design() {
         let count = |t: Tier| CATALOG.iter().filter(|d| d.tier == t).count();
-        assert_eq!(count(Tier::Host), 44);
+        assert_eq!(count(Tier::Host), 46);
         assert_eq!(count(Tier::Lab), 19);
         assert_eq!(count(Tier::Init), 1);
         assert_eq!(count(Tier::Network), 6);
@@ -682,10 +696,16 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(text.len(), 70);
+        assert_eq!(text.len(), 72);
         assert!(text[0].starts_with("A01|allow-list|host|allowed name gets an A record"));
         assert!(text[12].starts_with("A13|allow-list|host|exact-only =name"));
-        assert!(text[69].starts_with("H06|secrets|host|"));
+        assert!(text[71].starts_with("H06|secrets|host|"));
+        let d11 = text
+            .iter()
+            .position(|t| t.starts_with("D11|"))
+            .expect("D11");
+        assert!(text[d11 + 1].starts_with("D12|"));
+        assert!(text[d11 + 2].starts_with("E01|"));
     }
 
     #[test]
