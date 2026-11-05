@@ -20,7 +20,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -150,10 +150,149 @@ pub(crate) fn connect_ctl(dir: BorrowedFd<'_>) -> io::Result<UnixStream> {
     }
 }
 
-/// Whether the peer of `stream` runs as the same effective uid (`SO_PEERCRED`).
-pub(crate) fn peer_is_same_uid(stream: &UnixStream) -> io::Result<bool> {
-    // `UnixStream::peer_cred` is not stable on every supported toolchain, so
-    // the same `SO_PEERCRED` read is made directly.
+/// The most descriptors one frame may carry (the attach request sends one;
+/// the attach reply sends three).
+pub(crate) const MAX_FDS: usize = 4;
+
+/// Sends one frame; `fds` travel with the header bytes (SCM_RIGHTS). The
+/// payload follows on the same stream. `MSG_NOSIGNAL`: a vanished peer is an
+/// error, never SIGPIPE.
+pub(crate) fn send_frame(
+    stream: &UnixStream,
+    op: u8,
+    payload: &[u8],
+    fds: &[RawFd],
+) -> Result<(), super::proto::ProtoError> {
+    use super::proto::{MAX_FRAME, ProtoError};
+    use std::io::Write;
+    if payload.len() > MAX_FRAME {
+        return Err(ProtoError::TooLarge(payload.len()));
+    }
+    if fds.len() > MAX_FDS {
+        return Err(ProtoError::Malformed("too many descriptors for one frame"));
+    }
+    let len = payload.len() as u32;
+    let mut header = [0u8; 5];
+    header[0] = op;
+    header[1..].copy_from_slice(&len.to_be_bytes());
+    let fd_bytes = std::mem::size_of_val(fds);
+    // u64 storage keeps the control block aligned for struct cmsghdr.
+    let mut control = [0u64; 8];
+    let mut iov = libc::iovec {
+        iov_base: header.as_ptr() as *mut libc::c_void,
+        iov_len: header.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        let space = unsafe { libc::CMSG_SPACE(fd_bytes as u32) } as usize;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = space as _;
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_bytes as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                fds.as_ptr().cast::<u8>(),
+                libc::CMSG_DATA(cmsg),
+                fd_bytes,
+            );
+        }
+    }
+    let sent = loop {
+        let rc = unsafe { libc::sendmsg(stream.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let err = io_last();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(ProtoError::Io(err));
+        }
+    };
+    let mut w = stream;
+    if sent < header.len() {
+        w.write_all(&header[sent..])?;
+    }
+    w.write_all(payload)?;
+    w.flush()?;
+    Ok(())
+}
+
+/// Receives one frame and the descriptors that came with its header. The
+/// descriptors are close-on-exec (`MSG_CMSG_CLOEXEC`) and owned by the caller;
+/// a frame with `MSG_CTRUNC` fails closed.
+pub(crate) fn recv_frame(
+    stream: &UnixStream,
+) -> Result<(super::proto::Frame, Vec<std::os::fd::OwnedFd>), super::proto::ProtoError> {
+    use super::proto::{Frame, MAX_FRAME, ProtoError};
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let mut header = [0u8; 5];
+    let mut control = [0u64; 8];
+    let mut iov = libc::iovec {
+        iov_base: header.as_mut_ptr().cast(),
+        iov_len: header.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = std::mem::size_of_val(&control) as _;
+    let got = loop {
+        let rc = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if rc >= 0 {
+            break rc as usize;
+        }
+        let err = io_last();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(ProtoError::Io(err));
+        }
+    };
+    // Collect any descriptors first, so every error path below closes them.
+    let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                let count = data_len / std::mem::size_of::<RawFd>();
+                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                for i in 0..count {
+                    fds.push(std::os::fd::OwnedFd::from_raw_fd(*data.add(i)));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
+        }
+    }
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(ProtoError::Malformed("control data truncated"));
+    }
+    if got == 0 {
+        return Err(ProtoError::Eof);
+    }
+    let mut r = stream;
+    if got < header.len() {
+        r.read_exact(&mut header[got..])?;
+    }
+    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_FRAME {
+        return Err(ProtoError::TooLarge(len));
+    }
+    let mut payload = vec![0u8; len];
+    r.read_exact(&mut payload)?;
+    Ok((
+        Frame {
+            op: header[0],
+            payload,
+        },
+        fds,
+    ))
+}
+
+/// The pid and uid of the peer (`SO_PEERCRED`).
+pub(crate) fn peer_creds(stream: &UnixStream) -> io::Result<(libc::pid_t, u32)> {
     let mut cred = libc::ucred {
         pid: 0,
         uid: u32::MAX,
@@ -172,7 +311,20 @@ pub(crate) fn peer_is_same_uid(stream: &UnixStream) -> io::Result<bool> {
     if rc != 0 {
         return Err(io_last());
     }
-    Ok(cred.uid == euid())
+    Ok((cred.pid, cred.uid))
+}
+
+/// Removes `sbx.ctl` at the end of a session. Only a socket owned by this user
+/// is removed; a missing or foreign entry is left alone.
+pub(crate) fn unlink_ctl(dir: BorrowedFd<'_>) {
+    if let Ok(Some(st)) = stat_ctl(dir) {
+        if st.st_mode & libc::S_IFMT == libc::S_IFSOCK && st.st_uid == euid() {
+            let name = cname();
+            unsafe {
+                libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -210,8 +362,12 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         let client = connect_ctl(fd.as_fd()).expect("connect");
         let (server, _) = listener.accept().expect("accept");
-        assert!(peer_is_same_uid(&server).unwrap(), "the peer is this user");
-        assert!(peer_is_same_uid(&client).unwrap());
+        assert_eq!(
+            peer_creds(&server).unwrap().1,
+            euid(),
+            "the peer is this user"
+        );
+        assert_eq!(peer_creds(&client).unwrap().1, euid());
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -36,6 +36,11 @@ pub(crate) struct ExitFields {
     /// Issue #11: the achieved network mode (`transparent` | `explicit`), or
     /// null when setup never completed. Additive; the last key of the row.
     net_mode: Option<&'static str>,
+    /// Issue #18: the attached call this exit row ends (`0` = the resident).
+    /// Written only in persistent-session rows; absent (and not serialized)
+    /// everywhere else, so plain-run rows keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    call_id: Option<u32>,
 }
 
 /// One audit row. Field order IS the schema (§5 rows 1–12, then the exit-only
@@ -162,7 +167,8 @@ pub(crate) fn dns_row(ts: String, d: &DnsDecision) -> Row {
     row
 }
 
-/// exit: always the last row of a run.
+/// exit: always the last row of a run (the golden-row tests pin its shape).
+#[cfg(test)]
 pub(crate) fn exit_row(
     ts: String,
     o: &Outcome,
@@ -170,6 +176,20 @@ pub(crate) fn exit_row(
     truncated: bool,
     poisoned: bool,
     net_mode: Option<&'static str>,
+) -> Row {
+    exit_row_for(ts, o, duration, truncated, poisoned, net_mode, None)
+}
+
+/// [`exit_row`] for a persistent session (issue #18): `call_id` is `Some(0)` for
+/// the resident and `Some(n)` for an attached call.
+pub(crate) fn exit_row_for(
+    ts: String,
+    o: &Outcome,
+    duration: Duration,
+    truncated: bool,
+    poisoned: bool,
+    net_mode: Option<&'static str>,
+    call_id: Option<u32>,
 ) -> Row {
     let mut row = Row::blank(ts, "exit");
     row.reason = Some(exit_reason(o));
@@ -181,6 +201,32 @@ pub(crate) fn exit_row(
         output_truncated: truncated,
         dns_poisoned: poisoned,
         net_mode,
+        call_id,
+    });
+    row
+}
+
+/// The exit row of an attached call, built from the call end its attach
+/// process reported (issue #18). `code` is sbx's rc for the call and `outcome`
+/// one of the pinned call outcomes (`protocol::OUTCOMES`).
+pub(crate) fn call_exit_row(
+    ts: String,
+    call_id: u32,
+    code: i32,
+    outcome: &'static str,
+    duration_ms: u64,
+    net_mode: Option<&'static str>,
+) -> Row {
+    let mut row = Row::blank(ts, "exit");
+    row.exit = Some(ExitFields {
+        code,
+        outcome,
+        signal: (outcome == "signaled").then(|| code - 128),
+        duration_ms,
+        output_truncated: false,
+        dns_poisoned: false,
+        net_mode,
+        call_id: Some(call_id),
     });
     row
 }
@@ -347,6 +393,12 @@ impl AuditLog {
             self.latch.trip(Fault::Audit(text.clone()));
             state.failure = Some(text);
         }
+    }
+
+    /// Appends a row that is not an exit row (a persistent session's call
+    /// rows). Refused once the exit row was written, so the exit row stays last.
+    pub(crate) fn append_row(&self, row: &Row) {
+        self.write(row);
     }
 
     /// Writes the exit row (unless the log already failed) and closes the log for

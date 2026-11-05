@@ -16,7 +16,7 @@
 //!    words the audit exit row uses (`run` module docs point 7), so the holder
 //!    writes them verbatim.
 
-use std::io::{self, Read, Write};
+use std::io;
 
 use super::pin::MAX_POLICY_BYTES;
 
@@ -48,6 +48,19 @@ pub(crate) enum ProtoError {
     Malformed(&'static str),
 }
 
+impl std::fmt::Display for ProtoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProtoError::Eof => f.write_str("the peer closed the connection"),
+            ProtoError::Io(err) => write!(f, "control I/O failed: {err}"),
+            ProtoError::TooLarge(n) => {
+                write!(f, "frame of {n} bytes exceeds the {MAX_FRAME}-byte cap")
+            }
+            ProtoError::Malformed(why) => write!(f, "malformed control message: {why}"),
+        }
+    }
+}
+
 impl From<io::Error> for ProtoError {
     fn from(err: io::Error) -> Self {
         ProtoError::Io(err)
@@ -59,41 +72,6 @@ impl From<io::Error> for ProtoError {
 pub(crate) struct Frame {
     pub(crate) op: u8,
     pub(crate) payload: Vec<u8>,
-}
-
-/// Writes one frame. Oversized payloads are refused before anything is written.
-pub(crate) fn write_frame<W: Write>(w: &mut W, op: u8, payload: &[u8]) -> Result<(), ProtoError> {
-    if payload.len() > MAX_FRAME {
-        return Err(ProtoError::TooLarge(payload.len()));
-    }
-    let len = u32::try_from(payload.len()).map_err(|_| ProtoError::TooLarge(payload.len()))?;
-    w.write_all(&[op])?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(payload)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Reads one frame (rule 1).
-pub(crate) fn read_frame<R: Read>(r: &mut R) -> Result<Frame, ProtoError> {
-    let mut op = [0u8; 1];
-    loop {
-        match r.read(&mut op) {
-            Ok(0) => return Err(ProtoError::Eof),
-            Ok(_) => break,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(ProtoError::Io(err)),
-        }
-    }
-    let mut len = [0u8; 4];
-    r.read_exact(&mut len)?;
-    let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_FRAME {
-        return Err(ProtoError::TooLarge(len));
-    }
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload)?;
-    Ok(Frame { op: op[0], payload })
 }
 
 /// The end of one attached call, as the attach process reports it.
@@ -234,13 +212,18 @@ impl Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::run::keepalive::ctl::{recv_frame, send_frame};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
 
+    /// The frames travel over a real socket pair, through the same send and
+    /// receive functions the holder and attach use.
     fn round_trip_request(req: Request) -> Request {
+        let (a, b) = UnixStream::pair().expect("pair");
         let (op, payload) = req.encode();
-        let mut wire = Vec::new();
-        write_frame(&mut wire, op, &payload).expect("write");
-        let frame = read_frame(&mut Cursor::new(wire)).expect("read");
+        send_frame(&a, op, &payload, &[]).expect("send");
+        let (frame, fds) = recv_frame(&b).expect("recv");
+        assert!(fds.is_empty());
         Request::decode(frame).expect("decode")
     }
 
@@ -280,21 +263,23 @@ mod tests {
             Reply::Done,
             Reply::Refused("policy differs from the session's policy".into()),
         ] {
+            let (a, b) = UnixStream::pair().unwrap();
             let (op, payload) = reply.encode();
-            let mut wire = Vec::new();
-            write_frame(&mut wire, op, &payload).unwrap();
-            let frame = read_frame(&mut Cursor::new(wire)).unwrap();
+            send_frame(&a, op, &payload, &[]).unwrap();
+            let (frame, _) = recv_frame(&b).unwrap();
             assert_eq!(Reply::decode(frame).unwrap(), reply);
         }
     }
 
     #[test]
     fn oversized_declared_length_is_refused_before_reading_the_payload() {
-        // Only the header is present; a decoder that tried to read the payload
-        // would fail with an I/O error instead of TooLarge.
+        // Only the header arrives: a receiver that tried to read the payload
+        // would block or fail with I/O instead of reporting TooLarge.
+        let (mut a, b) = UnixStream::pair().unwrap();
         let mut wire = vec![b'A'];
         wire.extend_from_slice(&((MAX_FRAME as u32) + 1).to_be_bytes());
-        match read_frame(&mut Cursor::new(wire)) {
+        a.write_all(&wire).unwrap();
+        match recv_frame(&b) {
             Err(ProtoError::TooLarge(n)) => assert_eq!(n, MAX_FRAME + 1),
             other => panic!("expected TooLarge, got {other:?}"),
         }
@@ -302,31 +287,29 @@ mod tests {
 
     #[test]
     fn clean_close_is_eof_and_a_cut_frame_is_io() {
-        assert!(matches!(
-            read_frame(&mut Cursor::new(Vec::new())),
-            Err(ProtoError::Eof)
-        ));
-        let cut = vec![b'S', 0, 0];
-        assert!(matches!(
-            read_frame(&mut Cursor::new(cut)),
-            Err(ProtoError::Io(_))
-        ));
-        let short_payload = vec![b'A', 0, 0, 0, 9, 1, 2];
-        assert!(matches!(
-            read_frame(&mut Cursor::new(short_payload)),
-            Err(ProtoError::Io(_))
-        ));
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(a);
+        assert!(matches!(recv_frame(&b), Err(ProtoError::Eof)));
+
+        let (mut a, b) = UnixStream::pair().unwrap();
+        a.write_all(&[b'A', 0, 0, 0, 9, 1, 2]).unwrap();
+        drop(a);
+        assert!(matches!(recv_frame(&b), Err(ProtoError::Io(_))));
     }
 
     #[test]
-    fn write_refuses_oversized_payloads() {
+    fn send_refuses_oversized_payloads_before_writing() {
+        let (a, b) = UnixStream::pair().unwrap();
         let big = vec![0u8; MAX_FRAME + 1];
-        let mut sink = Vec::new();
         assert!(matches!(
-            write_frame(&mut sink, b'A', &big),
+            send_frame(&a, b'A', &big, &[]),
             Err(ProtoError::TooLarge(_))
         ));
-        assert!(sink.is_empty(), "nothing is written for a refused frame");
+        drop(a);
+        assert!(
+            matches!(recv_frame(&b), Err(ProtoError::Eof)),
+            "nothing was written"
+        );
     }
 
     #[test]

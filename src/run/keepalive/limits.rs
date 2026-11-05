@@ -67,7 +67,18 @@ impl Clock {
         }
     }
 
+    /// The idle timeout this clock enforces.
+    pub(crate) fn idle(&self) -> Duration {
+        self.idle
+    }
+
+    /// The max lifetime this clock enforces.
+    pub(crate) fn max(&self) -> Duration {
+        self.max
+    }
+
     /// Number of attached calls currently running.
+    #[cfg(test)]
     pub(crate) fn active(&self) -> usize {
         self.active
     }

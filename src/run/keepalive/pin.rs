@@ -36,11 +36,6 @@ impl PolicyPin {
     pub(crate) fn matches(&self, presented: &[u8]) -> bool {
         self.0.as_slice() == presented
     }
-
-    /// The pinned bytes (the holder hands them to `run`'s policy loader).
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.0
-    }
 }
 
 /// Reads a policy file for pinning or for an attach (rule 2).
@@ -106,7 +101,6 @@ mod tests {
         );
         assert!(!pin.matches(b"{\"version\":2}\n"));
         assert!(!pin.matches(b""));
-        assert_eq!(pin.bytes(), b"{\"version\":1}\n");
     }
 
     #[test]

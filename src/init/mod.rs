@@ -332,7 +332,7 @@ pub fn run_init(args: InitArgs) -> ExitCode {
             // message (no stderr parsing). Best effort — the staged stderr
             // line below is printed regardless, so standalone use is
             // unchanged.
-            if err.stage().reports_to_parent() {
+            if err.stage().reports_to_parent() && args.fd >= 0 {
                 fdpass::send_failure(args.fd, &err);
             }
             eprintln!("{err}");
@@ -370,6 +370,10 @@ pub struct InitArgs {
     pub min_mode: NetworkMode,
     /// Hidden fail-only test driver (`--test-break-rules`).
     pub test_break_rules: bool,
+    /// Issue #18: `Some((user, net))` selects the join pipeline. The two fds
+    /// are namespace descriptors of a live session (`--join-user`, `--join-net`);
+    /// `fd` is unused (pass -1).
+    pub join: Option<(RawFd, RawFd)>,
     /// The payload argv, exec'd last.
     pub cmd: Vec<OsString>,
 }
@@ -385,6 +389,9 @@ pub(crate) fn fallback_allowed(min_mode: NetworkMode) -> bool {
 /// sequences them. Returns `Err(exec_payload(..))` when exec fails; `Ok`
 /// would mean execvp returned success, which is impossible.
 fn pipeline(args: &InitArgs) -> Result<(), InitError> {
+    if let Some((user, net)) = args.join {
+        return join_pipeline(args, user, net);
+    }
     let fd = args.fd;
     arm_parent_death(args.parent_pid)?; // m6: first, so a dying parent takes us with it
     validate_control_fd(fd)?; // Stage::Control — BEFORE unshare: fast, deterministic
@@ -445,6 +452,67 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
     drop(sock);
     fd_hygiene(fd, &keep_set(args));
     Err(exec_payload(&args.cmd)) // Stage::Exec — returns ONLY on failure
+}
+
+/// The join pipeline of a persistent-session call (issue #18, design point 4).
+///
+/// Stages, in order: arm the parent-death signal; validate the namespace and
+/// kept descriptors; join the session's user namespace and then its network
+/// namespace; re-verify the session's nftables ruleset from inside the joined
+/// namespace (fail closed before any payload runs); hygiene; exec the call's
+/// bwrap. The join reports failures under the existing `netns` stage and the
+/// re-verification under `nft-verify`: the stage vocabulary is pinned on the
+/// wire, so no new stage is added (issue #18 deviation).
+fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitError> {
+    arm_parent_death(args.parent_pid)?;
+    validate_ns_fd(user, "user")?;
+    validate_ns_fd(net, "net")?;
+    if net == user {
+        return Err(InitError::new(
+            Stage::Control,
+            "--join-net must differ from --join-user",
+        ));
+    }
+    if let Some(keep) = args.keep_fd {
+        validate_keep_fd(keep, user)?;
+    }
+    if let Some(seccomp) = args.seccomp_fd {
+        validate_seccomp_fd(seccomp, user, args.keep_fd)?;
+    }
+    crate::run::keepalive::join::join_namespaces(user, net).map_err(|err| {
+        InitError::new(Stage::Netns, format!("join the session namespaces: {err}"))
+            .with_errno(err.raw_os_error())
+    })?;
+    let mut sock = NetlinkSocket::new();
+    rules::verify_dump(&mut sock)?; // Stage::NftVerify: the session's rules, now
+    drop(sock);
+    fd_hygiene(-1, &keep_set(args));
+    Err(exec_payload(&args.cmd))
+}
+
+/// `--join-user` / `--join-net` must be open namespace descriptors of the
+/// matching kind (`user:[…]` / `net:[…]`), checked before any setns.
+fn validate_ns_fd(fd: RawFd, kind: &str) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if fd <= 2 {
+        return Err(fail(format!("--join-{kind} {fd} must be greater than 2")));
+    }
+    // SAFETY: F_GETFD takes no pointers and only reads the descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(fail(format!(
+            "--join-{kind} {fd} is not an open descriptor: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let link = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        .map_err(|err| fail(format!("--join-{kind} {fd} cannot be inspected: {err}")))?;
+    let text = link.to_string_lossy();
+    if !text.starts_with(&format!("{kind}:[")) {
+        return Err(fail(format!(
+            "--join-{kind} {fd} is not a {kind} namespace ({text})"
+        )));
+    }
+    Ok(())
 }
 
 /// The fds that survive [`fd_hygiene`] on purpose (issue #10, #34 and #19): the
@@ -1039,6 +1107,7 @@ mod tests {
 
     fn args(fd: RawFd, keep_fd: Option<RawFd>, parent_pid: Option<i32>) -> InitArgs {
         InitArgs {
+            join: None,
             fd,
             keep_fd,
             seccomp_fd: None,

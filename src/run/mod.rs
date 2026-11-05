@@ -89,7 +89,7 @@
 //!     [`crate::landlock`] module docs point 9.
 
 mod audit;
-mod keepalive;
+pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
 mod plan;
@@ -122,8 +122,8 @@ use crate::policy::Policy;
 use crate::proxy::Proxy;
 use sys::pollfd;
 
-use audit::{AuditLog, exit_row, open_audit, ts};
-use lifecycle::{Cause, Pid1, Sandbox, main_loop, teardown};
+use audit::{AuditLog, exit_row_for, open_audit, ts};
+use lifecycle::{Cause, Pid1, Sandbox, main_loop, supervise, teardown};
 use mode::{effective_network, fallback_notice, refusal};
 use plan::{
     absolutize, audit_inside_session, effective_timeout, exit_code, lexical_normalize, passed_env,
@@ -170,6 +170,12 @@ pub struct RunArgs {
     pub landlock: crate::landlock::Mode,
     /// `--landlock-bind-tcp` ports (issue #19), in command-line order.
     pub landlock_bind_tcp: Vec<u16>,
+    /// `--keep-alive`: start a persistent session holder (issue #18).
+    pub keep_alive: bool,
+    /// `--idle-timeout` (keep-alive only); None = [`keepalive::limits::DEFAULT_IDLE`].
+    pub idle_timeout: Option<Duration>,
+    /// `--max-lifetime` (keep-alive only); None = the 8h default.
+    pub max_lifetime: Option<Duration>,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -211,34 +217,67 @@ pub enum Outcome {
 }
 
 /// The CLI seam. Pre-spawn failures return 125; every path after the `__init`
-/// spawn ends in `process::exit` (the runtime is never dropped).
+/// spawn ends in `process::exit` (the runtime is never dropped). `--keep-alive`
+/// forks a session holder first (see [`keepalive::holder`]).
 pub fn run(args: RunArgs) -> ExitCode {
+    if args.keep_alive {
+        return keepalive::holder::launch(args);
+    }
+    run_session(args, None)
+}
+
+/// The run body shared by a plain run (`hold` is `None`) and the session holder
+/// (`hold` is `Some`, issue #18: it reports readiness to the launcher and the
+/// session's exit rows carry `call_id` 0).
+pub(crate) fn run_session(args: RunArgs, mut hold: Option<keepalive::holder::Hold>) -> ExitCode {
     let t0 = Instant::now();
     let mut audit: Option<Arc<AuditLog>> = None;
+    let call_id = hold.is_some().then_some(0);
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute(args, t0, &mut audit)
+        execute(args, t0, &mut audit, &mut hold)
     }));
     std::panic::set_hook(previous_hook);
     let failure = match result {
         Ok(Ok(never)) => match never {},
         Ok(Err(Early::Failed(err))) => err.reason().to_owned(),
-        Ok(Err(Early::Signal(sig))) => conclude(
-            Outcome::Terminated(sig),
-            audit.as_deref(),
-            t0,
-            Conclusion::default(),
-        ),
-        Ok(Err(Early::TimedOut(limit))) => conclude(
-            Outcome::TimedOut(limit),
-            audit.as_deref(),
-            t0,
-            Conclusion::default(),
-        ),
+        Ok(Err(Early::Signal(sig))) => {
+            let text = format!("terminated by signal {sig}");
+            if let Some(h) = hold.as_mut() {
+                h.fail(&text);
+            }
+            conclude(
+                Outcome::Terminated(sig),
+                audit.as_deref(),
+                t0,
+                Conclusion {
+                    call_id,
+                    ..Conclusion::default()
+                },
+            )
+        }
+        Ok(Err(Early::TimedOut(limit))) => {
+            let text = format!("timed out after {limit:?}");
+            if let Some(h) = hold.as_mut() {
+                h.fail(&text);
+            }
+            conclude(
+                Outcome::TimedOut(limit),
+                audit.as_deref(),
+                t0,
+                Conclusion {
+                    call_id,
+                    ..Conclusion::default()
+                },
+            )
+        }
         Err(payload) => format!("internal error: {}", panic_text(payload.as_ref())),
     };
-    report_failure(&failure, t0, audit.as_deref())
+    if let Some(h) = hold.as_mut() {
+        h.fail(&failure);
+    }
+    report_failure(&failure, t0, audit.as_deref(), call_id)
 }
 
 /// Why `execute` stopped before the supervised phase: an sbx failure (125), a
@@ -258,6 +297,8 @@ impl From<RunError> for Early {
 /// Facts about the run that only the end of the run knows.
 #[derive(Default)]
 struct Conclusion {
+    /// Persistent sessions only (issue #18): the call id of the exit row.
+    call_id: Option<u32>,
     truncated: bool,
     poisoned: bool,
     stragglers: bool,
@@ -275,13 +316,14 @@ struct Conclusion {
 fn conclude(mut outcome: Outcome, audit: Option<&AuditLog>, t0: Instant, facts: Conclusion) -> ! {
     if let Some(audit) = audit {
         mark_audit_failure(&mut outcome, audit);
-        audit.finish(&exit_row(
+        audit.finish(&exit_row_for(
             ts(SystemTime::now()),
             &outcome,
             t0.elapsed(),
             facts.truncated,
             facts.poisoned,
             facts.net_mode,
+            facts.call_id,
         ));
         mark_audit_failure(&mut outcome, audit);
     }
@@ -355,15 +397,21 @@ fn ready_wait_cause(
 }
 
 /// The single site that writes the `sbx run: ` prefix for pre-spawn failures.
-fn report_failure(reason: &str, t0: Instant, audit: Option<&AuditLog>) -> ExitCode {
+fn report_failure(
+    reason: &str,
+    t0: Instant,
+    audit: Option<&AuditLog>,
+    call_id: Option<u32>,
+) -> ExitCode {
     if let Some(audit) = audit {
-        audit.finish(&exit_row(
+        audit.finish(&exit_row_for(
             ts(SystemTime::now()),
             &Outcome::Failed(reason.to_owned()),
             t0.elapsed(),
             false,
             false,
             None,
+            call_id,
         ));
     }
     write_diagnostics(false, &[format!("sbx run: {reason}")]);
@@ -498,11 +546,21 @@ fn execute(
     args: RunArgs,
     t0: Instant,
     audit_slot: &mut Option<Arc<AuditLog>>,
+    hold: &mut Option<keepalive::holder::Hold>,
 ) -> Result<Infallible, Early> {
     // S3 first: the policy is read BEFORE any signal is blocked (review 5). The open
     // is non-blocking and a non-regular file is refused, so a FIFO or device cannot
     // hang the run with the signals masked.
-    let policy = load_policy(&args.policy)?;
+    // A holder pins the exact bytes it parsed (issue #18); a plain run does not keep them.
+    let (policy, pinned): (Policy, Option<Vec<u8>>) = if hold.is_some() {
+        let bytes = keepalive::pin::read_policy_bytes(&args.policy).map_err(RunError::new)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| RunError::new(format!("{} is not valid UTF-8", args.policy.display())))?;
+        let policy = Policy::from_json_str(text).map_err(|err| RunError::new(err.to_string()))?;
+        (policy, Some(bytes))
+    } else {
+        (load_policy(&args.policy)?, None)
+    };
 
     // S1–S2: signal state before any thread and before any spawn.
     sys::reset_sigchld();
@@ -524,7 +582,12 @@ fn execute(
         .iter()
         .map(|p| p.as_path().to_path_buf())
         .collect();
-    let timeout = effective_timeout(args.timeout, policy.limits.timeout);
+    // A holder's `timeout` is its max lifetime (the setup bound); the resident
+    // itself has no run timeout (issue #18).
+    let timeout = match hold.as_ref() {
+        Some(h) => h.max,
+        None => effective_timeout(args.timeout, policy.limits.timeout),
+    };
     let deadline = deadline_from(t0, timeout);
     let session = lexical_normalize(&absolutize(&args.session_dir)?);
     let audit_path = match &args.audit {
@@ -551,6 +614,9 @@ fn execute(
 
     // S4: the session lock comes before materialize and before any audit row.
     let lock = SessionLock::acquire(&session)?;
+    if hold.is_some() {
+        keepalive::holder::redirect_log(&session)?;
+    }
 
     // S5: the audit log (refuses before any spawn).
     let latch = FaultLatch::new()
@@ -718,6 +784,7 @@ fn execute(
     // The map is shared by the proxies and the resolver, and read at teardown.
     let map = Arc::new(FakeIpMap::new(&DnsLimits::default()));
     let mut pumps: Option<Pumps> = None;
+    let mut holder: Option<keepalive::holder::Holder> = None;
 
     // S13–S17. Any failure here is a Cause::Setup and goes through teardown.
     // The achieved network mode, recorded on the exit row (issue #11, Q5).
@@ -754,6 +821,21 @@ fn execute(
                 net_mode = Some(mode.label());
                 if let AchievedMode::Explicit { reason, .. } = &mode {
                     write_diagnostics(false, &[fallback_notice(reason, policy.network.mode)]);
+                }
+                // Issue #18: bind sbx.ctl and capture the session namespaces
+                // while __init is parked, before the go byte.
+                if let Some(h) = hold.as_ref() {
+                    holder = Some(
+                        keepalive::holder::prepare(
+                            h,
+                            &session,
+                            sb.bwrap_pid,
+                            pinned.clone().unwrap_or_default(),
+                            mode.label(),
+                            audit.clone(),
+                        )
+                        .map_err(Cause::Setup)?,
+                    );
                 }
                 fds
             }
@@ -826,14 +908,32 @@ fn execute(
         })?;
         sb.go_sent = true;
         drop(parent_end);
+        // Issue #18: the session is up. The launcher may return now.
+        if let Some(h) = hold.as_mut() {
+            h.signal_ready();
+        }
         Ok(())
     })();
 
     // S18: supervise until the first cause, then tear down.
     let cause = match startup {
-        Ok(()) => main_loop(&mut sb, &signals, &latch, deadline, timeout),
+        Ok(()) => match holder.as_mut() {
+            // A holder's supervisor also serves the control socket (issue #18).
+            Some(h) => supervise(
+                &mut sb,
+                &signals,
+                &latch,
+                deadline_from(t0, Duration::from_secs(60 * 60 * 24 * 365 * 100)),
+                timeout,
+                h,
+            ),
+            None => main_loop(&mut sb, &signals, &latch, deadline, timeout),
+        },
         Err(cause) => cause,
     };
+    if let Some(h) = holder.as_mut() {
+        h.end_calls(keepalive::holder::CALL_GRACE);
+    }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
     // M1 and round 3 item 2: the status pipe says whether the shim started and
     // whether it failed (module docs point 11). It ends the run as `failed` only
@@ -855,12 +955,16 @@ fn execute(
             }
         }
     }
+    if let Some(h) = holder.take() {
+        h.finish();
+    }
     let _ = lock.touch();
     conclude(
         outcome,
         Some(&audit),
         t0,
         Conclusion {
+            call_id: hold.is_some().then_some(0),
             truncated: end.truncated,
             stderr_partial: end.stderr_partial,
             poisoned: map.poisoned(),
