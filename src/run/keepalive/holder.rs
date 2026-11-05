@@ -367,6 +367,20 @@ fn reply(stream: &UnixStream, msg: &Reply, fds: &[RawFd], deadline: Instant) {
     let _ = ctl::send_frame_until(stream, op, &payload, fds, deadline);
 }
 
+/// Whether the pidfd `fd` names process `pid` (review 3). The pid is read from
+/// the descriptor's fdinfo, so a caller cannot register a pidfd of some other
+/// process as its attach and get that process's call ended by the holder.
+pub(crate) fn pidfd_names_process(fd: RawFd, pid: libc::pid_t) -> bool {
+    std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|l| l.strip_prefix("Pid:"))
+                .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+        })
+        .is_some_and(|named| named == pid)
+}
+
 /// How one accept round ended (rule 10 and the batch cap).
 #[derive(Debug)]
 pub(crate) enum RoundEnd {
@@ -498,6 +512,15 @@ impl Holder {
             reply(
                 stream,
                 &Reply::Refused("attach must send exactly one descriptor".into()),
+                &[],
+                self.conn_deadline,
+            );
+            return;
+        }
+        if !pidfd_names_process(fds[0].as_raw_fd(), pid) {
+            reply(
+                stream,
+                &Reply::Refused("the attach descriptor does not name the sending process".into()),
                 &[],
                 self.conn_deadline,
             );
@@ -846,5 +869,30 @@ mod tests {
         );
         assert!(round.streams.is_empty());
         assert!(matches!(round.end, RoundEnd::Capped));
+    }
+
+    #[test]
+    fn a_pidfd_names_only_its_own_process() {
+        let own = sys::pidfd_open(std::process::id() as libc::pid_t).expect("pidfd");
+        assert!(pidfd_names_process(
+            own.as_raw_fd(),
+            std::process::id() as libc::pid_t
+        ));
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn");
+        let theirs = sys::pidfd_open(child.id() as libc::pid_t).expect("pidfd of child");
+        // The descriptor names the child, so it does not name this process.
+        assert!(pidfd_names_process(
+            theirs.as_raw_fd(),
+            child.id() as libc::pid_t
+        ));
+        assert!(!pidfd_names_process(
+            theirs.as_raw_fd(),
+            std::process::id() as libc::pid_t
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
