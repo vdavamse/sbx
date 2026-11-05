@@ -25,8 +25,7 @@ machine, and it does not protect against a broken kernel or a broken bwrap.
   Resolved addresses are checked against the IANA special-purpose tables, the Azure wireserver
   and the host's own interface addresses. The filesystem is an allow list. Host loopback, other
   sessions and the caller's environment are hidden. Processes are killed when the run ends.
-  Connections handled by
-  the proxies are audited (S16 states the limits).
+  Connections handled by the proxies are audited (S16 states the limits).
 - **Top residual risks** (section 7):
   1. **R1, domain fronting (High).** An allowed name on a shared CDN edge can open other sites on
      the same edge, because the encrypted `Host` or `:authority` is not inspected. v1 does not close
