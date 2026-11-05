@@ -2,7 +2,7 @@
 //! check (issue #13).
 //!
 //! 1. Contract: `check --conformance [--network] [--only ID|GROUP,...] [--list]
-//!    [--json]` prints 72 checks in catalog order; rc 0 only when nothing failed
+//!    [--json]` prints 78 checks in catalog order; rc 0 only when nothing failed
 //!    and nothing needed by a selected check was missing (see [`report`]).
 //! 2. Tiers: host scenarios (`sbx run` with a built-in policy and a probe
 //!    payload), the init tier (F03, the production `sbx __init`), the lab tier
@@ -47,6 +47,7 @@ pub mod policies;
 pub mod probe;
 pub mod report;
 pub mod scenarios;
+pub mod session_tier;
 pub mod spawn;
 
 use std::collections::BTreeMap;
@@ -290,10 +291,18 @@ fn run_one(
             r
         }
         Tier::Host => {
+            if d.id == "I04" {
+                // Needs a second uid: never run here (see session_tier).
+                return session_tier::foreign_uid_skip();
+            }
             if let Some(why) = host_cannot(mode, d) {
                 return CheckResult::skip(d.id, SkipKind::Capability, why);
             }
-            let names = host_tier::scenarios_of(d.id);
+            let names: &'static [&'static str] = if session_tier::handles(d.id) {
+                session_tier::scenarios_of(d.id)
+            } else {
+                host_tier::scenarios_of(d.id)
+            };
             if names.is_empty() {
                 return CheckResult::skip(d.id, SkipKind::NotImplemented, "no scenario plan");
             }

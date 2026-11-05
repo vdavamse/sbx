@@ -1,4 +1,6 @@
-//! The host tier's 46 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
+//! The host tier's 46 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H);
+//! group I (the persistent-session checks of issue #18) is evaluated by
+//! [`super::session_tier`] and also counts in the host tier.
 //! the scenario plan and the pure evaluators over scenario evidence.
 //!
 //! Evaluation rules (review fixes):
@@ -1451,6 +1453,9 @@ pub(super) fn d10(s: &Scns) -> R {
 
 /// Evaluate one host-tier check into a result.
 pub fn evaluate(id: &str, s: &Scns) -> CheckResult {
+    if super::session_tier::handles(id) {
+        return super::session_tier::evaluate(id, s);
+    }
     if id == "H06"
         && s.get("S12")
             .and_then(|x| x.notes.get("home_applicable"))

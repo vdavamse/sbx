@@ -287,7 +287,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-72 checks in eight groups, the same code that `cargo test --test conformance`
+78 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -306,6 +306,10 @@ checks that prove it, and lists what they do not prove.
   no path open; a broken nftables load or audit log ends the run with rc 125.
 - **G: cleanup** (`cleanup`): background processes die on exit, timeout and
   signals; the sandbox network namespace is empty afterwards.
+- **I: persistent sessions** (`session`): an attached call cannot see or signal
+  the resident or another call; a holder SIGKILL ends the resident and the calls;
+  a different policy is refused; a foreign-uid connection is refused (an opt-in
+  skip here, see the threat model); the idle and max-lifetime ends. Needs bwrap.
 - **H: secrets** (`secrets`): the caller's environment, `/proc` environments,
   inherited descriptors, HOME and processes are not visible to the payload.
 
