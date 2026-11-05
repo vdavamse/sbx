@@ -342,8 +342,16 @@ fn run_call(
     };
     drop(status_write);
 
-    let child_pidfd = sys::pidfd_open(child.id() as libc::pid_t)
-        .map_err(|err| RunError::new(format!("cannot watch sbx __init: {err}")))?;
+    let mut child = child;
+    let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {
+        Ok(fd) => fd,
+        Err(err) => {
+            // Kill and reap before returning, so the call's cgroup can go.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunError::new(format!("cannot watch sbx __init: {err}")).into());
+        }
+    };
     let mut sb = Sandbox {
         bwrap_pid: child.id() as libc::pid_t,
         child,
@@ -355,14 +363,28 @@ fn run_call(
         // The join has no go byte; teardown treats the child as launched.
         go_sent: true,
     };
-    let pumps = Pumps::start(
+    let kill_reap = |sb: &mut Sandbox| {
+        let _ = sb.child.kill();
+        let _ = sb.child.wait();
+    };
+    let pumps = match Pumps::start(
         &mut sb.child,
         OutputBudget::new(policy.limits.output_bytes),
         stdin_piped,
-    )
-    .map_err(|err| RunError::new(format!("cannot start the stdio pumps: {err}")))?;
-    let latch = FaultLatch::new()
-        .map_err(|err| RunError::new(format!("cannot create the fault latch: {err}")))?;
+    ) {
+        Ok(pumps) => pumps,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot start the stdio pumps: {err}")).into());
+        }
+    };
+    let latch = match FaultLatch::new() {
+        Ok(latch) => latch,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot create the fault latch: {err}")).into());
+        }
+    };
     let mut watch = HolderWatch {
         pidfd: holder_pidfd,
     };

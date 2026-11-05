@@ -104,6 +104,14 @@ pub fn v2_path(proc_self_cgroup: &str) -> Option<&str> {
         .filter(|p| p.starts_with('/') && !p.split('/').any(|c| c == ".."))
 }
 
+/// Pure: whether the process whose `/proc/<pid>/cgroup` text is
+/// `proc_cgroup` is in exactly `dir` (under the cgroup2 mount `root`). An
+/// exact comparison: at a namespace root (`0::/`) a suffix match would match
+/// every directory (review of #66).
+fn is_in(root: &Path, proc_cgroup: &str, dir: &Path) -> bool {
+    v2_path(proc_cgroup).is_some_and(|p| root.join(p.trim_start_matches('/')) == dir)
+}
+
 /// What [`setup`] needs to know about the host besides the cgroupfs.
 pub struct HostView<'a> {
     /// Whether a process sharing sbx's cgroup is sbx's own: an ancestor
@@ -117,6 +125,8 @@ pub struct HostView<'a> {
 /// The child cgroup holding the sandbox.
 #[derive(Debug)]
 pub struct SandboxCgroup {
+    /// The cgroup2 mount the paths below live under.
+    root: PathBuf,
     dir: PathBuf,
     /// Where sbx itself lives after [`setup`] (its cgroup, or the supervisor
     /// leaf it moved into): [`SandboxCgroup::spawn_inside`] returns here.
@@ -165,14 +175,13 @@ impl SandboxCgroup {
 impl Drop for SandboxCgroup {
     /// Remove the child on every path, early returns included (best effort:
     /// it must be empty, so it is retried briefly while the kernel finishes
-    /// reaping; a leftover is reported on stderr).
+    /// reaping; a leftover is reported on stderr). Exception: when sbx itself
+    /// is still inside (a failed move back), nothing can remove it and the
+    /// caller already reported why, so there is no retry and no warning.
     fn drop(&mut self) {
-        // sbx itself still inside (a failed move back): nothing can remove
-        // it, and the caller already reported why; no retry, no warning.
         let inside = fs::read_to_string("/proc/self/cgroup")
             .ok()
-            .and_then(|t| v2_path(&t).map(|p| self.dir.ends_with(p.trim_start_matches('/'))))
-            .unwrap_or(false);
+            .is_some_and(|t| is_in(&self.root, &t, &self.dir));
         if inside {
             return;
         }
@@ -285,7 +294,11 @@ pub fn setup(
         Err(e) => return Err(refuse(format!("cannot create {}: {e}", dir.display()))),
     }
     // Dropped (and so removed) if a limit cannot be set below.
-    let cg = SandboxCgroup { dir, home };
+    let cg = SandboxCgroup {
+        root: root.to_path_buf(),
+        dir,
+        home,
+    };
     let set = |file: &str, value: NonZeroU64| {
         fs::write(cg.dir.join(file), value.get().to_string())
             .map_err(|e| refuse(format!("cannot set {}: {e}", cg.dir.join(file).display())))
@@ -594,6 +607,20 @@ mod tests {
         };
         setup(&root, SELF_CG, 9, pids_only, &host).expect("pids needs no swap rule");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Review of #66: the self-inside test is exact, also at a cgroup
+    /// namespace root (`0::/`), where a suffix match matched everything.
+    #[test]
+    fn is_in_is_exact() {
+        let root = Path::new("/sys/fs/cgroup");
+        let dir = Path::new("/sys/fs/cgroup/scope/sbx-sandbox-7");
+        assert!(is_in(root, "0::/scope/sbx-sandbox-7\n", dir));
+        assert!(!is_in(root, "0::/\n", dir));
+        assert!(!is_in(root, "0::/scope\n", dir));
+        assert!(!is_in(root, "0::/sbx-sandbox-7\n", dir));
+        assert!(!is_in(root, "", dir));
+        assert!(is_in(root, "0::/\n", root));
     }
 
     #[test]

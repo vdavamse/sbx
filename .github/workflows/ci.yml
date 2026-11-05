@@ -304,6 +304,16 @@ jobs:
           cat pids.out
           N=$(sed -n 's/^forked \([0-9]*\) then 11$/\1/p' pids.out)
           [ -n "$N" ] && [ "$N" -lt 24 ] || { echo "FAIL: pids limit: rc $RC"; cat pids.out pids.err; FAIL=1; }
+          # --keep-alive: the holder (with its launcher) runs in its own
+          # delegated cgroup, an attach call in another (each call gets its own
+          # child cgroup, spawned from inside it), then stop.
+          in_cg ka "$BIN" run --keep-alive --policy "$T/pids.json" --session-dir "$T/s3" -- /usr/bin/sleep 300 > ka.out 2> ka.err
+          RC=$?
+          [ "$RC" -eq 0 ] || { echo "FAIL: keep-alive start rc $RC"; cat ka.out ka.err; FAIL=1; }
+          in_cg kacall "$BIN" attach --policy "$T/pids.json" --session-dir "$T/s3" -- /usr/bin/sh -c 'echo attached' > att.out 2> att.err
+          RC=$?
+          { [ "$RC" -eq 0 ] && grep -qx attached att.out; } || { echo "FAIL: attach rc $RC"; cat att.out att.err; FAIL=1; }
+          "$BIN" stop --session-dir "$T/s3" || { echo "FAIL: stop rc $?"; FAIL=1; }
           # The sandbox child cgroup is removed after each run.
           ls "$CGS"/*
           ls -d "$CGS"/*/sbx-sandbox-* 2>/dev/null && { echo "FAIL: sandbox cgroup left behind"; FAIL=1; }
