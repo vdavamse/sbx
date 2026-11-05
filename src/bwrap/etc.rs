@@ -5,7 +5,7 @@
 //!    exec (Q6). The generated files therefore live under `<session>/etc/`
 //!    and the argv builder binds each one individually (`--ro-bind`).
 //! 2. **Layout** — `<session>/{work,home,tmp}` (the three writable leaves)
-//!    plus `<session>etc/{resolv.conf,passwd,group}`. Only the leaves are
+//!    plus `<session>etc/{resolv.conf,hosts,passwd,group}`. Only the leaves are
 //!    ever bind-mounted into the sandbox — the session directory itself and
 //!    its parent never are (allow-list purity, [`super`] module docs point
 //!    3). Sandbox destinations: `work` → [`DEST_WORK`], `home` →
@@ -13,6 +13,12 @@
 //!    — so HOME is `/root`, Q7), `tmp` → [`DEST_TMP`].
 //! 3. **Pinned contents** — `resolv.conf` points DNS at the netns-local
 //!    resolver (`127.0.0.1:53` — the nft rules redirect udp/53 there, #9);
+//!    `hosts` carries ONLY the loopback `localhost` entries (issue #35) —
+//!    binding the host's `/etc/hosts` would let a pinned allowed name
+//!    resolve to its real IP, bypassing fake-IP DNS (the transparent
+//!    proxy then denies it: "unknown fake IP" — fail-closed, but it
+//!    breaks e.g. Kubernetes `hostAliases`) and would disclose host
+//!    entries;
 //!    `passwd`/`group` describe the single root identity (Q7) so
 //!    `id`/`whoami`/getpwuid consumers resolve WITHOUT binding the host's
 //!    `/etc/passwd`. Every file ends in exactly one `\n` — pinned
@@ -74,6 +80,11 @@ pub const RESOLV_CONF_CONTENT: &str = "nameserver 127.0.0.1\n";
 /// identity the sandbox uid 0 resolves against. Exactly one trailing `\n`.
 pub const PASSWD_CONTENT: &str = "root:x:0:0:root:/root:/bin/bash\n";
 
+/// Pinned content of the generated `/etc/hosts` (issue #35): loopback
+/// `localhost` only, so every other name goes through the fake-IP resolver
+/// (#9) and no host entry is disclosed. Exactly one trailing `\n`.
+pub const HOSTS_CONTENT: &str = "127.0.0.1 localhost\n::1 localhost\n";
+
 /// Pinned content of the generated `/etc/group` (Q7). Exactly one trailing
 /// `\n`.
 pub const GROUP_CONTENT: &str = "root:x:0:\n";
@@ -98,6 +109,8 @@ pub struct SessionLayout {
     /// `<session>/etc/resolv.conf` — generated, content
     /// [`RESOLV_CONF_CONTENT`].
     pub resolv_conf: PathBuf,
+    /// `<session>/etc/hosts` — generated, content [`HOSTS_CONTENT`].
+    pub hosts: PathBuf,
     /// `<session>/etc/passwd` — generated, content [`PASSWD_CONTENT`].
     pub passwd: PathBuf,
     /// `<session>/etc/group` — generated, content [`GROUP_CONTENT`].
@@ -114,6 +127,7 @@ pub fn session_layout(session_dir: &Path) -> SessionLayout {
         home: session_dir.join("home"),
         tmp: session_dir.join("tmp"),
         resolv_conf: etc_dir.join("resolv.conf"),
+        hosts: etc_dir.join("hosts"),
         passwd: etc_dir.join("passwd"),
         group: etc_dir.join("group"),
         etc_dir,
@@ -130,7 +144,7 @@ pub fn session_layout(session_dir: &Path) -> SessionLayout {
 /// `components()` collapses separator runs and normalizes `.` away, so
 /// RootDir-only IS the alias class): with `--session-dir /`,
 /// `materialize()` would truncate and rewrite the host's OWN
-/// `/etc/{resolv.conf,passwd,group}` (guaranteed destruction when sbx
+/// `/etc/{resolv.conf,hosts,passwd,group}` (guaranteed destruction when sbx
 /// runs as root; only EACCES saves it otherwise), and the leaves would
 /// bind the host's `/home` and `/tmp` rw into the sandbox. Rejects
 /// non-canonical segments — `.`, `..`, empty (`//` interior / trailing
@@ -224,6 +238,7 @@ impl SessionLayout {
         }
         for (path, content) in [
             (&self.resolv_conf, RESOLV_CONF_CONTENT),
+            (&self.hosts, HOSTS_CONTENT),
             (&self.passwd, PASSWD_CONTENT),
             (&self.group, GROUP_CONTENT),
         ] {
@@ -350,6 +365,7 @@ mod tests {
         assert_eq!(DEST_HOME, "/root");
         assert_eq!(DEST_TMP, "/tmp");
         assert_eq!(RESOLV_CONF_CONTENT, "nameserver 127.0.0.1\n");
+        assert_eq!(HOSTS_CONTENT, "127.0.0.1 localhost\n::1 localhost\n");
         assert_eq!(PASSWD_CONTENT, "root:x:0:0:root:/root:/bin/bash\n");
         assert_eq!(GROUP_CONTENT, "root:x:0:\n");
     }
@@ -363,6 +379,7 @@ mod tests {
         assert_eq!(layout.tmp, Path::new("/tmp/s/tmp"));
         assert_eq!(layout.etc_dir, Path::new("/tmp/s/etc"));
         assert_eq!(layout.resolv_conf, Path::new("/tmp/s/etc/resolv.conf"));
+        assert_eq!(layout.hosts, Path::new("/tmp/s/etc/hosts"));
         assert_eq!(layout.passwd, Path::new("/tmp/s/etc/passwd"));
         assert_eq!(layout.group, Path::new("/tmp/s/etc/group"));
         // Pure: computing a layout creates nothing.
@@ -471,9 +488,10 @@ mod tests {
                 created.display()
             );
         }
-        // The three files: byte-exact pinned contents, 0644.
+        // The four files: byte-exact pinned contents, 0644.
         for (path, content) in [
             (&layout.resolv_conf, RESOLV_CONF_CONTENT),
+            (&layout.hosts, HOSTS_CONTENT),
             (&layout.passwd, PASSWD_CONTENT),
             (&layout.group, GROUP_CONTENT),
         ] {

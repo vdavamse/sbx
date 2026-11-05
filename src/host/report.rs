@@ -62,7 +62,7 @@ pub fn render_human(r: &Report) -> String {
                 item.id,
                 item.detail
             );
-            if item.status == Status::Fail {
+            if matches!(item.status, Status::Fail | Status::Warn) {
                 if let Some(fix) = &item.fix {
                     let _ = writeln!(out, "{:indent$}fix: {fix}", "", indent = POLICY_INDENT);
                 }
@@ -383,6 +383,7 @@ network mode: unavailable (no policy can run until the failed items are fixed)
             EffectiveMode::Explicit,
             &|_| false,
             &|_| false,
+            &|_, _| crate::host::facts::SocketScan::default(),
         ));
         let text = render_human(&r);
         assert!(
