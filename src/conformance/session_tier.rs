@@ -5,6 +5,12 @@
 //! is gated like every other host check, so on a host without bwrap the group
 //! is a capability skip, never a pass.
 //!
+//! Landlock and these checks: the scenarios run with the layer off (the
+//! default), so I01's kill assertions measure pid isolation alone. Under a
+//! session's signal scope (S24) a kill is refused by Landlock whatever the pid
+//! namespace does, so a session with the layer on would pass I01 for the wrong
+//! reason. Keep the layer off in these scenarios.
+//!
 //! Rules that follow the host tier:
 //! * Controls come first in every evaluator. A control records that the
 //!   observed thing was really there before the assertion ran (the resident

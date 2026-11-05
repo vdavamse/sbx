@@ -673,6 +673,14 @@ sbx stop --session-dir S
   and its abstract unix sockets (their namespace is the network namespace). That
   sharing is what makes a dev server reachable, and it is a documented exception
   to isolation (S19, R31).
+- **Landlock.** `run --keep-alive --landlock MODE [--landlock-bind-tcp PORT]…`
+  sets the optional Landlock layer for the resident and for every attached call,
+  through the same code path as `run --landlock`. The settings are the session's:
+  the holder pins them at start, and an attach applies exactly those. `sbx attach`
+  takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
+  layer. Under its signal scope a call cannot signal the resident or another call.
+  The holder can still end a call (on stop, or when the holder dies), because the
+  holder and the attach sit outside every call's Landlock domain (S24).
 - **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
   run for that long. `--max-lifetime` (default 8h) ends it after that long
   regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
