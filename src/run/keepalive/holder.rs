@@ -40,6 +40,13 @@
 //!    record them `terminated`; tear the resident down; unlink `sbx.ctl`; then
 //!    reply `Done` to every `sbx stop` that asked. A stop returns only after the
 //!    session is gone.
+//! 10. **Accept failures.** `accept()` errors are classified by errno
+//!     ([`classify_accept`]). A resource exhaustion (`EMFILE`, `ENFILE`, `ENOBUFS`,
+//!     `ENOMEM`) takes the listener out of the poll for [`ACCEPT_BACKOFF`] and
+//!     retries afterwards, so a full descriptor table cannot spin the holder and
+//!     the session keeps serving once descriptors free up. Any other error ends the
+//!     session fail-closed: the exit row records `failed` and the calls are
+//!     stopped. A client that gave up (`ECONNABORTED`) is skipped.
 //! 9. **Death of the holder.** If the holder is killed, the resident dies through
 //!    the existing chain (`PR_SET_PDEATHSIG` on `__init`, `--die-with-parent` on
 //!    bwrap), and each attach dies because it watches the holder's pidfd. Nothing
@@ -74,6 +81,40 @@ pub(crate) const CALL_GRACE: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// The longest refusal reason the launcher will print.
 const MAX_MESSAGE: usize = 1024;
+/// How long the listener is left out of the poll after a resource-exhaustion
+/// `accept` failure (rule 10). A retry happens after this long, not in a spin.
+pub(crate) const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
+
+/// What the holder does with an `accept()` failure (rule 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AcceptFault {
+    /// The queue is empty for now (`EAGAIN`): stop accepting this round.
+    Drained,
+    /// A client gave up before accept (`ECONNABORTED` and the like): try the next.
+    Next,
+    /// Descriptors or memory are exhausted (`EMFILE`, `ENFILE`, `ENOBUFS`,
+    /// `ENOMEM`): leave the listener out of the poll for [`ACCEPT_BACKOFF`].
+    Backoff,
+    /// Anything else: the control socket is unusable; the session ends
+    /// fail-closed (exit row `failed`).
+    Fatal,
+}
+
+/// Classifies an `accept()` failure by its errno (rule 10; pure, unit-tested).
+pub(crate) fn classify_accept(errno: Option<i32>) -> AcceptFault {
+    match errno {
+        Some(libc::EAGAIN) => AcceptFault::Drained,
+        Some(libc::ECONNABORTED | libc::EPROTO | libc::EINTR) => AcceptFault::Next,
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM) => AcceptFault::Backoff,
+        _ => AcceptFault::Fatal,
+    }
+}
+
+/// The fd the poll sees for the listener: the listener itself, or `-1` (which
+/// `poll` ignores) while the holder backs off after an exhaustion error.
+pub(crate) fn listener_poll_fd(listener: RawFd, backing_off: bool) -> RawFd {
+    if backing_off { -1 } else { listener }
+}
 
 /// The launcher's pipe and the holder's lifetime limits (rule 1).
 pub(crate) struct Hold {
@@ -258,6 +299,10 @@ pub(crate) struct Holder {
     stopping: bool,
     stop_waiters: Vec<UnixStream>,
     stop_requested: bool,
+    /// Set after a resource-exhaustion `accept` failure (rule 10).
+    backoff_until: Option<Instant>,
+    /// Set by a fatal `accept` failure; the next wake ends the session.
+    fatal: Option<String>,
 }
 
 /// Builds the holder after the resident is up and before the go byte (rule 4 and
@@ -297,6 +342,8 @@ pub(crate) fn prepare(
         stopping: false,
         stop_waiters: Vec::new(),
         stop_requested: false,
+        backoff_until: None,
+        fatal: None,
     })
 }
 
@@ -314,10 +361,24 @@ impl Holder {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => self.handle(stream, now),
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(err) => match classify_accept(err.raw_os_error()) {
+                    AcceptFault::Next => continue,
+                    AcceptFault::Drained => break,
+                    AcceptFault::Backoff => {
+                        self.backoff_until = Some(now + ACCEPT_BACKOFF);
+                        break;
+                    }
+                    AcceptFault::Fatal => {
+                        self.fatal = Some(format!("control socket failed: accept: {err}"));
+                        break;
+                    }
+                },
             }
         }
+    }
+
+    fn backing_off(&self, now: Instant) -> bool {
+        self.backoff_until.is_some_and(|until| now < until)
     }
 
     /// One connection: peer check, one frame, one reply (or a silent drop).
@@ -529,13 +590,18 @@ impl Holder {
 
 impl Extra for Holder {
     fn fds(&self) -> Vec<RawFd> {
-        let mut fds = vec![self.listener.as_raw_fd()];
+        let backing_off = self.backing_off(Instant::now());
+        let mut fds = vec![listener_poll_fd(self.listener.as_raw_fd(), backing_off)];
         fds.extend(self.calls.iter().map(|c| c.pidfd.as_raw_fd()));
         fds
     }
 
     fn deadline(&self) -> Option<Instant> {
-        Some(self.clock.next_deadline())
+        let next = self.clock.next_deadline();
+        Some(match self.backoff_until {
+            Some(until) => next.min(until),
+            None => next,
+        })
     }
 
     fn wake(&mut self, revents: &[libc::c_short]) -> Option<Cause> {
@@ -552,7 +618,13 @@ impl Extra for Holder {
         if revents.first().is_some_and(|ev| sys::ready(*ev)) {
             self.accept_all(now);
         }
+        if self.backoff_until.is_some_and(|until| now >= until) {
+            self.backoff_until = None;
+        }
         self.reap_dead(&dead, now);
+        if let Some(text) = self.fatal.take() {
+            return Some(Cause::Setup(RunError::new(text)));
+        }
         if self.stop_requested {
             return Some(Cause::Signal(libc::SIGTERM));
         }
@@ -613,5 +685,24 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert!(std::str::from_utf8(&got[1..]).is_ok());
+    }
+
+    #[test]
+    fn accept_failures_are_classified_by_errno() {
+        assert_eq!(classify_accept(Some(libc::EMFILE)), AcceptFault::Backoff);
+        assert_eq!(classify_accept(Some(libc::ENFILE)), AcceptFault::Backoff);
+        assert_eq!(classify_accept(Some(libc::ENOBUFS)), AcceptFault::Backoff);
+        assert_eq!(classify_accept(Some(libc::ENOMEM)), AcceptFault::Backoff);
+        assert_eq!(classify_accept(Some(libc::EAGAIN)), AcceptFault::Drained);
+        assert_eq!(classify_accept(Some(libc::ECONNABORTED)), AcceptFault::Next);
+        assert_eq!(classify_accept(Some(libc::EINVAL)), AcceptFault::Fatal);
+        assert_eq!(classify_accept(None), AcceptFault::Fatal);
+    }
+
+    #[test]
+    fn a_backing_off_listener_is_polled_as_a_negative_fd() {
+        // poll(2) ignores negative fds, so the exhausted listener cannot spin the loop.
+        assert_eq!(listener_poll_fd(7, false), 7);
+        assert_eq!(listener_poll_fd(7, true), -1);
     }
 }

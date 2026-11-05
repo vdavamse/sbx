@@ -584,6 +584,14 @@ fn execute(
         .collect();
     // A holder's `timeout` is its max lifetime (the setup bound); the resident
     // itself has no run timeout (issue #18).
+    // A session that attach can join needs the nftables redirect (issue #18):
+    // refuse before anything is spawned when the policy is not transparent.
+    if hold.is_some() && policy.network.mode != crate::policy::NetworkMode::Transparent {
+        return Err(RunError::new(
+            "--keep-alive needs network mode transparent: attach joins the session's nftables rules, which explicit and none policies do not load",
+        )
+        .into());
+    }
     let timeout = match hold.as_ref() {
         Some(h) => h.max,
         None => effective_timeout(args.timeout, policy.limits.timeout),
@@ -821,6 +829,13 @@ fn execute(
                 net_mode = Some(mode.label());
                 if let AchievedMode::Explicit { reason, .. } = &mode {
                     write_diagnostics(false, &[fallback_notice(reason, policy.network.mode)]);
+                }
+                // Issue #18: a session that fell back to explicit mode can never be
+                // attached (no nftables rules to join): refuse it at startup.
+                if hold.is_some() && !matches!(mode, AchievedMode::Transparent) {
+                    return Err(Cause::Setup(RunError::new(
+                        "--keep-alive needs the transparent network mode, but this host provides only explicit (the nftables redirect is unavailable); attach could not join this session; run `sbx check`",
+                    )));
                 }
                 // Issue #18: bind sbx.ctl and capture the session namespaces
                 // while __init is parked, before the go byte.

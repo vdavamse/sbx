@@ -506,3 +506,34 @@ fn audit_rows_carry_call_ids() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn keep_alive_refuses_a_non_transparent_policy_at_startup_rc125() {
+    // No bwrap is needed: the refusal happens before anything is spawned.
+    let dir = scratch("explicit");
+    let policy = dir.join("explicit.json");
+    let body = fs::read_to_string(policy_path())
+        .unwrap()
+        .replace("\"transparent\"", "\"explicit\"");
+    fs::write(&policy, body).unwrap();
+    let session = dir.join("s");
+    let out = Command::new(SBX)
+        .args(["run", "--keep-alive", "--policy"])
+        .arg(&policy)
+        .arg("--session-dir")
+        .arg(&session)
+        .args(["--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(125), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("--keep-alive needs network mode transparent"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        !session.join("sbx.ctl").exists(),
+        "no control socket for a refused session"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
