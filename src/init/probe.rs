@@ -14,6 +14,15 @@
 //! step; a failed netns skips the nft/fallback/ipv6/listener steps but the
 //! bwrap steps still run; ipv6 and listeners are diagnostic and never cascade.
 //!
+//! Issue #18 (keep-alive) adds two steps after the bwrap ones, and they do not
+//! depend on the probe's own namespaces: `pidfd-open` (a pidfd of this process)
+//! and `keep-alive`, which proves the join a session attach performs. A child
+//! (the holder stand-in) unshares a fresh user and network namespace and parks;
+//! the probe captures its namespace descriptors, and a second child (the
+//! joiner, forked so the probe keeps its own namespaces) runs
+//! [`crate::run::keepalive::join::join_namespaces`] on them. Both children are
+//! bounded by [`KEEP_ALIVE_PROBE_TIMEOUT`] and reaped on every path.
+//!
 //! Output: exactly one JSON line on stdout (`ProbeReport`, `version` 1).
 
 use std::ffi::OsString;
@@ -32,10 +41,10 @@ use super::{InitError, netns, rules};
 /// The probe protocol version (`ProbeReport::version`). Bumped to 2 for issue
 /// #34's `bwrap-seccomp` step: the parent (`host::facts`) accepts exactly the
 /// version it was built with, so a stale probe is refused, not misread.
-pub const PROBE_VERSION: u32 = 2;
+pub const PROBE_VERSION: u32 = 3;
 
 /// The step names, in report order (pinned by `probe_steps_pinned`).
-pub const PROBE_STEPS: [&str; 11] = [
+pub const PROBE_STEPS: [&str; 13] = [
     "unshare",
     "idmap",
     "netns",
@@ -47,11 +56,17 @@ pub const PROBE_STEPS: [&str; 11] = [
     "bwrap-run",
     "bwrap-proc",
     "bwrap-seccomp",
+    "pidfd-open",
+    "keep-alive",
 ];
 
 /// Bound on each nested bwrap launch (the parent's whole probe is bounded
 /// separately; see `host::facts::PROBE_TIMEOUT`).
 pub const BWRAP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bound on each child of the keep-alive step: the holder stand-in's readiness
+/// message, and the joiner's exit (issue #18).
+pub const KEEP_ALIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The probe's JSON output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,7 +255,300 @@ pub(crate) fn probe_pipeline(bwrap: Option<&Path>, test_break_rules: bool) -> Pr
     }
 
     bwrap_steps(&mut steps, bwrap);
+    keep_alive_steps(&mut steps);
     steps.finish()
+}
+
+/// Issue #18: the `pidfd-open` and `keep-alive` steps (module docs). Both run
+/// after the bwrap steps and do not need the probe's own namespaces.
+fn keep_alive_steps(steps: &mut Steps) {
+    match pidfd_open_self() {
+        Ok(()) => steps.ok("pidfd-open"),
+        Err(err) => steps.push(
+            "pidfd-open",
+            StepStatus::Fail,
+            err.raw_os_error(),
+            Some(truncate_reason(&format!("pidfd_open of this process failed: {err}")).to_owned()),
+        ),
+    }
+    match keep_alive_join() {
+        Ok(()) => steps.ok("keep-alive"),
+        Err(fault) => steps.push(
+            "keep-alive",
+            StepStatus::Fail,
+            fault.errno,
+            Some(truncate_reason(&fault.reason).to_owned()),
+        ),
+    }
+}
+
+/// Why the keep-alive join failed: the errno when there is one, and the reason.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct KeepAliveFault {
+    pub(crate) errno: Option<i32>,
+    pub(crate) reason: String,
+}
+
+fn fault_of(err: &std::io::Error, what: &str) -> KeepAliveFault {
+    KeepAliveFault {
+        errno: err.raw_os_error(),
+        reason: format!("{what}: {err}"),
+    }
+}
+
+/// `pidfd_open(2)` on this process. Raw, so ENOSYS (a kernel below 5.3) keeps
+/// its errno; the attach needs a pidfd for its own process and its holder.
+fn pidfd_open_self() -> std::io::Result<()> {
+    // SAFETY: SYS_pidfd_open takes (pid, flags) by value; no pointers.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a non-negative return is a fresh descriptor this function owns.
+    unsafe {
+        libc::close(fd as RawFd);
+    }
+    Ok(())
+}
+
+/// A forked child the probe must not leave behind: SIGKILL and reap on drop, so
+/// every path (success, failure, panic unwinding through here) ends it.
+struct Reaper(Option<libc::pid_t>);
+
+impl Reaper {
+    fn pid(&self) -> libc::pid_t {
+        self.0.unwrap_or(-1)
+    }
+
+    /// Reaps a child that has already exited (EOF on its pipe).
+    fn wait(&mut self) {
+        if let Some(pid) = self.0.take() {
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid on a child this process forked and has not reaped.
+            unsafe {
+                libc::waitpid(pid, &mut status, 0);
+            }
+        }
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            // SAFETY: kill and waitpid on a child this process forked; SIGKILL
+            // cannot be blocked, so the blocking wait ends.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+}
+
+/// One bounded read: the bytes the descriptor yields once it is readable (empty
+/// at EOF), or `None` when the deadline passes first.
+fn read_bounded(fd: RawFd, deadline: Instant) -> std::io::Result<Option<Vec<u8>>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let millis = libc::c_int::try_from(remaining.as_millis()).unwrap_or(libc::c_int::MAX);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call.
+    let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
+    if ready < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if ready == 0 {
+        return Ok(None);
+    }
+    let mut buf = [0u8; 16];
+    // SAFETY: read into a buffer this function owns, on a descriptor it was given.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(buf[..n as usize].to_vec()))
+}
+
+/// A close-on-exec pipe (read end, write end), both blocking. Every read goes
+/// through [`read_bounded`], which polls first, so no read can block.
+fn pipe_cloexec() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe2 writes two descriptors into the array it is given.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are fresh and owned by nobody else.
+    Ok(unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+/// The holder stand-in's answer: `K` once it is parked in its fresh namespaces,
+/// or `E` and the errno (five bytes, one write).
+pub(crate) fn decode_holder_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
+    match bytes {
+        [b'K', ..] => Ok(()),
+        [b'E', e0, e1, e2, e3] => {
+            let errno = i32::from_ne_bytes([*e0, *e1, *e2, *e3]);
+            Err(KeepAliveFault {
+                errno: Some(errno),
+                reason: format!(
+                    "unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ),
+            })
+        }
+        _ => Err(KeepAliveFault {
+            errno: None,
+            reason: "the holder stand-in exited before it was ready".to_owned(),
+        }),
+    }
+}
+
+/// The joiner's answer: nothing on success (EOF after its exit), or the errno of
+/// its failed `setns` (four bytes).
+pub(crate) fn decode_joiner_answer(bytes: &[u8]) -> Result<(), KeepAliveFault> {
+    match bytes {
+        [] => Ok(()),
+        [e0, e1, e2, e3] => {
+            let errno = i32::from_ne_bytes([*e0, *e1, *e2, *e3]);
+            Err(KeepAliveFault {
+                errno: Some(errno),
+                reason: format!(
+                    "setns into the holder stand-in's user and network namespaces failed: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                ),
+            })
+        }
+        _ => Err(KeepAliveFault {
+            errno: None,
+            reason: "the joiner sent an unexpected answer".to_owned(),
+        }),
+    }
+}
+
+/// The keep-alive join (module docs): a holder stand-in in a fresh user and
+/// network namespace, its namespace descriptors captured as `run --keep-alive`
+/// captures the session's, and a forked joiner that runs the attach's `setns`
+/// pair on them. The probe's own namespaces are untouched.
+fn keep_alive_join() -> Result<(), KeepAliveFault> {
+    let deadline = Instant::now() + KEEP_ALIVE_PROBE_TIMEOUT;
+    let timeout_reason = |what: &str| KeepAliveFault {
+        errno: None,
+        reason: format!(
+            "{what} did not answer within {}s",
+            KEEP_ALIVE_PROBE_TIMEOUT.as_secs()
+        ),
+    };
+
+    let (answer_read, answer_write) =
+        pipe_cloexec().map_err(|e| fault_of(&e, "cannot create a pipe"))?;
+    // SAFETY: fork in the single-threaded probe; the child runs only libc calls
+    // and never returns (`holder_child`).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(fault_of(
+            &std::io::Error::last_os_error(),
+            "cannot fork the holder stand-in",
+        ));
+    }
+    if pid == 0 {
+        holder_child(answer_write.as_raw_fd());
+    }
+    drop(answer_write);
+    let holder = Reaper(Some(pid));
+    let bytes = read_bounded(answer_read.as_raw_fd(), deadline)
+        .map_err(|e| fault_of(&e, "cannot read the holder stand-in's answer"))?
+        .ok_or_else(|| timeout_reason("the holder stand-in"))?;
+    decode_holder_answer(&bytes)?;
+
+    let (user, net) = crate::run::keepalive::join::capture_namespaces(holder.pid())
+        .map_err(|e| fault_of(&e, "cannot open the holder stand-in's namespaces"))?;
+    let (join_read, join_write) =
+        pipe_cloexec().map_err(|e| fault_of(&e, "cannot create a pipe"))?;
+    // SAFETY: as for the holder fork above; `joiner_child` never returns.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(fault_of(
+            &std::io::Error::last_os_error(),
+            "cannot fork the joiner",
+        ));
+    }
+    if pid == 0 {
+        joiner_child(user.as_raw_fd(), net.as_raw_fd(), join_write.as_raw_fd());
+    }
+    drop(join_write);
+    let mut joiner = Reaper(Some(pid));
+    let bytes = read_bounded(join_read.as_raw_fd(), deadline)
+        .map_err(|e| fault_of(&e, "cannot read the joiner's answer"))?
+        .ok_or_else(|| timeout_reason("the joiner"))?;
+    decode_joiner_answer(&bytes)?;
+    // EOF: the joiner has exited, so this wait does not block for long.
+    joiner.wait();
+    Ok(())
+}
+
+/// The holder stand-in (the child that never returns): arms its death signal,
+/// unshares a fresh user and network namespace, reports `K` or `E`+errno, and
+/// parks until the probe reaps it.
+fn holder_child(report: RawFd) -> ! {
+    // SAFETY: prctl, unshare, write, pause and _exit take plain integers and a
+    // buffer this function owns; no Rust state is touched after the fork.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+        let mut msg = [0u8; 5];
+        if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) == 0 {
+            msg[0] = b'K';
+        } else {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            msg[0] = b'E';
+            msg[1..].copy_from_slice(&errno.to_ne_bytes());
+        }
+        libc::write(report, msg.as_ptr().cast(), msg.len());
+        loop {
+            libc::pause();
+        }
+    }
+}
+
+/// The joiner (the child that never returns): arms its death signal, joins the
+/// holder's namespaces as the attach does, and exits 0, or reports the errno of
+/// the failed `setns` (four bytes) and exits 1.
+fn joiner_child(user: RawFd, net: RawFd, report: RawFd) -> ! {
+    // SAFETY: as for `holder_child`; the joiner exits through `_exit`.
+    unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
+    }
+    match crate::run::keepalive::join::join_namespaces(user, net) {
+        Ok(()) => unsafe { libc::_exit(0) },
+        Err(err) => {
+            let errno = err.raw_os_error().unwrap_or(0);
+            // SAFETY: one write of four bytes this function owns, then _exit.
+            unsafe {
+                libc::write(report, errno.to_ne_bytes().as_ptr().cast(), 4);
+                libc::_exit(1)
+            }
+        }
+    }
 }
 
 /// The two nested bwrap launches (control without `--proc`, then `--proc`),
@@ -441,10 +749,12 @@ mod tests {
                 "fallback",
                 "bwrap-run",
                 "bwrap-proc",
-                "bwrap-seccomp"
+                "bwrap-seccomp",
+                "pidfd-open",
+                "keep-alive"
             ]
         );
-        assert_eq!(PROBE_VERSION, 2);
+        assert_eq!(PROBE_VERSION, 3);
         assert_eq!(BWRAP_PROBE_TIMEOUT, Duration::from_secs(5));
     }
 
@@ -509,7 +819,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&report).expect("serialises"),
-            r#"{"version":2,"steps":[{"step":"unshare","status":"ok","errno":null,"reason":null},{"step":"bwrap-proc","status":"skip","errno":null,"reason":"skipped: no usable bwrap"}]}"#
+            r#"{"version":3,"steps":[{"step":"unshare","status":"ok","errno":null,"reason":null},{"step":"bwrap-proc","status":"skip","errno":null,"reason":"skipped: no usable bwrap"}]}"#
         );
         let back: ProbeReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
@@ -526,5 +836,42 @@ mod tests {
         assert_eq!(report.steps[1].status, StepStatus::Skip);
         assert_eq!(report.steps[9].step, "bwrap-proc");
         assert_eq!(report.steps[10].step, "bwrap-seccomp");
+        assert_eq!(report.steps[11].step, "pidfd-open");
+        assert_eq!(report.steps[12].step, "keep-alive");
+    }
+
+    #[test]
+    fn keep_alive_answers_decode_strictly() {
+        // K: parked in the fresh namespaces.
+        assert_eq!(decode_holder_answer(b"K\0\0\0\0"), Ok(()));
+        // E + errno: the unshare failed, with the errno kept.
+        let eperm = libc::EPERM.to_ne_bytes();
+        let fault = decode_holder_answer(&[b'E', eperm[0], eperm[1], eperm[2], eperm[3]])
+            .expect_err("E is a failure");
+        assert_eq!(fault.errno, Some(libc::EPERM));
+        assert!(
+            fault
+                .reason
+                .starts_with("unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed:")
+        );
+        // EOF, a short or unknown message: the stand-in is not ready.
+        for bytes in [&b""[..], b"E", b"X\0\0\0\0"] {
+            let fault = decode_holder_answer(bytes).expect_err("not ready");
+            assert_eq!(fault.errno, None, "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn joiner_answers_decode_strictly() {
+        assert_eq!(decode_joiner_answer(b""), Ok(()));
+        let enospc = libc::ENOSPC.to_ne_bytes();
+        let fault = decode_joiner_answer(&enospc).expect_err("four bytes are an errno");
+        assert_eq!(fault.errno, Some(libc::ENOSPC));
+        assert!(
+            fault.reason.starts_with(
+                "setns into the holder stand-in's user and network namespaces failed:"
+            )
+        );
+        assert_eq!(decode_joiner_answer(b"abc").expect_err("short").errno, None);
     }
 }

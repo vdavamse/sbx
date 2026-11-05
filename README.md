@@ -186,6 +186,7 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ok    bwrap-proc  bwrap mounts a fresh /proc
   ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
   ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
+  ok    keep-alive  pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)
 
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
@@ -199,7 +200,12 @@ sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
 installs sbx's socket-family filter, see [Running commands](#running-commands):
 a failure here makes the network mode `unavailable`, because the sandbox cannot
 start without the filter), and `landlock` (report only: the Landlock ABI and which
-parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)).
+parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)),
+and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
+into a fresh user and network namespace, the two things `run --keep-alive` and
+`attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
+failure is a `warn` and never limits the network mode, as `landlock` does, so a
+host that runs plain sandboxes still exits 0.
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
@@ -274,6 +280,9 @@ platform, the Kubernetes and Docker forms are given:
 | `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
+| `keep-alive` | `pidfd_open` is refused (ENOSYS below Linux 5.3, or an outer seccomp profile) (report only) | run sbx on Linux 5.3 or newer; Kubernetes: a Localhost seccomp profile that allows `pidfd_open`, or `seccompProfile` Unconfined |
+| `keep-alive` | an unprivileged `setns` into a fresh user and network namespace is refused (EPERM or EACCES; report only) | allow `setns(CLONE_NEWUSER)` and `setns(CLONE_NEWNET)` for this user (a container seccomp profile often blocks `setns`; Kubernetes: a Localhost seccomp profile that allows it, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
+| `keep-alive` | the holder stand-in cannot be started, or the join fails for another reason (report only) | allow unprivileged user and network namespaces and `setns` for this user, or do not use `run --keep-alive`; plain `sbx run` does not need them |
 | `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |
 | `landlock` | Landlock is built in but disabled (report only) | add `landlock` to the `lsm=` kernel boot parameter |
 
@@ -664,7 +673,8 @@ sbx stop --session-dir S
 ```
 
 - **Opt in.** Plain `sbx run` is unchanged. `--keep-alive` is the only way to
-  create a session.
+  create a session. `sbx check` reports whether the host can hold and join a
+  session (the `keep-alive` item, report only: it never changes the exit code).
 - **Same policy.** Attach refuses a policy that is not byte-identical to the
   session's policy (rc 125, the reason on stderr). Nothing runs in that case.
 - **Each call is a sandbox.** Every attached call gets its own bwrap, with its
