@@ -1,0 +1,422 @@
+name: release
+
+# Release pipeline (issue #16): static musl binaries + SHA256 checksums +
+# build provenance attestations on a GitHub Release, the `sbx-bin` PyPI
+# wheels, and a container image with sbx + bubblewrap on GHCR.
+#
+# Triggers:
+#   * push of a `v*` tag: the real release. Every publishing job is gated on
+#     a tag PUSH (`github.event_name == 'push'`), so a manual dispatch against
+#     a tag ref is still only a dry run.
+#   * pull_request touching the pipeline, and workflow_dispatch: a DRY RUN.
+#     Everything is built and checked (binaries, wheels, image), nothing is
+#     published, attested or pushed.
+#
+# Default artifacts are the default-feature build: pure Rust, no C crypto.
+# Opt-in cargo features (e.g. `tls-termination`, which pulls in ring) are
+# never enabled here; the `pure Rust` step below fails if ring or aws-lc
+# ever reaches the default dependency tree.
+#
+# Supply chain: same rules as ci.yml — third-party actions pinned to full
+# commit SHAs (tag in a trailing comment), harden-runner in audit mode first
+# in every job, least-privilege permissions granted per job. PyPI uses
+# trusted publishing (OIDC): no API token exists anywhere. One-time setup on
+# pypi.org: add a trusted publisher for project `sbx-bin`, owner `vdavamse`,
+# repository `sbx`, workflow `release.yml`, environment `pypi`. In the
+# repository settings: create the `pypi` environment with a deployment rule
+# that allows only `v*` tags (plus required reviewers if wanted), and a tag
+# ruleset restricting who may create `v*` tags. The PyPI upload is
+# irreversible, so these are the gates in front of it.
+#
+# Publish order (each step needs the previous one): container image ->
+# GitHub Release -> PyPI. Images can be re-pushed; the Release is the
+# announcement; PyPI uploads are immutable, so they go last.
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "packaging/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a release in flight; dry runs may be superseded.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `shell: bash` is `bash --noprofile --norc -eo pipefail`: a failing command
+# on the left of a pipe fails the step (the default is `bash -e`, no
+# pipefail).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The tag, Cargo.toml and the wheel version must agree; computed once here.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          # Full history: the tag-on-main check below needs ancestry.
+          fetch-depth: 0
+
+      # Same toolchain source as the build jobs.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - id: v
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 --locked \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "sbx"))')
+          echo "Cargo.toml version: $VERSION"
+          if [[ "$REF" == refs/tags/v* ]] && [ "${REF#refs/tags/v}" != "$VERSION" ]; then
+            echo "::error::tag ${REF#refs/tags/} does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+          # A release tag must point at a commit on main (the tag ruleset
+          # limits WHO may tag, this limits WHAT may be released).
+          if [[ "$REF" == refs/tags/v* ]]; then
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::tagged commit $GITHUB_SHA is not on main"
+              exit 1
+            fi
+          fi
+          # Fails early on a version the wheel cannot express.
+          python3 -c 'import sys; sys.path.insert(0, "packaging/pypi"); import build_wheel as b; print("wheel version:", b.pep440_version(sys.argv[1]))' "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    needs: version
+    name: binary (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          # Native arm64 runner: no cross linker, and the binary is
+          # smoke-run on its own architecture.
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # No rust-cache here on purpose: release artifacts are built from a
+      # clean target directory (a poisoned cache must not reach a release).
+
+      - name: Pure Rust (no C crypto in the default build)
+        # The resolved default graph, not Cargo.lock: ring is in the lockfile
+        # as an optional rustls dependency, and `cargo tree -i ring` exits 0
+        # ("nothing to print") even when it is not built.
+        run: |
+          cargo tree --locked --target "$TARGET" -e normal --prefix none --format '{p}' \
+            | awk '{print $1}' | sort -u > deps.txt
+          grep -qx 'sbx' deps.txt || { echo "::error::sbx missing from its own dependency listing"; exit 1; }
+          rc=0
+          BAD=$(grep -xE 'ring|aws-lc-rs|aws-lc-sys|openssl-sys' deps.txt) || rc=$?
+          if [ "$rc" -ge 2 ]; then echo "::error::grep failed (rc $rc)"; exit 1; fi
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::C crypto in the default dependency tree: $BAD"
+            exit 1
+          fi
+          echo "ok: default build is pure Rust ($(wc -l < deps.txt) crates)"
+
+      - name: Build (static musl release, default features)
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Staticness asserts and smoke
+        run: |
+          BIN="target/$TARGET/release/sbx"
+          file "$BIN" | tee /dev/stderr | grep -qE "static(-pie|ally)? linked"
+          if readelf -lW "$BIN" | grep -q INTERP; then
+            echo "::error::binary has a PT_INTERP segment (not static)"
+            exit 1
+          fi
+          OUT=$("$BIN" --version)
+          [ "$OUT" = "sbx $VERSION" ] || { echo "::error::--version printed '$OUT'"; exit 1; }
+
+      - name: Package
+        run: |
+          NAME="sbx-$VERSION-$TARGET"
+          mkdir -p "dist/$NAME"
+          cp "target/$TARGET/release/sbx" LICENSE README.md "dist/$NAME/"
+          # Reproducible tarball: fixed order, owner and mtime (byte-identical
+          # for the same inputs and the same tar/gzip versions).
+          EPOCH=$(git log -1 --format=%ct)
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$EPOCH" -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          cp "target/$TARGET/release/sbx" "dist/sbx-$TARGET"
+          (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/sbx-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  wheels:
+    needs: [version, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: bin
+          merge-multiple: true
+
+      - name: Unit tests (wheel builder)
+        run: python3 packaging/pypi/test_build_wheel.py
+
+      - name: Build wheels
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            python3 packaging/pypi/build_wheel.py --binary "bin/sbx-$t" \
+              --target "$t" --version "$VERSION" --out wheels
+          done
+          ls -l wheels
+
+      - name: Install smoke (x86_64 wheel)
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --no-index wheels/*x86_64*.whl
+          /tmp/venv/bin/python - <<'PY'
+          import subprocess, sbx_bin
+          out = subprocess.run([sbx_bin.binary_path(), "--version"],
+                               capture_output=True, text=True, check=True).stdout
+          print(out.strip())
+          assert out.startswith("sbx "), out
+          PY
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels
+          path: wheels/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: [version, binaries]
+    name: image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    # Read-only: this job also runs on pull requests. The image leaves as an
+    # artifact; only the tag-gated image-publish job holds packages: write.
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binary-${{ matrix.target }}
+          path: bin
+
+      - name: Build and smoke
+        run: |
+          cp "bin/sbx-${{ matrix.target }}" packaging/container/sbx
+          docker build --pull -t "$IMAGE:$VERSION-${{ matrix.arch }}" packaging/container
+          OUT=$(docker run --rm "$IMAGE:$VERSION-${{ matrix.arch }}" --version)
+          [ "$OUT" = "sbx $VERSION" ] || { echo "::error::image --version printed '$OUT'"; exit 1; }
+          docker run --rm --entrypoint bwrap "$IMAGE:$VERSION-${{ matrix.arch }}" --version
+
+      - name: Save
+        run: docker save "$IMAGE:$VERSION-${{ matrix.arch }}" | gzip > "image-${{ matrix.arch }}.tar.gz"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-${{ matrix.arch }}
+          path: image-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---- publishing: tag pushes only ------------------------------------------
+
+  image-publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+
+      - name: Push per-arch images and the multi-arch manifest
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          for arch in amd64 arm64; do
+            docker load -i "images/image-$arch.tar.gz"
+            docker push "$IMAGE:$VERSION-$arch"
+          done
+          docker buildx imagetools create -t "$IMAGE:$VERSION" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
+
+  github-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [version, binaries, wheels, image-publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{binary-*,wheels}"
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -c ./*.tar.gz.sha256
+          sha256sum -- *.tar.gz *.whl > SHA256SUMS
+          cat SHA256SUMS
+
+      # One provenance attestation covering every published file
+      # (verify with `gh attestation verify <file> --repo vdavamse/sbx`).
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.whl
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          PRE=""
+          case "$VERSION" in *-*) PRE="--prerelease" ;; esac
+          gh release create "$TAG" --repo "$REPO" --verify-tag $PRE \
+            --title "sbx $VERSION" --generate-notes \
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.whl dist/SHA256SUMS
+
+  pypi:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # After the GitHub Release: PyPI uploads are immutable, so they go last.
+    needs: [wheels, github-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/sbx-bin/
+    permissions:
+      id-token: write
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels
+          path: wheels
+
+      # Trusted publishing (OIDC): no password/token input. PEP 740
+      # attestations are generated and uploaded by the action.
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: wheels
