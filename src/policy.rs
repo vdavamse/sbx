@@ -386,10 +386,13 @@ impl DomainRule {
         };
         let domain = Domain::parse(name).map_err(|err| {
             if exact {
-                DomainError(
-                    err.0
-                        .replace(&format!("(got {name:?})"), &format!("(got {raw:?})")),
-                )
+                let shown = err
+                    .0
+                    .replace(&format!("(got {name:?})"), &format!("(got {raw:?})"));
+                // Every pinned Domain message ends in `(got {name:?})`; a new
+                // one that does not would drop the marker from the quote.
+                debug_assert_ne!(shown, err.0, "message must quote the name");
+                DomainError(shown)
             } else {
                 err
             }

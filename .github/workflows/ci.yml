@@ -266,7 +266,7 @@ jobs:
           want = {i: ("skip", "opt-in") for i in net}
           assert non_ok == want, f"unexpected non-ok set: {non_ok}"
           offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-          assert len(offline) == 43 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "63 offline checks must pass"
+          assert len(offline) == 44 + 19 + 1 and all(c["status"] in ("ok", "warn") for c in offline), "64 offline checks must pass"
           assert rc == 0, f"rc {rc} (PR2 expects 0)"
           PY
           python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'

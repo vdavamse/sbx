@@ -1002,6 +1002,20 @@ fn every_host_check_with_a_control_fails_as_control_when_the_control_breaks() {
 }
 
 #[test]
+fn a13_connect_leg_alone_regressing_is_a_fail() {
+    // DNS still refuses the subdomain, but the CONNECT leg's deny row is gone
+    // (a proxy matcher diverging from DNS): A13 must fail on its assertion.
+    let mut m = good();
+    m.get_mut("S1")
+        .unwrap()
+        .audit
+        .retain(|r| r["client"] != "127.0.0.1:50062");
+    let (st, detail, control) = status_of("A13", &m);
+    assert_eq!(st, Status::Fail, "{detail}");
+    assert!(!control, "{detail}");
+}
+
+#[test]
 fn a11_row_only_on_the_other_leg_is_a_fail() {
     // The CONNECT leg's row exists but the transparent leg's row does not: the
     // transparent assertion must fail, not pass on the explicit row.

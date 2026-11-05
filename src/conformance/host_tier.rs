@@ -1,4 +1,4 @@
-//! The host tier's 43 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
+//! The host tier's 44 checks (issue #13, §4 groups A, B, C, D, F05/F06, G, H):
 //! the scenario plan and the pure evaluators over scenario evidence.
 //!
 //! Evaluation rules (review fixes):
