@@ -250,11 +250,13 @@ jobs:
           T=$(mktemp -d)
           mk_policy() {
             cat > "$T/$1.json" <<JSON
-          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"none","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"60s","output_bytes":1048576,$2}}
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"$3","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"60s","output_bytes":1048576,$2}}
           JSON
           }
-          mk_policy mem '"memory_bytes":67108864'
-          mk_policy pids '"pids":24'
+          mk_policy mem '"memory_bytes":67108864' none
+          mk_policy pids '"pids":24' none
+          # --keep-alive needs transparent mode (attach too).
+          mk_policy ka '"pids":64' transparent
           # 1. Fail closed: in the step's own (shared, undelegated) cgroup a set
           #    limit refuses with 125 and the reason; nothing runs.
           "$BIN" run --policy "$T/mem.json" --session-dir "$T/s0" -- /usr/bin/true 2> refuse.err
@@ -307,13 +309,15 @@ jobs:
           # --keep-alive: the holder (with its launcher) runs in its own
           # delegated cgroup, an attach call in another (each call gets its own
           # child cgroup, spawned from inside it), then stop.
-          in_cg ka "$BIN" run --keep-alive --policy "$T/pids.json" --session-dir "$T/s3" -- /usr/bin/sleep 300 > ka.out 2> ka.err
+          in_cg ka "$BIN" run --keep-alive --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sleep 300 > ka.out 2> ka.err
           RC=$?
-          [ "$RC" -eq 0 ] || { echo "FAIL: keep-alive start rc $RC"; cat ka.out ka.err; FAIL=1; }
-          in_cg kacall "$BIN" attach --policy "$T/pids.json" --session-dir "$T/s3" -- /usr/bin/sh -c 'echo attached' > att.out 2> att.err
+          { [ "$RC" -eq 0 ] && [ ! -s ka.err ]; } || { echo "FAIL: keep-alive start rc $RC"; cat ka.out ka.err; FAIL=1; }
+          in_cg kacall "$BIN" attach --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sh -c 'echo attached' > att.out 2> att.err
           RC=$?
           { [ "$RC" -eq 0 ] && grep -qx attached att.out; } || { echo "FAIL: attach rc $RC"; cat att.out att.err; FAIL=1; }
           "$BIN" stop --session-dir "$T/s3" || { echo "FAIL: stop rc $?"; FAIL=1; }
+          # The holder may linger a moment after answering stop.
+          for _ in $(seq 1 50); do [ -s "$CGS/ka/sbx-supervisor/cgroup.procs" ] || break; sleep 0.1; done
           # The sandbox child cgroup is removed after each run.
           ls "$CGS"/*
           ls -d "$CGS"/*/sbx-sandbox-* 2>/dev/null && { echo "FAIL: sandbox cgroup left behind"; FAIL=1; }
