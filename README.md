@@ -694,8 +694,9 @@ sbx stop --session-dir S
 - **Control socket.** `sbx.ctl` lives in the session directory and is reachable
   only by the same uid on the host. The sandbox cannot reach it: the session root
   is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
-  path that is or contains the session directory is refused. Only a policy path
-  that reaches it through a symlink is not caught (R35). A same-uid
+  path that is or contains the session directory is refused, lexically by the
+  launch builder and through a symlink by the pre-launch guard, for `run` and for
+  every attach call (R35, closed). A same-uid
   client can hold the control loop for up to 2 s per connection, in batches of
   8 connections per wake (R34). Each connection has one 2 s deadline for its
   request and its reply.
