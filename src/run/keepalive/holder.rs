@@ -87,6 +87,8 @@ pub(crate) const CALL_GRACE: Duration = Duration::from_secs(5);
 /// The budget of one control connection: the whole request and its reply share
 /// this single deadline (rule 4). A slow client cannot extend it byte by byte.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// How many accept batches the teardown drain serves at most (review 4).
+pub(crate) const DRAIN_ROUNDS: usize = 8;
 /// The most connections one supervisor wake serves (rule 4): the loop runs its
 /// signal, child and clock checks between batches.
 pub(crate) const ACCEPT_BATCH: usize = 8;
@@ -718,10 +720,31 @@ reason: "the session stopped while the call was running; it was killed after the
 
     /// Rule 8, last steps: remove `sbx.ctl` and answer every `sbx stop`.
     pub(crate) fn finish(mut self) {
+        self.drain_backlog();
         ctl::unlink_ctl(self.dir.as_fd());
         drop(self.listener);
         for waiter in self.stop_waiters.drain(..) {
             reply(&waiter, &Reply::Done, &[], Instant::now() + REQUEST_TIMEOUT);
+        }
+    }
+
+    /// Answers the connections already queued at the listener (review 4): a
+    /// connection that arrived after the supervisor ended but before the listener
+    /// closes would otherwise be reset, and its client would see rc 125. A `Stop`
+    /// joins the waiters (answered with `Done` by `finish`), and an `Attach` is
+    /// refused as stopping (`end_calls` set that flag). Bounded: a flood of
+    /// connections cannot hold the teardown.
+    fn drain_backlog(&mut self) {
+        for _ in 0..DRAIN_ROUNDS {
+            let now = Instant::now();
+            let round = accept_round(|| self.listener.accept().map(|(s, _)| s), ACCEPT_BATCH);
+            let capped = matches!(round.end, RoundEnd::Capped);
+            for stream in round.streams {
+                self.handle(stream, now);
+            }
+            if !capped {
+                break;
+            }
         }
     }
 }
@@ -928,5 +951,73 @@ mod tests {
         ));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// A holder over a real listener, with dummy descriptors and an audit log
+    /// that writes nothing: enough to exercise the control handlers in-process.
+    fn test_holder(listener: UnixListener, dir: OwnedFd) -> Holder {
+        let dev_null = || OwnedFd::from(std::fs::File::open("/dev/null").expect("/dev/null"));
+        listener.set_nonblocking(true).expect("nonblocking");
+        Holder {
+            listener,
+            dir,
+            pin: PolicyPin::new(b"policy".to_vec()),
+            clock: Clock::new(Instant::now(), DEFAULT_IDLE, DEFAULT_MAX_LIFETIME),
+            self_pidfd: dev_null(),
+            user_ns: dev_null(),
+            net_ns: dev_null(),
+            net_mode: "transparent",
+            audit: AuditLog::new(None, crate::run::serve::FaultLatch::new().expect("latch")),
+            map: Arc::new(FakeIpMap::new(&crate::dns::DnsLimits::default())),
+            calls: Vec::new(),
+            next_id: 1,
+            stopping: true,
+            stop_waiters: Vec::new(),
+            stop_requested: false,
+            backoff_until: None,
+            fatal: None,
+            conn_deadline: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn teardown_answers_queued_stops_done_and_attaches_stopping() {
+        // Review 4: two clients connected while the holder was tearing down, with
+        // no supervisor left to serve them. Both get an answer, not a reset.
+        use crate::run::keepalive::ctl::{recv_frame, send_frame};
+        let dir = std::env::temp_dir().join(format!("sbx-holder-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .expect("dir");
+        }
+        let dirfd = ctl::open_session_dir(&dir).expect("open dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind");
+        let holder = test_holder(listener, dirfd);
+
+        let stop_client = ctl::connect_ctl(holder.dir.as_fd()).expect("connect");
+        let (op, payload) = Request::Stop.encode();
+        send_frame(&stop_client, op, &payload, &[]).expect("send stop");
+        let attach_client = ctl::connect_ctl(holder.dir.as_fd()).expect("connect");
+        let (op, payload) = Request::Attach(b"policy".to_vec()).encode();
+        send_frame(&attach_client, op, &payload, &[]).expect("send attach");
+
+        holder.finish();
+
+        let (frame, _) = recv_frame(&attach_client).expect("the attach gets an answer");
+        assert_eq!(
+            Reply::decode(frame).expect("reply"),
+            Reply::Refused("session is stopping".into())
+        );
+        let (frame, _) = recv_frame(&stop_client).expect("the stop gets Done");
+        assert_eq!(Reply::decode(frame).expect("reply"), Reply::Done);
+        assert!(
+            !dir.join(ctl::CTL_NAME).exists(),
+            "the control socket is removed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
