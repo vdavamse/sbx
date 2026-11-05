@@ -9,7 +9,9 @@
 
 use std::path::Path;
 
+use crate::bwrap::guard::{self, GuardError};
 use crate::bwrap::version::{BWRAP_MIN, BwrapStatus, Unsupported};
+use crate::bwrap::{AliasCheck, PathCheck};
 use crate::init::Stage;
 use crate::init::fdpass::StagedFailure;
 use crate::init::probe::{ProbeReport, ProbeStep, StepStatus};
@@ -595,8 +597,9 @@ pub fn check_mode(required: NetworkMode, provided: EffectiveMode) -> Result<(), 
     }
 }
 
-/// The policy against the host: five items in the fixed order `network-mode`,
-/// `infra-etc`, `policy-paths`, `deny-paths`, `bind-sockets`. `exists`,
+/// The policy against the host: nine items in the fixed order `network-mode`,
+/// `infra-etc`, `policy-paths`, `deny-paths`, `bind-sockets`, then the
+/// pre-launch items of [`policy_check_with`]. `exists`,
 /// `is_non_dir` and `sockets` are the filesystem seams (`metadata` and
 /// [`super::facts::socket_scan`] in production, injected in tests).
 /// `bind-sockets` is a WARN, never a FAIL: the policy still runs.
@@ -608,8 +611,58 @@ pub fn policy_check(
     is_non_dir: &dyn Fn(&Path) -> bool,
     sockets: &dyn Fn(&[&Path], &[&Path]) -> SocketScan,
 ) -> PolicyCheck {
+    policy_check_with(
+        path,
+        policy,
+        provided,
+        &Seams {
+            exists,
+            is_non_dir,
+            verify: &guard::verify,
+            alias: &|check: &AliasCheck| guard::verify_aliases(std::slice::from_ref(check)),
+            bwrap: None,
+            hard_links: &guard::hard_links_under,
+            sockets,
+        },
+    )
+}
+
+/// The host-side seams of [`policy_check_with`]: the probes the pure
+/// classification needs, injected so tests control them.
+pub struct Seams<'a> {
+    /// Whether a policy or infra path exists.
+    pub exists: &'a dyn Fn(&Path) -> bool,
+    /// Whether a deny path is present and not a directory.
+    pub is_non_dir: &'a dyn Fn(&Path) -> bool,
+    /// The fd-relative pre-launch walk (#39), per check.
+    pub verify: &'a dyn Fn(&PathCheck) -> Result<(), GuardError>,
+    /// The deny-alias refusal (#40, Q5), per alias pair.
+    pub alias: &'a dyn Fn(&AliasCheck) -> Result<(), GuardError>,
+    /// The usable bwrap's version, `None` when bwrap is unusable.
+    pub bwrap: Option<(u32, u32, u32)>,
+    /// The bounded hard-link scan of one deny path (Q6).
+    pub hard_links: &'a dyn Fn(&Path) -> Vec<String>,
+    /// The bounded unix-socket scan of the policy binds (#35), skipping the
+    /// deny paths.
+    pub sockets: &'a dyn Fn(&[&Path], &[&Path]) -> SocketScan,
+}
+
+/// [`policy_check`] with explicit seams. Items: `network-mode`, `infra-etc`,
+/// `policy-paths`, `deny-paths`, `bind-sockets` (#35, warns),
+/// `mount-chains` (#39/#40, fails), `pin-cost` (warns above 50 pins),
+/// `bwrap-cve` (warns below 0.12.0), `deny-links` (warns on hard links).
+/// Only a `Fail` makes the policy not runnable; `Warn` and `Skip` do not.
+pub fn policy_check_with(
+    path: &str,
+    policy: &Policy,
+    provided: EffectiveMode,
+    seams: &Seams<'_>,
+) -> PolicyCheck {
+    let exists = seams.exists;
+    let is_non_dir = seams.is_non_dir;
+    let sockets = seams.sockets;
     let required = policy.network.mode;
-    let mut checks = Vec::with_capacity(5);
+    let mut checks = Vec::with_capacity(9);
 
     let network = match check_mode(required, provided) {
         Ok(()) => PolicyItem {
@@ -704,6 +757,12 @@ pub fn policy_check(
 
     let deny: Vec<&Path> = policy.filesystem.deny.iter().map(|p| p.as_path()).collect();
     checks.push(bind_sockets_item(&sockets(&ro_rw, &deny), ro_rw.len()));
+    let plan = crate::bwrap::path_plan(policy, None);
+    checks.push(mount_chains_item(&plan, seams));
+    let bwrap_item = bwrap_cve_item(plan.checks.len(), seams.bwrap);
+    checks.push(bwrap_item);
+    checks.push(pin_cost_item(plan.pins));
+    checks.push(deny_links_item(policy, seams.hard_links));
 
     let runnable = checks.iter().all(|c| c.status != Status::Fail);
     PolicyCheck {
@@ -711,6 +770,172 @@ pub fn policy_check(
         required,
         runnable,
         checks,
+    }
+}
+
+/// `mount-chains` (#39/#40, fails): every bwrap-resolved path under a policy,
+/// session or infra bind (rw or ro) must be a real directory chain (or the right type at the end), and no
+/// deny path may be reachable through a host alias. The same refusal `run`
+/// makes at S8a, so a policy that fails here fails there.
+fn mount_chains_item(plan: &crate::bwrap::Plan, seams: &Seams<'_>) -> PolicyItem {
+    let mut reasons: Vec<String> = Vec::new();
+    for check in &plan.checks {
+        if let Err(err) = (seams.verify)(check) {
+            reasons.push(err.to_string());
+        }
+    }
+    for alias in &plan.aliases {
+        if let Err(err) = (seams.alias)(alias) {
+            reasons.push(err.to_string());
+        }
+    }
+    if let Err(err) = crate::bwrap::guard::verify_binds(&plan.binds) {
+        reasons.push(err.to_string());
+    }
+    reasons.dedup();
+    let n = plan.checks.len();
+    if reasons.is_empty() {
+        return PolicyItem {
+            id: "mount-chains",
+            status: Status::Ok,
+            detail: format!(
+                "{n} mount paths under the binds are real directories; no deny path has a host alias"
+            ),
+            fix: None,
+        };
+    }
+    PolicyItem {
+        id: "mount-chains",
+        status: Status::Fail,
+        detail: reasons.join("; "),
+        fix: Some(
+            "remove the symbolic links, create the missing directories on the host, or move the entries out of the rw paths"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `bwrap-cve` (warns, never fails): bubblewrap below 0.12.0 predates the
+/// CVE-2026-87766 fix, unless the distribution backported it. Only a policy
+/// with mount paths under a policy or session bind is affected (a read-only
+/// bind too: the CVE's mkdir follows a planted link under any bind).
+fn bwrap_cve_item(n: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
+    use crate::bwrap::version::BWRAP_CVE_FIXED;
+    let Some(version) = bwrap else {
+        return PolicyItem {
+            id: "bwrap-cve",
+            status: Status::Skip,
+            detail: "bubblewrap is not usable on this host, so its version was not compared with the CVE-2026-87766 fix".to_owned(),
+            fix: None,
+        };
+    };
+    let shown = format!("{}.{}.{}", version.0, version.1, version.2);
+    if version >= BWRAP_CVE_FIXED || n == 0 {
+        return PolicyItem {
+            id: "bwrap-cve",
+            status: Status::Ok,
+            detail: if version >= BWRAP_CVE_FIXED {
+                format!("bubblewrap {shown} carries the CVE-2026-87766 fix (0.12.0 or later)")
+            } else {
+                format!(
+                    "bubblewrap {shown} predates 0.12.0, but this policy has no mount paths under its binds"
+                )
+            },
+            fix: None,
+        };
+    }
+    PolicyItem {
+        id: "bwrap-cve",
+        status: Status::Warn,
+        detail: format!(
+            "bubblewrap {shown} predates 0.12.0 (CVE-2026-87766) unless your distribution backported the fix; this policy has {n} mount paths under its binds. sbx verifies them before each run, but a concurrent writer can still race that check (0.12.0 closes the dest side only; see R26)"
+        ),
+        fix: Some("install bubblewrap 0.12.0 or later".to_owned()),
+    }
+}
+
+/// `pin-cost` (warns above 50 pins): every pin is one more bind for bwrap,
+/// which re-reads mountinfo per bind, so startup grows superlinearly with the
+/// pin count (about 13 ms at 0 pins and 28 ms at 60 pins on WSL2).
+fn pin_cost_item(pins: usize) -> PolicyItem {
+    if pins <= PIN_WARN_THRESHOLD {
+        return PolicyItem {
+            id: "pin-cost",
+            status: Status::Ok,
+            detail: format!(
+                "{pins} directory pins for the rw tree (warns above {PIN_WARN_THRESHOLD})"
+            ),
+            fix: None,
+        };
+    }
+    PolicyItem {
+        id: "pin-cost",
+        status: Status::Warn,
+        detail: format!(
+            "{pins} directory pins are needed (sbx pins the parents of nested binds and deny masks under rw paths); bwrap re-reads mountinfo per bind, so startup grows superlinearly with the pin count (measured on WSL2: 60 pins +17 ms, 300 pins +180 ms, 900 pins +1 s)"
+        ),
+        fix: Some(
+            "flatten the deny and nested-bind layout (fewer deny entries below nested directories), or deny a parent directory instead".to_owned(),
+        ),
+    }
+}
+
+/// The pin count above which `sbx check` warns (see `pin-cost`).
+pub const PIN_WARN_THRESHOLD: usize = 50;
+
+/// `deny-links` (warns): a regular file under a deny path that has a hard
+/// link outside it is visible through that name, which the mask does not
+/// hide. Only outer denies are scanned: a deny nested in another is masked
+/// by the outer one, and scanning it alone would count the outer tree's
+/// names as outside.
+fn deny_links_item(policy: &Policy, hard_links: &dyn Fn(&Path) -> Vec<String>) -> PolicyItem {
+    // Only a deny under a policy path names a host directory the sandbox can
+    // see; a session-only deny (under /root, /tmp or /work) has no host state.
+    let policy_paths: Vec<&Path> = policy
+        .filesystem
+        .ro
+        .iter()
+        .chain(policy.filesystem.rw.iter())
+        .map(|p| p.as_path())
+        .collect();
+    // Candidates: denies under a policy path, deduplicated. Then the outer
+    // ones among the candidates only, so a deny above every policy path does
+    // not hide a nested candidate from the scan.
+    let mut candidates: Vec<&Path> = policy
+        .filesystem
+        .deny
+        .iter()
+        .map(|deny| deny.as_path())
+        .filter(|deny| policy_paths.iter().any(|root| deny.starts_with(root)))
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    let found: Vec<String> = candidates
+        .iter()
+        .filter(|deny| {
+            !candidates
+                .iter()
+                .any(|outer| outer != *deny && deny.starts_with(outer))
+        })
+        .flat_map(|deny| hard_links(deny))
+        .collect();
+    if found.is_empty() {
+        return PolicyItem {
+            id: "deny-links",
+            status: Status::Ok,
+            detail: "no regular file under a deny path has a hard link outside it".to_owned(),
+            fix: None,
+        };
+    }
+    PolicyItem {
+        id: "deny-links",
+        status: Status::Warn,
+        detail: format!(
+            "{} file(s) under deny paths have a hard link outside them, which a host process can read under that name: {}",
+            found.len(),
+            found.join(", ")
+        ),
+        fix: Some("remove the extra hard links, or deny the other names as well".to_owned()),
     }
 }
 
@@ -1579,21 +1804,206 @@ mod tests {
         assert!(r.checks[1].detail.starts_with("missing or inaccessible infrastructure paths (bwrap binds them and aborts without them): "));
     }
 
+    /// Seams for the new items: real existence, injected walk/alias/links.
+    fn new_seams<'a>(
+        exists: &'a dyn Fn(&Path) -> bool,
+        is_non_dir: &'a dyn Fn(&Path) -> bool,
+        verify: &'a dyn Fn(&PathCheck) -> Result<(), GuardError>,
+        bwrap: Option<(u32, u32, u32)>,
+        hard_links: &'a dyn Fn(&Path) -> Vec<String>,
+    ) -> Seams<'a> {
+        Seams {
+            exists,
+            is_non_dir,
+            verify,
+            alias: &|_| Ok(()),
+            bwrap,
+            hard_links,
+            sockets: &no_sockets,
+        }
+    }
+
+    #[test]
+    fn mount_chain_failure_fails_the_item_and_the_policy() {
+        // The walk's refusal reason is the item's detail, and it blocks.
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/tmp"],"deny":["/tmp/x/secret"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let all = |_: &Path| true;
+        let no = |_: &Path| false;
+        let refuse = |c: &PathCheck| {
+            Err(GuardError::new(format!(
+                "unsafe filesystem path {:?}: boom",
+                c.target
+            )))
+        };
+        let none = |_: &Path| Vec::new();
+        let seams = new_seams(&all, &no, &refuse, Some((0, 12, 0)), &none);
+        let r = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        let item = r
+            .checks
+            .iter()
+            .find(|c| c.id == "mount-chains")
+            .expect("item");
+        assert_eq!(item.status, Status::Fail);
+        assert!(
+            item.detail
+                .contains("unsafe filesystem path \"/tmp/x/secret\": boom"),
+            "{}",
+            item.detail
+        );
+        assert!(!r.runnable);
+        assert_eq!(
+            item.fix.as_deref().map(|f| f.contains("symbolic links")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bwrap_cve_warns_below_0_12_only_with_mount_paths() {
+        let with_rw = r#"{"version":1,"filesystem":{"ro":["/usr","/tmp/x"],"rw":["/tmp"],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let no_rw = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let all = |_: &Path| true;
+        let no = |_: &Path| false;
+        let ok = |_: &PathCheck| Ok(());
+        let none = |_: &Path| Vec::new();
+        let item = |json: &str, bwrap: Option<(u32, u32, u32)>| {
+            let seams = new_seams(&all, &no, &ok, bwrap, &none);
+            let r = policy_check_with(
+                "p.json",
+                &policy_of(json),
+                EffectiveMode::Transparent,
+                &seams,
+            );
+            let cve = r
+                .checks
+                .into_iter()
+                .find(|c| c.id == "bwrap-cve")
+                .expect("item");
+            (cve, r.runnable)
+        };
+        // 0.9.0 with a rw tree: the warning, and the policy still runs.
+        let (cve, runnable) = item(with_rw, Some((0, 9, 0)));
+        assert_eq!(cve.status, Status::Warn);
+        assert!(
+            cve.detail.contains("predates 0.12.0 (CVE-2026-87766)"),
+            "{}",
+            cve.detail
+        );
+        assert!(runnable);
+        // 0.9.0 with no rw path: nothing to warn about.
+        let (cve, _) = item(no_rw, Some((0, 9, 0)));
+        assert_eq!(cve.status, Status::Ok);
+        // 0.12.0: fixed.
+        let (cve, _) = item(with_rw, Some((0, 12, 0)));
+        assert_eq!(cve.status, Status::Ok);
+        // No usable bwrap: skipped, and not a refusal by itself.
+        let (cve, runnable) = item(with_rw, None);
+        assert_eq!(cve.status, Status::Skip);
+        assert!(runnable);
+    }
+
+    #[test]
+    fn deny_links_warns_without_blocking() {
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":["/usr/lib/secret"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let all = |_: &Path| true;
+        let no = |_: &Path| false;
+        let ok = |_: &PathCheck| Ok(());
+        let links = |_: &Path| vec!["/usr/lib/secret/key".to_owned()];
+        let seams = new_seams(&all, &no, &ok, Some((0, 12, 0)), &links);
+        let r = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        let item = r
+            .checks
+            .iter()
+            .find(|c| c.id == "deny-links")
+            .expect("item");
+        assert_eq!(item.status, Status::Warn);
+        assert!(
+            item.detail.contains("/usr/lib/secret/key"),
+            "{}",
+            item.detail
+        );
+        assert!(r.runnable, "a hard-link warning must not block the run");
+    }
+
+    #[test]
+    fn deny_links_scans_only_outer_denies() {
+        // Review r3: a deny nested in another is masked by the outer one;
+        // scanning it alone would count the outer tree's names as outside.
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":["/usr/lib/secret","/usr/lib/secret/inner"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let all = |_: &Path| true;
+        let no = |_: &Path| false;
+        let ok = |_: &PathCheck| Ok(());
+        let scanned = std::cell::RefCell::new(Vec::new());
+        let links = |p: &Path| {
+            scanned.borrow_mut().push(p.to_path_buf());
+            Vec::new()
+        };
+        let seams = new_seams(&all, &no, &ok, Some((0, 12, 0)), &links);
+        let _ = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        assert_eq!(
+            *scanned.borrow(),
+            vec![std::path::PathBuf::from("/usr/lib/secret")]
+        );
+
+        // A deny above every policy path is not a candidate, so it does not
+        // hide a nested candidate; duplicates are scanned once.
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr/lib"],"rw":[],"deny":["/usr","/usr/lib/secret","/usr/lib/secret"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        scanned.borrow_mut().clear();
+        let _ = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        assert_eq!(
+            *scanned.borrow(),
+            vec![std::path::PathBuf::from("/usr/lib/secret")]
+        );
+    }
+
     /// Issue #35: socket files under binds WARN (still runnable), the deny
     /// list reaches the scanner, and a truncated scan is a WARN too.
     #[test]
     fn policy_bind_sockets_warns() {
+        // The pre-launch items get passing seams here (the fixture's deny
+        // path does not exist on the test host); this test is about the
+        // bind-sockets item and its runnable verdict alone.
+        let sockets_check =
+            |policy: &Policy, sockets: &dyn Fn(&[&Path], &[&Path]) -> SocketScan| {
+                let ok = |_: &PathCheck| Ok(());
+                policy_check_with(
+                    "p.json",
+                    policy,
+                    EffectiveMode::Explicit,
+                    &Seams {
+                        exists: &|_| true,
+                        is_non_dir: &|_| false,
+                        verify: &ok,
+                        alias: &|_| Ok(()),
+                        bwrap: Some((0, 12, 0)),
+                        hard_links: &|_| Vec::new(),
+                        sockets,
+                    },
+                )
+            };
         let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/run"],"deny":["/run/secret"]},"network":{"mode":"explicit","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
         let policy = policy_of(json);
-        let r = policy_check(
-            "p.json",
-            &policy,
-            EffectiveMode::Explicit,
-            &|_| true,
-            &|_| false,
-            &no_sockets,
-        );
-        assert_eq!(r.checks.len(), 5);
+        let r = sockets_check(&policy, &no_sockets);
+        assert_eq!(r.checks.len(), 9);
         assert_eq!(r.checks[4].id, "bind-sockets");
         assert_eq!(r.checks[4].status, Status::Ok);
         assert_eq!(
@@ -1614,14 +2024,7 @@ mod tests {
                 truncated: false,
             }
         };
-        let r = policy_check(
-            "p.json",
-            &policy,
-            EffectiveMode::Explicit,
-            &|_| true,
-            &|_| false,
-            &found,
-        );
+        let r = sockets_check(&policy, &found);
         assert!(r.runnable, "a WARN must not block the policy: {r:?}");
         assert_eq!(r.checks[4].status, Status::Warn);
         assert!(r.checks[4].detail.starts_with("unix socket files under filesystem.ro/rw are reachable from the sandbox (a read-only bind does not block connect): /run/s00.sock, "), "{}", r.checks[4].detail);
@@ -1639,14 +2042,7 @@ mod tests {
             found: vec![],
             truncated: true,
         };
-        let r = policy_check(
-            "p.json",
-            &policy,
-            EffectiveMode::Explicit,
-            &|_| true,
-            &|_| false,
-            &truncated,
-        );
+        let r = sockets_check(&policy, &truncated);
         assert!(r.runnable);
         assert_eq!(r.checks[4].status, Status::Warn);
         assert!(
@@ -1659,14 +2055,7 @@ mod tests {
             found: vec![PathBuf::from("/run/docker.sock")],
             truncated: true,
         };
-        let r = policy_check(
-            "p.json",
-            &policy,
-            EffectiveMode::Explicit,
-            &|_| true,
-            &|_| false,
-            &both,
-        );
+        let r = sockets_check(&policy, &both);
         assert_eq!(r.checks[4].status, Status::Warn);
         assert!(
             r.checks[4].detail.ends_with(

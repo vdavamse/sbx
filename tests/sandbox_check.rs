@@ -147,6 +147,36 @@ fn scenarios() -> Vec<Scenario> {
             gate: Gate::Bwrap,
             run: policy_host_deny_file,
         },
+        Scenario {
+            name: "policy-host-mount-chain-symlink",
+            gate: Gate::Bwrap,
+            run: policy_host_mount_chain_symlink,
+        },
+        Scenario {
+            name: "policy-host-mount-chain-clean",
+            gate: Gate::Bwrap,
+            run: policy_host_mount_chain_clean,
+        },
+        Scenario {
+            name: "policy-host-planted-under-ro-fails",
+            gate: Gate::Bwrap,
+            run: policy_host_planted_under_ro_fails,
+        },
+        Scenario {
+            name: "policy-host-n19-host-alias-fails",
+            gate: Gate::Bwrap,
+            run: policy_host_n19_host_alias_fails,
+        },
+        Scenario {
+            name: "policy-host-pin-cost-warn",
+            gate: Gate::Bwrap,
+            run: policy_host_pin_cost_warn,
+        },
+        Scenario {
+            name: "policy-host-deny-hard-link-warn",
+            gate: Gate::Bwrap,
+            run: policy_host_deny_hard_link_warn,
+        },
     ]
 }
 
@@ -215,6 +245,17 @@ fn policy_text(mode: &str, deny: &[&str]) -> String {
     format!(
         r#"{{"version":1,"filesystem":{{"ro":["/usr"],"rw":[],"deny":[{deny}]}},"network":{{"mode":"{mode}","allow":[],"ports":[]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"5s","output_bytes":1000}}}}"#
     )
+}
+
+/// One item of the `--policy --host` report's `policy.checks`.
+fn policy_item<'a>(
+    report: &'a serde_json::Value,
+    id: &str,
+) -> Result<&'a serde_json::Value, String> {
+    report["policy"]["checks"]
+        .as_array()
+        .and_then(|items| items.iter().find(|c| c["id"] == id))
+        .ok_or_else(|| format!("no policy check {id} in {report}"))
 }
 
 fn item<'a>(report: &'a serde_json::Value, id: &str) -> Result<&'a serde_json::Value, String> {
@@ -606,6 +647,210 @@ fn policy_host_deny_file() -> Result<(), String> {
     }
     if report["policy"]["runnable"] != false {
         return Err("policy must not be runnable".into());
+    }
+    Ok(())
+}
+
+/// A `--policy P --host` report for a policy with a writable tree and denies.
+fn host_report_for(dir: &Path, rw: &Path, deny: &[PathBuf]) -> Result<serde_json::Value, String> {
+    let policy = dir.join("policy.json");
+    let deny: Vec<String> = deny
+        .iter()
+        .map(|d| format!("{:?}", d.display().to_string()))
+        .collect();
+    let body = format!(
+        r#"{{"version":1,"filesystem":{{"ro":["/usr"],"rw":[{rw:?}],"deny":[{}]}},"network":{{"mode":"transparent","allow":[],"ports":[]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"5s","output_bytes":1000}}}}"#,
+        deny.join(","),
+        rw = rw.display().to_string(),
+    );
+    fs::write(&policy, body).map_err(|e| e.to_string())?;
+    let bwrap = bwrap_path()?;
+    let out = run(Command::new(SBX)
+        .args(["check", "--policy"])
+        .arg(&policy)
+        .args(["--host", "--json"])
+        .env("SBX_BWRAP", &bwrap))?;
+    let (stdout, _) = text(&out);
+    serde_json::from_str(&stdout).map_err(|e| format!("json: {e}: {stdout}"))
+}
+
+/// #39/#40: a planted symlink on a mount chain fails `mount-chains`, and the
+/// policy cannot run. `bwrap-cve` warns on bwrap < 0.12.0 (the local bwrap
+/// may be newer, so only the consistency of the two items is required).
+fn policy_host_mount_chain_symlink() -> Result<(), String> {
+    let dir = scratch("chain-link");
+    let proj = dir.join("proj");
+    let outside = dir.join("outside");
+    fs::create_dir_all(proj.join("real/secrets")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&outside).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(&outside, proj.join("a")).map_err(|e| e.to_string())?;
+    let report = host_report_for(&dir, &proj, &[proj.join("a/secrets")])?;
+    let _ = fs::remove_dir_all(&dir);
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "fail"
+        || !chains["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("symbolic link")
+    {
+        return Err(format!("mount-chains: {chains}"));
+    }
+    if report["policy"]["runnable"] != false {
+        return Err("a symlinked mount chain must not be runnable".into());
+    }
+    let cve = policy_item(&report, "bwrap-cve")?;
+    let status = cve["status"].as_str().unwrap_or("");
+    let predates = cve["detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("predates 0.12.0");
+    if (status == "warn") != predates {
+        return Err(format!("bwrap-cve inconsistent: {cve}"));
+    }
+    Ok(())
+}
+
+/// The same tree with a real directory is clean.
+fn policy_host_mount_chain_clean() -> Result<(), String> {
+    let dir = scratch("chain-ok");
+    let proj = dir.join("proj");
+    fs::create_dir_all(proj.join("a/secrets")).map_err(|e| e.to_string())?;
+    let report = host_report_for(&dir, &proj, &[proj.join("a/secrets")])?;
+    let _ = fs::remove_dir_all(&dir);
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "ok" {
+        return Err(format!("mount-chains: {chains}"));
+    }
+    Ok(())
+}
+
+/// A hard link to a file inside a deny directory warns (`deny-links`) and
+/// does not, by itself, make the policy unrunnable.
+fn policy_host_deny_hard_link_warn() -> Result<(), String> {
+    let dir = scratch("hardlink");
+    let proj = dir.join("proj");
+    fs::create_dir_all(proj.join("secrets")).map_err(|e| e.to_string())?;
+    fs::write(proj.join("secrets/key"), b"K").map_err(|e| e.to_string())?;
+    fs::hard_link(proj.join("secrets/key"), proj.join("key-elsewhere"))
+        .map_err(|e| e.to_string())?;
+    let report = host_report_for(&dir, &proj, &[proj.join("secrets")])?;
+    let _ = fs::remove_dir_all(&dir);
+    let links = policy_item(&report, "deny-links")?;
+    if links["status"] != "warn"
+        || !links["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("secrets/key")
+    {
+        return Err(format!("deny-links: {links}"));
+    }
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "ok" {
+        return Err(format!("mount-chains must stay ok: {chains}"));
+    }
+    Ok(())
+}
+
+/// M1 (a3): a planted symlink under a read-only bind (inside a writable tree)
+/// fails `mount-chains`: the walk covers read-only covers too.
+fn policy_host_planted_under_ro_fails() -> Result<(), String> {
+    let dir = scratch("ro-planted");
+    let y = dir.join("y");
+    let out = dir.join("out");
+    fs::create_dir_all(y.join("r/a2/s")).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(format!("/oldroot{}", out.display()), y.join("r/a"))
+        .map_err(|e| e.to_string())?;
+    let policy = dir.join("policy.json");
+    let body = format!(
+        r#"{{"version":1,"filesystem":{{"ro":["/usr",{:?}],"rw":[{:?}],"deny":[{:?}]}},"network":{{"mode":"transparent","allow":[],"ports":[]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"5s","output_bytes":1000}}}}"#,
+        y.join("r").display().to_string(),
+        y.display().to_string(),
+        y.join("r/a/s").display().to_string(),
+    );
+    fs::write(&policy, body).map_err(|e| e.to_string())?;
+    let out_run = run(Command::new(SBX)
+        .args(["check", "--policy"])
+        .arg(&policy)
+        .args(["--host", "--json"])
+        .env("SBX_BWRAP", bwrap_path()?))?;
+    let (stdout, _) = text(&out_run);
+    let _ = fs::remove_dir_all(&dir);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| format!("json: {e}: {stdout}"))?;
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "fail"
+        || !chains["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("symbolic link")
+    {
+        return Err(format!("mount-chains: {chains}"));
+    }
+    if report["policy"]["runnable"] != false {
+        return Err("a planted link under a read-only bind must not be runnable".into());
+    }
+    Ok(())
+}
+
+/// m2: a policy whose pins exceed the threshold warns (`pin-cost`); it does
+/// not block the policy.
+fn policy_host_pin_cost_warn() -> Result<(), String> {
+    let dir = scratch("pincost");
+    let proj = dir.join("proj");
+    let mut denies = Vec::new();
+    for i in 0..60 {
+        let d = proj.join(format!("a{i}/b/c/s"));
+        fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+        denies.push(d);
+    }
+    let report = host_report_for(&dir, &proj, &denies)?;
+    let _ = fs::remove_dir_all(&dir);
+    let cost = policy_item(&report, "pin-cost")?;
+    if cost["status"] != "warn" {
+        return Err(format!("pin-cost: {cost}"));
+    }
+    if cost["detail"].as_str().unwrap_or("").is_empty() {
+        return Err("pin-cost has no detail".into());
+    }
+    Ok(())
+}
+
+/// N19 (PR #47): a host-symlink alias of a writable bind's real tree fails
+/// `mount-chains`, the same refusal `run` makes before spawning.
+fn policy_host_n19_host_alias_fails() -> Result<(), String> {
+    let dir = scratch("n19-check");
+    let real = dir.join("real");
+    fs::create_dir_all(real.join("p")).map_err(|e| e.to_string())?;
+    let lnk = dir.join("lnk");
+    std::os::unix::fs::symlink(&real, &lnk).map_err(|e| e.to_string())?;
+    let policy = dir.join("policy.json");
+    let body = format!(
+        r#"{{"version":1,"filesystem":{{"ro":["/usr",{:?}],"rw":[{:?}],"deny":[]}},"network":{{"mode":"transparent","allow":[],"ports":[]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"5s","output_bytes":1000}}}}"#,
+        lnk.join("p").display().to_string(),
+        real.display().to_string(),
+    );
+    fs::write(&policy, body).map_err(|e| e.to_string())?;
+    let out = run(Command::new(SBX)
+        .args(["check", "--policy"])
+        .arg(&policy)
+        .args(["--host", "--json"])
+        .env("SBX_BWRAP", bwrap_path()?))?;
+    let (stdout, _) = text(&out);
+    let _ = fs::remove_dir_all(&dir);
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).map_err(|e| format!("json: {e}: {stdout}"))?;
+    let chains = policy_item(&report, "mount-chains")?;
+    if chains["status"] != "fail"
+        || !chains["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("symbolic link")
+    {
+        return Err(format!("mount-chains: {chains}"));
+    }
+    if report["policy"]["runnable"] != false {
+        return Err("a host-alias overlap must not be runnable".into());
     }
     Ok(())
 }
