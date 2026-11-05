@@ -74,6 +74,7 @@ use super::join::capture_namespaces;
 use super::limits::{Clock, DEFAULT_IDLE, DEFAULT_MAX_LIFETIME, EndReason};
 use super::pin::{MISMATCH, PolicyPin};
 use super::proto::{Reply, Request};
+use crate::dns::FakeIpMap;
 use crate::run::audit::{AuditLog, CallExit, call_exit_row, ts};
 use crate::run::lifecycle::{Cause, Extra};
 use crate::run::sys;
@@ -304,6 +305,9 @@ pub(crate) struct Holder {
     net_ns: OwnedFd,
     net_mode: &'static str,
     audit: Arc<AuditLog>,
+    /// The session's fake-IP map, shared with the proxies (its poison flag is
+    /// the call rows' `dns_poisoned`).
+    map: Arc<FakeIpMap>,
     calls: Vec<Call>,
     next_id: u32,
     stopping: bool,
@@ -317,6 +321,17 @@ pub(crate) struct Holder {
     conn_deadline: Instant,
 }
 
+/// What the holder is built from besides the session paths (`prepare`).
+pub(crate) struct HolderInputs {
+    /// The policy bytes the session pins.
+    pub(crate) pin_bytes: Vec<u8>,
+    /// The achieved network mode (`transparent` or `explicit`).
+    pub(crate) net_mode: &'static str,
+    pub(crate) audit: Arc<AuditLog>,
+    /// The session's fake-IP map, shared with the proxies.
+    pub(crate) map: Arc<FakeIpMap>,
+}
+
 /// Builds the holder after the resident is up and before the go byte (rule 4 and
 /// the pre-go capture of design point 2): binds `sbx.ctl`, captures the
 /// namespace descriptors of the parked `__init` (`init_pid`), and pins the policy.
@@ -325,10 +340,14 @@ pub(crate) fn prepare(
     t0: Instant,
     session: &Path,
     init_pid: libc::pid_t,
-    pin_bytes: Vec<u8>,
-    net_mode: &'static str,
-    audit: Arc<AuditLog>,
+    inputs: HolderInputs,
 ) -> Result<Holder, RunError> {
+    let HolderInputs {
+        pin_bytes,
+        net_mode,
+        audit,
+        map,
+    } = inputs;
     let dir = ctl::open_session_dir(session)
         .map_err(|err| RunError::new(format!("cannot open the session directory: {err}")))?;
     let listener = ctl::bind_ctl(dir.as_fd())
@@ -351,6 +370,7 @@ pub(crate) fn prepare(
         net_ns,
         net_mode,
         audit,
+        map,
         calls: Vec::new(),
         next_id: 1,
         stopping: false,
@@ -613,7 +633,7 @@ impl Holder {
                 duration_ms: end.duration_ms,
                 net_mode: Some(self.net_mode),
                 truncated: end.truncated,
-                dns_poisoned: false,
+                dns_poisoned: self.map.poisoned(),
                 reason: &end.reason,
             },
         ));
@@ -645,7 +665,7 @@ impl Holder {
                     duration_ms: ms,
                     net_mode: Some(self.net_mode),
                     truncated: false,
-                    dns_poisoned: false,
+                    dns_poisoned: self.map.poisoned(),
                     reason: "the attach process exited without reporting the call end",
                 },
             ));
@@ -690,7 +710,7 @@ outcome: "terminated",
 duration_ms: ms,
 net_mode: Some(self.net_mode),
 truncated: false,
-dns_poisoned: false,
+dns_poisoned: self.map.poisoned(),
 reason: "the session stopped while the call was running; it was killed after the grace period",
 }));
         }

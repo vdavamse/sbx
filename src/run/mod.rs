@@ -851,9 +851,12 @@ fn execute(
                             t0,
                             &session,
                             sb.bwrap_pid,
-                            pinned.clone().unwrap_or_default(),
-                            mode.label(),
-                            audit.clone(),
+                            keepalive::holder::HolderInputs {
+                                pin_bytes: pinned.clone().unwrap_or_default(),
+                                net_mode: mode.label(),
+                                audit: audit.clone(),
+                                map: map.clone(),
+                            },
                         )
                         .map_err(Cause::Setup)?,
                     );
