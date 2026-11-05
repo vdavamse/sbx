@@ -311,13 +311,14 @@ jobs:
           # child cgroup, spawned from inside it), then stop.
           in_cg ka "$BIN" run --keep-alive --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sleep 300 > ka.out 2> ka.err
           RC=$?
-          { [ "$RC" -eq 0 ] && [ ! -s ka.err ]; } || { echo "FAIL: keep-alive start rc $RC"; cat ka.out ka.err; FAIL=1; }
+          { [ "$RC" -eq 0 ] && [ ! -s ka.err ]; } || { echo "FAIL: keep-alive start rc $RC (or stderr not empty)"; cat ka.out ka.err; FAIL=1; }
           in_cg kacall "$BIN" attach --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sh -c 'echo attached' > att.out 2> att.err
           RC=$?
           { [ "$RC" -eq 0 ] && grep -qx attached att.out; } || { echo "FAIL: attach rc $RC"; cat att.out att.err; FAIL=1; }
           "$BIN" stop --session-dir "$T/s3" || { echo "FAIL: stop rc $?"; FAIL=1; }
           # The holder may linger a moment after answering stop.
-          for _ in $(seq 1 50); do [ -s "$CGS/ka/sbx-supervisor/cgroup.procs" ] || break; sleep 0.1; done
+          # (cgroupfs files report size 0, so test the content, not -s.)
+          for _ in $(seq 1 50); do [ -n "$(cat "$CGS/ka/sbx-supervisor/cgroup.procs" 2>/dev/null)" ] || break; sleep 0.1; done
           # The sandbox child cgroup is removed after each run.
           ls "$CGS"/*
           ls -d "$CGS"/*/sbx-sandbox-* 2>/dev/null && { echo "FAIL: sandbox cgroup left behind"; FAIL=1; }
