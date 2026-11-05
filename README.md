@@ -683,8 +683,15 @@ sbx stop --session-dir S
 - **Death.** If the holder is killed, the resident and every attached call die
   too (S20). A later `sbx run --keep-alive` on the same directory starts a new
   session.
-- **Transparent mode only.** An attach to a session that runs in explicit mode
-  is refused (rc 125). Its nftables rules are what the join re-verifies.
+- **Transparent mode only.** `run --keep-alive` refuses to start a session whose
+  policy is not `transparent` (rc 125, before anything runs). It also refuses a
+  host that falls back to explicit mode, because then no nftables rules exist for
+  an attach to join. Attach keeps its own refusal for a session in that state.
+- **Control socket.** `sbx.ctl` lives in the session directory and is reachable
+  only by the same uid on the host. The sandbox cannot reach it: the session root
+  is not bound (only `work`, `home`, `tmp` and the `etc` files are). A policy that
+  binds the session directory or an ancestor would expose it (R35). A same-uid
+  client can hold the control loop for up to 2 s per connection (R34).
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
   rows carry no `call_id` (R30).
