@@ -136,6 +136,23 @@ jobs:
           unshare -Urn true
           echo "unprivileged userns smoke OK"
           bwrap --version
+          # Ubuntu 26.04 runner images (2026-11) load AppArmor's
+          # bwrap-userns-restrict profile: everything bwrap runs is confined
+          # to `unpriv_bwrap`, which denies nested user namespaces. The
+          # sandbox_check ro-proc-sys scenario probes `sbx check` INSIDE a
+          # bwrap user namespace and needs exactly that nesting. Unload the
+          # profile (runner-only; same intent as the sysctl above) instead of
+          # weakening the test.
+          sudo aa-status 2>/dev/null | grep -iE 'bwrap' || true
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict \
+              && echo "unloaded AppArmor bwrap-userns-restrict" || true
+          fi
+          # Smoke test: a user+net namespace nested inside bwrap's user
+          # namespace must work, or the prep fails here with a clear message.
+          bwrap --unshare-user --dev-bind / / -- unshare -Urn true \
+            || { echo "::error::nested userns inside bwrap is unavailable on this runner"; exit 1; }
+          echo "nested userns (inside bwrap) smoke OK"
 
       - name: cargo test
         run: cargo test --locked
