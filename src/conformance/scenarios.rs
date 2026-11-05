@@ -119,6 +119,7 @@ pub fn group_of(name: &str) -> &'static str {
         "S14" => "S14",
         "S15" => "S15",
         "SS-pid" | "SS-kill" | "SS-policy" | "SS-idle" | "SS-life" => "SS",
+        "S16" => "S16",
         _ => "?",
     }
 }
@@ -129,6 +130,7 @@ pub fn run_group(env: &Env, group: &str) -> Vec<Scn> {
         "S12" => s12(env),
         "S14" => vec![s14(env)],
         "S15" => vec![s15(env)],
+        "S16" => vec![s16(env)],
         "S1" => vec![s1(env)],
         "S13" => vec![s13(env)],
         "S2" => s2(env),
@@ -1640,5 +1642,166 @@ fn s15(env: &Env) -> Scn {
         }
     });
     scn.ctl.insert("d12.control", control);
+    scn
+}
+
+/// Host top-level directories D13 probes. None of them is part of the sandbox
+/// layout (which has `/usr`, `/etc`, `/proc`, `/dev`, `/tmp`, `/root`, `/work`
+/// and the `/bin`-style links), so each must be ENOENT inside unless the policy
+/// binds something under it.
+pub const D13_CANDIDATES: [&str; 8] = [
+    "/var", "/opt", "/srv", "/mnt", "/boot", "/home", "/media", "/snap",
+];
+
+/// The D13 candidates that exist on this host and that the S16 policy does not
+/// reach: a candidate that is an ancestor of the sbx binary or of the run base
+/// is bound (its parents are created by bwrap), so it is not probed.
+pub fn d13_paths(exe: &str, base: &str) -> Vec<String> {
+    D13_CANDIDATES
+        .iter()
+        .filter(|c| {
+            let under = format!("{c}/");
+            !exe.starts_with(&under) && !base.starts_with(&under) && base != **c
+        })
+        .filter(|c| fs::symlink_metadata(c).is_ok())
+        .map(|c| (*c).to_owned())
+        .collect()
+}
+
+/// S16's host re-read: the file's text, or `absent: <ErrorKind Debug>`
+/// (`absent: NotFound` for a missing file — the exact text D14 requires).
+pub fn host_read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| format!("absent: {:?}", e.kind()))
+}
+
+/// The #45 tree: `fs/ro` (read-only bind) with `file` (text `RO`), `visible`
+/// and the denied `secret/token`; `fs/rw` (writable bind) with `visible` and
+/// the denied `secret/token`; `fs/outside`, a sibling the policy never names.
+fn d45_tree(root: &Path) -> std::io::Result<()> {
+    let _ = fs::remove_dir_all(root);
+    for side in ["ro", "rw"] {
+        fs::create_dir_all(root.join(side).join("secret"))?;
+        fs::write(root.join(side).join("visible"), b"V")?;
+        fs::write(root.join(side).join("secret/token"), b"TOKEN")?;
+    }
+    fs::write(root.join("outside"), b"OUT")?;
+    fs::write(root.join("ro/file"), b"RO")
+}
+
+/// S16 (D13, D14, D15; #45): one run under a policy with an extra ro bind, an
+/// rw bind, and a deny inside each. D13: host top-level directories outside
+/// the policy are ENOENT. D14: writes into the ro bind (truncate an existing
+/// file, create a new one) fail with EROFS while the file stays readable and
+/// the rw bind stays writable (controls). D15: the denied tokens are ENOENT
+/// under both covers while their siblings are visible (controls). The host
+/// tree is re-read after the run.
+fn s16(env: &Env) -> Scn {
+    let mut scn = Scn::named("S16");
+    let root = env.base.join("fs45");
+    if let Err(e) = d45_tree(&root) {
+        return Scn::unavailable("S16", format!("cannot prepare the tree: {e}"));
+    }
+    let ro = format!("{}/ro", root.display());
+    let rw = format!("{}/rw", root.display());
+    let text = policies::paths_policy_json(
+        &env.exe_text,
+        std::slice::from_ref(&ro),
+        std::slice::from_ref(&rw),
+        &[format!("{ro}/secret"), format!("{rw}/secret")],
+    );
+    let Ok(policy) = policies::write_policy(&env.base, "p-S16", &text) else {
+        return Scn::unavailable("S16", "cannot write policy".to_owned());
+    };
+    // D13 probes: the host top-level candidates, a sibling of the allowed
+    // binds (its parent exists inside, created by bwrap for the binds), and
+    // /etc/shadow (`/etc` exists inside but is synthetic plus 6 infra paths).
+    let mut hidden = d13_paths(&env.exe_text, &env.base.to_string_lossy());
+    hidden.push(format!("{}/outside", root.display()));
+    if fs::symlink_metadata("/etc/shadow").is_ok() {
+        hidden.push("/etc/shadow".to_owned());
+    }
+    let mut ops = vec![
+        hello("s16.hello"),
+        // D13's own positive control: Stat reports a path that does exist.
+        Op::Stat {
+            id: "d13.ctl".into(),
+            path: format!("{ro}/visible"),
+        },
+    ];
+    for (i, path) in hidden.iter().enumerate() {
+        ops.push(Op::Stat {
+            id: format!("d13.{i}"),
+            path: path.clone(),
+        });
+    }
+    ops.extend([
+        Op::Read {
+            id: "d14.read".into(),
+            path: format!("{ro}/file"),
+            needles: vec!["RO".into()],
+            max: 64,
+        },
+        Op::Write {
+            id: "d14.trunc".into(),
+            path: format!("{ro}/file"),
+            text: "X".into(),
+        },
+        Op::Write {
+            id: "d14.create".into(),
+            path: format!("{ro}/new"),
+            text: "X".into(),
+        },
+        Op::Write {
+            id: "d14.ctl".into(),
+            path: format!("{rw}/new"),
+            text: "X".into(),
+        },
+        Op::Stat {
+            id: "d15.ro.vis".into(),
+            path: format!("{ro}/visible"),
+        },
+        Op::Stat {
+            id: "d15.rw.vis".into(),
+            path: format!("{rw}/visible"),
+        },
+        Op::Stat {
+            id: "d15.ro".into(),
+            path: format!("{ro}/secret/token"),
+        },
+        Op::Stat {
+            id: "d15.rw".into(),
+            path: format!("{rw}/secret/token"),
+        },
+    ]);
+    let session = env.base.join("s-S16");
+    let audit = env.base.join("a-S16.jsonl");
+    let bound = budget_bound(&ops);
+    let mut r = match SbxRun::new(&env.exe, &policy, &session, payload(ops, &env.exe_text))
+        .audit(&audit)
+        .spawn()
+    {
+        Ok(r) => r,
+        Err(e) => return Scn::unavailable("S16", format!("cannot spawn sbx run: {e}")),
+    };
+    r.wait_exit(Instant::now() + bound);
+    let fin = r.finish();
+    finish_scn(&mut scn, fin, &audit, false);
+
+    let read = |p: PathBuf| host_read(&p);
+    scn.notes.insert(
+        "d13.paths",
+        serde_json::to_string(&hidden).unwrap_or_default(),
+    );
+    scn.notes.insert("ro_file", read(root.join("ro/file")));
+    scn.notes.insert("ro_new", read(root.join("ro/new")));
+    scn.notes.insert("rw_new", read(root.join("rw/new")));
+    scn.notes.insert(
+        "tokens",
+        format!(
+            "{},{}",
+            read(root.join("ro/secret/token")),
+            read(root.join("rw/secret/token"))
+        ),
+    );
     scn
 }

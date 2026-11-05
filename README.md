@@ -287,7 +287,7 @@ pre-check is tracked as a follow-up.
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-78 checks in nine groups, the same code that `cargo test --test conformance`
+81 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 

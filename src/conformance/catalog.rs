@@ -1,4 +1,4 @@
-//! The conformance catalog: all 78 checks, in report order (issue #13; group I,
+//! The conformance catalog: all 81 checks, in report order (issue #13; group I,
 //! the persistent sessions of issue #18, adds six).
 //!
 //! Pure data plus the selector parser. The ids, group keys, titles and the
@@ -166,8 +166,8 @@ const fn c(
 use Group::{A, B, C, D, E, F, G, H, I};
 use Tier::{Host as Hs, Init as If, Lab as Lb, Network as Nw};
 
-/// The 78 checks, in report order (group, then id).
-pub const CATALOG: [CheckDef; 78] = [
+/// The 81 checks, in report order (group, then id).
+pub const CATALOG: [CheckDef; 81] = [
     c(
         "A01",
         A,
@@ -452,6 +452,21 @@ pub const CATALOG: [CheckDef; 78] = [
         S,
     ),
     c(
+        "D13",
+        D,
+        Hs,
+        "host paths outside the policy are invisible",
+        S,
+    ),
+    c("D14", D, Hs, "writes into an ro bind fail with EROFS", S),
+    c(
+        "D15",
+        D,
+        Hs,
+        "deny masks hide their targets under ro and rw covers",
+        S,
+    ),
+    c(
         "E01",
         E,
         Nw,
@@ -690,9 +705,9 @@ mod tests {
 
     #[test]
     fn catalog_has_78_unique_ids_in_group_order() {
-        assert_eq!(CATALOG.len(), 78);
+        assert_eq!(CATALOG.len(), 81);
         let ids: BTreeSet<_> = CATALOG.iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 78);
+        assert_eq!(ids.len(), 81);
         let mut last = 0usize;
         for d in CATALOG.iter() {
             let g = GROUPS.iter().position(|g| *g == d.group).unwrap();
@@ -710,7 +725,7 @@ mod tests {
     #[test]
     fn tier_counts_match_the_design() {
         let count = |t: Tier| CATALOG.iter().filter(|d| d.tier == t).count();
-        assert_eq!(count(Tier::Host), 52);
+        assert_eq!(count(Tier::Host), 55);
         assert_eq!(count(Tier::Lab), 19);
         assert_eq!(count(Tier::Init), 1);
         assert_eq!(count(Tier::Network), 6);
@@ -744,17 +759,20 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(text.len(), 78);
+        assert_eq!(text.len(), 81);
         assert!(text[0].starts_with("A01|allow-list|host|allowed name gets an A record"));
         assert!(text[12].starts_with("A13|allow-list|host|exact-only =name"));
-        assert!(text[71].starts_with("H06|secrets|host|"));
+        assert!(text[74].starts_with("H06|secrets|host|"));
         let d11 = text
             .iter()
             .position(|t| t.starts_with("D11|"))
             .expect("D11");
         assert!(text[d11 + 1].starts_with("D12|"));
-        assert!(text[d11 + 2].starts_with("E01|"));
-        assert!(text[77].starts_with("I06|session|host|max lifetime"));
+        assert!(text[d11 + 2].starts_with("D13|isolation|host|"));
+        assert!(text[d11 + 3].starts_with("D14|isolation|host|"));
+        assert!(text[d11 + 4].starts_with("D15|isolation|host|"));
+        assert!(text[d11 + 5].starts_with("E01|"));
+        assert!(text[80].starts_with("I06|session|host|max lifetime"));
     }
 
     #[test]

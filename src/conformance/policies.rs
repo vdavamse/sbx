@@ -56,10 +56,16 @@ pub fn policy_json(which: Builtin, exe: &str, network_tag: Option<&str>) -> Stri
 /// A filesystem policy for the #40 scenarios (D11, D12): mode none, `/usr`
 /// and the sbx binary read-only, the given rw and deny paths.
 pub fn fs_policy_json(exe: &str, rw: &[String], deny: &[String]) -> String {
+    paths_policy_json(exe, &[], rw, deny)
+}
+
+/// [`fs_policy_json`] plus extra read-only binds (#45, D13-D15).
+pub fn paths_policy_json(exe: &str, ro_extra: &[String], rw: &[String], deny: &[String]) -> String {
     let mut ro = vec![json!("/usr")];
     if !exe.starts_with("/usr/") {
         ro.push(json!(exe));
     }
+    ro.extend(ro_extra.iter().map(|p| json!(p)));
     let doc: Value = json!({
         "version": 1,
         "filesystem": {"ro": ro, "rw": rw, "deny": deny},
@@ -88,6 +94,30 @@ mod tests {
             let text = policy_json(which, "/mnt/sbx", None);
             Policy::from_json_str(&text).unwrap_or_else(|e| panic!("{which:?}: {e:?}"));
         }
+    }
+
+    #[test]
+    fn paths_policy_valid_and_carries_every_list() {
+        let text = paths_policy_json(
+            "/opt/sbx",
+            &["/x/ro".to_owned()],
+            &["/x/rw".to_owned()],
+            &["/x/ro/secret".to_owned(), "/x/rw/secret".to_owned()],
+        );
+        Policy::from_json_str(&text).unwrap_or_else(|e| panic!("{e:?}"));
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["filesystem"]["ro"], json!(["/usr", "/opt/sbx", "/x/ro"]));
+        assert_eq!(v["filesystem"]["rw"], json!(["/x/rw"]));
+        assert_eq!(
+            v["filesystem"]["deny"],
+            json!(["/x/ro/secret", "/x/rw/secret"])
+        );
+        assert_eq!(v["network"]["mode"], "none");
+        // fs_policy_json is the no-extra-ro special case.
+        assert_eq!(
+            fs_policy_json("/opt/sbx", &["/x/rw".to_owned()], &[]),
+            paths_policy_json("/opt/sbx", &[], &["/x/rw".to_owned()], &[])
+        );
     }
 
     #[test]
