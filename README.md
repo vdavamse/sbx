@@ -187,7 +187,7 @@ be masked, and one that sits under a bound path or an sbx-generated `/etc` file
 is flagged), `mount-chains` (the pre-launch verification of `run` below, which
 fails the policy when `run` would refuse), `bwrap-cve` (warns when bwrap is
 older than 0.12.0 and the policy has mount paths under its binds), `deny-links`
-(warns when a file under a deny path has another hard link) and `pin-cost` (warns
+(warns when a file under a deny path has a hard link outside it) and `pin-cost` (warns
 above 50 directory pins).
 
 **JSON.** `sbx check --json` prints the same report as a JSON object with
@@ -226,7 +226,7 @@ platform, the Kubernetes and Docker forms are given:
 | `bwrap` | bwrap is older than 0.8, or unusable | install bubblewrap 0.8 or newer, or set `SBX_BWRAP` to one |
 | `mount-chains` | a path bwrap resolves under a policy bind is a symbolic link, is missing or has the wrong type, or a deny path is reachable through a host symlink alias | remove the symbolic link, create the directory on the host, or move the entry out of the `rw` path (the message names the component) |
 | `bwrap-cve` | bwrap is older than 0.12.0 and the policy has mount paths under its binds (a warning; the run still starts) | install bubblewrap 0.12.0 or later (CVE-2026-87766); a distribution backport is not visible in the version string |
-| `deny-links` | a regular file under a deny path has another hard link (a warning) | remove the extra hard link, or deny the other name as well |
+| `deny-links` | a regular file under a deny path has a hard link outside it (a warning) | remove the extra hard link, or deny the other name as well |
 | `pin-cost` | the policy needs more than 50 directory pins (a warning): each pin is an extra bind, and startup grows superlinearly with the count | keep the deny list short, or deny a parent directory instead of many nested entries |
 | `bwrap-run` | bwrap cannot apply `--disable-userns` because `/proc/sys` is read-only | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
@@ -362,7 +362,7 @@ path bwrap will resolve under a policy bind (read-only or writable, #39, #40):
 
 - A path that is a symbolic link, is missing, or has the wrong type on the way to
   a bind dest or a deny entry is refused: rc 125, `sbx run: filesystem path … `,
-  with nothing created. Each component is opened without following links, so
+  with nothing created outside the session directory and the audit log. Each component is opened without following links, so
   bwrap never sees one. A `deny` entry under `rw` must already exist as a
   directory on the host; bwrap would otherwise create it, and its parents, there.
 - A `deny` path that the host reaches through a symbolic link alias of another

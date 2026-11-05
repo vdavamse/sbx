@@ -7,7 +7,8 @@
 //! bwrap create a directory, or mount over, an arbitrary host path (CVE-2026-
 //! 87766). The payload also controls the contents of every writable tree, so
 //! sbx cannot trust them. This module checks, before anything is spawned,
-//! that every path bwrap will resolve under a writable cover is a real
+//! that every path bwrap will resolve under a policy, session or infra cover
+//! (rw or ro) is a real
 //! directory chain (no symlinks, nothing missing, the right type), and that
 //! no deny mask is reachable on the host through a second path.
 //!
@@ -331,7 +332,8 @@ pub const LINK_SCAN_BUDGET: usize = 10_000;
 /// all inside `dir` (e.g. `git clone --local` objects under a denied `.git`)
 /// is not reported: its link count equals the names found in the scan.
 /// Bounded by [`LINK_SCAN_BUDGET`]; past it, files seen so far are judged on
-/// the names found so far. Symlinks are not followed. A non-directory yields
+/// the names found so far. An unreadable subdirectory also undercounts the
+/// names found; both can only over-report (the safe direction). Symlinks are not followed. A non-directory yields
 /// nothing.
 pub fn hard_links_under(dir: &Path) -> Vec<String> {
     use std::collections::HashMap;

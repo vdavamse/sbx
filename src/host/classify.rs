@@ -761,8 +761,8 @@ pub fn policy_check_with(
     }
 }
 
-/// `mount-chains` (#39/#40, fails): every bwrap-resolved path under a writable
-/// bind must be a real directory chain (or the right type at the end), and no
+/// `mount-chains` (#39/#40, fails): every bwrap-resolved path under a policy,
+/// session or infra bind (rw or ro) must be a real directory chain (or the right type at the end), and no
 /// deny path may be reachable through a host alias. The same refusal `run`
 /// makes at S8a, so a policy that fails here fails there.
 fn mount_chains_item(plan: &crate::bwrap::Plan, seams: &Seams<'_>) -> PolicyItem {
@@ -836,7 +836,7 @@ fn bwrap_cve_item(n: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
         id: "bwrap-cve",
         status: Status::Warn,
         detail: format!(
-            "bubblewrap {shown} predates 0.12.0 (CVE-2026-87766) unless your distribution backported the fix; this policy has {n} mount paths under its binds. sbx verifies them before each run, but a concurrent writer can still race that check"
+            "bubblewrap {shown} predates 0.12.0 (CVE-2026-87766) unless your distribution backported the fix; this policy has {n} mount paths under its binds. sbx verifies them before each run, but a concurrent writer can still race that check (0.12.0 closes the dest side only; see R26)"
         ),
         fix: Some("install bubblewrap 0.12.0 or later".to_owned()),
     }
@@ -871,8 +871,11 @@ fn pin_cost_item(pins: usize) -> PolicyItem {
 /// The pin count above which `sbx check` warns (see `pin-cost`).
 pub const PIN_WARN_THRESHOLD: usize = 50;
 
-/// `deny-links` (warns): a regular file under a deny path that has another
-/// hard link is visible through that name, which the mask does not hide.
+/// `deny-links` (warns): a regular file under a deny path that has a hard
+/// link outside it is visible through that name, which the mask does not
+/// hide. Only outer denies are scanned: a deny nested in another is masked
+/// by the outer one, and scanning it alone would count the outer tree's
+/// names as outside.
 fn deny_links_item(policy: &Policy, hard_links: &dyn Fn(&Path) -> Vec<String>) -> PolicyItem {
     // Only a deny under a policy path names a host directory the sandbox can
     // see; a session-only deny (under /root, /tmp or /work) has no host state.
@@ -889,13 +892,20 @@ fn deny_links_item(policy: &Policy, hard_links: &dyn Fn(&Path) -> Vec<String>) -
         .iter()
         .map(|deny| deny.as_path())
         .filter(|deny| policy_paths.iter().any(|root| deny.starts_with(root)))
+        .filter(|deny| {
+            !policy
+                .filesystem
+                .deny
+                .iter()
+                .any(|outer| outer.as_path() != *deny && deny.starts_with(outer.as_path()))
+        })
         .flat_map(hard_links)
         .collect();
     if found.is_empty() {
         return PolicyItem {
             id: "deny-links",
             status: Status::Ok,
-            detail: "no regular file under a deny path has another hard link".to_owned(),
+            detail: "no regular file under a deny path has a hard link outside it".to_owned(),
             fix: None,
         };
     }
@@ -903,7 +913,7 @@ fn deny_links_item(policy: &Policy, hard_links: &dyn Fn(&Path) -> Vec<String>) -
         id: "deny-links",
         status: Status::Warn,
         detail: format!(
-            "{} file(s) under deny paths have another hard link, which a host process can read under that name: {}",
+            "{} file(s) under deny paths have a hard link outside them, which a host process can read under that name: {}",
             found.len(),
             found.join(", ")
         ),
@@ -1837,6 +1847,32 @@ mod tests {
             item.detail
         );
         assert!(r.runnable, "a hard-link warning must not block the run");
+    }
+
+    #[test]
+    fn deny_links_scans_only_outer_denies() {
+        // Review r3: a deny nested in another is masked by the outer one;
+        // scanning it alone would count the outer tree's names as outside.
+        let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":["/usr/lib/secret","/usr/lib/secret/inner"]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
+        let all = |_: &Path| true;
+        let no = |_: &Path| false;
+        let ok = |_: &PathCheck| Ok(());
+        let scanned = std::cell::RefCell::new(Vec::new());
+        let links = |p: &Path| {
+            scanned.borrow_mut().push(p.to_path_buf());
+            Vec::new()
+        };
+        let seams = new_seams(&all, &no, &ok, Some((0, 12, 0)), &links);
+        let _ = policy_check_with(
+            "p.json",
+            &policy_of(json),
+            EffectiveMode::Transparent,
+            &seams,
+        );
+        assert_eq!(
+            *scanned.borrow(),
+            vec![std::path::PathBuf::from("/usr/lib/secret")]
+        );
     }
 
     #[test]

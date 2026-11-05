@@ -31,9 +31,11 @@ machine, and it does not protect against a broken kernel or a broken bwrap.
      this.
   2. **R2, allowed destinations are exfiltration channels (High by design).** Allowing `github.com`
      allows uploading to any GitHub repository. sbx enforces names, not intent.
-  3. **R26, bwrap CVE-2026-87766 (Low after sbx's pre-launch guard, #39).** A setup-time symlink
-     traversal in bwrap before 0.12.0. sbx verifies every path bwrap resolves under a `rw` bind
-     before it spawns, and refuses a planted symlink with rc 125. sbx's minimum bwrap version is
+  3. **R26, bwrap CVE-2026-87766 (Medium when policies share a writable tree, Low otherwise, #39).**
+     A setup-time symlink traversal in bwrap before 0.12.0. sbx verifies every path bwrap resolves
+     under a policy or session bind (rw or ro) before it spawns, and refuses a planted symlink with
+     rc 125. A concurrent writer outside the same policy can still swap a bind source after that
+     check; this race stays open on every bwrap version. sbx's minimum bwrap version is
      still 0.8, so an older bwrap starts, and `sbx check` warns below 0.12.0.
   4. **R15, kernel and bwrap bugs (High impact, low likelihood).** sbx shares the host kernel.
 - The table in section 7 gives all residuals with their severity and tracking issue.
@@ -303,7 +305,7 @@ Notes on the table:
   describes what PASS, FAIL, warn and skip mean.
 - `sbx check` reports `ok bwrap <version>` for any bwrap 0.8 or later. On a version before 0.12.0 it
   warns (`bwrap-cve`, for example `bubblewrap 0.9.0 predates 0.12.0`) when the policy has mount
-  paths inside `rw` paths. It never fails on the version (R26). `mount-chains` fails when the
+  paths under its binds (rw or ro). It never fails on the version (R26). `mount-chains` fails when the
   guard would refuse at run time (R26, R27).
 - `D05` is a warning, not a failure. It means a unix socket file is visible under a bind. Review the
   bind list when it appears.

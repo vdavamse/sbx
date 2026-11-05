@@ -801,6 +801,22 @@ mod tests {
         // The inner deny (/srv/proj/a/secret/inner) resolves inside the
         // outer tmpfs: no check for it.
         assert_eq!(got, want);
+        // The host tree each walk starts from: the cover's source.
+        let root_of = |t: &str| {
+            let c = plan.checks.iter().find(|c| c.target == t).unwrap();
+            (c.root.clone(), c.rel.join("/"))
+        };
+        let session_tmp = root_of("/tmp/x/deny");
+        assert!(
+            session_tmp.0.starts_with(SESSION_DIR) && session_tmp.0.ends_with("tmp"),
+            "{session_tmp:?}"
+        );
+        assert_eq!(session_tmp.1, "x/deny");
+        assert_eq!(
+            root_of("/srv/proj/vendor/lib/x/key"),
+            (PathBuf::from("/srv/proj/vendor/lib"), "x/key".to_owned())
+        );
+        assert_eq!(root_of("/etc/ssl/private").0, PathBuf::from("/etc/ssl"));
     }
 
     fn policy_of(json: &str) -> Policy {

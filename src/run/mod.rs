@@ -56,8 +56,8 @@
 //!     bind or deny under an `rw` path at depth 2 or more; `mv` copies
 //!     instead. A missing deny path under an `rw` bind is refused (bwrap would
 //!     create it on the host). The guard's check and bwrap's setup are separate
-//!     steps: a writer outside the same policy can race them on bwrap before
-//!     0.12.0 (R26). Connections still open at exit get no `close` row. The
+//!     steps: a writer outside the same policy can race them (R26): dests and
+//!     sources on bwrap before 0.12.0, bind sources on every version. Connections still open at exit get no `close` row. The
 //!     audit log is not fsynced. Socket families: only AF_UNIX, AF_INET,
 //!     AF_INET6 and AF_NETLINK are creatable (issue #34; everything else is
 //!     EAFNOSUPPORT, including AF_VSOCK), io_uring is ENOSYS, and 32-bit or
@@ -577,7 +577,7 @@ fn execute(
 
     // S8a (#39/#40, N19): before anything is spawned, verify every path bwrap
     // will resolve under a bind cover, rw or ro (fd-relative, no symlinks,
-    // nothing missing under rw), and that no deny mask is reachable through a
+    // nothing missing under an rw policy bind), and that no deny mask is reachable through a
     // host symlink. Refusal is 125; nothing is created outside the session
     // directory and the audit log (S5/S7 ran already).
     for check in launch.path_checks() {
