@@ -22,9 +22,15 @@ name: release
 # in every job, least-privilege permissions granted per job. PyPI uses
 # trusted publishing (OIDC): no API token exists anywhere. One-time setup on
 # pypi.org: add a trusted publisher for project `sbx-bin`, owner `vdavamse`,
-# repository `sbx`, workflow `release.yml`, environment `pypi`; create the
-# `pypi` environment in the repository settings (optionally with required
-# reviewers).
+# repository `sbx`, workflow `release.yml`, environment `pypi`. In the
+# repository settings: create the `pypi` environment with a deployment rule
+# that allows only `v*` tags (plus required reviewers if wanted), and a tag
+# ruleset restricting who may create `v*` tags. The PyPI upload is
+# irreversible, so these are the gates in front of it.
+#
+# Publish order (each step needs the previous one): container image ->
+# GitHub Release -> PyPI. Images can be re-pushed; the Release is the
+# announcement; PyPI uploads are immutable, so they go last.
 
 on:
   push:
@@ -46,6 +52,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# `shell: bash` is `bash --noprofile --norc -eo pipefail`: a failing command
+# on the left of a pipe fails the step (the default is `bash -e`, no
+# pipefail).
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # The tag, Cargo.toml and the wheel version must agree; computed once here.
   version:
@@ -61,6 +74,9 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+
+      # Same toolchain source as the build jobs.
+      - uses: dtolnay/rust-toolchain@stable
 
       - id: v
         env:
@@ -112,14 +128,18 @@ jobs:
       # clean target directory (a poisoned cache must not reach a release).
 
       - name: Pure Rust (no C crypto in the default build)
+        # The resolved default graph, not Cargo.lock: ring is in the lockfile
+        # as an optional rustls dependency, and `cargo tree -i ring` exits 0
+        # ("nothing to print") even when it is not built.
         run: |
-          for crate in ring aws-lc-rs aws-lc-sys openssl-sys; do
-            if cargo tree --locked --target "$TARGET" -e normal -i "$crate" >/dev/null 2>&1; then
-              echo "::error::$crate is in the default dependency tree"
-              exit 1
-            fi
-          done
-          echo "ok: default build is pure Rust"
+          cargo tree --locked --target "$TARGET" -e normal --prefix none --format '{p}' \
+            | awk '{print $1}' | sort -u > deps.txt
+          grep -qx 'sbx' deps.txt || { echo "::error::sbx missing from its own dependency listing"; exit 1; }
+          if BAD=$(grep -xE 'ring|aws-lc-rs|aws-lc-sys|openssl-sys' deps.txt); then
+            echo "::error::C crypto in the default dependency tree: $BAD"
+            exit 1
+          fi
+          echo "ok: default build is pure Rust ($(wc -l < deps.txt) crates)"
 
       - name: Build (static musl release, default features)
         run: cargo build --release --locked --target "$TARGET"
@@ -140,7 +160,8 @@ jobs:
           NAME="sbx-$VERSION-$TARGET"
           mkdir -p "dist/$NAME"
           cp "target/$TARGET/release/sbx" LICENSE README.md "dist/$NAME/"
-          # Reproducible tarball: fixed order, owner and mtime.
+          # Reproducible tarball: fixed order, owner and mtime (byte-identical
+          # for the same inputs and the same tar/gzip versions).
           EPOCH=$(git log -1 --format=%ct)
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime="@$EPOCH" -C dist -czf "dist/$NAME.tar.gz" "$NAME"
@@ -313,7 +334,7 @@ jobs:
 
   github-release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [version, binaries, wheels]
+    needs: [version, binaries, wheels, image-publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

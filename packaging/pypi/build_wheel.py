@@ -8,7 +8,8 @@ writing it directly keeps the release job free of third-party build tooling.
 
 Stdlib only. Deterministic: every entry gets the same timestamp
 (``SOURCE_DATE_EPOCH``, default 1980-01-01), sorted order and fixed modes,
-so rebuilding from the same inputs yields a byte-identical wheel.
+so rebuilding from the same inputs with the same Python (zlib) yields a
+byte-identical wheel.
 
 Usage:
   build_wheel.py --binary target/x86_64-unknown-linux-musl/release/sbx \\
@@ -118,7 +119,9 @@ def build(binary: Path, target: str, cargo_version: str, out: Path, epoch: int) 
         (f"{dist_info}/WHEEL", _wheel_file(PLATFORM_TAGS[target]).encode(), 0o644),
         (f"{dist_info}/licenses/LICENSE", (REPO_ROOT / "LICENSE").read_bytes(), 0o644),
     ]
-    files.sort(key=lambda f: f[0])
+    # Package files first, then .dist-info (the wheel spec recommends the
+    # metadata last); sorted within each group.
+    files.sort(key=lambda f: (f[0].startswith(dist_info), f[0]))
     record = "".join(f"{name},{_record_hash(data)},{len(data)}\n" for name, data, _ in files)
     record += f"{dist_info}/RECORD,,\n"
     files.append((f"{dist_info}/RECORD", record.encode(), 0o644))

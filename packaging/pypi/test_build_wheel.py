@@ -69,8 +69,13 @@ class WheelTests(unittest.TestCase):
         with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
             self.assertEqual(
-                sorted(names[:-1]), names[:-1], "entries sorted, RECORD last"
+                names[:2], ["sbx_bin/__init__.py", "sbx_bin/sbx"], "package files first"
             )
+            self.assertTrue(
+                all(n.startswith("sbx_bin-0.1.0.dist-info/") for n in names[2:]),
+                ".dist-info last",
+            )
+            self.assertEqual(sorted(names[2:-1]), names[2:-1], "sorted within groups")
             self.assertEqual(names[-1], "sbx_bin-0.1.0.dist-info/RECORD")
             self.assertEqual(
                 set(names),
