@@ -18,17 +18,20 @@ build from source:
 ```sh
 sudo apt-get install bubblewrap          # or point SBX_BWRAP at a bwrap binary
 git clone https://github.com/vdavamse/sbx && cd sbx
-cargo build --release --locked
-sudo install target/release/sbx /usr/local/bin/
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked --target x86_64-unknown-linux-musl
+sudo install target/x86_64-unknown-linux-musl/release/sbx /usr/local/bin/
 ```
 
-Write a policy. This one lets the sandbox read `/usr` and the TLS roots, write
-one project directory, and reach PyPI over HTTPS, and nothing else:
+Write a policy. This one lets the sandbox read `/usr`, write one project
+directory, and reach PyPI over HTTPS. sbx always adds a few things of its own:
+the TLS roots and a small generated `/etc`, `/proc`, `/dev`, and a private
+`/work`, `/root` and `/tmp` in the session directory.
 
 ```json
 {
   "version": 1,
-  "filesystem": { "ro": ["/usr", "/etc/ssl"], "rw": ["/home/me/project"], "deny": [] },
+  "filesystem": { "ro": ["/usr"], "rw": ["/home/me/project"], "deny": [] },
   "network": { "mode": "transparent", "allow": ["pypi.org", "files.pythonhosted.org"], "ports": [443] },
   "env": { "pass": [], "set": {} },
   "limits": { "timeout": "120s", "output_bytes": 10485760 }
@@ -48,7 +51,12 @@ sbx 0.1.0 host check (kernel 6.8.0-1-generic)
   ...
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 
-$ sbx check --policy p.json --host     # exit 0: the policy runs on this host
+$ sbx check --policy p.json --host     # the host report again, then the policy items
+...
+policy p.json (requires transparent):
+  ok    network-mode  ...
+  ...
+policy: can run on this host
 ```
 
 Run a command. Everything after `--` is the command, verbatim:
@@ -143,7 +151,8 @@ in [`examples/`](examples/)):
   `none` (no network access). `allow` lists the reachable names, and `ports`
   the allowed ports (443 and 80 are inspected; any other is denied).
 - `env`: `pass` names the caller's variables to inherit; `set` adds fixed
-  values. Everything else is cleared.
+  values. Everything else is cleared, except `HOME`, `PATH` and `TMPDIR`
+  (which `set` can override) and the proxy and CA variables sbx sets itself.
 - `limits`: `timeout` and `output_bytes`, plus optional per-process limits and
   whole-sandbox cgroup limits (`memory_bytes`, `pids`).
 

@@ -545,19 +545,20 @@ deletes sessions, so it is conservative by design.
 
 `sbx run` re-executes itself as the internal `sbx __init` helper. `__init` unshares a user and a
 network namespace, brings the sandbox loopback up as `10.255.255.1` with a default route, disables
-IPv6, and binds three listeners: the transparent proxy (`15001/tcp`), the explicit proxy
-(`127.0.0.1:3128`) and the DNS resolver (`53/udp`). It loads the nftables ruleset (TCP to the
+IPv6, and binds three listeners: the transparent proxy (`127.0.0.1:15001/tcp`), the explicit
+proxy (`127.0.0.1:3128/tcp`) and the DNS resolver (`127.0.0.1:53/udp`). It loads the nftables ruleset (TCP to the
 transparent proxy, UDP 53 to the resolver, everything else dropped) and verifies it by dumping it
-back. Then it hands the listener sockets to `sbx run` over a unix socket (`SCM_RIGHTS`) and execs
+back. Then it hands the listener sockets to `sbx run` over a unix socketpair (`SCM_RIGHTS`), waits for
+`sbx run`'s go byte (sent once the proxies and the resolver are serving), and then execs
 unmodified `bwrap` with the policy's mounts, a cleared environment (the policy's
 `env` plus the variables sbx sets), pid, ipc, uts and user isolation, `--disable-userns`, a generated `/etc` and the seccomp
 filter. A setup failure is reported as `sbx __init: <stage>: <reason>`, and the payload never
 starts.
 
 - **DNS.** The resolver answers A queries for allow-listed names with a per-run address from
-  `198.18.0.0/15` (the fake IP) and maps it back to the name for the proxy. AAAA queries get an
-  empty answer, every other name gets NXDOMAIN, nothing is forwarded upstream, and DNS over TCP is
-  not served.
+  `198.18.0.0/15` (the fake IP) and maps it back to the name for the proxy. Other query types for an
+  allowed name (AAAA included) get an empty answer, a name outside the allow list gets NXDOMAIN
+  for every type, nothing is forwarded upstream, and DNS over TCP is not served.
 - **Proxy.** The transparent proxy recovers the dialed fake IP (`SO_ORIGINAL_DST`), maps it to the
   name, and checks the first bytes: the TLS `ClientHello` SNI on port 443 (ECH denied) and the HTTP
   request line and `Host` on port 80. An allowed name is resolved and dialed by sbx under the

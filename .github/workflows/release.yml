@@ -173,6 +173,7 @@ jobs:
           NAME="sbx-$VERSION-$TARGET"
           mkdir -p "dist/$NAME"
           cp "target/$TARGET/release/sbx" LICENSE README.md "dist/$NAME/"
+          cp -r docs "dist/$NAME/"
           # Reproducible tarball: fixed order, owner and mtime (byte-identical
           # for the same inputs and the same tar/gzip versions).
           EPOCH=$(git log -1 --format=%ct)

@@ -42,7 +42,8 @@ failure is a `warn`. Like `landlock`, it is report only: it never limits the
 network mode, so a host that runs plain sandboxes still exits 0.
 `conntrack` (report only) shows the host's conntrack table: the sandbox's NAT redirect needs
 conntrack, and each sandbox network namespace's entries count against `nf_conntrack_max` and use
-host kernel memory. It is `skip` when the table cannot be read.
+host kernel memory. It is `skip` when the conntrack limit cannot be
+read (`nf_conntrack` not loaded, or `/proc/sys/net/netfilter` hidden).
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
@@ -69,7 +70,7 @@ be masked, and one that sits under a bound path or an sbx-generated `/etc` file
 is flagged), `bind-sockets` (a `warn` listing the unix socket files under
 `filesystem.ro` and `filesystem.rw`, outside `filesystem.deny`; see
 [Unix sockets under binds](usage.md#running-commands)), `mount-chains` (the pre-launch
-verification of `run` below, which fails the policy when `run` would refuse),
+verification `run` performs, see [Running commands](usage.md#running-commands), which fails the policy when `run` would refuse),
 `bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
 paths under its binds), `deny-links` (warns when a file under a deny path has a
 hard link outside it), `pin-cost` (warns above 50 directory pins) and

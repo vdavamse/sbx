@@ -51,7 +51,7 @@ Pushing a `vX.Y.Z` tag that matches `Cargo.toml` runs
 `.github/workflows/release.yml`, which publishes:
 
 - **GitHub Release:** `sbx-X.Y.Z-{x86_64,aarch64}-unknown-linux-musl.tar.gz`
-  (the static binary, LICENSE, README), a `.sha256` per tarball, the wheels
+  (the static binary, LICENSE, README and `docs/`), a `.sha256` per tarball, the wheels
   and a combined `SHA256SUMS`. Every tarball and wheel carries a build
   provenance attestation:
   `gh attestation verify sbx-X.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo vdavamse/sbx`.
@@ -82,3 +82,6 @@ CI (`.github/workflows/ci.yml`) runs lint, MSRV, tests, static musl builds
 for x86_64 + aarch64 (with staticness asserts and a smoke run of the built
 binary), and `cargo deny` (advisories / licenses / bans / sources per
 `deny.toml`).
+
+`spikes/` holds standalone experiment packages; they are excluded from the
+Cargo workspace.

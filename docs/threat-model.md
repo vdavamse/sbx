@@ -320,7 +320,7 @@ Notes on the table:
 - `sbx check` reports the host's capabilities and the modes it supports.
 - `sbx check --conformance` runs every offline tier (host, init and lab) against the built-in policies,
   not the caller's policy. The lab tier uses local fixtures. A PASS is a point-in-time result for this
-  host. `--network` adds the network tier (opt-in, needs internet). The README `## Conformance` section
+  host. `--network` adds the network tier (opt-in, needs internet). [Conformance](conformance.md)
   describes what PASS, FAIL, warn and skip mean.
 - `sbx check` reports `ok bwrap <version>` for any bwrap 0.8 or later. On a version before 0.12.0 it
   warns (`bwrap-cve`, for example `bubblewrap 0.9.0 predates 0.12.0`) when the policy has mount
@@ -335,7 +335,7 @@ Notes on the table:
 
 - **Keeping this document true.** `tests/threat_model_doc.rs` runs under `cargo test --locked`. It
   checks that every backticked check id exists in the catalog, that every catalog check is cited in
-  section 6, that each "N checks" statement here and in the README matches the catalog size (trailing
+  section 6, that each "N checks" statement here, in the README and in `docs/conformance.md` matches the catalog size (trailing
   punctuation allowed), that README.md and SECURITY.md link this file, that every `src/` path exists,
   that every `path:identifier` reference (and each bare identifier in a comma-separated list after it)
   names a non-comment occurrence in that file, and that every "module docs point N" names a numbered
