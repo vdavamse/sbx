@@ -5,8 +5,8 @@ added capabilities. The pod runs in its own user namespace (`hostUsers: false`),
 its sandboxes inside it. The example lives in [`examples/kubernetes/`](../examples/kubernetes/),
 and the `kubernetes` CI job runs it on every pull request.
 
-Read it together with the README sections [Host check](../README.md#host-check) and
-[Conformance](../README.md#conformance) and with the [threat model](threat-model.md). Item names
+Read it together with [Host check](host-check.md) and
+[Conformance](conformance.md) and with the [threat model](threat-model.md). Item names
 such as `userns` and `netns-ipv6` are `sbx check` items; row names such as S7 and R5 are rows of
 the threat model.
 
@@ -137,8 +137,8 @@ what `sbx check` reported. Every other setting stayed as in the example.
 | `seccompProfile: Localhost` (the derived profile) | The runtime default profile does not let a process without capabilities create namespaces, mount or `pivot_root`. | With `RuntimeDefault`: `userns` FAIL: `unshare(CLONE_NEWUSER\|CLONE_NEWNET) is blocked by a seccomp filter (EPERM; typical inside containers)`; every probe-derived item was skipped. Network mode `unavailable`, rc 1. |
 | `appArmorProfile: Unconfined` | On nodes with AppArmor, the runtime's default profile applies otherwise (see [AppArmor](#apparmor)). | **Not observable here**: AppArmor was not enabled on the test host, so removing the setting changed nothing (all items ok). In CI on an AppArmor runner the pod without it was still `unconfined` (`/proc/self/attr/current`) and all items were ok, most likely because containerd in the kind node does not detect AppArmor (the node has no securityfs mounted; inferred, not verified), so it applies no default profile; that is not a test of an AppArmor-enforcing node either. |
 
-The fix lines `sbx check` printed for these failures match the README
-[fix hints](../README.md#host-check) table: `procMount: Unmasked` for `netns-ipv6` and `bwrap-run`
+The fix lines `sbx check` printed for these failures match the
+[fix hints](host-check.md) table: `procMount: Unmasked` for `netns-ipv6` and `bwrap-run`
 (both texts come from `PROC_FIX` in `src/host/classify.rs`), and the Localhost seccomp profile for
 `userns` (`U_SECCOMP`). The `bwrap-proc` failure (a masked `/proc`) could not be shown on its own:
 with the default `/proc`, `bwrap-run` fails first and `bwrap-proc` is skipped.
@@ -217,8 +217,8 @@ pod itself holds no capabilities. This is the same surface any host with unprivi
 exposes (threat model section 4, "Host kernel: trusted and shared"; R15, R16). The
 payload does not get these abilities: bwrap runs it with `--disable-userns` and `--cap-drop ALL`
 (S3; checks `C13` and `D10` passed in the pod), and sbx's own filter returns EPERM for `mount`,
-`umount2` and `pivot_root` in the payload (S2, the deny list in the README section
-[Running commands](../README.md#running-commands)). sbx's filter does not filter the namespace flags
+`umount2` and `pivot_root` in the payload (S2, the deny list in
+[Running commands](usage.md#running-commands)). sbx's filter does not filter the namespace flags
 of `clone` and `unshare`; `--disable-userns` and the capability drop refuse them (R16).
 
 Seccomp filters stack: the pod's filter stays in force for every process sbx starts, so the payload
@@ -362,7 +362,7 @@ profile (allowed by `baseline`; not tested by sbx) or a namespace exemption.
 
 ## Network modes in a pod
 
-The modes are the same as on a host (README [Host check](../README.md#host-check), threat model
+The modes are the same as on a host ([Host check](host-check.md), threat model
 section 5). sbx creates its own network namespace inside the pod and loads its nftables rules
 there, so the pod needs no `NET_ADMIN`. The pod's own network namespace is what sbx calls the host
 network: the proxies dial upstreams from it (threat model section 4, "The sbx proxies and
@@ -386,7 +386,7 @@ were not run in a pod. What differs:
 - **`hostAliases` and the pod's `/etc/hosts`.** The sandbox gets a generated `/etc/hosts` with
   only `localhost` and the sandbox hostname (R5, closed; observed in the pod), so the
   kubelet-managed file is not disclosed. The proxy resolves allowed names on the pod side, where
-  `hostAliases` entries apply. Per the README section [Running commands](../README.md#running-commands) (`/etc/hosts`),
+  `hostAliases` entries apply. Per [Running commands](usage.md#running-commands) (`/etc/hosts`),
   such a name works only when it maps to a public address; private, link-local and other
   special-purpose addresses stay denied by the resolved-address guard (S7). Not tested in a pod.
 - **Name resolution uses the pod's resolver.** Allowed names are resolved with the pod's
@@ -404,7 +404,7 @@ were not run in a pod. What differs:
   A node with a public address is therefore not denied (R12): an allowed name that resolves to it
   reaches whatever the node serves on the ports sbx inspects, 443 and 80 (for example an ingress
   controller on the host network). Other ports, such as the kubelet's 10250 or NodePorts, are denied
-  by the port rule (only 443 and 80 are inspected; README [Running commands](../README.md#running-commands)).
+  by the port rule (only 443 and 80 are inspected; [Running commands](usage.md#running-commands)).
 - **Resources.** sbx sets no CPU, memory or pids quotas (R14). The example sets pod requests,
   limits and `emptyDir` size limits; size them for your payloads. Kubernetes has no per-pod pids
   field in the pod spec; the kubelet's `podPidsLimit` setting caps the processes of every pod on a

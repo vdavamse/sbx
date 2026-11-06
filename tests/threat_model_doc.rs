@@ -7,7 +7,7 @@
 //! * every backticked check id in the document exists in the catalog;
 //! * every catalog check is cited in the guarantee table (section 6);
 //! * every "N checks" / "N catalog checks" / "N executable checks" statement in
-//!   the document and the README equals the catalog size (trailing punctuation
+//!   the document, the README and docs/conformance.md equals the catalog size (trailing punctuation
 //!   is ignored);
 //! * every `src/` path cited exists, and every `src/<file>.rs:<identifier>`
 //!   reference (and each bare identifier in a comma-separated list after it)
@@ -269,6 +269,7 @@ fn stated_check_counts_match_the_catalog() {
     for (name, text) in [
         (DOC, read_repo_file(DOC)),
         ("README.md", read_repo_file("README.md")),
+        ("docs/conformance.md", read_repo_file("docs/conformance.md")),
     ] {
         let counts = stated_check_counts(&prose_lines(&text));
         assert!(

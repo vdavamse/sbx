@@ -173,6 +173,7 @@ jobs:
           NAME="sbx-$VERSION-$TARGET"
           mkdir -p "dist/$NAME"
           cp "target/$TARGET/release/sbx" LICENSE README.md "dist/$NAME/"
+          cp -r docs "dist/$NAME/"
           # Reproducible tarball: fixed order, owner and mtime (byte-identical
           # for the same inputs and the same tar/gzip versions).
           EPOCH=$(git log -1 --format=%ct)
@@ -392,7 +393,7 @@ jobs:
           case "$VERSION" in *-*) PRE="--prerelease" ;; esac
           # Issue #17: the shipped binaries are default builds. Say so plainly
           # above the generated notes.
-          NOTES='These binaries are default builds: they pass TLS through and do not include TLS termination (`network.mitm_hosts` and `network.paths` are refused). To terminate TLS for named hosts, build from source with `cargo build --release --features tls-termination` (see the README section "TLS termination (opt-in, build feature)").'
+          NOTES='These binaries are default builds: they pass TLS through and do not include TLS termination (`network.mitm_hosts` and `network.paths` are refused). To terminate TLS for named hosts, build from source with `cargo build --release --features tls-termination` (see docs/tls-termination.md).'
           gh release create "$TAG" --repo "$REPO" --verify-tag $PRE \
             --title "sbx $VERSION" --notes "$NOTES" --generate-notes \
             dist/*.tar.gz dist/*.tar.gz.sha256 dist/*.whl dist/SHA256SUMS
