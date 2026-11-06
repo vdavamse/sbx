@@ -202,6 +202,8 @@ mod tests {
             open_files: None,
             file_bytes: None,
             address_space_bytes: None,
+            memory_bytes: None,
+            pids: None,
         }
     }
 
@@ -214,6 +216,8 @@ mod tests {
     fn from_limits_keeps_the_fixed_order() {
         let l = Limits {
             address_space_bytes: NonZeroU64::new(1 << 30),
+            memory_bytes: None,
+            pids: None,
             processes: NonZeroU64::new(64),
             file_bytes: NonZeroU64::new(1 << 20),
             open_files: NonZeroU64::new(256),

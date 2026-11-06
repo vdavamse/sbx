@@ -521,6 +521,31 @@ processes, tmpfs sizes or the total disk use. See
             "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
 ```
 
+**cgroup limits (issue #43).** `limits.memory_bytes` and `limits.pids` bound
+the whole sandbox, not each process: they become `memory.max` (with
+`memory.swap.max` 0 where swap is accounted) and `pids.max` on a child cgroup
+that holds `__init`, bwrap and every payload process. Over `memory_bytes` the
+kernel OOM-kills a sandboxed process (typically exit 137); past `pids` a fork
+fails with `EAGAIN`. They need a delegated cgroup v2 that sbx runs in alone,
+for example:
+
+```sh
+systemd-run --user --scope -p Delegate=yes sbx run --policy p.json --session-dir s -- make
+```
+
+sbx then moves itself into a leaf (`sbx-supervisor`), enables the `memory` and
+`pids` controllers for its cgroup's children and creates `sbx-sandbox-<pid>`,
+removed after the run. When the cgroup is not delegated, lacks a controller, or
+holds other processes (sbx's own `--keep-alive` launcher excepted), a run with
+either limit is refused (125, `need a delegated cgroup v2`): the limit is never
+dropped silently. With `memory_bytes`, a host where swap is active but not
+accounted for cgroups (`swapaccount=0`) is refused too, since the limit could
+not keep the sandbox out of swap. sbx checks that its cgroup is writable, not
+who manages it: run as root it can restructure any cgroup it sits in alone, so
+give it a dedicated scope (`Delegate=yes`). With
+`--keep-alive`, each run and each attached call gets its own child cgroup, so
+the limits apply per call; an `sbx attach` needs the same delegation.
+
 **Run-level caps (issue #43).** Three more bounds apply to every run, with no
 policy field:
 

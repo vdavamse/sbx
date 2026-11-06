@@ -236,6 +236,97 @@ jobs:
           printf '%s\n' "$OUT" | grep -qx 'vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'packet errno 97' && printf '%s\n' "$OUT" | grep -qx 'hiword errno 97' && printf '%s\n' "$OUT" | grep -qx 'socketpair-vsock errno 97' && printf '%s\n' "$OUT" | grep -qx 'unix ok' && [ "$RC" -eq 0 ] || { echo "FAIL: socket-family filter rc $RC: $OUT"; FAIL=1; }
           exit "$FAIL"
 
+      # Issue #43: cgroup v2 limits (limits.memory_bytes, limits.pids) on the
+      # static musl release binary. The runner has no delegated cgroup for its
+      # user, so the step makes one with sudo (root creates it and hands it to
+      # the runner user, as systemd's Delegate=yes would), then runs sbx ALONE
+      # in it: sbx moves itself into a supervisor leaf, enables memory and pids
+      # for the children, and puts the sandbox in its own child cgroup.
+      - name: "Smoke: cgroup v2 limits (release musl)"
+        run: |
+          set +e
+          FAIL=0
+          BIN="$PWD/target/x86_64-unknown-linux-musl/release/sbx"
+          T=$(mktemp -d)
+          mk_policy() {
+            cat > "$T/$1.json" <<JSON
+          {"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"$3","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"60s","output_bytes":1048576,$2}}
+          JSON
+          }
+          mk_policy mem '"memory_bytes":67108864' none
+          mk_policy pids '"pids":24' none
+          # --keep-alive needs transparent mode (attach too).
+          mk_policy ka '"pids":64' transparent
+          # 1. Fail closed: in the step's own (shared, undelegated) cgroup a set
+          #    limit refuses with 125 and the reason; nothing runs.
+          "$BIN" run --policy "$T/mem.json" --session-dir "$T/s0" -- /usr/bin/true 2> refuse.err
+          RC=$?
+          [ "$RC" -eq 125 ] || { echo "FAIL: undelegated run rc $RC (expected 125)"; cat refuse.err; FAIL=1; }
+          grep -q "need a delegated cgroup v2" refuse.err || { echo "FAIL: refusal text:"; cat refuse.err; FAIL=1; }
+          # 2. One fresh delegated cgroup per run: after a run has enabled
+          #    controllers for its children, a cgroup can no longer take
+          #    processes (no internal processes), so it cannot be reused.
+          CGS=/sys/fs/cgroup/sbx-ci-$$
+          sudo mkdir "$CGS"
+          # The per-run cgroups below are the delegated ones; their parent must
+          # offer them the controllers (as the delegating manager would).
+          echo "+memory +pids" | sudo tee "$CGS/cgroup.subtree_control" > /dev/null
+          # Runs CMD with the calling subshell moved into the fresh cgroup $1
+          # first, so sbx is the only process there once it execs. A failed
+          # move stops the subshell (it must not run sbx elsewhere).
+          in_cg() {
+            local cg="$CGS/$1"; shift
+            sudo mkdir "$cg" && sudo chown -R "$(id -u):$(id -g)" "$cg" || return 1
+            # $BASHPID is read before the pipe: inside the pipeline it would be
+            # the short-lived echo subshell's pid (ESRCH on the move).
+            ( me=$BASHPID; echo "$me" | sudo tee "$cg/cgroup.procs" > /dev/null || exit 99; exec "$@" )
+          }
+          cat "$CGS/cgroup.controllers"
+          # memory: a 256 MiB allocation under a 64 MiB limit is OOM-killed.
+          in_cg mem "$BIN" run --policy "$T/mem.json" --session-dir "$T/s1" -- \
+            /usr/bin/python3 -c 'b = bytearray(256 << 20); b[::4096] = b"x" * len(b[::4096]); print("allocated")' > mem.out 2> mem.err
+          RC=$?
+          [ "$RC" -eq 137 ] || { echo "FAIL: memory limit rc $RC (expected 137, OOM SIGKILL)"; cat mem.out mem.err; FAIL=1; }
+          grep -q allocated mem.out && { echo "FAIL: the allocation succeeded"; FAIL=1; }
+          # pids: forking stops below the 24-task limit (bwrap and the payload
+          # already hold some), and the run itself still ends normally.
+          in_cg pids "$BIN" run --policy "$T/pids.json" --session-dir "$T/s2" -- \
+            /usr/bin/python3 -c '
+          import os, time
+          n = 0
+          try:
+              while n < 200:
+                  if os.fork() == 0:
+                      time.sleep(30); os._exit(0)
+                  n += 1
+          except OSError as e:
+              print("forked", n, "then", e.errno)
+          ' > pids.out 2> pids.err
+          RC=$?
+          cat pids.out
+          N=$(sed -n 's/^forked \([0-9]*\) then 11$/\1/p' pids.out)
+          [ -n "$N" ] && [ "$N" -lt 24 ] || { echo "FAIL: pids limit: rc $RC"; cat pids.out pids.err; FAIL=1; }
+          # --keep-alive: the holder (with its launcher) runs in its own
+          # delegated cgroup, an attach call in another (each call gets its own
+          # child cgroup, spawned from inside it), then stop.
+          in_cg ka "$BIN" run --keep-alive --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sleep 300 > ka.out 2> ka.err
+          RC=$?
+          { [ "$RC" -eq 0 ] && [ ! -s ka.err ]; } || { echo "FAIL: keep-alive start rc $RC (or stderr not empty)"; cat ka.out ka.err; FAIL=1; }
+          in_cg kacall "$BIN" attach --policy "$T/ka.json" --session-dir "$T/s3" -- /usr/bin/sh -c 'echo attached' > att.out 2> att.err
+          RC=$?
+          { [ "$RC" -eq 0 ] && grep -qx attached att.out; } || { echo "FAIL: attach rc $RC"; cat att.out att.err; FAIL=1; }
+          "$BIN" stop --session-dir "$T/s3" || { echo "FAIL: stop rc $?"; FAIL=1; }
+          # The holder may linger a moment after answering stop.
+          # (cgroupfs files report size 0, so test the content, not -s.)
+          for _ in $(seq 1 50); do [ -n "$(cat "$CGS/ka/sbx-supervisor/cgroup.procs" 2>/dev/null)" ] || break; sleep 0.1; done
+          # The sandbox child cgroup is removed after each run.
+          ls "$CGS"/*
+          ls -d "$CGS"/*/sbx-sandbox-* 2>/dev/null && { echo "FAIL: sandbox cgroup left behind"; FAIL=1; }
+          # Cleanup: leaves first (the supervisor leaves are empty once sbx
+          # exited), then the per-run cgroups, then the parent.
+          for d in "$CGS"/*/sbx-supervisor "$CGS"/*/ "$CGS"; do sudo rmdir "$d" 2>/dev/null; done
+          exit "$FAIL"
+
       # Issue #19: the Landlock layer on the static musl release binary.
       # The runner's Landlock ABI is printed so a skipped layer is visible in the
       # log. The payload must see `mkdir` at `/` fail under the layer (EACCES),

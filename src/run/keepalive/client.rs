@@ -284,7 +284,10 @@ fn run_call(
         None => None,
     };
     let (stdin, stdin_piped) = stdin_mode();
-    let child = join_command(
+    // Issue #43: the call's cgroup limits. The join execs bwrap at once (no go
+    // byte), so sbx spawns from inside the child cgroup (`spawn_inside`).
+    let limits_cgroup = crate::run::cgroup_for(policy)?;
+    let mut command = join_command(
         JoinFds {
             user: user_fd,
             net: net_fd,
@@ -299,9 +302,31 @@ fn run_call(
         &crate::init::rlimit::from_limits(&policy.limits),
         &launch,
         stdin,
-    )
-    .spawn()
-    .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    );
+    let spawned = match &limits_cgroup {
+        None => command.spawn(),
+        Some(cg) => {
+            let (spawned, back) = cg
+                .spawn_inside(|| command.spawn())
+                .map_err(|err| RunError::new(err.to_string()))?;
+            match (spawned, back) {
+                (Ok(mut child), Err(err)) => {
+                    // sbx stayed in the sandbox cgroup: refuse rather than
+                    // supervise from inside the limited cgroup.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RunError::new(err.to_string()).into());
+                }
+                // Both failed: the stuck-in-the-cgroup error is the one to
+                // report (the spawn error is secondary).
+                (Err(_), Err(err)) => return Err(RunError::new(err.to_string()).into()),
+                (spawned, Ok(())) => spawned,
+            }
+        }
+    };
+    let child = spawned.map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    // `limits_cgroup` drops (and removes the child cgroup) at the end of the
+    // call, after teardown; early returns remove it too.
     drop(info_write);
     drop(seccomp_memfd);
     drop(user_ns);
@@ -317,8 +342,16 @@ fn run_call(
     };
     drop(status_write);
 
-    let child_pidfd = sys::pidfd_open(child.id() as libc::pid_t)
-        .map_err(|err| RunError::new(format!("cannot watch sbx __init: {err}")))?;
+    let mut child = child;
+    let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {
+        Ok(fd) => fd,
+        Err(err) => {
+            // Kill and reap before returning, so the call's cgroup can go.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunError::new(format!("cannot watch sbx __init: {err}")).into());
+        }
+    };
     let mut sb = Sandbox {
         bwrap_pid: child.id() as libc::pid_t,
         child,
@@ -330,14 +363,28 @@ fn run_call(
         // The join has no go byte; teardown treats the child as launched.
         go_sent: true,
     };
-    let pumps = Pumps::start(
+    let kill_reap = |sb: &mut Sandbox| {
+        let _ = sb.child.kill();
+        let _ = sb.child.wait();
+    };
+    let pumps = match Pumps::start(
         &mut sb.child,
         OutputBudget::new(policy.limits.output_bytes),
         stdin_piped,
-    )
-    .map_err(|err| RunError::new(format!("cannot start the stdio pumps: {err}")))?;
-    let latch = FaultLatch::new()
-        .map_err(|err| RunError::new(format!("cannot create the fault latch: {err}")))?;
+    ) {
+        Ok(pumps) => pumps,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot start the stdio pumps: {err}")).into());
+        }
+    };
+    let latch = match FaultLatch::new() {
+        Ok(latch) => latch,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot create the fault latch: {err}")).into());
+        }
+    };
     let mut watch = HolderWatch {
         pidfd: holder_pidfd,
     };
