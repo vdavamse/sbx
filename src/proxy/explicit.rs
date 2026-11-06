@@ -41,7 +41,10 @@
 //!    `//host/path` is origin-form (no scheme) and is forwarded as-is.
 //! 9. **Tunnel residuals** — bytes pipelined after the CONNECT head are
 //!    chained into the inspector ([`finish_residual`] appends whatever the
-//!    inspector did not reach). What the upstream receives: on 443 the
+//!    inspector did not reach). For a terminated host on 443 (issue #17,
+//!    `crate::proxy` module docs point 14) that replay goes to the terminator
+//!    instead, which forwards only the declared body and drops anything
+//!    pipelined after it. What the upstream receives: on 443 the
 //!    client's bytes verbatim (CH1 plus any pipelined tail, in order); on 80
 //!    the inspected request head with the `Connection: close` rewrite
 //!    (module docs point 6 of `http`), then the rest verbatim; on forward
@@ -68,8 +71,8 @@ use tokio::net::TcpStream;
 use super::http::{self, Framing, HeadCheck};
 use super::relay::linger_close;
 use super::{
-    Connected, Decision, ExplicitKind, Failed, Limits, NameSource, Proxy, Rejected, RelayMode,
-    Verdict, Via, connect_upstream, hello, redact_for_audit,
+    Connected, Decision, ExplicitKind, Failed, Handoff, Limits, NameSource, Proxy, Rejected,
+    RelayMode, Terminator, Verdict, Via, connect_upstream, hello, redact_for_audit,
 };
 use crate::egress;
 use crate::policy::Domain;
@@ -121,7 +124,10 @@ pub(crate) fn explicit_response(verdict: &Verdict, tunnel_open: bool) -> Option<
             | Rejected::HostMismatch { .. }
             | Rejected::HostPortMismatch { .. }
             | Rejected::TargetMismatch { .. }
-            | Rejected::DialDenied { .. } => Some(RESPONSE_403),
+            | Rejected::DialDenied { .. }
+            | Rejected::PathNotAllowed { .. }
+            | Rejected::MitmPlainHttp { .. }
+            | Rejected::TerminationUnavailable { .. } => Some(RESPONSE_403),
             Rejected::HeadTooLarge { .. }
             | Rejected::HttpMalformed { .. }
             | Rejected::Http2Preface
@@ -138,18 +144,21 @@ pub(crate) fn explicit_response(verdict: &Verdict, tunnel_open: bool) -> Option<
             | Rejected::AmbiguousFraming { .. }
             | Rejected::NotTls { .. }
             | Rejected::HelloTooLarge { .. }
-            | Rejected::HelloMalformed { .. } => Some(RESPONSE_400),
+            | Rejected::HelloMalformed { .. }
+            | Rejected::UnsupportedRequest { .. } => Some(RESPONSE_400),
             // ConnLimit (#43): refused at accept and closed unread; no head
             // was read, so no HTTP status is owed.
             Rejected::OriginalDst { .. }
             | Rejected::Eof
             | Rejected::DecisionTimeout { .. }
-            | Rejected::ConnLimit { .. } => None,
+            | Rejected::ConnLimit { .. }
+            | Rejected::TlsClientHandshake { .. } => None,
         },
         Verdict::Error(failed) => match failed {
-            Failed::Resolve { .. } | Failed::EmptyResolve { .. } | Failed::Connect { .. } => {
-                Some(RESPONSE_502)
-            }
+            Failed::Resolve { .. }
+            | Failed::EmptyResolve { .. }
+            | Failed::Connect { .. }
+            | Failed::UpstreamTls { .. } => Some(RESPONSE_502),
             Failed::ConnectTimeout { .. } => Some(RESPONSE_504),
         },
     }
@@ -451,6 +460,24 @@ fn reparse_head<'h, 'b>(
     }
 }
 
+/// What [`decide_explicit_step`] hands back: a decided connection, or (issue
+/// #17) a CONNECT to a terminated host whose inspected ClientHello the
+/// terminator takes over (the `200` has already been written).
+pub(crate) enum ExplicitStep {
+    Decided(ExplicitDecided),
+    Terminate {
+        handoff: Handoff,
+        terminator: Arc<Terminator>,
+    },
+}
+
+/// Result of scope A's protocol inspection (issue #17): the ordinary relay
+/// state, or the terminated-host handoff.
+enum Pre {
+    Relay(Vec<u8>, RelayMode),
+    Terminate(Handoff),
+}
+
 /// What [`decide_explicit`] hands back to the connection handler.
 pub(crate) struct ExplicitDecided {
     pub decision: Decision,
@@ -504,7 +531,7 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     proxy: &Proxy,
     st: &mut Progress,
-) -> Result<(Vec<u8>, RelayMode), Rejected> {
+) -> Result<Pre, Rejected> {
     let limits: &Limits = &proxy.limits;
     let mut head = http::read_head(client, limits).await?;
     let req = match parse_proxy_request(&head.buf, head.head_end, limits.max_http_headers) {
@@ -536,6 +563,20 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
             name: req.host.clone(),
         });
     }
+    // 3b. Terminated hosts (issue #17, crate::proxy module docs point 14): plain HTTP is
+    //     denied, and a 443 terminated host without a terminator is refused.
+    //     Both checks run BEFORE the `200`, so the client gets a real 403.
+    let terminated = proxy.mitm.hosts.contains(&req.host);
+    if terminated && req.port == 80 {
+        return Err(Rejected::MitmPlainHttp {
+            name: req.host.clone(),
+        });
+    }
+    if terminated && proxy.mitm.terminator.is_none() {
+        return Err(Rejected::TerminationUnavailable {
+            name: req.host.clone(),
+        });
+    }
     // 4. Head checks (Host, framing, CONNECT body).
     check_proxy_head(&head.buf[..head.head_end], &req, limits.max_http_headers)?;
 
@@ -544,7 +585,7 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
             let mut replay =
                 rewrite_forward_head(&head.buf[..head.head_end], &req, limits.max_http_headers)?;
             replay.extend_from_slice(&head.buf[head.head_end..]);
-            Ok((replay, RelayMode::CloseOnUpstreamEof))
+            Ok(Pre::Relay(replay, RelayMode::CloseOnUpstreamEof))
         }
         // Fail closed BEFORE any `200`: parse_proxy_request never yields
         // Unknown on success, so this arm is only a backstop.
@@ -562,6 +603,22 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
             //    is chained in front of the client stream.
             let residual = head.buf.split_off(head.head_end);
             let mut chained = (&residual[..]).chain(&mut *client);
+            if terminated && req.port == 443 {
+                // Issue #17: the ClientHello (SNI verified against the
+                // CONNECT host) plus the residual is the terminator's replay.
+                let inspected = hello::inspect_tls_from(
+                    &mut chained,
+                    &req.host,
+                    NameSource::ConnectTarget,
+                    limits,
+                )
+                .await?;
+                let replay = finish_residual(inspected, chained);
+                return Ok(Pre::Terminate(Handoff {
+                    replay,
+                    name: req.host.clone(),
+                }));
+            }
             let (inspected, mode) = if req.port == 443 {
                 let replay = hello::inspect_tls_from(
                     &mut chained,
@@ -584,7 +641,7 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
                 let replay = http::inspect_http_with(&mut chained, &check, limits).await?;
                 (replay, RelayMode::CloseOnUpstreamEof)
             };
-            Ok((finish_residual(inspected, chained), mode))
+            Ok(Pre::Relay(finish_residual(inspected, chained), mode))
         }
     }
 }
@@ -606,11 +663,13 @@ fn finish_residual<S: AsyncRead + Unpin>(
 
 /// The explicit pipeline (issue #8, Q7): scope A, then scope B (the dial).
 /// Generic over the client stream so unit tests drive it over duplex.
-pub(crate) async fn decide_explicit<S: AsyncRead + AsyncWrite + Unpin>(
+/// A terminated host (issue #17) returns [`ExplicitStep::Terminate`] instead
+/// of dialing; the caller hands the owned client to the terminator.
+pub(crate) async fn decide_explicit_step<S: AsyncRead + AsyncWrite + Unpin>(
     client: &mut S,
     client_addr: SocketAddr,
     proxy: &Proxy,
-) -> ExplicitDecided {
+) -> ExplicitStep {
     let mut st = Progress {
         kind: ExplicitKind::Unknown,
         port: None,
@@ -620,23 +679,38 @@ pub(crate) async fn decide_explicit<S: AsyncRead + AsyncWrite + Unpin>(
     let budget = proxy.limits.decision_timeout;
     let pre = match tokio::time::timeout(budget, pre_connect(client, proxy, &mut st)).await {
         Ok(Ok(pre)) => pre,
-        Ok(Err(rejected)) => return st.deny(client_addr, rejected),
+        Ok(Err(rejected)) => return ExplicitStep::Decided(st.deny(client_addr, rejected)),
         Err(_elapsed) => {
-            return st.deny(
+            return ExplicitStep::Decided(st.deny(
                 client_addr,
                 Rejected::DecisionTimeout {
                     secs: budget.as_secs(),
                 },
-            );
+            ));
         }
     };
-    let (replay, mode) = pre;
+    let (replay, mode) = match pre {
+        Pre::Relay(replay, mode) => (replay, mode),
+        Pre::Terminate(handoff) => {
+            return match proxy.mitm.terminator.clone() {
+                Some(terminator) => ExplicitStep::Terminate {
+                    handoff,
+                    terminator,
+                },
+                // Unreachable (checked before the 200); fail closed anyway.
+                None => ExplicitStep::Decided(st.deny(
+                    client_addr,
+                    Rejected::TerminationUnavailable { name: handoff.name },
+                )),
+            };
+        }
+    };
     let (Some(name), Some(port)) = (st.name.clone(), st.port) else {
         // Unreachable: pre_connect sets both before any success return.
-        return st.deny(client_addr, Rejected::NotProxyRequest);
+        return ExplicitStep::Decided(st.deny(client_addr, Rejected::NotProxyRequest));
     };
     // Scope B — the dial, outside scope A's timeout (the scopes never nest).
-    match connect_upstream(proxy, &name, port).await {
+    ExplicitStep::Decided(match connect_upstream(proxy, &name, port).await {
         Ok(connected) => ExplicitDecided {
             decision: st.decision(
                 client_addr,
@@ -657,6 +731,23 @@ pub(crate) async fn decide_explicit<S: AsyncRead + AsyncWrite + Unpin>(
             tunnel_open: st.tunnel_open,
             relay: None,
         },
+    })
+}
+
+/// The test-facing explicit pipeline: [`decide_explicit_step`] for every
+/// input that does not terminate. A terminated host panics here (its
+/// outcome is owned by the terminator).
+#[cfg(test)]
+pub(crate) async fn decide_explicit<S: AsyncRead + AsyncWrite + Unpin>(
+    client: &mut S,
+    client_addr: SocketAddr,
+    proxy: &Proxy,
+) -> ExplicitDecided {
+    match decide_explicit_step(client, client_addr, proxy).await {
+        ExplicitStep::Decided(decided) => decided,
+        ExplicitStep::Terminate { .. } => {
+            panic!("terminated host reached the passthrough test seam")
+        }
     }
 }
 
@@ -670,11 +761,34 @@ pub(crate) async fn handle_explicit_connection(
 ) {
     // Proxy-standard; failure ignored (same policy as the transparent path).
     let _ = client.set_nodelay(true);
+    let decided = match decide_explicit_step(&mut client, client_addr, &proxy).await {
+        ExplicitStep::Decided(decided) => decided,
+        ExplicitStep::Terminate {
+            handoff,
+            terminator,
+        } => {
+            // Issue #17: the tunnel is open; the terminator answers and
+            // records the connection's one decision (Via CONNECT :443).
+            let name = handoff.name.clone();
+            terminator
+                .terminate(client, handoff, &proxy, move |verdict| Decision {
+                    client: client_addr,
+                    via: Via::Explicit {
+                        kind: ExplicitKind::Connect,
+                        port: Some(super::TLS_PORT),
+                    },
+                    name: Some(name.clone()),
+                    verdict,
+                })
+                .await;
+            return;
+        }
+    };
     let ExplicitDecided {
         decision,
         tunnel_open,
         relay,
-    } = decide_explicit(&mut client, client_addr, &proxy).await;
+    } = decided;
     proxy.sink.record(&decision);
     match relay {
         Some(ExplicitRelay {
@@ -790,6 +904,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
             ports: vec![443, 80, 8080, 22],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let sink: Arc<dyn DecisionSink> = Arc::new(Sink::default());
         let proxy = Proxy::new(&network, Arc::new(NoDns), sink, connector, limits);
@@ -1140,6 +1256,8 @@ mod tests {
                 mode: policy::NetworkMode::Transparent,
                 allow: vec![rule("allowed.test")],
                 ports: vec![443],
+                mitm_hosts: Vec::new(),
+                paths: Vec::new(),
             };
             let sink = Arc::new(ClosedSink::default());
             let proxy = Proxy::new(&network, Arc::new(NoNames), sink.clone(), connector, limits);
@@ -1224,6 +1342,8 @@ mod tests {
                 mode: policy::NetworkMode::Transparent,
                 allow: vec![rule("allowed.test")],
                 ports: vec![443],
+                mitm_hosts: Vec::new(),
+                paths: Vec::new(),
             };
             let sink = Arc::new(ClosedSink::default());
             let proxy = Proxy::new(&network, Arc::new(NoNames), sink.clone(), connector, limits);
@@ -1827,6 +1947,8 @@ mod tests {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
             ports: vec![443, 80, 8080, 22],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
         };
         let sink: Arc<dyn DecisionSink> = Arc::new(Sink::default());
         Proxy::new(&network, Arc::new(NoDns), sink, connector, limits)
@@ -2057,5 +2179,173 @@ mod tests {
             let replay = finish_residual(head.buf, chained);
             assert_eq!(replay, residual, "the replay is the residual, in order");
         });
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    use super::*;
+    use crate::policy;
+    use crate::proxy::hello::build_client_hello;
+    use crate::proxy::{
+        ConnectError, Connected, Connector, DecisionSink, DnsMap, Limits, Proxy, Rejected,
+    };
+
+    const CLIENT: &str = "192.0.2.10:40000";
+
+    fn dom(raw: &str) -> Domain {
+        Domain::parse(raw).expect("fixture name")
+    }
+
+    struct NoMap;
+
+    impl DnsMap for NoMap {
+        fn name_for(&self, _ip: std::net::Ipv4Addr) -> Option<Domain> {
+            None
+        }
+    }
+
+    struct NullSink;
+
+    impl DecisionSink for NullSink {
+        fn record(&self, _decision: &Decision) {}
+    }
+
+    /// Any dial is a test failure: a terminated host must never reach it
+    /// before its request was checked.
+    struct NoDial;
+
+    impl Connector for NoDial {
+        fn connect(
+            &self,
+            _name: &Domain,
+            _port: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Connected, ConnectError>> + Send + '_>> {
+            Box::pin(async {
+                Err(ConnectError::Connect {
+                    detail: "dial reached in a termination test".to_owned(),
+                })
+            })
+        }
+    }
+
+    fn proxy(terminator: Option<Arc<Terminator>>) -> Arc<Proxy> {
+        let network = policy::Network {
+            mode: policy::NetworkMode::Explicit,
+            allow: vec![crate::policy::DomainRule::parse("allowed.test").expect("rule")],
+            ports: vec![443, 80],
+            mitm_hosts: vec![dom("allowed.test")],
+            paths: vec![policy::UrlPrefix::parse("https://allowed.test/v1/").expect("rule")],
+        };
+        let mut proxy = Proxy::new(
+            &network,
+            Arc::new(NoMap),
+            Arc::new(NullSink),
+            Arc::new(NoDial),
+            Limits::default(),
+        );
+        Arc::get_mut(&mut proxy)
+            .expect("sole owner")
+            .mitm
+            .terminator = terminator;
+        proxy
+    }
+
+    /// Run the explicit scope over a duplex: the client sends `bytes`; returns
+    /// the step and everything the proxy wrote back before the duplex closed.
+    fn step(proxy: &Proxy, bytes: &[u8]) -> (ExplicitStep, Vec<u8>) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (mut server, mut peer) = duplex(64 * 1024);
+                peer.write_all(bytes).await.expect("client write");
+                let client_addr: SocketAddr = CLIENT.parse().expect("client");
+                let step = decide_explicit_step(&mut server, client_addr, proxy).await;
+                drop(server);
+                let mut written = Vec::new();
+                peer.read_to_end(&mut written).await.expect("client read");
+                (step, written)
+            })
+    }
+
+    fn connect(target: &str) -> Vec<u8> {
+        format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").into_bytes()
+    }
+
+    #[test]
+    fn connect_to_a_terminated_host_on_port_80_is_403_before_the_200() {
+        let (step, written) = step(&proxy(None), &connect("allowed.test:80"));
+        let ExplicitStep::Decided(decided) = step else {
+            panic!("a plain-HTTP request to a terminated host must not hand off");
+        };
+        assert!(!decided.tunnel_open);
+        assert!(matches!(
+            decided.decision.verdict,
+            Verdict::Denied(Rejected::MitmPlainHttp { .. })
+        ));
+        assert_eq!(
+            explicit_response(&decided.decision.verdict, decided.tunnel_open),
+            Some(RESPONSE_403)
+        );
+        assert!(written.is_empty(), "no 200 before the refusal");
+    }
+
+    #[test]
+    fn connect_to_a_terminated_host_without_a_terminator_is_refused_before_the_200() {
+        let hello = build_client_hello(Some("allowed.test"), &[]);
+        let mut bytes = connect("allowed.test:443");
+        bytes.extend_from_slice(&hello);
+        let (step, written) = step(&proxy(None), &bytes);
+        let ExplicitStep::Decided(decided) = step else {
+            panic!("no terminator: the connection must be decided, not handed off");
+        };
+        assert!(matches!(
+            decided.decision.verdict,
+            Verdict::Denied(Rejected::TerminationUnavailable { .. })
+        ));
+        assert!(!decided.tunnel_open);
+        assert!(written.is_empty(), "no 200 for a refused terminated host");
+    }
+
+    #[cfg(feature = "tls-termination")]
+    #[test]
+    fn connect_to_a_terminated_host_writes_the_200_then_hands_off() {
+        use std::time::Duration;
+
+        // Issue #17: the tunnel opens (200), the ClientHello is inspected, and
+        // the terminator receives the replay. The dial is never attempted here.
+        let term = Arc::new(
+            crate::tls::Terminator::new(
+                crate::tls::RunCa::generate(&[dom("allowed.test")], Duration::from_secs(60))
+                    .expect("CA"),
+            )
+            .expect("terminator"),
+        );
+        let hello = build_client_hello(Some("allowed.test"), &[]);
+        let mut bytes = connect("allowed.test:443");
+        bytes.extend_from_slice(&hello);
+        let (step, written) = step(&proxy(Some(term)), &bytes);
+        match step {
+            ExplicitStep::Terminate { handoff, .. } => {
+                assert_eq!(handoff.name.as_str(), "allowed.test");
+                assert_eq!(handoff.replay, hello);
+            }
+            ExplicitStep::Decided(decided) => {
+                panic!("expected a handoff: {:?}", decided.decision)
+            }
+        }
+        assert!(
+            written.starts_with(b"HTTP/1.1 200"),
+            "the tunnel is opened before the TLS handshake"
+        );
     }
 }

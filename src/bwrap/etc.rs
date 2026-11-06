@@ -120,7 +120,22 @@ pub struct SessionLayout {
     pub passwd: PathBuf,
     /// `<session>/etc/group` — generated, content [`GROUP_CONTENT`].
     pub group: PathBuf,
+    /// `<session>/etc/sbx-ca.pem` — the per-run CA certificate (issue #17).
+    /// Written by [`SessionLayout::write_termination_files`] only when the
+    /// policy names `network.mitm_hosts`; bound to [`DEST_CA_CERT`].
+    pub ca_cert: PathBuf,
+    /// `<session>/etc/sbx-ca-bundle.pem` — host trust roots + the per-run CA
+    /// (issue #17). Bound to [`DEST_CA_BUNDLE`].
+    pub ca_bundle: PathBuf,
 }
+
+/// Sandbox-side path of the per-run CA certificate (issue #17, D4). Only the
+/// certificate is ever mounted here; the CA key never reaches the sandbox.
+pub const DEST_CA_CERT: &str = "/etc/sbx/ca.pem";
+
+/// Sandbox-side path of the trust bundle (host roots + the per-run CA),
+/// issue #17, D4. Read by SSL_CERT_FILE and its siblings.
+pub const DEST_CA_BUNDLE: &str = "/etc/sbx/ca-bundle.pem";
 
 /// Compute the layout for `session_dir` — pure joins (module docs point 2);
 /// nothing is created or validated. `session_dir` absoluteness is
@@ -135,6 +150,8 @@ pub fn session_layout(session_dir: &Path) -> SessionLayout {
         hosts: etc_dir.join("hosts"),
         passwd: etc_dir.join("passwd"),
         group: etc_dir.join("group"),
+        ca_cert: etc_dir.join("sbx-ca.pem"),
+        ca_bundle: etc_dir.join("sbx-ca-bundle.pem"),
         etc_dir,
         session_dir: session_dir.to_path_buf(),
     }
@@ -250,6 +267,20 @@ impl SessionLayout {
             write_synthetic_file(path, content)?;
         }
         Ok(())
+    }
+
+    /// Write the per-run trust files into `etc/` (issue #17, D4): the CA
+    /// certificate alone and the trust bundle. Both are public material;
+    /// the same hardened writer as the synthetic `/etc` files. Callers pass
+    /// PEM text only, never a key. Must run after [`Self::materialize`].
+    pub fn write_termination_files(
+        &self,
+        ca_cert_pem: &str,
+        bundle_pem: &str,
+    ) -> std::io::Result<()> {
+        check_private_dir(&self.etc_dir)?;
+        write_synthetic_file(&self.ca_cert, ca_cert_pem)?;
+        write_synthetic_file(&self.ca_bundle, bundle_pem)
     }
 }
 
@@ -376,6 +407,52 @@ mod tests {
     }
 
     #[test]
+    fn termination_files_hold_only_public_material() {
+        // Key custody (issue #17): the session directory receives the CA
+        // certificate and the bundle, and nothing that looks like a key.
+        let dir = scratch("termination-files");
+        let layout = session_layout(&dir);
+        layout.materialize().expect("materialize");
+        let cert = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let bundle = "ROOTS\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        layout
+            .write_termination_files(cert, bundle)
+            .expect("write termination files");
+        assert_eq!(
+            std::fs::read_to_string(&layout.ca_cert).expect("cert"),
+            cert
+        );
+        assert_eq!(
+            std::fs::read_to_string(&layout.ca_bundle).expect("bundle"),
+            bundle
+        );
+        assert_eq!(mode_of(&layout.ca_cert), FILE_MODE);
+
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable session dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&dir, &mut files);
+        assert!(files.len() >= 5, "layout + termination files: {files:?}");
+        for file in files {
+            let text = std::fs::read(&file).expect("file");
+            assert!(
+                !text.windows(11).any(|w| w == b"PRIVATE KEY"),
+                "{} carries key material",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_layout_is_pure_joins() {
         let layout = session_layout(Path::new("/tmp/s"));
         assert_eq!(layout.session_dir, Path::new("/tmp/s"));
@@ -387,6 +464,8 @@ mod tests {
         assert_eq!(layout.hosts, Path::new("/tmp/s/etc/hosts"));
         assert_eq!(layout.passwd, Path::new("/tmp/s/etc/passwd"));
         assert_eq!(layout.group, Path::new("/tmp/s/etc/group"));
+        assert_eq!(layout.ca_cert, Path::new("/tmp/s/etc/sbx-ca.pem"));
+        assert_eq!(layout.ca_bundle, Path::new("/tmp/s/etc/sbx-ca-bundle.pem"));
         // Pure: computing a layout creates nothing.
         let absent = session_layout(Path::new("/nonexistent/sbx-etc-layout-test"));
         assert!(

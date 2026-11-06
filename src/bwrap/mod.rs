@@ -1236,3 +1236,128 @@ mod tests {
         assert_eq!(boxed.to_string(), "x");
     }
 }
+
+#[cfg(test)]
+mod termination_argv_tests {
+    use super::*;
+
+    /// A plain transparent policy; the termination fields are set on the
+    /// struct below, because validation (correctly) refuses them in the
+    /// default build. The argv builder itself has no such gate.
+    const PLAIN: &str = r#"{
+      "version": 1,
+      "filesystem": { "ro": [], "rw": [], "deny": [] },
+      "network": { "mode": "transparent", "allow": ["api.example.com"], "ports": [443] },
+      "env": { "pass": [], "set": {} },
+      "limits": { "timeout": "60s", "output_bytes": 1024 }
+    }"#;
+
+    fn terminating() -> Policy {
+        let mut policy = Policy::from_json_str(PLAIN).expect("fixture");
+        policy
+            .network
+            .mitm_hosts
+            .push(crate::policy::Domain::parse("api.example.com").expect("name"));
+        policy
+            .network
+            .paths
+            .push(crate::policy::UrlPrefix::parse("https://api.example.com/v1/").expect("rule"));
+        policy
+    }
+
+    fn argv_of(policy: &Policy) -> Vec<String> {
+        let env = BTreeMap::new();
+        let command = vec![OsString::from("/bin/true")];
+        let input = Build {
+            policy,
+            session_dir: Path::new("/tmp/sbx-termination-session"),
+            bwrap_path: Path::new("/usr/bin/bwrap"),
+            command: &command,
+            cwd: None,
+            passed_env: &env,
+            info_fd: None,
+            seccomp_fd: 10,
+            landlock: None,
+            deny_tmpfs_size: None,
+        };
+        build(&input)
+            .expect("valid input")
+            .argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn has_run(argv: &[String], run: &[&str]) -> bool {
+        argv.windows(run.len())
+            .any(|window| window.iter().map(String::as_str).eq(run.iter().copied()))
+    }
+
+    #[test]
+    fn trust_mounts_and_env_only_appear_when_hosts_are_terminated() {
+        let plain = argv_of(&Policy::from_json_str(PLAIN).expect("fixture"));
+        assert!(!plain.iter().any(|arg| arg.contains("sbx-ca")));
+        assert!(!plain.iter().any(|arg| arg == "SSL_CERT_FILE"));
+
+        let argv = argv_of(&terminating());
+        // The certificate and the bundle, read-only, at fixed sandbox paths.
+        assert!(has_run(
+            &argv,
+            &[
+                "--ro-bind",
+                "/tmp/sbx-termination-session/etc/sbx-ca.pem",
+                "/etc/sbx/ca.pem"
+            ]
+        ));
+        assert!(has_run(
+            &argv,
+            &[
+                "--ro-bind",
+                "/tmp/sbx-termination-session/etc/sbx-ca-bundle.pem",
+                "/etc/sbx/ca-bundle.pem"
+            ]
+        ));
+        for (name, value) in [
+            ("SSL_CERT_FILE", "/etc/sbx/ca-bundle.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/sbx/ca-bundle.pem"),
+            ("CURL_CA_BUNDLE", "/etc/sbx/ca-bundle.pem"),
+            ("GIT_SSL_CAINFO", "/etc/sbx/ca-bundle.pem"),
+            ("CARGO_HTTP_CAINFO", "/etc/sbx/ca-bundle.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/sbx/ca.pem"),
+        ] {
+            assert!(has_run(&argv, &["--setenv", name, value]), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_ca_key_is_never_in_argv_or_env() {
+        // Key custody (issue #17): nothing the launcher emits names a key or
+        // carries key material. Only the certificate paths and bundle appear.
+        let argv = argv_of(&terminating());
+        for arg in &argv {
+            assert!(!arg.contains("PRIVATE KEY"), "{arg}");
+            assert!(!arg.contains(".key"), "{arg}");
+        }
+    }
+
+    #[test]
+    fn trust_env_is_emitted_after_policy_env_so_policy_cannot_override_it() {
+        let mut policy = terminating();
+        policy
+            .env
+            .set
+            .insert("SSL_CERT_FILE".to_owned(), "/attacker/roots.pem".to_owned());
+        let argv = argv_of(&policy);
+        let position = |value: &str| {
+            argv.windows(3).rposition(|window| {
+                window[0] == "--setenv" && window[1] == "SSL_CERT_FILE" && window[2] == value
+            })
+        };
+        let policy_at = position("/attacker/roots.pem").expect("policy entry emitted");
+        let trust_at = position("/etc/sbx/ca-bundle.pem").expect("trust entry emitted");
+        assert!(
+            trust_at > policy_at,
+            "the trust value must come last (last --setenv wins)"
+        );
+    }
+}

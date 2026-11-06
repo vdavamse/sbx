@@ -48,6 +48,8 @@ use std::time::Duration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema, schema_for};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::egress;
+
 /// The policy schema version this sbx build accepts.
 ///
 /// The JSON Schema deliberately renders `version` as a loose integer so the
@@ -513,7 +515,9 @@ pub struct Filesystem {
 ///
 /// `mode` states the minimum isolation this policy accepts; `allow` and
 /// `ports` form the egress allow-list — destinations and ports that are not
-/// listed are blocked.
+/// listed are blocked. `mitm_hosts` and `paths` are optional: they enable
+/// URL-path rules by terminating TLS for the listed hosts, and they require
+/// an sbx built with the `tls-termination` feature.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
@@ -528,6 +532,149 @@ pub struct Network {
     /// Destination ports the sandbox may use. Port 0 is not a valid
     /// destination port and is rejected.
     pub ports: Vec<u16>,
+
+    /// Hosts whose TLS sbx terminates, so that `paths` can be enforced. Each
+    /// name must be exact (no wildcards), listed in `allow`, and reachable on
+    /// port 443. Every other host stays a transparent TLS passthrough. A
+    /// terminated host cannot use certificate pinning or client certificates,
+    /// speaks HTTP/1.1 only, and gets one request per connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mitm_hosts: Vec<Domain>,
+
+    /// URL-path rules, written `https://HOST/PREFIX`. Each HOST must be listed
+    /// in `mitm_hosts`, and every `mitm_hosts` entry needs at least one rule.
+    /// A request is allowed when its path starts with PREFIX at a segment
+    /// boundary: a PREFIX ending in `/` matches everything below it, and any
+    /// other PREFIX matches the exact path or the path followed by `/`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<UrlPrefix>,
+}
+
+/// A URL-path rule for a TLS-terminated host: `https://HOST/PREFIX`.
+///
+/// Matching is on the origin-form request path only (the query string is
+/// ignored). Paths that are percent-encoded, contain a backslash, `//`, or
+/// `.` / `..` segments, or contain control characters are denied rather than normalized,
+/// so the rule sees exactly the path the server would route on.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UrlPrefix {
+    host: Domain,
+    prefix: String,
+}
+
+impl UrlPrefix {
+    /// Parse a `https://HOST/PREFIX` rule. Scheme, host and path are each
+    /// checked; every rejection is a pinned message.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let rest = raw
+            .strip_prefix("https://")
+            .ok_or_else(|| format!("URL-path rule {raw:?} must start with https://"))?;
+        let Some(at) = rest.find('/') else {
+            return Err(format!(
+                "URL-path rule {raw:?} needs a path after the host (use \"https://HOST/\" for every path)"
+            ));
+        };
+        let (authority, path) = rest.split_at(at);
+        if authority.contains(['@', ':', '[', ']']) {
+            return Err(format!(
+                "URL-path rule {raw:?} must not contain userinfo, a port or brackets"
+            ));
+        }
+        let host =
+            Domain::parse(authority).map_err(|err| format!("URL-path rule {raw:?}: {err}"))?;
+        if !is_normalized_path(path) {
+            return Err(format!(
+                "URL-path rule {raw:?} has a path that is not normalized (printable ASCII only; no '?', '#', '\\', '%', ';', empty or dot segments)"
+            ));
+        }
+        Ok(Self {
+            host,
+            prefix: path.to_owned(),
+        })
+    }
+
+    /// The rule's host (always a `network.mitm_hosts` entry once validated).
+    pub fn host(&self) -> &Domain {
+        &self.host
+    }
+
+    /// Whether a request target (origin-form, as sent on the wire) is inside
+    /// this rule. Fail-closed: anything that is not a normalized origin-form
+    /// path matches nothing.
+    pub fn permits_target(&self, target: &str) -> bool {
+        if target.contains('#') {
+            return false;
+        }
+        let path = target.split_once('?').map_or(target, |(path, _query)| path);
+        if !is_normalized_path(path) {
+            return false;
+        }
+        if self.prefix.ends_with('/') {
+            path.starts_with(self.prefix.as_str())
+        } else {
+            path == self.prefix
+                || path
+                    .strip_prefix(self.prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    }
+}
+
+// Normalized path check shared by rules and request targets: absolute, no
+// percent-encoding, backslash, '?', '#' or ';', no control characters or
+// spaces, no '.'/'..' segments, and no empty segment except a single trailing
+// one. ';' is refused because some servers strip path parameters before
+// resolving dot segments (Tomcat: `/v1/..;/admin` is `/admin`), which would
+// turn a prefix match into a traversal. Non-ASCII bytes are refused because
+// some servers fold Unicode lookalikes (fullwidth `．．` is `..` after NFKC or
+// best-fit mapping) before routing (PR #64 review m2).
+fn is_normalized_path(path: &str) -> bool {
+    let Some(body) = path.strip_prefix('/') else {
+        return false;
+    };
+    if body
+        .bytes()
+        .any(|b| b <= 0x20 || b >= 0x7f || matches!(b, b'?' | b'#' | b'\\' | b'%' | b';'))
+    {
+        return false;
+    }
+    let segments: Vec<&str> = body.split('/').collect();
+    let last = segments.len() - 1;
+    segments
+        .iter()
+        .enumerate()
+        .all(|(index, segment)| match *segment {
+            "." | ".." => false,
+            "" => index == last,
+            _ => true,
+        })
+}
+
+impl Serialize for UrlPrefix {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("https://{}{}", self.host.as_str(), self.prefix))
+    }
+}
+
+impl<'de> Deserialize<'de> for UrlPrefix {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for UrlPrefix {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("UrlPrefix")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": "^https://",
+            "description": "A URL-path rule, https://HOST/PREFIX. HOST is a domain name listed in network.mitm_hosts; PREFIX starts with '/' and is printable ASCII with no query, fragment, percent-encoding, backslash, ';' or dot segments."
+        })
+    }
 }
 
 /// Environment variables visible inside the sandbox.
@@ -746,6 +893,18 @@ impl RawPolicy {
                 )));
             }
         }
+        // Opt-in TLS termination (issue #17, D2). Without the feature the
+        // policy is refused: `check --policy` and `run` share this path, so
+        // both refuse. Constructed policies cannot bypass it (validate is the
+        // single gate for every Policy-producing path).
+        #[cfg(not(feature = "tls-termination"))]
+        if !self.network.mitm_hosts.is_empty() || !self.network.paths.is_empty() {
+            return Err(PolicyError(
+                "network.mitm_hosts requires an sbx built with the tls-termination feature"
+                    .to_owned(),
+            ));
+        }
+        validate_termination(&self.network)?;
         for (index, port) in self.network.ports.iter().enumerate() {
             if *port == 0 {
                 return Err(PolicyError(format!(
@@ -896,6 +1055,77 @@ impl Policy {
             limits: raw.limits,
         }
     }
+}
+
+/// Whether a plain (subdomain) rule for `rule` matches `host`: the host itself
+/// or a dot-boundaried subdomain of it (the `egress::allowed` semantics).
+fn covers(rule: &Domain, host: &Domain) -> bool {
+    let (rule, host) = (rule.as_str(), host.as_str());
+    host == rule
+        || host
+            .strip_suffix(rule)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+// The termination rules (issue #17, D2). Pinned messages; order = first error.
+fn validate_termination(network: &Network) -> Result<(), PolicyError> {
+    let terminating = !network.mitm_hosts.is_empty() || !network.paths.is_empty();
+    if terminating && network.mode == NetworkMode::None {
+        return Err(PolicyError(
+            "network.mode none cannot be combined with network.mitm_hosts or network.paths"
+                .to_owned(),
+        ));
+    }
+    if !network.mitm_hosts.is_empty() && !network.ports.contains(&443) {
+        return Err(PolicyError(
+            "network.mitm_hosts requires port 443 in network.ports".to_owned(),
+        ));
+    }
+    for (index, host) in network.mitm_hosts.iter().enumerate() {
+        if network.mitm_hosts[..index].contains(host) {
+            return Err(PolicyError(format!(
+                "network.mitm_hosts[{index}] duplicates {}",
+                host.as_str()
+            )));
+        }
+        if egress::allowed(host.as_str(), &network.allow).is_none() {
+            return Err(PolicyError(format!(
+                "network.mitm_hosts[{index}] {} is not in network.allow",
+                host.as_str()
+            )));
+        }
+        // PR #64 review M2: a subdomain rule covering a terminated host also
+        // allows passthrough names (its siblings, or its own subdomains) that a
+        // shared edge may route to the same vhost by `Host`, past the path
+        // rules. A terminated host must be allowed by exact rules only.
+        if let Some(rule) = network
+            .allow
+            .iter()
+            .find(|rule| !rule.is_exact() && covers(rule.domain(), host))
+        {
+            return Err(PolicyError(format!(
+                "network.mitm_hosts[{index}] {} is covered by the subdomain rule {} in network.allow; allow a terminated host only by an exact rule (={})",
+                host.as_str(),
+                rule.as_str(),
+                host.as_str()
+            )));
+        }
+        if !network.paths.iter().any(|rule| rule.host() == host) {
+            return Err(PolicyError(format!(
+                "network.mitm_hosts[{index}] {} has no network.paths rule (a terminated host needs at least one URL-path rule)",
+                host.as_str()
+            )));
+        }
+    }
+    for (index, rule) in network.paths.iter().enumerate() {
+        if !network.mitm_hosts.contains(rule.host()) {
+            return Err(PolicyError(format!(
+                "network.paths[{index}] host {} is not in network.mitm_hosts",
+                rule.host().as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 // POSIX portable filename charset for environment names — hand-rolled to
@@ -1970,8 +2200,8 @@ mod tests {
         assert_eq!(defs["AbsolutePath"]["type"], "string");
         assert_eq!(defs["AbsolutePath"]["pattern"], "^/([^/]+/)*[^/]+$");
         // Network.allow references DomainRule (the `=` marker is not a
-        // hostname character, so it carries no `format`); Domain is no
-        // longer reachable from the policy schema.
+        // hostname character, so it carries no `format`); Domain is reachable
+        // only through network.mitm_hosts (issue #17: exact host names).
         assert_eq!(defs["DomainRule"]["type"], "string");
         assert!(defs["DomainRule"].get("format").is_none());
         assert!(
@@ -1983,7 +2213,10 @@ mod tests {
             defs["Network"]["properties"]["allow"]["items"]["$ref"],
             "#/$defs/DomainRule"
         );
-        assert!(defs.get("Domain").is_none());
+        assert_eq!(
+            defs["Network"]["properties"]["mitm_hosts"]["items"]["$ref"],
+            "#/$defs/Domain"
+        );
 
         // u16 ports: range lands in the schema for free.
         let ports = &defs["Network"]["properties"]["ports"]["items"];
@@ -2191,5 +2424,224 @@ mod tests {
         assert!(err.contains("not valid UTF-8"), "{err}");
         assert!(err.contains("invalid-utf8.json"), "{err}");
         assert!(!err.contains("cannot read"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod termination_tests {
+    use super::*;
+
+    /// A complete policy document with `extra` appended to the network section.
+    fn doc(extra: &str) -> String {
+        format!(
+            r#"{{"version": 1, "filesystem": {{"ro": [], "rw": [], "deny": []}}, "network": {{"mode": "transparent", "allow": ["=api.example.com", "=example.com"], "ports": [443, 80]{extra}}}, "env": {{"pass": [], "set": {{}}}}, "limits": {{"timeout": "60s", "output_bytes": 1024}}}}"#
+        )
+    }
+
+    const MITM: &str =
+        r#", "mitm_hosts": ["api.example.com"], "paths": ["https://api.example.com/v1/"]"#;
+
+    #[test]
+    fn url_prefix_parse_accepts_well_formed_rules() {
+        for raw in [
+            "https://api.example.com/",
+            "https://api.example.com/v1",
+            "https://api.example.com/v1/",
+            "https://api.example.com/v1/items.json",
+        ] {
+            UrlPrefix::parse(raw).unwrap_or_else(|err| panic!("{raw}: {err}"));
+        }
+    }
+
+    #[test]
+    fn url_prefix_parse_pinned_rejections() {
+        let cases = [
+            (
+                "http://api.example.com/v1",
+                r#"URL-path rule "http://api.example.com/v1" must start with https://"#,
+            ),
+            (
+                "https://api.example.com",
+                r#"URL-path rule "https://api.example.com" needs a path after the host (use "https://HOST/" for every path)"#,
+            ),
+            (
+                "https://u@api.example.com/v1",
+                r#"URL-path rule "https://u@api.example.com/v1" must not contain userinfo, a port or brackets"#,
+            ),
+            (
+                "https://api.example.com:8443/v1",
+                r#"URL-path rule "https://api.example.com:8443/v1" must not contain userinfo, a port or brackets"#,
+            ),
+            (
+                "https://*.example.com/v1",
+                r#"URL-path rule "https://*.example.com/v1": wildcard domains are not allowed (got "*.example.com")"#,
+            ),
+            (
+                "https://api.example.com/v1?x=1",
+                r#"URL-path rule "https://api.example.com/v1?x=1" has a path that is not normalized (printable ASCII only; no '?', '#', '\', '%', ';', empty or dot segments)"#,
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(UrlPrefix::parse(raw).unwrap_err(), want, "{raw}");
+        }
+        for raw in [
+            "https://api.example.com/v1/../x",
+            "https://api.example.com/a//b",
+            "https://api.example.com/%2e%2e",
+            "https://api.example.com/a\\b",
+            "https://api.example.com/a b",
+            "https://api.example.com/./x",
+        ] {
+            let err = UrlPrefix::parse(raw).expect_err(raw);
+            assert!(
+                err.contains("has a path that is not normalized"),
+                "{raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_prefix_serde_round_trips_as_its_string() {
+        let rule = UrlPrefix::parse("https://api.example.com/v1/").expect("valid");
+        let json = serde_json::to_string(&rule).expect("serialize");
+        assert_eq!(json, r#""https://api.example.com/v1/""#);
+        let back: UrlPrefix = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, rule);
+        assert!(serde_json::from_str::<UrlPrefix>(r#""http://x.example.com/""#).is_err());
+    }
+
+    #[test]
+    fn permits_target_respects_segment_boundaries() {
+        let dir = UrlPrefix::parse("https://api.example.com/v1/").expect("valid");
+        for target in ["/v1/", "/v1/items?x=1", "/v1/a/b"] {
+            assert!(dir.permits_target(target), "{target}");
+        }
+        for target in ["/v1", "/v10/x", "/v1x", "/", "/other"] {
+            assert!(!dir.permits_target(target), "{target}");
+        }
+
+        let exact = UrlPrefix::parse("https://api.example.com/v1").expect("valid");
+        for target in ["/v1", "/v1?q=1", "/v1/x"] {
+            assert!(exact.permits_target(target), "{target}");
+        }
+        for target in ["/v10", "/v1x"] {
+            assert!(!exact.permits_target(target), "{target}");
+        }
+
+        let root = UrlPrefix::parse("https://api.example.com/").expect("valid");
+        for target in ["/", "/anything/at/all?q"] {
+            assert!(root.permits_target(target), "{target}");
+        }
+    }
+
+    #[test]
+    fn permits_target_fails_closed_on_unnormalized_targets() {
+        let root = UrlPrefix::parse("https://api.example.com/").expect("valid");
+        for target in [
+            "/a/../b",
+            "/a/./b",
+            "//x",
+            "/a//b",
+            "/%2e%2e/x",
+            "/a%2Fb",
+            "/a\\b",
+            "/a b",
+            "/a#frag",
+            "/a\tb",
+            "/v1/..;/admin",
+            "/a;jsessionid=1",
+            "/v1/\u{ff0e}\u{ff0e}/admin",
+            "/caf\u{e9}",
+            "*",
+            "http://api.example.com/x",
+            "",
+        ] {
+            assert!(!root.permits_target(target), "{target:?}");
+        }
+    }
+
+    #[cfg(not(feature = "tls-termination"))]
+    #[test]
+    fn default_build_refuses_termination_policies() {
+        let want = "network.mitm_hosts requires an sbx built with the tls-termination feature";
+        let err = Policy::from_json_str(&doc(MITM)).expect_err("mitm refused");
+        assert_eq!(err.to_string(), want);
+        // Paths alone are refused by the same rule (both fields are gated).
+        let paths_only = doc(r#", "paths": ["https://api.example.com/v1/"]"#);
+        assert_eq!(
+            Policy::from_json_str(&paths_only)
+                .expect_err("paths refused")
+                .to_string(),
+            want
+        );
+        // Direct serde deserialization goes through the same validate().
+        assert!(serde_json::from_str::<Policy>(&doc(MITM)).is_err());
+        // A policy without the fields is unchanged.
+        Policy::from_json_str(&doc("")).expect("plain policy still accepted");
+    }
+
+    #[cfg(feature = "tls-termination")]
+    #[test]
+    fn termination_policy_accepted_and_rules_pinned() {
+        let ok = Policy::from_json_str(&doc(MITM)).expect("valid termination policy");
+        assert_eq!(ok.network.mitm_hosts[0].as_str(), "api.example.com");
+        assert_eq!(ok.network.paths.len(), 1);
+
+        let cases = [
+            (
+                doc(r#", "mitm_hosts": ["api.example.com"]"#),
+                "network.mitm_hosts[0] api.example.com has no network.paths rule (a terminated host needs at least one URL-path rule)",
+            ),
+            (
+                doc(r#", "mitm_hosts": ["example.org"], "paths": ["https://example.org/"]"#),
+                "network.mitm_hosts[0] example.org is not in network.allow",
+            ),
+            (
+                doc(
+                    r#", "mitm_hosts": ["api.example.com", "api.example.com"], "paths": ["https://api.example.com/"]"#,
+                ),
+                "network.mitm_hosts[1] duplicates api.example.com",
+            ),
+            (
+                doc(r#", "paths": ["https://api.example.com/"]"#),
+                "network.paths[0] host api.example.com is not in network.mitm_hosts",
+            ),
+            (
+                doc(MITM).replace(r#""=example.com""#, r#""example.com""#),
+                "network.mitm_hosts[0] api.example.com is covered by the subdomain rule example.com in network.allow; allow a terminated host only by an exact rule (=api.example.com)",
+            ),
+            (
+                doc(MITM).replace(r#""=api.example.com""#, r#""api.example.com""#),
+                "network.mitm_hosts[0] api.example.com is covered by the subdomain rule api.example.com in network.allow; allow a terminated host only by an exact rule (=api.example.com)",
+            ),
+            (
+                doc(MITM).replace("[443, 80]", "[80]"),
+                "network.mitm_hosts requires port 443 in network.ports",
+            ),
+            (
+                doc(MITM).replace("\"transparent\"", "\"none\""),
+                "network.mode none cannot be combined with network.mitm_hosts or network.paths",
+            ),
+        ];
+        for (json, want) in cases {
+            let err = Policy::from_json_str(&json).expect_err(&json);
+            assert_eq!(err.to_string(), want);
+        }
+    }
+
+    #[test]
+    fn schema_documents_termination_fields() {
+        let schema: serde_json::Value =
+            serde_json::from_str(&schema_json()).expect("schema is JSON");
+        let defs = &schema["$defs"];
+        assert!(defs["Network"]["properties"]["mitm_hosts"].is_object());
+        assert!(defs["Network"]["properties"]["paths"].is_object());
+        // Optional fields: never required, so existing policies stay valid.
+        assert_eq!(
+            defs["Network"]["required"],
+            serde_json::json!(["mode", "allow", "ports"])
+        );
+        assert_eq!(defs["UrlPrefix"]["type"], "string");
+        assert_eq!(defs["UrlPrefix"]["pattern"], "^https://");
     }
 }

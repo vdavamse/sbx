@@ -78,12 +78,16 @@ pub(crate) fn fallback_notice(reason: &str, required: NetworkMode) -> String {
 /// The network section the proxies and the resolver are built from. Mode
 /// `none` clamps allow/ports to empty: the proxies and DNS are still served,
 /// so every attempt becomes an audited denial. Other modes are unchanged.
-/// bwrap::build always gets the ORIGINAL policy (Q11: no env injection).
+/// The termination lists clear with them (issue #17; validation already
+/// refuses them under mode none). bwrap::build always gets the ORIGINAL policy
+/// (Q11: no env injection).
 pub(crate) fn effective_network(policy: &policy::Policy) -> policy::Network {
     let mut net = policy.network.clone();
     if net.mode == NetworkMode::None {
         net.allow.clear();
         net.ports.clear();
+        net.mitm_hosts.clear();
+        net.paths.clear();
     }
     net
 }

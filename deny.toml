@@ -12,6 +12,11 @@
 # — GPL/AGPL/LGPL stay out), and crates whose license cannot be determined
 # are always errors (use [[licenses.clarify]] if that ever happens).
 
+[graph]
+# Check the graph WITH the opt-in feature (issue #17), so the [[bans.features]]
+# entry for `time` below sees the crate it bans features on.
+features = ["tls-termination"]
+
 [advisories]
 # Fail on yanked crates in the committed lockfile (cargo-deny default: warn).
 yanked = "deny"
@@ -21,6 +26,8 @@ yanked = "deny"
 ignore = [
     # hickory-proto 0.25.2 (issue #9). Both lift when MSRV >= 1.88 allows 0.26.1+.
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto DNSSEC code (pub mod dnssec) is compiled only behind its dnssec-ring or dnssec-aws-lc-rs features; sbx enables neither, enforced by the [[bans.features]] entry for hickory-proto below" },
+    # time 0.3.45 (issue #17, tls-termination feature only). Lifts when MSRV >= 1.88 allows 0.3.47+.
+    { id = "RUSTSEC-2026-0009", reason = "time RFC 2822 parser stack exhaustion: the parser is compiled only behind time's `parsing` feature, which nothing in sbx's tree enables (rcgen/yasna use std/alloc only), enforced by the [[bans.features]] entry for time below; sbx parses no dates at all; fixed only in 0.3.47, which needs rustc 1.88 > MSRV 1.85" },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto encoder O(n^2) name compression: sbx encodes at most 3 names per response (question, one answer owner, the OPT root) from a header-gated question of <= 255 bytes; fixed only in 0.26.1, which needs rustc 1.88 > MSRV 1.85" },
 ]
 
@@ -30,6 +37,12 @@ ignore = [
 [[bans.features]]
 crate = "hickory-proto"
 deny = ["dnssec-ring", "dnssec-aws-lc-rs", "__dnssec"]
+
+# Precondition for the RUSTSEC-2026-0009 ignore above: time's parsers (and so
+# its RFC 2822 parser) are compiled only with its `parsing` feature.
+[[bans.features]]
+crate = "time"
+deny = ["parsing"]
 
 [licenses]
 # Everything not listed here is denied. The list is deliberately
@@ -53,6 +66,9 @@ allow = [
     # File-level copyleft, compatible with static linking into an
     # Apache-2.0 binary.
     "MPL-2.0",
+    # webpki-roots (issue #17, the opt-in `tls-termination` feature): the
+    # Mozilla root data is CDLA-Permissive-2.0, a permissive data license.
+    "CDLA-Permissive-2.0",
     # Ubiquitous permissive licenses for C-binding fallback crates.
     "BSD-2-Clause",
     "BSD-3-Clause",
