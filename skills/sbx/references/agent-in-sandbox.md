@@ -73,6 +73,7 @@ There is no TTY inside (see SKILL.md), so run the agent's non-interactive mode a
 close stdin:
 
 ```sh
+mkdir -p ~/.cache/sbx/audit     # sbx creates the audit file, not its directory
 sbx run --policy agent.json --session-dir ~/.cache/sbx/agent-task-42 \
   --cwd /home/me/project --audit ~/.cache/sbx/audit/task-42.jsonl \
   -- /home/me/.local/share/claude/versions/2.1.319 -p "fix the failing test in tests/" </dev/null

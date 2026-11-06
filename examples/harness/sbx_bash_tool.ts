@@ -9,29 +9,37 @@
 // Each conversation gets one session directory (ROOT/sessions/<conversation>),
 // so /work, /root and /tmp persist across calls. Shell state does not: every
 // call is a new `bash`. The wrapper therefore tracks the working directory
-// itself (an EXIT trap writes $PWD to /tmp/.sbx-tool-cwd, which is
-// S/tmp/.sbx-tool-cwd on the host) and replays the exports it was given.
+// itself (an EXIT trap writes $PWD to /tmp/.sbx-tool-cwd.<token>, a fresh name
+// per call, which is S/tmp/.sbx-tool-cwd.<token> on the host) and replays the
+// exports it was given. One conversation must be owned by one SbxBashTool: its
+// queue serializes the calls, and the audit rows after a call's offset are then
+// that call's.
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 const DEFAULT_CWD = "/work";
-const CWD_FILE = ".sbx-tool-cwd"; // in the session's /tmp
+const CWD_FILE = ".sbx-tool-cwd."; // + a per-call token, in the session's /tmp
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const CONVERSATION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-// The command arrives as $1. It is moved out of the positional parameters so
-// the command sees $# = 0, as under a plain `bash -c CMD`. Its stdout and
-// stderr are merged into sbx's stdout. The EXIT trap records the final working
-// directory even when the command calls `exit`, and even when the output was
-// truncated (a file, not a stream under limits.output_bytes).
+// The command arrives as $1 and the per-call token as $2. Both are moved out of
+// the positional parameters so the command sees $# = 0, as under a plain
+// `bash -c CMD`. Its stdout and stderr are merged into sbx's stdout. The EXIT
+// trap records the final working directory even when the command calls `exit`,
+// and even when the output was truncated (a file, not a stream under
+// limits.output_bytes). A fresh file name per call means nothing the command
+// plants under /tmp can make the host-side read or cleanup fail. A command that
+// replaces the trap or ends in `exec` keeps the previous cwd.
 const SCRIPT =
-  "__sbx_cmd=$1; set --\n" +
-  "trap 'printf %s \"$PWD\" > /tmp/" + CWD_FILE + "' EXIT\n" +
+  "__sbx_cmd=$1 __sbx_tok=$2; set --\n" +
+  "trap 'printf %s \"$PWD\" > \"/tmp/" + CWD_FILE + "$__sbx_tok\" 2>/dev/null' EXIT\n" +
   '{ eval "$__sbx_cmd"; } 2>&1\n';
 
-export type ToolStatus = "exited" | "timeout" | "sandbox_error";
+export type ToolStatus = "exited" | "timeout" | "killed" | "sandbox_error";
 
 export interface ToolResult {
   status: ToolStatus;
@@ -46,6 +54,8 @@ export function forModel(r: ToolResult): string {
   let out = r.output;
   if (r.truncated) out += "\n[output truncated by the sandbox output limit]";
   if (r.status === "timeout") return out + "\n[command timed out and was killed]";
+  // The sandbox itself was killed (for example by the OOM killer).
+  if (r.status === "killed") return out + `\n[the sandbox was killed: ${r.sandboxMessage}]`;
   if (r.status === "sandbox_error") {
     // Not the command's failure: the sandbox could not run it.
     return "[sandbox error, the command did not run as given] " + r.sandboxMessage;
@@ -90,6 +100,9 @@ export class SbxBashTool {
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(opts: { sbx: string; policy: string; root: string; conversation: string; env?: Record<string, string> }) {
+    if (!CONVERSATION_ID.test(opts.conversation)) {
+      throw new RangeError(`invalid conversation id: ${opts.conversation}`);
+    }
     this.sbx = opts.sbx;
     this.policy = opts.policy;
     this.root = opts.root;
@@ -125,8 +138,8 @@ export class SbxBashTool {
       .sort()
       .map((k) => `export ${k}=${shQuote(this.env[k])}\n`)
       .join("");
-    const cwdFile = path.join(this.sessionDir, "tmp", CWD_FILE);
-    fs.rmSync(cwdFile, { force: true });
+    const token = randomBytes(8).toString("hex");
+    const cwdFile = path.join(this.sessionDir, "tmp", CWD_FILE + token);
     let auditOffset = 0;
     try {
       auditOffset = fs.statSync(this.auditPath).size;
@@ -140,7 +153,7 @@ export class SbxBashTool {
       "--cwd", this.cwd,
       "--timeout", `${timeoutS}s`,
       "--audit", this.auditPath,
-      "--", "bash", "-c", SCRIPT, "sbx-bash-tool", exports + command,
+      "--", "bash", "-c", SCRIPT, "sbx-bash-tool", exports + command, token,
     ];
     const { rc, stdout, stderr, backstop } = await new Promise<{
       rc: number; stdout: string; stderr: string; backstop: boolean;
@@ -192,9 +205,22 @@ export class SbxBashTool {
     const result = (status: ToolStatus, sandboxMessage = ""): ToolResult => ({
       status, exitCode: rc, output, truncated, sandboxMessage, auditOutcome: outcome,
     });
+    const newCwd = readCwd(cwdFile);
+    try {
+      fs.unlinkSync(cwdFile);
+    } catch {
+      // best effort: the sandbox controls /tmp
+    }
+
+    // A refused run writes no exit row, so another caller's row could be
+    // misread as this call's: classify this refusal before reading rows.
+    if (rc === 125 && diagnostics.some((l) => l.includes("session directory is in use"))) {
+      return result("sandbox_error", message);
+    }
     // The audit outcome is authoritative; stderr is only a fallback.
     if (outcome === "timeout") return result("timeout", message);
     if (outcome === "failed" || outcome === "terminated") return result("sandbox_error", message);
+    if (outcome === "signaled") return result("killed", message || `signal ${exitRow?.signal}`);
     if (outcome === null) {
       // No exit row: sbx refused or failed before the command ran under audit.
       if (rc === 124 && message.includes("timed out")) return result("timeout", message);
@@ -206,14 +232,13 @@ export class SbxBashTool {
       this.cwd = DEFAULT_CWD;
       return result("sandbox_error", message);
     }
-    const newCwd = readCwd(cwdFile);
     if (newCwd) this.cwd = newCwd;
     if (message) output += (output && !output.endsWith("\n") ? "\n" : "") + message;
     return result("exited");
   }
 
   // The exit row this call appended (calls of a session are serialized).
-  private exitRow(offset: number): { outcome?: string; output_truncated?: boolean } | null {
+  private exitRow(offset: number): { outcome?: string; output_truncated?: boolean; signal?: number | null } | null {
     let text: string;
     try {
       const fd = fs.openSync(this.auditPath, "r");
@@ -280,8 +305,10 @@ async function selftest(sbx: string): Promise<number> {
       r.status === "exited" && r.truncated && r.output.length <= 4096,
       [r.status, r.truncated, r.output.length]);
     check("cwd tracked through truncated output", tool.cwd === "/tmp", tool.cwd);
-    await tool.run(`ln -sfn /etc/passwd /tmp/${CWD_FILE}; trap - EXIT; cd /`);
-    check("a symlinked cwd file is ignored", tool.cwd === "/tmp", tool.cwd);
+    await tool.run(`trap - EXIT; cd /; mkdir -p /tmp/${CWD_FILE}x; chmod 500 /tmp`);
+    r = await tool.run("chmod 700 /tmp; pwd");
+    check("planted entries and an unwritable /tmp do not break the tool",
+      r.status === "exited" && r.output === "/tmp\n" && tool.cwd === "/tmp", r);
     await tool.run("mkdir -p /tmp/gone && cd /tmp/gone");
     await tool.run("rmdir /tmp/gone");
     r = await tool.run("pwd");
@@ -294,6 +321,13 @@ async function selftest(sbx: string): Promise<number> {
     const bad = await new SbxBashTool({ sbx, policy, root, conversation: "conv-1", env: { "X;id": "1" } })
       .run("true").then(() => false, (e: unknown) => e instanceof RangeError);
     check("invalid env name rejected", bad, null);
+    let badId = false;
+    try {
+      new SbxBashTool({ sbx, policy, root, conversation: "../x" });
+    } catch (e) {
+      badId = e instanceof RangeError;
+    }
+    check("invalid conversation id rejected", badId, null);
 
     // Calls on one tool are queued, so they never collide. A second tool on the
     // same conversation (as a second harness process would) is refused by sbx

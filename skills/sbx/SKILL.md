@@ -25,7 +25,7 @@ failing items, and the reasons are on stderr.
 | `/tmp` (`$TMPDIR`) | `S/tmp` | writable, and persists with the session (not a fresh tmpfs) |
 | `S` itself, `S/sbx.lock`, `S/sbx.ctl` | — | **not visible**; a policy path that is or contains `S` is refused (125) |
 | `/bin`, `/sbin`, `/lib`, `/lib64` | symlinks to `usr/…` | usable only if `/usr` is bound (and skipped when a bind covers them) |
-| `/etc` | generated | `passwd`, `group`, `hosts`, `resolv.conf`, plus `ssl`, `ca-certificates`, `alternatives`, `ld.so.cache`, `localtime`, `nsswitch.conf` from the host, plus any policy bind under `/etc` |
+| `/etc` | generated | `passwd`, `group`, `hosts`, `resolv.conf`, plus `ssl`, `ca-certificates`, `alternatives`, `ld.so.cache`, `localtime`, `nsswitch.conf` from the host, plus any other policy bind under `/etc` (the generated files always win) |
 | `/proc`, `/dev` | fresh | |
 | anything else on the host | — | does not exist; a `deny` entry is an empty tmpfs over its path |
 
@@ -75,7 +75,8 @@ or headless mode.
 | 2 | usage error (clap) |
 
 A command can exit 124, 125 or 128+N by itself. Only the `outcome` of the audit `exit` row
-(`exited`, `timeout`, `failed`, `signaled`, `terminated`) tells them apart. The full table
+(`exited`, `timeout`, `failed`, `signaled`, `terminated`) tells them apart. bwrap's rc 1
+has outcome `exited`, like a command exiting 1: only its `bwrap: ` stderr line tells it apart. The full table
 is in [docs/usage.md, Exit codes](https://github.com/vdavamse/sbx/blob/main/docs/usage.md#running-commands).
 
 ## Network
@@ -92,10 +93,10 @@ is in [docs/usage.md, Exit codes](https://github.com/vdavamse/sbx/blob/main/docs
   A denied name shows as `"event":"dns","verdict":"denied","reason":"… is not in the
   policy allow list"`. Without `--audit` there is no log.
 - `A` must not be inside `S` or any `ro` / `rw` path (rc 125), and it must be a regular
-  file you own. Several runs may append to one file.
+  file you own. Its directory must already exist; sbx creates the file, not the directory. Several runs may append to one file.
 
 ```sh
-jq -c 'select(.verdict=="denied" or .verdict=="teardown") | {event,host,reason}' A  # what was blocked
+jq -c 'select(.verdict=="denied" or .verdict=="teardown") | {event,host,reason}' A  # policy denials
 tail -n 1 A | jq '{code,outcome,output_truncated}'              # how the run ended
 ```
 

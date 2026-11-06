@@ -38,13 +38,14 @@ const REPO_URL: &str = "https://github.com/vdavamse/sbx/";
 
 /// Messages the skill quotes verbatim (or as a prefix); each must still be
 /// produced somewhere in `src/`.
-const QUOTED_MESSAGES: [&str; 6] = [
+const QUOTED_MESSAGES: [&str; 7] = [
     "session directory is in use",
     "output truncated at",
     "timed out after",
     "is not in the policy allow list",
     "cwd must be absolute",
     "sbx run: notice:",
+    "sandbox killed by signal",
 ];
 
 /// Flags of other programs that the skill mentions (the agent's `--version`,

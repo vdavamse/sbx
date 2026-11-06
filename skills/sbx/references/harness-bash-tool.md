@@ -35,9 +35,11 @@ shell function, or a background job (`server &`) ends with the call, and the san
 kills every remaining process when the call ends. The harness has to carry the state:
 
 - **cwd.** Track it yourself and pass `--cwd`. The wrappers set an `EXIT` trap that
-  writes `$PWD` to `/tmp/.sbx-tool-cwd` (that is `S/tmp/.sbx-tool-cwd` on the host), so
-  the cwd survives `exit N` and truncated output. The sandbox controls that file: read
-  it without following symlinks, and accept only a short absolute path. `--cwd` must be
+  writes `$PWD` to `/tmp/.sbx-tool-cwd.<token>`, a fresh name per call (that is
+  `S/tmp/.sbx-tool-cwd.<token>` on the host), so the cwd survives `exit N` and truncated
+  output. The sandbox controls that directory: read the file without following
+  symlinks, accept only a short absolute path, and never let its cleanup fail the call.
+  A command that sets its own `EXIT` trap or ends in `exec` keeps the previous cwd. `--cwd` must be
   absolute and must exist inside the sandbox. A missing one fails in bwrap
   (`bwrap: Can't chdir to …`, rc 1), so reset to `/work` when that happens.
 - **env.** Keep a map of the variables you want and prepend `export K='v'` lines to the
@@ -64,7 +66,10 @@ with rc 125 and `sbx run: session directory is in use: "…"`. While a keep-aliv
 holds `S`, plain `run` on it fails the same way, so use `attach`.
 
 - Serialize the tool calls of one conversation (a lock or a queue per session). Both
-  wrappers do this.
+  wrappers do this, so one conversation must be owned by one wrapper object: two
+  objects or processes on one session also share its audit file, and a refused call
+  (which writes no exit row) could then read the other call's row. The wrappers
+  classify `session directory is in use` before reading rows for that reason.
 - Parallel tool calls need separate session directories. Note that they then do not
   see each other's `/work`. Alternatively, attach them all to one keep-alive session:
   attached calls can run concurrently.
@@ -78,7 +83,8 @@ holds `S`, plain `run` on it fails the same way, so use `attach`.
 | rc 125, `outcome` `failed` (stderr `sbx run: …`), or no `exit` row at all | a **sandbox/harness error**, not the command's failure: surface sbx's stderr line, and log it for the operator |
 | `outcome` `terminated` (rc 129–143) | sbx itself got a signal (the harness is shutting down): a sandbox error |
 | rc 1 with stderr `bwrap: …` | a sandbox setup error (usually a stale `--cwd`) |
-| rc 128+N | killed by signal N; 137 is SIGKILL (for example out of memory) |
+| rc 128+N, `outcome` `exited` | the command was killed by signal N (137 is SIGKILL) |
+| rc 128+N, `outcome` `signaled` (stderr `sbx run: sandbox killed by signal N (NAME)`) | the sandbox itself was killed, for example by the OOM killer: say "killed by signal N", not "exited 128+N" |
 | stderr `sbx run: output truncated at N bytes (limits.output_bytes)` or audit `output_truncated: true` | the output is cut, so say so; truncation alone does not stop the command |
 
 - Exit status alone is ambiguous, because a command may exit 124 or 125 itself. The

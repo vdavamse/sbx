@@ -12,8 +12,11 @@ library only, Python 3.8+.
 Each conversation gets one session directory (ROOT/sessions/<conversation>),
 so /work, /root and /tmp persist across calls. Shell state does not: every
 call is a new `bash`. The wrapper therefore tracks the working directory
-itself (an EXIT trap writes $PWD to /tmp/.sbx-tool-cwd, which is
-S/tmp/.sbx-tool-cwd on the host) and replays the exports it was given.
+itself (an EXIT trap writes $PWD to /tmp/.sbx-tool-cwd.<token>, a fresh name
+per call, which is S/tmp/.sbx-tool-cwd.<token> on the host) and replays the
+exports it was given. One conversation must be owned by one SbxBashTool: its
+lock serializes the calls, and the audit rows after a call's offset are then
+that call's.
 
 Run `python3 sbx_bash_tool.py --selftest [SBX]` to exercise it against a real
 sbx binary (CI does this).
@@ -22,6 +25,7 @@ sbx binary (CI does this).
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
 import subprocess
@@ -33,24 +37,28 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 DEFAULT_CWD = "/work"
-CWD_FILE = ".sbx-tool-cwd"  # in the session's /tmp
+CWD_FILE = ".sbx-tool-cwd."  # + a per-call token, in the session's /tmp
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
-# The command arrives as $1. It is moved out of the positional parameters so
-# the command sees $# = 0, as under a plain `bash -c CMD`. Its stdout and
-# stderr are merged into sbx's stdout. The EXIT trap records the final
-# working directory even when the command calls `exit`, and even when the
-# output was truncated (a file, not a stream under limits.output_bytes).
+# The command arrives as $1 and the per-call token as $2. Both are moved out
+# of the positional parameters so the command sees $# = 0, as under a plain
+# `bash -c CMD`. Its stdout and stderr are merged into sbx's stdout. The EXIT
+# trap records the final working directory even when the command calls
+# `exit`, and even when the output was truncated (a file, not a stream under
+# limits.output_bytes). A fresh file name per call means nothing the command
+# plants under /tmp can make the host-side read or cleanup fail. A command
+# that replaces the trap or ends in `exec` keeps the previous cwd.
 SCRIPT = (
-    '__sbx_cmd=$1; set --\n'
-    "trap 'printf %s \"$PWD\" > /tmp/" + CWD_FILE + "' EXIT\n"
+    '__sbx_cmd=$1 __sbx_tok=$2; set --\n'
+    "trap 'printf %s \"$PWD\" > \"/tmp/" + CWD_FILE + "$__sbx_tok\" 2>/dev/null' EXIT\n"
     '{ eval "$__sbx_cmd"; } 2>&1\n'
 )
 
 
 @dataclass
 class ToolResult:
-    status: str  # "exited" | "timeout" | "sandbox_error"
+    status: str  # "exited" | "timeout" | "killed" | "sandbox_error"
     exit_code: int
     output: str
     truncated: bool = False
@@ -64,6 +72,9 @@ class ToolResult:
             out += "\n[output truncated by the sandbox output limit]"
         if self.status == "timeout":
             return out + "\n[command timed out and was killed]"
+        if self.status == "killed":
+            # The sandbox itself was killed (for example by the OOM killer).
+            return out + "\n[the sandbox was killed: %s]" % self.sandbox_message
         if self.status == "sandbox_error":
             # Not the command's failure: the sandbox could not run it.
             return "[sandbox error, the command did not run as given] " + self.sandbox_message
@@ -83,6 +94,10 @@ class SbxBashTool:
     # One `sbx run` per session at a time: serialize calls of this conversation.
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
+    def __post_init__(self) -> None:
+        if not CONVERSATION_ID.match(self.conversation):
+            raise ValueError("invalid conversation id: %r" % self.conversation)
+
     @property
     def session_dir(self) -> str:
         return os.path.join(self.root, "sessions", self.conversation)
@@ -93,7 +108,7 @@ class SbxBashTool:
         return os.path.join(self.root, "audit", self.conversation + ".jsonl")
 
     def run(self, command: str, timeout_s: int = 120) -> ToolResult:
-        if not isinstance(timeout_s, int) or timeout_s < 1:
+        if type(timeout_s) is not int or timeout_s < 1:
             raise ValueError("timeout_s must be a whole number of seconds >= 1")
         for name in self.env:
             if not ENV_NAME.match(name):
@@ -107,11 +122,8 @@ class SbxBashTool:
         exports = "".join(
             "export %s=%s\n" % (k, shlex.quote(v)) for k, v in sorted(self.env.items())
         )
-        cwd_file = os.path.join(self.session_dir, "tmp", CWD_FILE)
-        try:
-            os.unlink(cwd_file)
-        except FileNotFoundError:
-            pass
+        token = secrets.token_hex(8)
+        cwd_file = os.path.join(self.session_dir, "tmp", CWD_FILE + token)
         try:
             audit_offset = os.path.getsize(self.audit_path)
         except FileNotFoundError:
@@ -123,7 +135,7 @@ class SbxBashTool:
             "--cwd", self.cwd,
             "--timeout", "%ds" % timeout_s,
             "--audit", self.audit_path,
-            "--", "bash", "-c", SCRIPT, "sbx-bash-tool", exports + command,
+            "--", "bash", "-c", SCRIPT, "sbx-bash-tool", exports + command, token,
         ]
         try:
             proc = subprocess.run(
@@ -156,11 +168,23 @@ class SbxBashTool:
         def result(status: str, msg: str = "") -> ToolResult:
             return ToolResult(status, rc, output, truncated, msg, outcome)
 
+        new_cwd = self._read_cwd(cwd_file)
+        try:
+            os.unlink(cwd_file)
+        except OSError:
+            pass  # best effort: the sandbox controls /tmp
+
+        # A refused run writes no exit row, so another caller's row could be
+        # misread as this call's: classify this refusal before reading rows.
+        if rc == 125 and any("session directory is in use" in l for l in diagnostics):
+            return result("sandbox_error", message)
         # The audit outcome is authoritative; stderr is only a fallback.
         if outcome == "timeout":
             return result("timeout", message)
         if outcome in ("failed", "terminated"):
             return result("sandbox_error", message)
+        if outcome == "signaled":
+            return result("killed", message or "signal %s" % exit_row.get("signal"))
         if outcome is None:
             # No exit row: sbx refused or failed before the command ran under audit.
             if rc == 124 and "timed out" in message:
@@ -171,7 +195,6 @@ class SbxBashTool:
             # cwd no longer exists: reset it so the next call can run.
             self.cwd = DEFAULT_CWD
             return result("sandbox_error", message)
-        new_cwd = self._read_cwd(cwd_file)
         if new_cwd:
             self.cwd = new_cwd
         if message:
@@ -255,8 +278,10 @@ def selftest(sbx: str) -> int:
         check("output truncated at limits.output_bytes", r.status == "exited" and r.truncated
               and len(r.output) <= 4096, (r.status, r.truncated, len(r.output)))
         check("cwd tracked through truncated output", tool.cwd == "/tmp", tool.cwd)
-        tool.run("ln -sfn /etc/passwd /tmp/" + CWD_FILE + "; trap - EXIT; cd /")
-        check("a symlinked cwd file is ignored", tool.cwd == "/tmp", tool.cwd)
+        tool.run("trap - EXIT; cd /; mkdir -p /tmp/" + CWD_FILE + "x; chmod 500 /tmp")
+        r = tool.run("chmod 700 /tmp; pwd")
+        check("planted entries and an unwritable /tmp do not break the tool",
+              r.status == "exited" and r.output == "/tmp\n" and tool.cwd == "/tmp", r)
         tool.run("mkdir -p /tmp/gone && cd /tmp/gone")
         tool.run("rmdir /tmp/gone")
         r = tool.run("pwd")
@@ -274,6 +299,11 @@ def selftest(sbx: str) -> int:
             check("invalid env name rejected", False, "no error")
         except ValueError:
             check("invalid env name rejected", True, None)
+        try:
+            SbxBashTool(sbx=sbx, policy=policy, root=tool.root, conversation="../x")
+            check("invalid conversation id rejected", False, "no error")
+        except ValueError:
+            check("invalid conversation id rejected", True, None)
 
         # A second run on the same session while one is running: sbx refuses
         # with 125 ("session directory is in use"). Separate tool objects
