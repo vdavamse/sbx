@@ -472,7 +472,7 @@ image, creates the kind cluster, and checks that `uid_map` is not the host map. 
 - gating: `sbx check` (every item except the report-only `landlock` ok, including `keep-alive`;
   the report-only `conntrack` ok or skip; network mode `transparent`),
   `sbx check --policy /etc/sbx/default.json --host` (rc 0) and `sbx check --conformance` (the same
-  `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 75 offline checks ok or
+  `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 77 offline checks ok or
   warn except `I04`, which is an opt-in skip like `E01` to `E06`, rc 0);
 - gating: the `procMount` and seccomp rows of the table above (`netns-ipv6` errno 30 and
   `bwrap-run`; `userns` errno 1);

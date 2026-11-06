@@ -697,8 +697,8 @@ jobs:
           fi
           LIST=$("$BIN" check --conformance --list 2>&1)
           check_rc 0 $? "sbx check --conformance --list"
-          [ "$(echo "$LIST" | grep -c '^  [A-I][0-9][0-9]  ')" -eq 81 ] || { echo "FAIL: --list is not 81 rows"; FAIL=1; }
-          "$BIN" check --conformance --list --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["checks"]) == 81' || { echo "FAIL: --list --json is not 81 checks"; FAIL=1; }
+          [ "$(echo "$LIST" | grep -c '^  [A-I][0-9][0-9]  ')" -eq 83 ] || { echo "FAIL: --list is not 83 rows"; FAIL=1; }
+          "$BIN" check --conformance --list --json | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["checks"]) == 83' || { echo "FAIL: --list --json is not 83 checks"; FAIL=1; }
           "$BIN" check --conformance --only Z99 > /dev/null 2>&1
           check_rc 2 $? "sbx check --conformance --only Z99"
           echo '{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"30s","output_bytes":1048576}}' > conf-policy.json

@@ -18,8 +18,7 @@
 //!    it — the CONNECT target is the sole authority); its name and port
 //!    suffix must match the target (Q2).
 //! 5. **Framing** — CONNECT carries no body (D6: at most one
-//!    `Content-Length: 0`); the strict table (Q8) denies CL+TE, duplicate or
-//!    malformed CL, and non-final-chunked TE on every explicit request.
+//!    `Content-Length: 0`); the strict table (Q8) denies CL+TE, duplicate or malformed CL, and non-final-chunked TE on every explicit request. A forward request's body is framed and streamed by the per-request relay (issue #29, C3); nothing after its framed end is forwarded.
 //! 6. **Order (Q7)** — scope A (under `decision_timeout`): read head → parse
 //!    → port → inspector → allow list → head checks → (CONNECT) write
 //!    `200` → inspect the tunnel's first bytes. Scope B (after A closes):
@@ -35,8 +34,9 @@
 //!    (D5).
 //! 8. **Forward rewrite (Q6/D7)** — the forward head is REBUILT from the
 //!    validated parse, not patched: origin-form target, fragment dropped,
-//!    `Proxy-*` and `Connection`/`Keep-Alive`/`Upgrade` dropped, one
-//!    `Connection: close` added. Fields named by a `Connection` token are
+//!    `Proxy-*` and `Connection`/`Keep-Alive`/`Upgrade` dropped, and one
+//!    `Connection: close` added. The close is ALWAYS added: the forward request is
+//!    the last on its upstream connection (point 12). Fields named by a `Connection` token are
 //!    kept. Known residual, documented not denied: a target such as
 //!    `//host/path` is origin-form (no scheme) and is forwarded as-is.
 //! 9. **Tunnel residuals** — bytes pipelined after the CONNECT head are
@@ -45,17 +45,15 @@
 //!    `crate::proxy` module docs point 14) that replay goes to the terminator
 //!    instead, which forwards only the declared body and drops anything
 //!    pipelined after it. What the upstream receives: on 443 the
-//!    client's bytes verbatim (CH1 plus any pipelined tail, in order); on 80
-//!    the inspected request head with the `Connection: close` rewrite
-//!    (module docs point 6 of `http`), then the rest verbatim; on forward
-//!    requests the REBUILT head (point 8) followed by the verbatim body.
+//!    client's bytes verbatim (CH1 plus any pipelined tail, in order); on 80 the inspected request head: byte-identical when keep-alive, with the
+//!    `Connection: close` rewrite when it is last (module docs points 6 and 8 of
+//!    `http`), and the pending bytes then follow through the per-request relay
+//!    (relay module docs point 4); on forward requests the REBUILT head (point 8),
+//!    and the bytes after the request's framed end are never forwarded (point 12).
 //! 10. **Residuals (documented, not fixed in #8)** — (a) a CONNECT dial failure
-//!     after the `200` is a silent close; (b) body framing beyond the strict
-//!     table is deferred (F3); (c) pipelined second requests on a kept-alive
-//!     connection are not inspected: on 80 the `Connection: close` rewrite
-//!     covers only the first request, so a second request with a foreign
-//!     `Host` could reach a shared vhost (the h2/vhost-confusion class, #14);
-//!     (d) fields named by a `Connection` token are forwarded.
+//!     after the `200` is a silent close; (d) fields named by a `Connection`
+//!     token are forwarded. (Issue #29 closed the former (b) and (c): see the
+//!     proxy module docs point 15 and point 12 below.)
 //! 11. **Audit (Q10)** — one [`Decision`] per connection, recorded before
 //!     any relay byte or deny response. Client-derived text in reasons is
 //!     [`crate::proxy::redact_for_audit`]ed: authority only, no path, query,
@@ -68,8 +66,9 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Chain};
 use tokio::net::TcpStream;
 
+use super::h1::RequestMeta;
 use super::http::{self, Framing, HeadCheck};
-use super::relay::linger_close;
+use super::relay::{HttpBinding, HttpFlavor, HttpStart, linger_close};
 use super::{
     Connected, Decision, ExplicitKind, Failed, Handoff, Limits, NameSource, Proxy, Rejected,
     RelayMode, Terminator, Verdict, Via, connect_upstream, hello, redact_for_audit,
@@ -205,6 +204,16 @@ pub(crate) fn parse_proxy_request(
     head_end: usize,
     max_headers: usize,
 ) -> Result<ProxyRequest, ParseFail> {
+    // The bare-LF rule of http::parse_head_with, for the explicit head
+    // (issue #29 review, item 6).
+    if http::head_has_bare_lf(&buf[..head_end.min(buf.len())]) {
+        return Err(fail(
+            ExplicitKind::Unknown,
+            Rejected::AmbiguousFraming {
+                detail: http::FRAMING_BARE_LF,
+            },
+        ));
+    }
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
     let mut request = httparse::Request::new(&mut headers);
     let consumed = match request.parse(buf) {
@@ -380,7 +389,7 @@ pub(crate) fn check_proxy_head(
     head: &[u8],
     req: &ProxyRequest,
     max_headers: usize,
-) -> Result<(), Rejected> {
+) -> Result<RequestMeta, Rejected> {
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
     let request = reparse_head(head, &mut headers)?;
     let (source, require) = match req.kind {
@@ -405,10 +414,25 @@ pub(crate) fn check_proxy_head(
                 return Err(Rejected::ConnectHasBody);
             }
         }
-        return Ok(());
+        return connect_meta(request.headers, req.minor_version);
     }
-    http::check_framing(request.headers, req.minor_version)?;
-    Ok(())
+    connect_meta(request.headers, req.minor_version)
+}
+
+/// The request facts of a validated explicit head (module docs point 5): the
+/// strict framing table, `close`, and `upgrade`.
+fn connect_meta(
+    headers: &[httparse::Header<'_>],
+    minor_version: u8,
+) -> Result<RequestMeta, Rejected> {
+    let framing = http::check_framing(headers, minor_version)?;
+    let (close, upgrade) = http::connection_semantics(headers);
+    Ok(RequestMeta {
+        framing,
+        minor_version,
+        close,
+        upgrade,
+    })
 }
 
 /// Rebuild the absolute-form head as origin-form (issue #8, T4 / D7): the
@@ -462,7 +486,10 @@ fn reparse_head<'h, 'b>(
 
 /// What [`decide_explicit_step`] hands back: a decided connection, or (issue
 /// #17) a CONNECT to a terminated host whose inspected ClientHello the
-/// terminator takes over (the `200` has already been written).
+/// terminator takes over (the `200` has already been written). The size gap
+/// (the per-request relay state, issue #29) is fine: one value per connection,
+/// moved once, never stored.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ExplicitStep {
     Decided(ExplicitDecided),
     Terminate {
@@ -578,14 +605,30 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
         });
     }
     // 4. Head checks (Host, framing, CONNECT body).
-    check_proxy_head(&head.buf[..head.head_end], &req, limits.max_http_headers)?;
+    let meta = check_proxy_head(&head.buf[..head.head_end], &req, limits.max_http_headers)?;
 
     match req.kind {
         ExplicitKind::Forward => {
-            let mut replay =
+            // One request per connection (module docs point 12): the forward
+            // request is ALWAYS the last on its upstream, so the rebuilt head
+            // carries `Connection: close` and nothing after its framed end is
+            // ever forwarded. The pending bytes stay in order behind the head.
+            let first = RequestMeta {
+                close: true,
+                ..meta
+            };
+            let replay =
                 rewrite_forward_head(&head.buf[..head.head_end], &req, limits.max_http_headers)?;
-            replay.extend_from_slice(&head.buf[head.head_end..]);
-            Ok(Pre::Relay(replay, RelayMode::CloseOnUpstreamEof))
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: req.host.clone(),
+                    port: req.port,
+                    flavor: HttpFlavor::Forward,
+                },
+                first,
+                pending: head.buf.split_off(head.head_end),
+            };
+            Ok(Pre::Relay(replay, RelayMode::Http(start)))
         }
         // Fail closed BEFORE any `200`: parse_proxy_request never yields
         // Unknown on success, so this arm is only a backstop.
@@ -619,7 +662,7 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
                     name: req.host.clone(),
                 }));
             }
-            let (inspected, mode) = if req.port == 443 {
+            if req.port == 443 {
                 let replay = hello::inspect_tls_from(
                     &mut chained,
                     &req.host,
@@ -627,21 +670,33 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
                     limits,
                 )
                 .await?;
+                let replay = finish_residual(replay, chained);
                 let scan_from =
                     hello::first_record_end(&replay).ok_or_else(|| Rejected::HelloMalformed {
                         detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
                     })?;
-                (replay, RelayMode::Scanned { scan_from })
+                Ok(Pre::Relay(replay, RelayMode::Scanned { scan_from }))
             } else {
                 let check = HeadCheck {
                     expected: &req.host,
                     port: 80,
                     source: NameSource::ConnectTarget,
                 };
-                let replay = http::inspect_http_with(&mut chained, &check, limits).await?;
-                (replay, RelayMode::CloseOnUpstreamEof)
-            };
-            Ok(Pre::Relay(finish_residual(inspected, chained), mode))
+                let inspected = http::inspect_http_with(&mut chained, &check, limits).await?;
+                let pending = finish_residual(inspected.pending, chained);
+                let first = inspected.meta;
+                let replay = http::upstream_head(inspected.head, &first);
+                let start = HttpStart {
+                    binding: HttpBinding {
+                        name: req.host.clone(),
+                        port: 80,
+                        flavor: HttpFlavor::ConnectTunnel,
+                    },
+                    first,
+                    pending,
+                };
+                Ok(Pre::Relay(replay, RelayMode::Http(start)))
+            }
         }
     }
 }
@@ -649,7 +704,7 @@ async fn pre_connect<S: AsyncRead + AsyncWrite + Unpin>(
 /// The tunnel-residual step (issue #8, module docs point 9). `chained`
 /// yielded the pipelined residual first and the client stream after it;
 /// `inspected` is what the inspector consumed. The residual bytes the
-/// inspector did not reach are appended here, so the replay is an in-order
+/// inspector did not reach are appended here, so the bytes are an in-order
 /// prefix of the client's byte stream. LOAD-BEARING: without this append a
 /// residual larger than one read chunk is silently dropped.
 fn finish_residual<S: AsyncRead + Unpin>(
@@ -835,6 +890,7 @@ mod tests {
     use crate::policy::{self, DomainRule};
     use crate::proxy::AUDIT_TEXT_CAP;
     use crate::proxy::hello::{build_client_hello, first_record_end};
+    use crate::proxy::relay::{HttpEnd, relay_http};
     use crate::proxy::{
         Connector, DecisionSink, DialFn, DnsMap, GuardedConnector, ResolveFn, Upstream,
     };
@@ -1145,7 +1201,7 @@ mod tests {
         };
         // D1: HTTP/1.0 CONNECT may omit Host; HTTP/1.1 must carry one.
         let (buf, req) = parsed("CONNECT allowed.test:443 HTTP/1.0\r\n\r\n");
-        assert_eq!(check_proxy_head(&buf[..], &req, 64), Ok(()));
+        assert_eq!(check_proxy_head(&buf[..], &req, 64).map(|_| ()), Ok(()));
         let (buf, req) = parsed("CONNECT allowed.test:443 HTTP/1.1\r\n\r\n");
         assert_eq!(
             check_proxy_head(&buf[..], &req, 64),
@@ -1155,7 +1211,7 @@ mod tests {
         let (buf, req) = parsed(
             "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\n",
         );
-        assert_eq!(check_proxy_head(&buf[..], &req, 64), Ok(()));
+        assert_eq!(check_proxy_head(&buf[..], &req, 64).map(|_| ()), Ok(()));
         let (buf, req) = parsed(
             "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 5\r\n\r\n",
         );
@@ -1189,6 +1245,37 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    /// Issue #29 review, item 5 on the explicit paths: a Connection token that
+    /// names a framing header or Host is denied for CONNECT and for absolute-form
+    /// forward (both go through `check_framing`).
+    #[test]
+    fn explicit_connection_tokens_naming_framing_are_denied() {
+        let check = |raw: &str| {
+            let bytes = raw.as_bytes().to_vec();
+            let end = bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("terminated")
+                + 4;
+            let req = parse_proxy_request(&bytes, end, 64).expect("parses");
+            check_proxy_head(&bytes[..end], &req, 64)
+        };
+        let want = Err(Rejected::AmbiguousFraming {
+            detail: http::FRAMING_CONNECTION_NAMES,
+        });
+        assert_eq!(
+            check("CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\nConnection: Transfer-Encoding\r\n\r\n")
+                .map(|_| ()),
+            want.clone().map(|_: ()| ())
+        );
+        assert_eq!(
+            check("GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nProxy-Connection: content_length\r\n\r\n")
+                .map(|_| ()),
+            want.map(|_: ()| ())
+        );
+        assert!(check("GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n").is_ok());
     }
 
     #[test]
@@ -1565,17 +1652,43 @@ mod tests {
     }
 
     #[test]
-    fn decide_explicit_connect_80_tunnel_forwards_with_connection_close() {
+    fn decide_explicit_connect_80_tunnel_keep_alive_and_last_requests() {
+        // Module docs point 9 / issue #29 C1: CONNECT-80 is the per-request relay
+        // bound to the CONNECT target. A bodyless keep-alive request is not last
+        // and goes upstream byte-identical; a request with `Connection: close`
+        // is last and gets the close token inserted.
         block_on(async {
             let (proxy, _dials) = proxy(Duration::from_secs(5));
             let mut bytes = connect("allowed.test:80");
             bytes.extend_from_slice(b"GET /p HTTP/1.1\r\nHost: allowed.test\r\n\r\n");
             let (decided, _) = drive(&proxy, &bytes).await;
             let relay = decided.relay.expect("allowed");
-            assert_eq!(relay.mode, RelayMode::CloseOnUpstreamEof);
+            let RelayMode::Http(start) = &relay.mode else {
+                panic!("CONNECT-80 runs the per-request relay: {:?}", relay.mode);
+            };
+            assert_eq!(start.binding.flavor, HttpFlavor::ConnectTunnel);
+            assert_eq!(start.binding.name, dom("allowed.test"));
+            assert_eq!(start.binding.port, 80);
+            assert_eq!(
+                relay.replay,
+                b"GET /p HTTP/1.1\r\nHost: allowed.test\r\n\r\n".to_vec()
+            );
+            assert!(start.pending.is_empty());
+        });
+        block_on(async {
+            let (proxy, _dials) = proxy(Duration::from_secs(5));
+            let mut bytes = connect("allowed.test:80");
+            bytes.extend_from_slice(
+                b"GET /p HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n",
+            );
+            let (decided, _) = drive(&proxy, &bytes).await;
+            let relay = decided.relay.expect("allowed");
             let text = String::from_utf8(relay.replay).expect("ascii head");
             assert!(text.starts_with("GET /p HTTP/1.1\r\n"));
-            assert!(text.contains("Connection: close\r\n"));
+            assert!(
+                text.ends_with("Connection: close\r\nConnection: close\r\n\r\n"),
+                "{text:?}"
+            );
         });
     }
 
@@ -1594,7 +1707,7 @@ mod tests {
                 }
             );
             let relay = decided.relay.expect("allowed");
-            assert_eq!(relay.mode, RelayMode::CloseOnUpstreamEof);
+            assert!(matches!(relay.mode, RelayMode::Http(_)), "{:?}", relay.mode);
             assert_eq!(
                 relay.replay,
                 b"GET /p?q HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n".to_vec()
@@ -1864,22 +1977,43 @@ mod tests {
     }
 
     #[test]
-    fn relay_until_upstream_eof_replays_then_closes_on_upstream_eof() {
+    fn relay_http_replays_last_head_then_closes_on_upstream_eof() {
+        // The explicit forward shape: a last request (close) is written upstream
+        // as its rewritten head; the upstream's EOF ends the exchange and the
+        // client sees a clean EOF after the response.
         block_on(async {
-            let (client, mut client_peer) = duplex(4096);
+            let (mut client, mut client_peer) = duplex(4096);
             let (mut upstream, mut up_peer) = duplex(4096);
-            // The upstream answers, then half-closes: its EOF ends the exchange.
             up_peer
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .await
                 .expect("upstream write");
             up_peer.shutdown().await.expect("upstream shutdown");
             let replay = b"GET /p HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
-            let ended =
-                crate::proxy::relay::relay_until_upstream_eof(client, replay, &mut upstream)
-                    .await
-                    .expect("relay");
-            assert!(matches!(ended, crate::proxy::relay::RelayEnd::Finished));
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: dom("allowed.test"),
+                    port: 80,
+                    flavor: HttpFlavor::Forward,
+                },
+                first: RequestMeta {
+                    framing: Framing::None,
+                    minor_version: 1,
+                    close: true,
+                    upgrade: false,
+                },
+                pending: Vec::new(),
+            };
+            let ended = relay_http(
+                &mut client,
+                replay,
+                start,
+                &mut upstream,
+                &Limits::default(),
+            )
+            .await
+            .expect("relay");
+            assert!(matches!(ended, HttpEnd::Finished), "{ended:?}");
             // The replay reached the upstream intact (first bytes it read).
             let mut seen = vec![0u8; replay.len()];
             up_peer.read_exact(&mut seen).await.expect("replay bytes");
@@ -1919,7 +2053,7 @@ mod tests {
                     let mut buf = bytes.to_vec();
                     buf.truncate(end);
                     match check_proxy_head(&buf, &req, 64) {
-                        Ok(()) => continue,
+                        Ok(_) => continue,
                         Err(rejected) => rejected.reason(),
                     }
                 }
@@ -2098,14 +2232,16 @@ mod tests {
     }
 
     #[test]
-    fn relay_until_upstream_eof_half_closes_upstream_on_client_eof() {
-        // M1(d): the client half-closes; the upstream must see EOF on its read
-        // side (the replay + the client's bytes, then the EOF), and its reply
-        // must still reach the client before the relay ends.
+    fn relay_http_half_closes_upstream_on_client_eof() {
+        // Port of relay_waits_for_client_half_close (module docs point 4): a
+        // client EOF shuts the upstream write half (the upstream sees EOF), and
+        // the upstream's reply still reaches the client before the relay ends.
+        // The first request is bodyless keep-alive, so the client's EOF is
+        // observed (a last request stops reading the client; see relay.rs).
         block_on(async {
-            let (client, mut client_peer) = duplex(4096);
+            let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+            let (mut client, mut client_peer) = duplex(4096);
             let (mut upstream, up_peer) = duplex(4096);
-            client_peer.write_all(b"PING").await.expect("client write");
             client_peer.shutdown().await.expect("client half-close");
             let server = tokio::spawn(async move {
                 let mut up_peer = up_peer;
@@ -2118,17 +2254,26 @@ mod tests {
                 up_peer.shutdown().await.expect("upstream half-close");
                 seen
             });
-            let ended =
-                crate::proxy::relay::relay_until_upstream_eof(client, b"REPLAY", &mut upstream)
-                    .await
-                    .expect("relay");
-            assert!(matches!(ended, crate::proxy::relay::RelayEnd::Finished));
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: dom("allowed.test"),
+                    port: 80,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first: RequestMeta {
+                    framing: Framing::None,
+                    minor_version: 1,
+                    close: false,
+                    upgrade: false,
+                },
+                pending: Vec::new(),
+            };
+            let ended = relay_http(&mut client, head, start, &mut upstream, &Limits::default())
+                .await
+                .expect("relay");
+            assert!(matches!(ended, HttpEnd::Finished), "{ended:?}");
             let seen = server.await.expect("server task");
-            assert_eq!(
-                seen,
-                b"REPLAYPING".to_vec(),
-                "upstream saw EOF after the client bytes"
-            );
+            assert_eq!(seen, head.to_vec(), "upstream saw the head, then EOF");
             let mut got = Vec::new();
             client_peer
                 .read_to_end(&mut got)

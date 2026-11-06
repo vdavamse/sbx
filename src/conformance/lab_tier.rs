@@ -28,10 +28,10 @@ use super::spawn::{SbxRun, poll_gone};
 use crate::host::Status;
 use crate::proxy::relay::TORN_DOWN_SECOND_HELLO;
 
-/// The 19 lab checks, in catalog order.
-pub const LAB_IDS: [&str; 19] = [
+/// The 21 lab checks, in catalog order.
+pub const LAB_IDS: [&str; 21] = [
     "A02", "A03", "A04", "A05", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07",
-    "B08", "B09", "C02", "C07", "F02", "F04",
+    "B08", "B09", "B11", "B12", "C02", "C07", "F02", "F04",
 ];
 
 /// The evaluator inputs: the scenario results plus the fixture logs at the
@@ -63,8 +63,8 @@ pub fn run_all(
     let want = |ids: &[&str]| selected.iter().any(|s| ids.contains(s));
     let mut scns: Scns = BTreeMap::new();
     if want(&[
-        "A02", "A03", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "C02",
-        "C07",
+        "A02", "A03", "A06", "A12", "B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11",
+        "C02", "C07",
     ]) {
         let s = l1(env);
         scns.insert(s.name, s);
@@ -251,6 +251,22 @@ fn l1_ops(nonce: &str) -> Vec<Op> {
         ],
     ));
     v.push(tcp_name(
+        "b11",
+        &b("b11"),
+        80,
+        vec![
+            // Issue #29 review (item 2): the follow-up is a fully valid,
+            // bodyless GET with the SAME Host, so per-request Host checks cannot
+            // stop it. Only "a body ends the connection" can.
+            text(&format!(
+                "POST / HTTP/1.1\r\nHost: {0}\r\nContent-Length: 4\r\n\r\nbody\
+                 GET / HTTP/1.1\r\nHost: {0}\r\n\r\n",
+                b("b11")
+            )),
+            read_to_end(),
+        ],
+    ));
+    v.push(tcp_name(
         "b07",
         &b("b07"),
         443,
@@ -316,6 +332,22 @@ fn l2(env: &Env) -> Scn {
                 connect("b09"),
                 read_until("\r\n\r\n"),
                 hello("other-b09.conformance.test"),
+                read_to_end(),
+            ],
+        ),
+        // Issue #29, B12: two absolute-form requests in ONE write. The first is
+        // answered; the identical pipelined follow-up is never forwarded.
+        tcp_env(
+            "b12",
+            vec![
+                text(&format!(
+                    // Issue #29 review (item 3): an identical, fully valid
+                    // follow-up to the SAME authority, so only "one request per
+                    // connection" can stop it.
+                    "GET http://{0}/x HTTP/1.1\r\nHost: {0}\r\n\r\n\
+                     GET http://{0}/x HTTP/1.1\r\nHost: {0}\r\n\r\n",
+                    a("b12")
+                )),
                 read_to_end(),
             ],
         ),
@@ -567,6 +599,8 @@ fn evaluate(id: &str, ev: &Ev<'_>) -> R {
         "B04" => b04(ev),
         "B05" => b05(ev),
         "B06" => b06(ev),
+        "B11" => b11(ev),
+        "B12" => b12(ev),
         "B07" => b07(ev),
         "B08" => b08(ev),
         "B09" => b09(ev),
@@ -693,9 +727,12 @@ fn a03(ev: &Ev<'_>) -> R {
         !reqs.is_empty(),
         format!("a03: fixture saw no request with Host {n}"),
     )?;
+    // Issue #29 F3: a bodyless HTTP/1.1 request is forwarded verbatim and may
+    // be kept alive, so the proxy inserts no `Connection: close` (the probe
+    // sends none). B06 and B11 cover the requests that are made last.
     need(
-        reqs.iter().any(|h| h.connection_close),
-        "a03: fixture request lacks Connection: close",
+        reqs.iter().all(|h| !h.connection_close),
+        "a03: a bodyless HTTP/1.1 request got an inserted Connection: close",
     )?;
     need(
         connect_row(s, &n, "transparent"),
@@ -996,6 +1033,98 @@ fn b06(ev: &Ev<'_>) -> R {
         second == 0,
         format!("b06: {second} bytes came back for the foreign Host"),
     )?;
+    // Issue #29: the keep-alive first request is forwarded verbatim (no close
+    // token), so the fixture saw exactly one request for the name, and the
+    // proxy's teardown of the follow-up is audited.
+    let on_conn: Vec<&HttpRec> = ev
+        .http
+        .iter()
+        .filter(|h| h.host.as_deref() == Some(n.as_str()))
+        .collect();
+    need(
+        on_conn.len() == 1,
+        format!(
+            "b06: fixture saw {} requests for {n}, expected exactly 1",
+            on_conn.len()
+        ),
+    )?;
+    let torn = s.audit.iter().any(|r| {
+        r["event"] == "deny"
+            && r["verdict"] == "teardown"
+            && r["host"].as_str() == Some(n.as_str())
+            && r["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("relay torn down: HTTP request 2 denied:"))
+    });
+    need(torn, "b06: no teardown row for the foreign-Host follow-up")?;
+    need(
+        !ev.http
+            .iter()
+            .any(|h| h.host.as_deref() == Some("other-b06.conformance.test")),
+        "b06: the fixture saw the foreign Host",
+    )?;
+    Ok("keep-alive follow-up with a foreign Host is not forwarded".to_owned())
+}
+
+/// B11 (issue #29, F3): a body-bearing request is LAST — the close token goes
+/// in, and nothing pipelined after its body reaches the fixture.
+fn b11(ev: &Ev<'_>) -> R {
+    let s = l1_scn(ev)?;
+    let r = res(s, "b11")?;
+    let n = name("b11");
+    ctl(
+        read_text(r, 0).starts_with("HTTP/1.1 200"),
+        format!("the POST was not answered ({:?})", read_text(r, 0)),
+    )?;
+    let on_conn: Vec<&HttpRec> = ev
+        .http
+        .iter()
+        .filter(|h| h.host.as_deref() == Some(n.as_str()))
+        .collect();
+    need(
+        on_conn.len() == 1 && on_conn[0].connection_close && on_conn[0].method == "POST",
+        format!(
+            "b11: fixture saw {} requests for {n}, expected exactly 1 POST with Connection: close",
+            on_conn.len()
+        ),
+    )?;
+    // One request on the connection (the follow-up is never forwarded), and no
+    // byte after the body reached the fixture.
+    let on_connection = ev.http.iter().filter(|h| h.conn == on_conn[0].conn).count();
+    need(
+        on_connection == 1,
+        format!("b11: {on_connection} requests on the connection, expected 1"),
+    )?;
+    need(
+        on_conn[0].drained,
+        "b11: the drain after the close request has not finished (a partial count is not evidence)",
+    )?;
+    need(
+        on_conn[0].post_close_bytes == 0,
+        format!(
+            "b11: {} bytes after the body were forwarded",
+            on_conn[0].post_close_bytes
+        ),
+    )?;
+    Ok("bytes after a request body are not forwarded".to_owned())
+}
+
+/// B12 (issue #29, C2): explicit forward is one request per connection. The
+/// pipelined follow-up (the same authority) is never forwarded, and the first
+/// request reaches the fixture with `Connection: close`.
+fn b12(ev: &Ev<'_>) -> R {
+    let s = l2_scn(ev)?;
+    let r = res(s, "b12")?;
+    let n = name("b12");
+    let text_all = read_text(r, 0);
+    ctl(
+        text_all.starts_with("HTTP/1.1 200"),
+        format!("the first request was not answered ({text_all:?})"),
+    )?;
+    need(
+        text_all.matches("HTTP/1.1 ").count() == 1,
+        "b12: a response came back for the pipelined follow-up",
+    )?;
     let on_conn: Vec<&HttpRec> = ev
         .http
         .iter()
@@ -1004,17 +1133,24 @@ fn b06(ev: &Ev<'_>) -> R {
     need(
         on_conn.len() == 1 && on_conn[0].connection_close,
         format!(
-            "b06: fixture saw {} requests for {n}, expected exactly 1 with Connection: close",
+            "b12: fixture saw {} requests for {n}, expected exactly 1 with Connection: close",
             on_conn.len()
         ),
     )?;
+    // Nothing after the first request's framed end reached the fixture: the
+    // identical follow-up was never forwarded (review item 2).
     need(
-        !ev.http
-            .iter()
-            .any(|h| h.host.as_deref() == Some("other-b06.conformance.test")),
-        "b06: the fixture saw the foreign Host",
+        on_conn[0].drained,
+        "b12: the drain after the first request has not finished (a partial count is not evidence)",
     )?;
-    Ok("keep-alive follow-up with a foreign Host is not forwarded".to_owned())
+    need(
+        on_conn[0].post_close_bytes == 0,
+        format!(
+            "b12: {} bytes after the first request reached the fixture",
+            on_conn[0].post_close_bytes
+        ),
+    )?;
+    Ok("explicit: a pipelined follow-up request is not forwarded".to_owned())
 }
 
 fn b07(ev: &Ev<'_>) -> R {
@@ -1261,12 +1397,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lab_ids_are_the_nineteen() {
-        assert_eq!(LAB_IDS.len(), 19);
+    fn lab_ids_are_the_twenty_one() {
+        assert_eq!(LAB_IDS.len(), 21);
         let mut sorted = LAB_IDS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 19);
+        assert_eq!(sorted.len(), 21);
     }
 
     #[test]

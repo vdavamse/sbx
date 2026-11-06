@@ -22,7 +22,10 @@ use crate::policy::{Domain, UrlPrefix};
 use crate::proxy::NameSource;
 use crate::proxy::Rejected;
 use crate::proxy::TLS_PORT;
-use crate::proxy::http::{Framing, HEAD_TERMINATOR_MISMATCH, check_framing, check_host, trim_ows};
+use crate::proxy::http::{
+    FRAMING_BARE_LF, Framing, HEAD_TERMINATOR_MISMATCH, check_framing, check_host,
+    head_has_bare_lf, trim_ows,
+};
 
 /// The HTTP/2 client connection preface's request line (RFC 9113 §3.4).
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0";
@@ -49,6 +52,13 @@ pub(crate) fn check_request(
     paths: &[UrlPrefix],
     max_headers: usize,
 ) -> Result<Framing, Rejected> {
+    // A bare LF inside the head is denied before httparse runs, as on every
+    // other path (issue #29: httparse accepts it mid-head).
+    if head_has_bare_lf(head) {
+        return Err(Rejected::AmbiguousFraming {
+            detail: FRAMING_BARE_LF,
+        });
+    }
     let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
     let mut request = httparse::Request::new(&mut headers);
     let consumed = match request.parse(head) {
@@ -161,6 +171,17 @@ mod tests {
 
     fn check(lines: &str) -> Result<Framing, Rejected> {
         check_request(&head(lines), &name(), &rules(), 64)
+    }
+
+    #[test]
+    fn a_bare_lf_in_the_head_is_denied() {
+        // Issue #29: the terminated path refuses a bare LF like every other.
+        assert_eq!(
+            check("GET /v1/items HTTP/1.1\nHost: api.example.com"),
+            Err(Rejected::AmbiguousFraming {
+                detail: FRAMING_BARE_LF
+            })
+        );
     }
 
     #[test]

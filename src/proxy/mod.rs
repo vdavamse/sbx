@@ -65,7 +65,9 @@
 //!    pinned reasons never compete. A per-run concurrency cap
 //!    ([`Limits::max_connections`], issue #43) covers both listeners: an
 //!    accept over it is closed unread with one [`Rejected::ConnLimit`]
-//!    decision. No relay idle timeout in v1 (#29).
+//!    decision. A relay idle timeout (issue #29, C4:
+//!    [`Limits::relay_idle_timeout`], 300 s, `--relay-idle-timeout`) closes
+//!    every relay that moves no payload byte in either direction.
 //! 7. **v1 limitations (deliberate)** — only 443/80 have inspectors; any
 //!    other policy-listed port denies because unverifiable-name traffic
 //!    must not pass (Q1). TLS is PASSED THROUGH in the default build, never
@@ -99,11 +101,7 @@
 //!    the replay buffer (`inspect_tls_replays_pipelined_bytes` pins it),
 //!    and the upstream sees the client's byte stream verbatim (terminated
 //!    hosts, point 14, send their own rewritten request instead) — with ONE
-//!    documented deviation (round-2 review fix): on port 80 the validated
-//!    head is replayed with an inserted `Connection: close` (http.rs module
-//!    docs point 6 — the name binding's connection-lifetime enforcement;
-//!    request line, client headers, and every body byte stay
-//!    byte-identical).
+//!    documented deviation (issue #29, F3): on port 80 a LAST request's head (HTTP/1.0, `close`, `Upgrade`, or a body) is replayed with an inserted `Connection: close` (http.rs module docs points 6 and 8); a bodyless keep-alive request is byte-identical, and nothing after a last request is forwarded.
 //! 10. **Accept-loop resilience** — proxy death = sandbox death (fdpass),
 //!     so transient accept errors (EMFILE/ENFILE/ECONNABORTED/ENOBUFS/
 //!     ENOMEM …) get bounded exponential backoff and NEVER an exit; only a
@@ -191,8 +189,11 @@
 //!     The strict framing table applies on transparent :80 as well (F2).
 //!     Residuals, documented: a CONNECT dial failure after the `200` is a
 //!     silent close; body framing beyond the strict table is deferred (F3);
-//!     pipelined second requests on one connection are not inspected (the
-//!     vhost-confusion class, #14; see the `explicit` module docs point 10).
+//!     pipelined second requests on one connection are not inspected (the vhost-confusion class, #14; see the `explicit` module docs point 10). Issue
+//!     #29 (F3): body framing is strict and streamed, and every pipelined request
+//!     on a port-80 connection (transparent or CONNECT-80) is inspected before its
+//!     bytes are forwarded. Explicit forward is one request per connection
+//!     (explicit module docs point 12).
 //!     A CONNECT to a terminated host (point 14) is handed to the terminator
 //!     after the `200`, with the same SNI check first.
 //! 14. **TLS termination for URL-path rules (issue #17, opt-in)** — with the
@@ -209,9 +210,18 @@
 //!     (`Rejected::MitmPlainHttp`), and a terminated host without a terminator
 //!     is refused before its hello is read (`Rejected::TerminationUnavailable`,
 //!     which is every terminated host in the default build). Every other host
-//!     keeps points 1–13 unchanged.
+//!     keeps points 1–13 and 15 unchanged.
+//! 15. **HTTP/1 per-request relay (issue #29, F3)** — port 80 (transparent),
+//!     CONNECT-80 and absolute-form forward run [`relay::relay_http`]. Request 1
+//!     is inspected in the decision phase (`http::inspect_http`); every later head
+//!     is inspected before its bytes are written (`http::inspect_head`, http module
+//!     docs point 7), and bodies are framed by `h1::RequestStream` and streamed. A
+//!     denied later request is a silent teardown on transparent and CONNECT-80
+//!     (`relay::Teardown::Request`, relay module docs point 9). The name, port, DNS
+//!     map, allow list and dial are fixed per connection and not re-run.
 
 pub(crate) mod explicit;
+pub(crate) mod h1;
 pub mod hello;
 pub(crate) mod http;
 pub(crate) mod relay;
@@ -231,6 +241,7 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::egress;
 use crate::init::consts;
 use crate::policy::{self, Domain, DomainRule};
+use relay::{HttpBinding, HttpEnd, HttpFlavor, HttpStart, RelayEnd};
 
 /// The ports with a v1 protocol inspector (module docs point 7): 443 is
 /// inspected as TLS ([`hello`]), 80 as HTTP/1 ([`http`]). Any other
@@ -282,6 +293,11 @@ pub struct Limits {
     pub connect_timeout: Duration,
     /// Upper bound of the transient-accept-error backoff (1 ms doubling).
     pub accept_backoff_max: Duration,
+    /// Inactivity bound on every relay (issue #29, C4): a relay that moves no
+    /// payload byte in either direction for this long is closed, with the
+    /// `close` row carrying `reason: "idle_timeout"` (module docs point 6).
+    /// The decision phase is bounded by [`Self::decision_timeout`] instead.
+    pub relay_idle_timeout: Duration,
     /// Concurrent proxied connections per run, both listeners together
     /// (issue #43). An accept over the cap is closed at once with one
     /// [`Rejected::ConnLimit`] decision; its slot frees when a connection
@@ -302,6 +318,33 @@ impl Default for Limits {
             connect_timeout: Duration::from_secs(10),
             accept_backoff_max: Duration::from_millis(100),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            relay_idle_timeout: Duration::from_secs(300),
+        }
+    }
+}
+
+/// Why a relay ended, for the `close` audit row (issue #29, C4). `Ended` is
+/// every natural end (EOF, reset, scanner teardown); `IdleTimeout` is the
+/// inactivity watchdog ([`Limits::relay_idle_timeout`]). Non-exhaustive, so a
+/// later end reason is not a breaking change for external sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CloseReason {
+    /// The relay ended on its own.
+    Ended,
+    /// No payload byte moved for [`Limits::relay_idle_timeout`].
+    IdleTimeout,
+}
+
+/// The audit `reason` of an idle-timeout close (pinned golden string).
+pub const IDLE_TIMEOUT_REASON: &str = "idle_timeout";
+
+impl CloseReason {
+    /// The `close` row's `reason` (`None` for a natural end).
+    pub fn audit_reason(&self) -> Option<&'static str> {
+        match self {
+            CloseReason::Ended => None,
+            CloseReason::IdleTimeout => Some(IDLE_TIMEOUT_REASON),
         }
     }
 }
@@ -895,8 +938,18 @@ pub trait DecisionSink: Send + Sync + 'static {
     /// connection, AFTER `teardown` (if it fired), on EVERY relay end. Never
     /// called for Denied/Error, nor for a relay still running at runtime stop.
     /// Default: no-op. SYNC + CHEAP + NON-BLOCKING + must-not-panic. NOT a
-    /// second `record`.
+    /// second `record`. Kept with main's signature (issue #29 review): the
+    /// relay calls [`Self::closed_with_reason`], whose default forwards here.
     fn closed(&self, _decision: &Decision, _up: u64, _down: u64) {}
+
+    /// [`Self::closed`] with the reason the relay segment ended (issue #29, C4):
+    /// `IdleTimeout` when the relay idle watchdog closed it. The relay calls only
+    /// this method. The default forwards to [`Self::closed`], so an external
+    /// sink that implements only `closed` keeps working and does not see the
+    /// reason. The sinks sbx ships (the JSONL audit log) override this.
+    fn closed_with_reason(&self, decision: &Decision, up: u64, down: u64, _end: CloseReason) {
+        self.closed(decision, up, down);
+    }
 }
 
 /// A bidirectional byte stream usable as an upstream (relay endpoint).
@@ -1248,12 +1301,8 @@ impl Proxy {
         dns_map: Arc<dyn DnsMap>,
         sink: Arc<dyn DecisionSink>,
         host_addrs: egress::HostAddrs,
-        max_connections: usize,
+        limits: Limits,
     ) -> Arc<Self> {
-        let limits = Limits {
-            max_connections,
-            ..Limits::default()
-        };
         let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
         Self::new(network, dns_map, sink, connector, limits)
     }
@@ -1299,12 +1348,8 @@ impl Proxy {
         sink: Arc<dyn DecisionSink>,
         terminator: Arc<Terminator>,
         host_addrs: egress::HostAddrs,
-        max_connections: usize,
+        limits: Limits,
     ) -> Arc<Self> {
-        let limits = Limits {
-            max_connections,
-            ..Limits::default()
-        };
         let connector = Arc::new(GuardedConnector::system(limits.connect_timeout, host_addrs));
         Self::with_terminator(network, dns_map, sink, connector, limits, Some(terminator))
     }
@@ -1417,15 +1462,19 @@ pub(crate) struct ConnCtx {
 /// record; `None` on the unscanned HTTP path). The client stream stays with
 /// the caller ([`decide`] only borrows it).
 pub(crate) struct RelayStart {
+    /// The bytes written upstream first: the full inspected ClientHello
+    /// buffer on 443 ([`RelayMode::Scanned`]), or the request-1 head as it
+    /// goes upstream on the HTTP paths ([`RelayMode::Http`]; the pending
+    /// bytes travel in the mode).
     pub replay: Vec<u8>,
     pub connected: Connected,
-    pub scan_from: Option<usize>,
+    pub mode: RelayMode,
 }
 
 /// One accepted connection: decide → record (exactly once) → replay →
-/// relay. Relay errors are normal lifecycle (EOF/RST) and swallowed; there
-/// is no idle timeout in v1 (module docs point 6). Drop closes both
-/// sockets.
+/// relay. Relay errors are normal lifecycle (EOF/RST) and swallowed; an
+/// idle relay is closed by [`relay_tail`] (module docs point 6). Drop closes
+/// both sockets.
 ///
 /// The client socket stays open until its decision row is recorded: a deny
 /// closes it only after `record`, so the payload cannot see the close, exit,
@@ -1488,13 +1537,9 @@ pub(crate) async fn handle_connection(
     if let Some(RelayStart {
         replay,
         mut connected,
-        scan_from,
+        mode,
     }) = relay
     {
-        let mode = match scan_from {
-            Some(scan_from) => RelayMode::Scanned { scan_from },
-            None => RelayMode::Plain,
-        };
         relay_tail(
             &proxy,
             &decision,
@@ -1523,59 +1568,82 @@ pub(crate) enum Step {
     },
 }
 
-/// How the relay phase runs (issue #8 seam): the 443 second-hello scanner
-/// starting at `scan_from`, or the plain bidirectional copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the relay phase runs. 443 keeps the second-hello scanner from
+/// `scan_from` (module docs point 12 of relay.rs); every HTTP/1 path runs the
+/// per-request relay (issue #29, F3; module docs point 15).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RelayMode {
     /// 443 — client→upstream runs through the scanner from this offset.
     Scanned { scan_from: usize },
-    /// 80 (transparent) — plain `copy_bidirectional`.
-    Plain,
-    /// Explicit CONNECT-80 tunnel and absolute-form forward (issue #8): the
-    /// request carries `Connection: close`, so upstream EOF ends the
-    /// exchange (`relay::relay_until_upstream_eof`).
-    CloseOnUpstreamEof,
+    /// Port 80 (transparent), CONNECT-80 and absolute-form forward: the
+    /// per-request relay with its binding, first-request facts and pending
+    /// client bytes.
+    Http(HttpStart),
 }
 
-/// The shared relay tail (issue #8 seam): replay the FULL buffer upstream
-/// (module docs point 9 — inspection consumed those bytes FROM the client),
-/// relay, and report a scanner teardown to the sink (a blocked attack must
-/// not be audit-invisible behind its `allowed …` line). Errors are normal
-/// lifecycle — swallowed. The relay only BORROWS the client: the stream is
-/// dropped (closed) here, after the teardown and close rows are recorded,
-/// so a torn-down attack's row cannot be lost to the payload exiting on
-/// the close (S16).
+/// The shared relay tail (issue #8 seam): replay the head or ClientHello
+/// buffer upstream (module docs point 9 — inspection consumed those bytes FROM
+/// the client), relay under the idle watchdog (module docs point 6), report a
+/// teardown to the sink (a blocked attack must not be audit-invisible behind
+/// its `allowed …` line), and close the segment exactly once with its
+/// reason. Errors are normal lifecycle — swallowed. The relay only BORROWS the
+/// client: the stream is dropped (closed) here, after the teardown and close
+/// rows are recorded, so neither a torn-down request's row nor an
+/// `idle_timeout` close row can be lost to the payload exiting on the close
+/// (S16).
 pub(crate) async fn relay_tail<C>(
     proxy: &Proxy,
     decision: &Decision,
-    mut client: C,
+    client: C,
     replay: &[u8],
     mode: RelayMode,
     upstream: &mut Upstream,
 ) where
     C: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut counted = relay::Counted::new(&mut *upstream);
-    match mode {
-        // Explicit-only; the transparent relay never sees this mode.
-        // Clean end or transport error: normal relay lifecycle — swallowed.
-        RelayMode::CloseOnUpstreamEof => {
-            let _ = relay::relay_until_upstream_eof(&mut client, replay, &mut counted).await;
-        }
-        RelayMode::Scanned { .. } | RelayMode::Plain => {
-            let scan_from = match mode {
-                RelayMode::Scanned { scan_from } => Some(scan_from),
-                _ => None,
-            };
-            match relay::relay(&mut client, replay, scan_from, &mut counted).await {
-                Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
-                // Clean end or transport error (EOF/RST/broken pipe): normal relay
-                // lifecycle — swallowed.
-                Ok(relay::RelayEnd::Finished) | Err(_) => {}
+    let limits = &proxy.limits;
+    let act = relay::Activity::new();
+    let mut client = relay::Watched::new(client, act.clone());
+    let mut counted = relay::Counted::new(relay::Watched::new(&mut *upstream, act.clone()));
+    // Set when a per-request relay ended naturally and the client still owes
+    // its close (the linger below). Issue #29 review: the linger runs AFTER
+    // the idle watchdog has been raced, so a natural end is never labelled
+    // `idle_timeout` by a quiet linger.
+    let mut linger = false;
+    let relayed = relay::until_idle(&act, limits.relay_idle_timeout, async {
+        match mode {
+            RelayMode::Scanned { scan_from } => {
+                match relay::relay(&mut client, replay, Some(scan_from), &mut counted).await {
+                    Ok(RelayEnd::TornDown(teardown)) => {
+                        proxy.sink.teardown(decision, &teardown.detail());
+                    }
+                    // Clean end or transport error (EOF/RST/broken pipe):
+                    // normal relay lifecycle — swallowed.
+                    Ok(RelayEnd::Finished) | Err(_) => {}
+                }
+            }
+            RelayMode::Http(start) => {
+                match relay::relay_http(&mut client, replay, start, &mut counted, limits).await {
+                    Ok(HttpEnd::TornDown(teardown)) => {
+                        proxy.sink.teardown(decision, &teardown.detail());
+                    }
+                    Ok(HttpEnd::Finished) => linger = true,
+                    Err(_) => {}
+                }
             }
         }
+    })
+    .await;
+    let end = match relayed {
+        Some(()) => CloseReason::Ended,
+        None => CloseReason::IdleTimeout,
+    };
+    if linger && end == CloseReason::Ended {
+        relay::linger_close(&mut client).await;
     }
-    proxy.sink.closed(decision, counted.up(), counted.down());
+    proxy
+        .sink
+        .closed_with_reason(decision, counted.up(), counted.down(), end);
 }
 
 /// `getsockopt(SO_ORIGINAL_DST)` on an ACCEPTED socket of the redirected
@@ -1699,21 +1767,19 @@ pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
     // 4. Protocol branch under the decision timeout — ONE scope around the
     //    whole inspection (elapsed ⇒ future dropped mid-read, buffered
     //    bytes discarded — fail-closed; module docs point 6).
-    let inspected = match port {
-        TLS_PORT => {
-            tokio::time::timeout(
-                proxy.limits.decision_timeout,
-                hello::inspect_tls(client, &name, &proxy.limits),
-            )
-            .await
-        }
-        HTTP_PORT => {
-            tokio::time::timeout(
-                proxy.limits.decision_timeout,
-                http::inspect_http(client, &name, port, &proxy.limits),
-            )
-            .await
-        }
+    let preamble = match port {
+        TLS_PORT => tokio::time::timeout(
+            proxy.limits.decision_timeout,
+            hello::inspect_tls(client, &name, &proxy.limits),
+        )
+        .await
+        .map(|inspected| inspected.map(Preamble::Tls)),
+        HTTP_PORT => tokio::time::timeout(
+            proxy.limits.decision_timeout,
+            http::inspect_http(client, &name, port, &proxy.limits),
+        )
+        .await
+        .map(|inspected| inspected.map(Preamble::Http)),
         // Q1: policy-listed but uninspectable ⇒ deny, immediate (no
         // timeout needed — nothing is read).
         other => {
@@ -1727,8 +1793,8 @@ pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
             );
         }
     };
-    let replay = match inspected {
-        Ok(Ok(replay)) => replay,
+    let preamble = match preamble {
+        Ok(Ok(preamble)) => preamble,
         Ok(Err(rejected)) => {
             return Step::Decided(decision(&ctx, Some(name), Verdict::Denied(rejected)), None);
         }
@@ -1748,14 +1814,15 @@ pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
     // 4b. SNI verified on a terminated host: hand the connection to the
     //     terminator (module docs point 14). No dial happens here.
     if terminated {
-        return match proxy.mitm.terminator.clone() {
-            Some(terminator) => Step::Terminate {
+        return match (preamble, proxy.mitm.terminator.clone()) {
+            (Preamble::Tls(replay), Some(terminator)) => Step::Terminate {
                 handoff: Handoff { replay, name },
                 ctx,
                 terminator,
             },
-            // Unreachable (checked at 3b); fail closed anyway.
-            None => Step::Decided(
+            // Unreachable (3b refuses port 80 and a missing terminator); fail
+            // closed anyway.
+            _ => Step::Decided(
                 decision(
                     &ctx,
                     Some(name.clone()),
@@ -1774,25 +1841,46 @@ pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
     // 6. Allowed — the decision carries the guarded peer actually
     //    connected; the relay state carries the FULL replay buffer and,
     //    on 443, the scanner handoff offset (module docs point 12).
-    let scan_from = if port == TLS_PORT {
-        // Unreachable None (inspect_tls walked the record — the ECH
-        // walker requires it fully present); fail closed anyway (house
-        // rule: no panics).
-        let Some(hello_end) = hello::first_record_end(&replay) else {
-            return Step::Decided(
-                decision(
-                    &ctx,
-                    Some(name),
-                    Verdict::Denied(Rejected::HelloMalformed {
-                        detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
-                    }),
-                ),
-                None,
-            );
-        };
-        Some(hello_end)
-    } else {
-        None
+    let (replay, mode) = match preamble {
+        Preamble::Tls(replay) => {
+            // Unreachable None (inspect_tls walked the record — the ECH
+            // walker requires it fully present); fail closed anyway (house
+            // rule: no panics).
+            let Some(hello_end) = hello::first_record_end(&replay) else {
+                return Step::Decided(
+                    decision(
+                        &ctx,
+                        Some(name),
+                        Verdict::Denied(Rejected::HelloMalformed {
+                            detail: hello::RECORD_END_LOST_DETAIL.to_owned(),
+                        }),
+                    ),
+                    None,
+                );
+            };
+            (
+                replay,
+                RelayMode::Scanned {
+                    scan_from: hello_end,
+                },
+            )
+        }
+        Preamble::Http(inspected) => {
+            // Request 1 goes upstream with the same `Connection: close` rule
+            // as every later request (module docs point 6 of http.rs); the
+            // pending bytes stay in order behind it.
+            let replay = http::upstream_head(inspected.head, &inspected.meta);
+            let start = HttpStart {
+                binding: HttpBinding {
+                    name: name.clone(),
+                    port,
+                    flavor: HttpFlavor::Transparent,
+                },
+                first: inspected.meta,
+                pending: inspected.pending,
+            };
+            (replay, RelayMode::Http(start))
+        }
     };
     Step::Decided(
         decision(
@@ -1806,9 +1894,18 @@ pub(crate) async fn decide_step<S: AsyncRead + Unpin>(
         Some(RelayStart {
             replay,
             connected,
-            scan_from,
+            mode,
         }),
     )
+}
+
+/// What a protocol inspection hands the relay (the decide-local twin of the
+/// two inspectors' outputs).
+enum Preamble {
+    /// 443: the inspected ClientHello buffer.
+    Tls(Vec<u8>),
+    /// 80: request 1's head and pending bytes.
+    Http(http::Inspected),
 }
 
 /// The test-facing transparent pipeline: [`decide_step`] for every input
@@ -1916,6 +2013,7 @@ fn accept_error_is_fatal(err: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::h1::RequestMeta;
     use std::collections::HashMap;
     use std::io::Read as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2029,15 +2127,24 @@ mod tests {
                 .expect("events lock")
                 .push(format!("teardown:{detail}"));
         }
-        fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+        fn closed_with_reason(&self, _decision: &Decision, up: u64, down: u64, end: CloseReason) {
+            // The idle-timeout close is tagged; a natural end keeps the old shape.
+            let tag = match end {
+                CloseReason::Ended => "",
+                CloseReason::IdleTimeout => ":idle",
+            };
             self.events
                 .lock()
                 .expect("events lock")
-                .push(format!("closed:{up}:{down}"));
+                .push(format!("closed:{up}:{down}{tag}"));
         }
     }
 
     fn order_proxy(sink: Arc<OrderSink>) -> Arc<Proxy> {
+        order_proxy_with(sink, Limits::default())
+    }
+
+    fn order_proxy_with(sink: Arc<OrderSink>, limits: Limits) -> Arc<Proxy> {
         let network = policy::Network {
             mode: policy::NetworkMode::Transparent,
             allow: vec![rule("allowed.test")],
@@ -2046,13 +2153,7 @@ mod tests {
             paths: Vec::new(),
         };
         let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
-        Proxy::new(
-            &network,
-            Arc::new(map),
-            sink,
-            never_connector().0,
-            Limits::default(),
-        )
+        Proxy::new(&network, Arc::new(map), sink, never_connector().0, limits)
     }
 
     fn allowed_decision() -> Decision {
@@ -2071,15 +2172,31 @@ mod tests {
 
     #[test]
     fn closed_once_with_bytes_after_plain_relay() {
-        // Issue #10, T9: `up` = replay + client body (as the upstream accepted),
-        // `down` = upstream bytes read; exactly one `closed`, after the relay.
+        // Issue #10, T9: `up` = the head + the client body (as the upstream
+        // accepted), `down` = upstream bytes read; exactly one `closed`, after
+        // the relay. The body makes the request last, so the body is the last
+        // client bytes forwarded (issue #29).
         let sink = Arc::new(OrderSink::default());
         let proxy = order_proxy(sink.clone());
         let decision = allowed_decision();
         let (up_near, mut up_far) = duplex(4096);
         let mut upstream: Upstream = Box::new(up_near);
         let (mut client_far, client) = duplex(4096);
-        let replay: &[u8] = b"HEAD\r\n\r\n";
+        let replay: &[u8] = b"POST / HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 5\r\n\r\n";
+        let mode = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::Length(5),
+                minor_version: 1,
+                close: false,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
         block_on(async {
             let far = tokio::spawn(async move {
                 let mut got = vec![0u8; replay.len() + 5];
@@ -2093,20 +2210,68 @@ mod tests {
             });
             client_far.write_all(b"BODY!").await.expect("client write");
             client_far.shutdown().await.expect("client shutdown");
-            relay_tail(
-                &proxy,
-                &decision,
-                client,
-                replay,
-                RelayMode::Plain,
-                &mut upstream,
-            )
-            .await;
+            relay_tail(&proxy, &decision, client, replay, mode, &mut upstream).await;
             let got = far.await.expect("far task");
-            assert_eq!(got, b"HEAD\r\n\r\nBODY!");
+            let mut want = replay.to_vec();
+            want.extend_from_slice(b"BODY!");
+            assert_eq!(got, want);
         });
         // down = the 10 upstream bytes ("BYE!!!!!!!").
-        assert_eq!(sink.events(), vec!["closed:13:10".to_owned()]);
+        assert_eq!(
+            sink.events(),
+            vec![format!("closed:{}:10", replay.len() + 5)]
+        );
+    }
+
+    /// Issue #29 review, item 5: the linger after a natural end runs outside
+    /// the idle watchdog. The upstream ends the segment at once; the client
+    /// keeps its side open, so the linger runs to its own bound. The close must
+    /// stay `Ended`: a quiet linger longer than the idle bound must not label it
+    /// `idle_timeout`.
+    #[test]
+    fn natural_end_is_not_labelled_idle_during_the_linger() {
+        let sink = Arc::new(OrderSink::default());
+        let limits = Limits {
+            relay_idle_timeout: Duration::from_millis(100),
+            ..Limits::default()
+        };
+        let proxy = order_proxy_with(sink.clone(), limits);
+        let decision = allowed_decision();
+        let (up_near, mut up_far) = duplex(4096);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (client_far, client) = duplex(4096);
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n";
+        let response: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let mode = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::None,
+                minor_version: 1,
+                close: true,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
+        block_on(async {
+            let far = tokio::spawn(async move {
+                let mut got = vec![0u8; head.len()];
+                up_far.read_exact(&mut got).await.expect("upstream read");
+                up_far.write_all(response).await.expect("upstream write");
+                up_far.shutdown().await.expect("upstream shutdown");
+            });
+            relay_tail(&proxy, &decision, client, head, mode, &mut upstream).await;
+            far.await.expect("far task");
+        });
+        drop(client_far);
+        assert_eq!(
+            sink.events(),
+            vec![format!("closed:{}:{}", head.len(), response.len())],
+            "a natural end must not be tagged idle"
+        );
     }
 
     #[test]
@@ -2224,6 +2389,142 @@ mod tests {
         );
     }
 
+    /// Probes the client's far end at `teardown` and at the close row: did the
+    /// proxy close the client before the row was written (S16)?
+    struct HttpCloseProbe {
+        far: Mutex<DuplexStream>,
+        eof_at_teardown: Mutex<Option<bool>>,
+        eof_at_close: Mutex<Option<(bool, CloseReason)>>,
+    }
+
+    impl HttpCloseProbe {
+        fn new(far: DuplexStream) -> Self {
+            Self {
+                far: Mutex::new(far),
+                eof_at_teardown: Mutex::new(None),
+                eof_at_close: Mutex::new(None),
+            }
+        }
+
+        fn far_eof(&self) -> bool {
+            let mut far = self.far.lock().expect("far lock");
+            let mut byte = [0u8; 1];
+            let mut buf = tokio::io::ReadBuf::new(&mut byte);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            matches!(
+                Pin::new(&mut *far).poll_read(&mut cx, &mut buf),
+                std::task::Poll::Ready(Ok(())) if buf.filled().is_empty()
+            )
+        }
+    }
+
+    impl DecisionSink for HttpCloseProbe {
+        fn record(&self, _decision: &Decision) {}
+        fn teardown(&self, _decision: &Decision, _detail: &str) {
+            *self.eof_at_teardown.lock().expect("probe lock") = Some(self.far_eof());
+        }
+        fn closed_with_reason(&self, _decision: &Decision, _up: u64, _down: u64, end: CloseReason) {
+            *self.eof_at_close.lock().expect("probe lock") = Some((self.far_eof(), end));
+        }
+    }
+
+    fn probe_proxy(sink: Arc<HttpCloseProbe>, limits: Limits) -> Arc<Proxy> {
+        let network = policy::Network {
+            mode: policy::NetworkMode::Transparent,
+            allow: vec![rule("allowed.test")],
+            ports: vec![HTTP_PORT],
+            mitm_hosts: Vec::new(),
+            paths: Vec::new(),
+        };
+        let map = StaticMap::new(&[(FAKE_IP, "allowed.test")]);
+        Proxy::new(&network, Arc::new(map), sink, never_connector().0, limits)
+    }
+
+    fn keepalive_get() -> RelayMode {
+        RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::None,
+                minor_version: 1,
+                close: false,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn per_request_deny_row_precedes_the_client_close() {
+        // S16 (#67) for the per-request relay: request 2 names a foreign host,
+        // so the relay tears down; its row and the close row are both written
+        // while the client is still open.
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        let (up_near, _up_far) = duplex(64 * 1024);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (mut client_far, client) = duplex(64 * 1024);
+        let sink = block_on(async {
+            client_far
+                .write_all(b"GET / HTTP/1.1\r\nHost: other.test\r\n\r\n")
+                .await
+                .expect("client write");
+            let sink = Arc::new(HttpCloseProbe::new(client_far));
+            let proxy = probe_proxy(sink.clone(), Limits::default());
+            relay_tail(
+                &proxy,
+                &allowed_decision(),
+                client,
+                head,
+                keepalive_get(),
+                &mut upstream,
+            )
+            .await;
+            sink
+        });
+        assert_eq!(
+            *sink.eof_at_teardown.lock().expect("probe lock"),
+            Some(false),
+            "the client was closed before the per-request deny row"
+        );
+        assert_eq!(
+            *sink.eof_at_close.lock().expect("probe lock"),
+            Some((false, CloseReason::Ended)),
+            "the client was closed before the close row"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_row_precedes_the_client_close() {
+        // S16 (#67) for the idle watchdog: the `idle_timeout` close row is
+        // written while the client is still open.
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        let (up_near, _up_far) = duplex(64 * 1024);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (client_far, client) = duplex(64 * 1024);
+        let sink = Arc::new(HttpCloseProbe::new(client_far));
+        let limits = Limits {
+            relay_idle_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        };
+        let proxy = probe_proxy(sink.clone(), limits);
+        block_on(relay_tail(
+            &proxy,
+            &allowed_decision(),
+            client,
+            head,
+            keepalive_get(),
+            &mut upstream,
+        ));
+        assert_eq!(
+            *sink.eof_at_close.lock().expect("probe lock"),
+            Some((false, CloseReason::IdleTimeout)),
+            "the client was closed before the idle_timeout row"
+        );
+    }
+
     #[test]
     fn closed_counts_upstream_only_in_close_on_eof_mode() {
         // The explicit forward path: the (rewritten) head is replayed upstream,
@@ -2247,7 +2548,20 @@ mod tests {
                 &decision,
                 client,
                 head,
-                RelayMode::CloseOnUpstreamEof,
+                RelayMode::Http(relay::HttpStart {
+                    binding: relay::HttpBinding {
+                        name: dom("allowed.test"),
+                        port: 80,
+                        flavor: relay::HttpFlavor::Forward,
+                    },
+                    first: RequestMeta {
+                        framing: http::Framing::None,
+                        minor_version: 1,
+                        close: true,
+                        upgrade: false,
+                    },
+                    pending: Vec::new(),
+                }),
                 &mut upstream,
             )
             .await;
@@ -2280,6 +2594,26 @@ mod tests {
         }
         let decision = allowed_decision();
         MinimalSink.closed(&decision, 1, 2);
+    }
+
+    /// Issue #29 review, item 8: an external sink that implements only the
+    /// main-branch `closed` keeps receiving every segment end. The relay calls
+    /// `closed_with_reason`; its default forwards to `closed` and drops the reason.
+    #[test]
+    fn closed_with_reason_default_forwards_to_closed() {
+        #[derive(Default)]
+        struct ClosedOnly(Mutex<Vec<(u64, u64)>>);
+        impl DecisionSink for ClosedOnly {
+            fn record(&self, _decision: &Decision) {}
+            fn closed(&self, _decision: &Decision, up: u64, down: u64) {
+                self.0.lock().expect("closed lock").push((up, down));
+            }
+        }
+        let sink = ClosedOnly::default();
+        let decision = allowed_decision();
+        sink.closed_with_reason(&decision, 3, 4, CloseReason::IdleTimeout);
+        sink.closed_with_reason(&decision, 5, 6, CloseReason::Ended);
+        assert_eq!(*sink.0.lock().expect("closed lock"), vec![(3, 4), (5, 6)]);
     }
 
     #[test]
@@ -2893,6 +3227,63 @@ mod tests {
         assert_eq!(limits.decision_timeout, Duration::from_secs(10));
         assert_eq!(limits.connect_timeout, Duration::from_secs(10));
         assert_eq!(limits.accept_backoff_max, Duration::from_millis(100));
+        assert_eq!(limits.relay_idle_timeout, Duration::from_secs(300));
+    }
+
+    /// Issue #29, C4: an idle relay closes with `IdleTimeout` and the sink
+    /// hears it exactly once; a silent HTTP relay (keep-alive, no bytes) and a
+    /// silent scanned TLS relay both trip the watchdog.
+    #[test]
+    fn idle_timeout_fires_with_reason() {
+        let limits = Limits {
+            relay_idle_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        };
+        let head: &[u8] = b"GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n";
+        let http = RelayMode::Http(relay::HttpStart {
+            binding: relay::HttpBinding {
+                name: dom("allowed.test"),
+                port: 80,
+                flavor: relay::HttpFlavor::Transparent,
+            },
+            first: RequestMeta {
+                framing: http::Framing::None,
+                minor_version: 1,
+                close: false,
+                upgrade: false,
+            },
+            pending: Vec::new(),
+        });
+        let hello = tls_hello("allowed.test");
+        for (replay, mode) in [
+            (head.to_vec(), http),
+            (
+                hello.clone(),
+                RelayMode::Scanned {
+                    scan_from: hello.len(),
+                },
+            ),
+        ] {
+            let sink = Arc::new(OrderSink::default());
+            let proxy = order_proxy_with(sink.clone(), limits.clone());
+            let decision = allowed_decision();
+            let (up_near, _up_far) = duplex(4096);
+            let mut upstream: Upstream = Box::new(up_near);
+            let (_client_far, client) = duplex(4096);
+            block_on(relay_tail(
+                &proxy,
+                &decision,
+                client,
+                &replay,
+                mode,
+                &mut upstream,
+            ));
+            // `up` is the replay the upstream accepted; nothing came back.
+            assert_eq!(
+                sink.events(),
+                vec![format!("closed:{}:0:idle", replay.len())]
+            );
+        }
     }
 
     // ---- the pipeline order + AC denials ----------------------------------
@@ -3125,14 +3516,19 @@ mod tests {
         let RelayStart {
             replay,
             connected,
-            scan_from,
+            mode,
             ..
         } = relay.expect("the allowed path returns the relay state");
         assert_eq!(replay, hello);
         assert_eq!(connected.peer, sock(PUBLIC));
         // The 443 relay is SCANNED (module docs point 12): the handoff is
         // the end of the single-record fixture hello.
-        assert_eq!(scan_from, Some(hello.len()));
+        assert_eq!(
+            mode,
+            RelayMode::Scanned {
+                scan_from: hello.len()
+            }
+        );
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), TLS_PORT)]);
     }
 
@@ -3155,19 +3551,16 @@ mod tests {
                 upstream: sock("93.184.216.34:80"),
             }
         );
-        let RelayStart {
-            replay, scan_from, ..
-        } = relay.expect("the allowed path returns the relay state");
-        // The validated head carries the inserted `Connection: close`
-        // (http.rs module docs point 6 — the name binding's
-        // connection-lifetime enforcement); everything else is
-        // byte-identical.
-        assert_eq!(
-            replay,
-            b"GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n"
-        );
-        // The HTTP relay is UNSCANNED (module docs point 12: 443 only).
-        assert_eq!(scan_from, None);
+        let RelayStart { replay, mode, .. } =
+            relay.expect("the allowed path returns the relay state");
+        // A bodyless keep-alive request is not last: its head goes upstream
+        // byte-identical (http.rs module docs points 6 and 8).
+        assert_eq!(replay, head.to_vec());
+        let RelayMode::Http(start) = mode else {
+            panic!("port 80 runs the per-request relay: {mode:?}");
+        };
+        assert!(!start.first.is_last(), "{:?}", start.first);
+        assert!(start.pending.is_empty());
         assert_eq!(log_of(&log), [("allowed.test".to_owned(), HTTP_PORT)]);
     }
 
