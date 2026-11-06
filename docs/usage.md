@@ -4,6 +4,14 @@ The reference for `sbx run`, persistent sessions (`--keep-alive`, `attach`, `sto
 and how a run is put together. The [README](../README.md) has the quick start; the host report is
 in [Host check](host-check.md).
 
+For agents and agent harnesses, the skill in [`skills/sbx/`](../skills/sbx/SKILL.md)
+summarizes the parts of this reference that are easy to get wrong (the sandbox
+layout, `--cwd`, standard streams, exit codes, the audit log) and links back here.
+Install it by copying the directory to `~/.claude/skills/sbx` or to a project's
+`.claude/skills/sbx`. Its two use cases, an agent running inside the sandbox and a
+harness that runs each bash tool call through `sbx run`, have tested wrappers in
+[`examples/harness/`](../examples/harness/).
+
 ## Running commands
 
 `sbx run --policy P --session-dir D [--cwd C] [--timeout T] [--audit F] -- CMD…`
