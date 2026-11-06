@@ -2,14 +2,14 @@
 
 This document states what `sbx` protects against, what it does not, and what is left over (the
 residual risks). Each guarantee (S1 to S16) names the conformance checks that test it
-(`sbx check --conformance`, see the README `## Conformance` section) and the code that implements
+(`sbx check --conformance`, see [Conformance](conformance.md)) and the code that implements
 it. Checks that are not in the catalog are named separately.
 
 Scope: `sbx` at `main` @ `53ee605` (2026-10-17). Code references are `path:identifier` (a function,
 constant, type or test name). Line numbers are left out on purpose; re-verify the references when
 the code changes. `tests/threat_model_doc.rs` checks that every check id cited here exists in the
-catalog, that every catalog check is cited in section 6, that the check counts stated here and in
-the README match the catalog, and that every `path:identifier` reference resolves.
+catalog, that every catalog check is cited in section 6, that the check counts stated here, in
+the README and in `docs/conformance.md` match the catalog, and that every `path:identifier` reference resolves.
 
 This is a statement of bounds, not a claim of safety. Sandboxing reduces risk. It is not a virtual
 machine, and it does not protect against a broken kernel or a broken bwrap.

@@ -9,174 +9,96 @@ namespaces via unmodified `bwrap`, plus an nftables egress policy inside a
 private network namespace), executes the command under a JSON policy with a
 timeout and an audit trail, and tears everything down on exit.
 
-## Non-goals
+## Quick start
 
-- **Not a container runtime.** No images, registries, OCI specs, or
-  long-lived "containers" — one command, one sandbox, one lifetime.
-- **Linux only.** The sandbox is built from Linux kernel features
-  (namespaces, nftables); there are no macOS or Windows plans.
-- **No eBPF cgroup firewall.** Egress filtering uses nftables inside the
-  sandbox's network namespace, which works unprivileged (proven by the
-  issue #1 spike, `spikes/nft-load`). Why: see the
-  [threat model](docs/threat-model.md#81-why-not-an-ebpf-cgroup-firewall).
-- **No TLS interception in the default build.** The default binary passes
-  TLS through and filters on SNI/IP; no MITM CA is installed inside the
-  sandbox. An opt-in build feature terminates TLS for the hosts a policy
-  names, to enforce URL-path rules (see
-  [TLS termination](#tls-termination-opt-in-build-feature)). Why, and the
-  domain-fronting residual the default build leaves: see the
-  [threat model](docs/threat-model.md#84-why-tls-passthrough-in-v1).
-
-## Status
-
-**In progress** (issues #2–#11). The CLI parses the full documented
-interface, `check` is real (issue #11 added the host report, see
-[Host check](#host-check)), and `run` is real (issue #10, see
-[Running commands](#running-commands)): `check --policy` validates a policy file
-against the versioned policy schema and `--print-schema` prints that JSON Schema;
-example policies live in [`examples/`](examples/).
-The library also carries the egress decision core (issue #4): the
-domain allow-list matcher and the resolved-address guard that the proxy
-and fake-IP resolver (#7–#9) call. The explicit HTTP proxy (#8)
-serves `CONNECT` and absolute-form requests on the explicit listener with
-the same policy and inspectors; `sbx run` (#10) serves both listeners.
-The fake-IP DNS resolver is real (issue #9): A queries for allow-listed names
-get a per-run address from `198.18.0.0/15` that the transparent proxy maps back
-to the name; AAAA gets an empty answer, every other name NXDOMAIN, and nothing
-is ever forwarded upstream (TCP DNS is not served).
-Every `run` installs a seccomp filter that allow-lists four socket families
-(issue #34: `AF_VSOCK` and the other families outside the list fail with
-`EAFNOSUPPORT`) and refuses a short list of kernel-surface syscalls with `EPERM`
-(issue #42; see [Running commands](#running-commands)).
-The internal `__init` helper is
-real (issue #5): `sbx run` (#10) will re-exec it with one end of a
-control socketpair, and it unshares user + network namespaces, brings
-loopback up as `10.255.255.1` with a default route into the sandbox,
-disables IPv6, binds the three proxy listeners (transparent `:15001/tcp`,
-explicit `:3128/tcp`, DNS `:53/udp`), atomically loads the spike-proven
-nftables ruleset with post-load dump verification, hands the listener
-fds to the parent over SCM_RIGHTS, waits for the go byte, then `exec`s
-the payload command. `__init` setup failures are staged — `sbx __init:
-<stage>: <reason>` on stderr, exit `1`, payload never started; success
-is silent and the exit code is the payload's. The bwrap argv builder is
-real (issue #6): the library turns a policy + session directory into the
-full unmodified-bwrap invocation (allow-list mounts, a
-cleared-and-whitelisted environment, pid/ipc/uts/user isolation,
-`--disable-userns`, synthetic `/etc`), materializes the session's
-synthetic files, and discovers/validates the host bwrap (≥ 0.8); `run`
-(#10) wires it behind `__init`. The transparent egress proxy is real
-(issue #7): the parent serves the handed-off transparent listener fd,
-recovers the sandbox's dialed destination via `SO_ORIGINAL_DST`, maps
-fake IPs back to names through the fake-IP map (#9), and
-inspects the protocol preamble: TLS `ClientHello` SNI on 443 (rustls
-parser, no crypto provider, ECH denied) and the HTTP request line + `Host`
-on 80. The default build never terminates TLS; the opt-in
-`tls-termination` feature (#17) terminates it for named hosts only. Allowed names are resolved and dialed by
-name under the resolved-address guard — every resolved address, plus a
-connected-peer re-check as the DNS-rebinding backstop — then the
-buffered bytes are replayed and the connection is relayed, with the
-validated name binding enforced for the whole connection lifetime: HTTP
-heads are replayed with an inserted `Connection: close` (no keep-alive
-reuse past the validated request), and on 443 a relay-phase scanner
-tears the connection down on any second `ClientHello` (the post-HRR
-retry shape) — the library module docs record the accepted residuals;
-every connection produces exactly one audit decision with the pinned deny
-vocabulary through the sink seam #10 plugs into (whose `teardown` hook
-surfaces blocked relay-phase attacks). `sbx run` is the sandbox
-lifecycle (issue #10): timeouts, signals, stdio pumps, the output cap and the
-JSONL audit log; its exit codes are in [Running commands](#running-commands).
-`sbx gc` removes expired session directories (see [Garbage collection](#garbage-collection));
-`0` success, `1` refused ROOT or any per-session failure, `2` usage. For `check`
-and `__init`: `0` success, `1` runtime failure (including an invalid or
-unreadable policy file), `2` usage error (clap's convention). The architecture
-and issue roadmap live in tracking issue #20. `spikes/` holds
-standalone experiment packages that are excluded from the Cargo
-workspace.
-
-## How it will work (summary of #20)
-
-`sbx run` hosts an egress proxy (TLS passthrough, allow-listed
-destinations) and a fake-IP DNS resolver, and writes an audit log (JSON
-Lines). It re-execs itself as `sbx __init`, which unshares user + network
-namespaces, brings up loopback, installs ~6 nftables rules (TCP → proxy
-port, UDP/53 → resolver, drop the rest) and hands the listener sockets back
-over a unix socket (SCM_RIGHTS). `sbx run` then launches unmodified `bwrap`
-with dropped capabilities, user namespaces disabled inside the sandbox,
-allow-listed mounts, an empty environment, and the sandboxed command.
-
-## TLS termination (opt-in, build feature)
-
-The default binary never terminates TLS. A policy can opt specific hosts in,
-so that sbx can enforce URL-path rules for them. The feature is compiled in
-only when you ask for it:
+You need Linux 5.3 or newer with unprivileged user namespaces, bubblewrap 0.8
+or newer, and Rust 1.85 or newer to build. No release has been tagged yet, so
+build from source:
 
 ```sh
-cargo build --release --features tls-termination
+sudo apt-get install bubblewrap          # or point SBX_BWRAP at a bwrap binary
+git clone https://github.com/vdavamse/sbx && cd sbx
+cargo build --release --locked
+sudo install target/release/sbx /usr/local/bin/
 ```
 
-A policy with `network.mitm_hosts` or `network.paths` is refused by the
-default binary: `sbx check --policy` exits 1 and `sbx run` exits 125, with the
-message `network.mitm_hosts requires an sbx built with the tls-termination
-feature`. The opt-in policy looks like this:
+Write a policy. This one lets the sandbox read `/usr` and the TLS roots, write
+one project directory, and reach PyPI over HTTPS, and nothing else:
 
 ```json
-"network": {
-  "mode": "transparent",
-  "allow": ["=api.example.com"],
-  "ports": [443],
-  "mitm_hosts": ["api.example.com"],
-  "paths": ["https://api.example.com/v1/"]
+{
+  "version": 1,
+  "filesystem": { "ro": ["/usr", "/etc/ssl"], "rw": ["/home/me/project"], "deny": [] },
+  "network": { "mode": "transparent", "allow": ["pypi.org", "files.pythonhosted.org"], "ports": [443] },
+  "env": { "pass": [], "set": {} },
+  "limits": { "timeout": "120s", "output_bytes": 10485760 }
 }
 ```
 
-- **Scope.** Only the `mitm_hosts` names are terminated, and each must be an
-  exact name that is reachable on port 443 and that `allow` covers with exact
-  rules only (`=api.example.com`). A subdomain rule such as `example.com` is
-  refused, because it would also allow passthrough names (`www.example.com`)
-  that a shared CDN or load balancer can route to the terminated host by
-  `Host`, past the path rules. Every other host stays a byte-for-byte TLS
-  passthrough. Path rules hold only for connections whose SNI is the
-  terminated name: another allowed name served by the same edge can still
-  carry its `Host` (threat model R1). A `paths` rule applies to
-  one host and matches the request path at a segment boundary: a rule ending
-  in `/` covers everything below it.
-- **Per-run CA, key custody.** `sbx run` creates a CA in memory for each run.
-  Its certificate is written into the session directory and bound read-only at
-  `/etc/sbx/ca.pem` and `/etc/sbx/ca-bundle.pem`. The bundle also holds the
-  host's trust roots. `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
-  `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO` and `NODE_EXTRA_CA_CERTS` point at
-  them, and policy `env` cannot override these. The private key never touches
-  disk, the sandbox, the bwrap argv or the environment, and `sbx run` marks
-  itself non-dumpable (and sets `RLIMIT_CORE` to 0) before creating it, so no
-  core file readable by the invoking user can hold it. The CA
-  is valid for the run timeout plus one hour (for a `--keep-alive` session, its
-  max lifetime plus one hour), capped at 24 hours. Its name constraints permit
-  exactly the `mitm_hosts` names, not their subdomains. A run is refused when
-  no host CA bundle is found (`/etc/ssl/certs/ca-certificates.crt`,
-  `/etc/pki/tls/certs/ca-bundle.crt` or `/etc/ssl/cert.pem`), since the bundle
-  would then break every passthrough HTTPS host.
-- **Upstream.** The upstream certificate is verified against the Mozilla root
-  set, with the policy host name. Verification is never disabled, and there is
-  no plaintext fallback. A failed handshake returns `502` over TLS.
-- **Per request.** The request `Host` must equal the SNI, and its path must
-  match a rule. Paths are printable ASCII with no `%`, `;`, `\` or dot
-  segments. URL-override headers (`X-Original-URL`, `X-Rewrite-URL` and kin)
-  are refused. Anything else is answered `403` (path) or `400` (request shape)
-  over TLS. The path rule also depends on the upstream honoring the request's
-  framing (`Content-Length`, `Connection: close`).
-- **Costs.** Certificate-pinned upstreams and upstreams that need a client
-  certificate fail for terminated hosts. The client protocol is HTTP/1.1 only,
-  so an HTTP/2-only client fails the handshake. Each connection carries one
-  request, with no keep-alive, and chunked request bodies and protocol
-  upgrades are denied. Plain HTTP on port 80 to a terminated host is denied.
-  Programs that ignore the trust variables reject the CA, which fails closed.
-  Residuals are in the [threat model](docs/threat-model.md) (R37, S25, S26).
+Save it as `p.json` (with your own project path), then check the host and the
+policy:
+
+```
+$ sbx check
+sbx 0.1.0 host check (kernel 6.8.0-1-generic)
+
+  ok    userns      unprivileged user + network namespaces work
+  ...
+  ok    bwrap       bubblewrap 0.9.0 at /usr/bin/bwrap
+  ...
+network mode: transparent (policies with network mode transparent, explicit or none can run)
+
+$ sbx check --policy p.json --host     # exit 0: the policy runs on this host
+```
+
+Run a command. Everything after `--` is the command, verbatim:
+
+```
+$ sbx run --policy p.json --session-dir ~/.cache/sbx/demo --cwd /home/me/project \
+    -- pip install --target deps requests
+Collecting requests
+...
+Successfully installed certifi-… charset_normalizer-… idna-… requests-… urllib3-…
+```
+
+The packages land in `/home/me/project/deps` on the host. (`--target` is there
+because `/usr` is read-only in the sandbox, and Debian and Ubuntu refuse a
+system-wide `pip install` anyway.) A name outside the allow list does not
+resolve, and `--audit` records why:
+
+```
+$ sbx run --policy p.json --session-dir ~/.cache/sbx/demo --audit audit.jsonl \
+    -- curl -sS https://example.com
+curl: (6) Could not resolve host: example.com
+$ head -1 audit.jsonl
+{"ts":"…","event":"dns","host":"example.com",…,"reason":"example.com is not in the policy allow list",…,"verdict":"denied","rcode":3,…}
+```
+
+`sbx run` exits with the command's own status (6 here). Its own failures use
+124 (timeout) and 125 (an sbx failure); the full table is in
+[docs/usage.md](docs/usage.md#running-commands).
+
+## How it works
+
+`sbx run` starts a private user and network namespace and loads a small
+nftables ruleset there: TCP goes to an in-process proxy, DNS to a fake-IP
+resolver, and everything else is dropped. It then launches unmodified `bwrap`
+with the policy's mounts, a cleared environment, no capabilities and user
+namespaces disabled inside the sandbox. The resolver answers only allow-listed
+names. The proxy checks the TLS SNI (port 443) or the HTTP `Host` (port 80)
+against the allow list, dials the real host itself, and passes TLS through
+untouched. With `--audit`, DNS answers, connections and the exit status are
+written to a JSON Lines log.
+
+The details are in [docs/usage.md](docs/usage.md#how-a-run-works). What this
+protects against, and what it does not, is in the
+[threat model](docs/threat-model.md).
 
 ## CLI
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout DURATION] [--audit FILE]
+        [--timeout DURATION] [--audit FILE] [--max-connections N]
         [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
         -- COMMAND [ARGS...]
 sbx run --keep-alive --policy policy.json --session-dir DIR
@@ -201,14 +123,33 @@ CLI value can shorten the policy limit, never extend it).
 Everything after `--` in `sbx run` is the command, verbatim, including
 hyphenated arguments.
 
-`check` with no policy prints the [host report](#host-check). `check --policy`
+`check` with no policy prints the [host report](docs/host-check.md). `check --policy`
 validates a policy file (silently, and without probing the host; exit `1` with
 `sbx check: <reason>` on failure); add `--host` to also check the policy against
 this host. `check --print-schema` prints the policy JSON Schema (draft 2020-12)
 to stdout. `--print-schema` cannot be combined with `--policy`, `--host` or
-`--json`. Policy files follow schema version 1 — see [`examples/`](examples/).
+`--json`.
 
-## Policy allow list
+## Policy
+
+A policy is a JSON file, schema version 1 (`sbx check --print-schema`; examples
+in [`examples/`](examples/)):
+
+- `filesystem`: `ro` and `rw` paths are bound at the same path inside the
+  sandbox; a `deny` entry hides its path with an empty tmpfs.
+- `network`: `mode` is `transparent` (the command connects normally and the
+  proxy filters it), `explicit` (the command uses sbx's HTTP proxy through the
+  proxy variables sbx sets; direct connections never leave the sandbox) or
+  `none` (no network access). `allow` lists the reachable names, and `ports`
+  the allowed ports (443 and 80 are inspected; any other is denied).
+- `env`: `pass` names the caller's variables to inherit; `set` adds fixed
+  values. Everything else is cleared.
+- `limits`: `timeout` and `output_bytes`, plus optional per-process limits and
+  whole-sandbox cgroup limits (`memory_bytes`, `pids`).
+
+The run-time rules for each field are in [docs/usage.md](docs/usage.md#running-commands).
+
+### Policy allow list
 
 `network.allow` lists the names the sandbox may reach. Each entry is a domain
 name with no scheme, port, path, wildcard or IP literal. A plain entry allows
@@ -239,856 +180,73 @@ any other invalid domain, and any entry whose name normalises to start with `=`
 
 ## Host check
 
-`sbx check` reports what this host can run, and which fix would unlock more.
-It runs the same setup stages `sbx run` runs, in a throwaway namespace, plus two
-nested bwrap launches, so its answer is the one `run` will get. It takes about
-20 ms and changes nothing on the host.
-
-```
-$ sbx check
-sbx 0.1.0 host check (kernel 6.8.0-1-generic)
-
-  ok    userns      unprivileged user + network namespaces work
-  ok    netns       sandbox loopback network configured
-  ok    netns-ipv6  IPv6 disabled inside the sandbox network namespace
-  ok    nft         nftables NAT redirect loaded and verified
-  ok    fallback    default route removable for explicit mode
-  ok    bwrap       bubblewrap 0.9.0 at /usr/bin/bwrap
-  ok    bwrap-run   bwrap starts a sandbox inside the sbx namespaces
-  ok    bwrap-proc  bwrap mounts a fresh /proc
-  ok    seccomp     bwrap installs sbx's socket-family filter (installation only; denials not probed)
-  ok    landlock    Landlock ABI 7 (report-only): available: filesystem, TCP bind, signal scope
-  ok    keep-alive  pidfd and an unprivileged setns into a fresh user and network namespace work (run --keep-alive, attach)
-
-network mode: transparent (policies with network mode transparent, explicit or none can run)
-```
-
-The items, in order: `userns` (unprivileged user and network namespaces),
-`netns` (the sandbox loopback), `netns-ipv6` (IPv6 can be disabled inside the
-sandbox), `nft` (the nftables NAT redirect that transparent mode needs),
-`fallback` (the default route can be removed, which the explicit mode needs),
-`bwrap` (the bubblewrap binary and its version), `bwrap-run` and `bwrap-proc`
-(bwrap can start a sandbox here, and mount a fresh `/proc`), `seccomp` (bwrap
-installs sbx's socket-family filter, see [Running commands](#running-commands):
-a failure here makes the network mode `unavailable`, because the sandbox cannot
-start without the filter), and `landlock` (report only: the Landlock ABI and which
-parts of the optional layer the kernel provides, see **Landlock layer** under [Running commands](#running-commands)),
-and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
-into a fresh user and network namespace, the two things `run --keep-alive` and
-`attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
-failure is a `warn`. Like `landlock`, it is report only: it never limits the
-network mode, so a host that runs plain sandboxes still exits 0.
-An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
-failed, with the reason), or `warn` (a degraded but working state, with a fix).
-
-**Network modes.** The host provides one of three modes, from strongest to
-weakest:
-
-| host provides | runs policies with `network.mode` | means |
-|---|---|---|
-| `transparent` | `transparent`, `explicit`, `none` | the full firewall loads (nft redirect) |
-| `explicit` | `explicit`, `none` | no nft redirect; direct IPv4 connections fail with ENETUNREACH, direct IPv6 with EADDRNOTAVAIL (IPv6 is disabled in the sandbox); the explicit proxy (127.0.0.1:3128) and the local DNS listener answer; the transparent listener (127.0.0.1:15001) accepts but nothing is redirected to it |
-| `unavailable` | nothing | the sandbox cannot be set up; fix the `FAIL` items first |
-
-A policy with `network.mode: transparent` cannot run on an `explicit` host:
-`sbx run` refuses it with rc 125. A policy with `explicit` or `none` runs on an
-`explicit` host. The explicit fallback happens only when the policy allows it,
-and it is never silent: `sbx run` prints one notice line with the nft error, and
-the audit exit row records the mode the run got (see [Running commands](#running-commands)).
-
-**Policy comparison.** `sbx check --policy P --host` adds nine checks to the
-host report: `network-mode` (the policy's mode against the host), `infra-etc`
-(the `/etc` files every sandbox binds), `policy-paths` (every `filesystem.ro` and
-`filesystem.rw` path exists), `deny-paths` (a deny entry that is a file cannot
-be masked, and one that sits under a bound path or an sbx-generated `/etc` file
-is flagged), `bind-sockets` (a `warn` listing the unix socket files under
-`filesystem.ro` and `filesystem.rw`, outside `filesystem.deny`; see
-[Unix sockets under binds](#running-commands)), `mount-chains` (the pre-launch
-verification of `run` below, which fails the policy when `run` would refuse),
-`bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
-paths under its binds), `deny-links` (warns when a file under a deny path has a
-hard link outside it), `pin-cost` (warns above 50 directory pins) and
-`deny-tmpfs-size` (warns when bwrap is older than 0.10 and the policy has deny
-masks, which then stay unsized). A `warn` does not stop the policy from running.
-
-**JSON.** `sbx check --json` prints the same report as a JSON object with
-`"version": 1`: `network_mode`, `runnable_modes`, `probe_error` and one object per
-item (`id`, `status`, `detail`, `evidence`, `errno`, `impact`, `fix`). The keys
-are stable; new items may be added in later versions.
-
-**Exit codes.** `0`: the report was produced and the host provides at least the
-explicit mode (and, with `--policy P --host`, the policy runs here). `1`: the host
-is unavailable, the probe failed, the policy is invalid or unreadable, or the policy
-cannot run on this host. `2`: a usage error. The full report is always on stdout,
-and the reasons on stderr.
-
-**Fix hints.** Each failing item carries one fix. Where the fix depends on the
-platform, the Kubernetes and Docker forms are given (for Kubernetes, the full
-setup is in [docs/kubernetes.md](docs/kubernetes.md)):
-
-| item | the condition | fix |
-|---|---|---|
-| `userns` | AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns = 1`) | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, or give sbx an AppArmor profile that allows userns; Kubernetes: `appArmorProfile` Unconfined or a Localhost profile that allows userns |
-| `userns` | `kernel.unprivileged_userns_clone = 0` | `sudo sysctl -w kernel.unprivileged_userns_clone=1` |
-| `userns` | `unshare` is blocked by a seccomp filter (EPERM, typical in containers) | Kubernetes: `hostUsers: false` plus a Localhost seccomp profile allowing `unshare`, `clone`/`clone3` with namespace flags, `mount` and `pivot_root` (or `seccompProfile` Unconfined); Docker: `--security-opt seccomp=unconfined` or an equivalent profile |
-| `userns` | `unshare` is not permitted (EPERM) | allow unprivileged user namespaces for this user (AppArmor/SELinux policy, seccomp, `kernel.unprivileged_userns_clone`) |
-| `userns` | `user.max_user_namespaces = 0` | `sudo sysctl -w user.max_user_namespaces=15000` |
-| `userns` | ENOSPC: the limit is exhausted or nesting is forbidden (for example inside `bwrap --disable-userns`) | run sbx outside sandboxes that forbid nested user namespaces, or raise `user.max_user_namespaces` |
-| `userns` | ENOSPC with `user.max_net_namespaces = 0` while user namespaces are allowed | `sudo sysctl -w user.max_net_namespaces=15000` |
-| `userns` | EUSERS: nested too deeply | run sbx at a shallower nesting level |
-| `userns` | EINVAL: no user or network namespace support | use a kernel built with `CONFIG_USER_NS=y` and `CONFIG_NET_NS=y` |
-| `userns` | the id maps cannot be written (`/proc/self/{setgroups,uid_map,gid_map}`) | allow writes to those files in a fresh user namespace (a read-only or masked `/proc` blocks them) |
-| `netns` | the loopback cannot be configured, or the proxy and DNS listeners cannot be bound | report a bug with the evidence line and `uname -r` |
-| `netns-ipv6` | `/proc/sys` is read-only (EROFS, typical in containers) | Kubernetes: `securityContext.procMount: Unmasked` (requires `hostUsers: false`); Docker: `--security-opt systempaths=unconfined` |
-| `netns-ipv6` | writing `/proc/sys/net` is denied | the same as above (`procMount: Unmasked`; `systempaths=unconfined`) |
-| `nft` | the nftables NAT redirect is unavailable (transparent mode needs it; explicit and none do not) | `sudo modprobe -a nf_tables nf_nat nft_chain_nat nft_redir nft_fib nft_fib_ipv4`, or use network mode `explicit` |
-| `nft` | the kernel's ruleset differs from the expected one | report a bug with the evidence line and `uname -r` |
-| `fallback` | the default route cannot be removed (the explicit mode is unavailable) | report a bug with the evidence line and `uname -r` |
-| `bwrap` | bwrap is not found | install bubblewrap 0.8 or newer (for example `apt-get install bubblewrap`), or set `SBX_BWRAP` |
-| `bwrap` | bwrap is older than 0.8, or unusable | install bubblewrap 0.8 or newer, or set `SBX_BWRAP` to one |
-| `mount-chains` | a path bwrap resolves under a policy bind is a symbolic link, is missing or has the wrong type, or a deny path is reachable through a host symlink alias | remove the symbolic link, create the directory on the host, or move the entry out of the `rw` path (the message names the component) |
-| `bwrap-cve` | bwrap is older than 0.12.0 and the policy has mount paths under its binds (a warning; the run still starts) | install bubblewrap 0.12.0 or later (CVE-2026-87766); a distribution backport is not visible in the version string |
-| `deny-links` | a regular file under a deny path has a hard link outside it (a warning) | remove the extra hard link, or deny the other name as well |
-| `deny-tmpfs-size` | bubblewrap is older than 0.10, so the deny masks are unsized tmpfs (a warning; from 0.10 each mask is capped at 1 MiB) | install bubblewrap 0.10 or later, or run under a memory limit |
-| `pin-cost` | the policy needs more than 50 directory pins (a warning): each pin is an extra bind, and startup grows superlinearly with the count | keep the deny list short, or deny a parent directory instead of many nested entries |
-| `bwrap-run` | bwrap cannot apply `--disable-userns` because `/proc/sys` is read-only | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
-| `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
-| `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
-| `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
-| `keep-alive` | `pidfd_open` is refused (ENOSYS below Linux 5.3, or an outer seccomp profile) (report only) | run sbx on Linux 5.3 or newer; Kubernetes: a Localhost seccomp profile that allows `pidfd_open`, or `seccompProfile` Unconfined |
-| `keep-alive` | the holder stand-in's `unshare(CLONE_NEWUSER\|CLONE_NEWNET)` is refused (EPERM or EACCES). The probe's own namespace was created, so only the nested user and network namespaces are refused; report only | allow nested `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNET)` for this user (a seccomp or container profile that blocks them; Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
-| `keep-alive` | an unprivileged `setns` into a fresh user and network namespace is refused (EPERM or EACCES; report only) | allow `setns(CLONE_NEWUSER)` and `setns(CLONE_NEWNET)` for this user (a container seccomp profile often blocks `setns`; Kubernetes: a Localhost seccomp profile that allows it, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
-| `keep-alive` | the holder stand-in cannot be started, or the join fails for another reason (report only) | allow unprivileged user and network namespaces and `setns` for this user, or do not use `run --keep-alive`; plain `sbx run` does not need them |
-| `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |
-| `landlock` | Landlock is built in but disabled (report only) | add `landlock` to the `lsm=` kernel boot parameter |
-
-**Masked `/proc`.** On a host that masks `/proc` in a way that passes the
-probe but fails later, the sandbox starts and then bwrap exits with its own rc
-1; `sbx run` reports that exit as the payload's status, not as a refusal. `sbx
-check` reports the failure as `bwrap-proc` with the `procMount` hint. `sbx run` does
-no pre-check, so the payload's own rc (bwrap's rc 1) passes through. A per-run
-pre-check is tracked as a follow-up.
+`sbx check` reports what this host can run, and which fix would unlock more. It
+runs the same setup stages `sbx run` runs, in a throwaway namespace, takes about
+20 ms and changes nothing on the host. Each failing item carries a `fix:` line.
+`sbx check --policy P --host` also checks a policy against the host. The items,
+network modes, JSON output, exit codes and the full fix table are in
+[docs/host-check.md](docs/host-check.md).
 
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
 81 checks in nine groups, the same code that `cargo test --test conformance`
-runs in CI. The [threat model](docs/threat-model.md) maps each guarantee to the
-checks that prove it, and lists what they do not prove.
-
-- **A: allow list** (`allow-list`): allowed names resolve and reach the upstream;
-  everything else is refused on DNS, CONNECT and TLS.
-- **B: SNI/Host confusion** (`sni-host`): a mismatched SNI, Host or ECH hello is
-  refused, and a second ClientHello tears the connection down.
-- **C: no direct egress** (`no-direct-egress`): no route, no raw, packet, XDP,
-  vsock or ICMP sockets, no non-53 UDP, no IPv6, no netlink changes.
-- **D: isolation** (`isolation`): host loopback, abstract and pathname unix
-  sockets, other sessions' listeners, files and fake IPs, and host processes
-  are unreachable.
-- **E: tooling** (`tooling`, network tier): real `curl`, `git`, `pip` and `npm`
-  through the policy, and the real-network negatives; opt-in with `--network`.
-- **F: fail-closed** (`fail-closed`): SIGKILL, SIGSTOP and a missing proxy leave
-  no path open; a broken nftables load or audit log ends the run with rc 125.
-- **G: cleanup** (`cleanup`): background processes die on exit, timeout and
-  signals; the sandbox network namespace is empty afterwards.
-- **I: persistent sessions** (`session`): an attached call cannot see or signal
-  the resident or another call; a holder SIGKILL ends the resident and the calls;
-  a different policy is refused; a foreign-uid connection is refused (an opt-in
-  skip here, see the threat model); the idle and max-lifetime ends. Needs bwrap.
-- **H: secrets** (`secrets`): the caller's environment, `/proc` environments,
-  inherited descriptors, HOME and processes are not visible to the payload.
-
-The tiers: **host** (a `sbx run` per scenario, built-in policies), **init**
-(the production `sbx __init` with the listeners dropped), **lab** (an
-unprivileged nested user, network and mount namespace with a local fixture on
-9.9.9.9 and a lab DNS that never touches the real network), and **network**
-(opt-in, real hosts). The offline tiers need no root and never dial a real
-upstream: every lab upstream is local.
-Their files live under `$TMPDIR/sbx-conformance-*`, with two documented
-exceptions: the D04 control socket `/tmp/sbxc-<8 hex>.s` (kept short because
-`sun_path` is 108 bytes), and, when `$TMPDIR` lies under `$HOME`, the base
-directory under `/tmp` (so the sandbox's bind parents do not expose `$HOME`).
-Both are removed at the end of a run.
-
-```
-sbx check --conformance                    # every offline check
-sbx check --conformance --only A,D         # a group, or ids: --only A01,H06
-sbx check --conformance --list             # the catalog (add --json for each check's needs)
-sbx check --conformance --network --json   # add the network tier; JSON report
-```
-
-Exit codes: `0` when nothing failed and nothing needed by a selected check was
-missing (warn rows and opt-in skips are allowed); `1` when a check FAILs or a
-selected check is skipped for a missing capability or is not implemented in this
-build; `2` for a usage error. The JSON document has `kind: "conformance"` and
-`version: 1`; `summary.conformant` matches the exit code. A FAIL keeps the
-temporary artifacts and prints their path on stderr. A full offline run takes a
-few seconds (the budget is 120 s).
-
-A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
-hazard, not a defect. Find the bind that holds it with
-`sbx check --policy P --host` (the `bind-sockets` item).
-
-**Lab tier.** The 19 lab checks (A02–A06, A12, B01–B09, C02, C07, F02, F04) run
-inside a child that unshares user, network and mount namespaces: no root, and
-`lo` gets `9.9.9.9` (the fixture) and the trap addresses. The lab's
-`resolv.conf` and `nsswitch.conf` are bound over the host's (`/etc/hosts` is
-not touched). Its DNS answers `*.conformance.test` only and never forwards, and
-it logs every query so the checks can prove that. The lab does not disable
-`nscd`: a host name cache can only make A02–A06 fail (their "lab DNS saw the
-name" control is absent), never pass without the proxy's own lookup. The lab
-child dies with `sbx check` (`PR_SET_PDEATHSIG`), and its timing uses the
-monotonic clock, which every process on the host shares. If the host cannot create a
-nested user namespace, the lab checks are capability skips (rc `1`) with the
-stage that failed, never passes. The lab is bounded to 60 s.
-
-**Network tier.** `--network` runs six real tool checks (E01–E06) against
-pypi.org, github.com, registry.npmjs.org and example.com, one `sbx run` each,
-within a 300 s total allowance. E06 first proves the same policy reaches
-pypi.org, so its negatives cannot pass vacuously. A missing tool (`curl`, `git`, `python3` with
-pip, `npm`) is an opt-in skip, not a failure. The CI job `conformance-network`
-runs it nightly; it does not gate pull requests.
-
-Operator policies are not supported by `--conformance` in v1.
-
-## Running commands
-
-`sbx run --policy P --session-dir D [--cwd C] [--timeout T] [--audit F] -- CMD…`
-runs `CMD` verbatim (no shell, arguments byte-exact) inside the bwrap sandbox
-built from the policy. Inside the sandbox a private network namespace carries
-sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
-
-**Exit codes**
-
-| Situation | rc | audit `outcome` | stderr (sbx's own line) |
-|---|---|---|---|
-| the command exits N | N | `exited` | none |
-| the command is killed by a signal (bwrap reports it as 128+N) | 128+N | `exited` | none |
-| the sandbox itself is killed by a signal sbx did not send (for example the OOM killer; 137 for SIGKILL) | 128+N | `signaled` | `sbx run: sandbox killed by signal N (NAME)` |
-| `--timeout` / policy `limits.timeout` elapsed | 124 | `timeout` | `sbx run: timed out after 90s` |
-| sbx received SIGTERM / SIGINT / SIGHUP / SIGQUIT | 143 / 130 / 129 / 131 | `terminated` | `sbx run: terminated by SIGTERM` |
-| an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
-| the host cannot provide the policy's network mode, or cannot run sandboxes (issue #11) | 125 | `failed` | `sbx run: policy requires network mode <mode> but this host provides only explicit: <reason>; fix: <fix>; run \`sbx check\` for a full host report` (or `… but this host cannot run sandboxes: …`); the staged line of `__init` comes first |
-| the explicit fallback ran (the nft redirect is unavailable, the policy is `explicit` or `none`) | the command's own | the command's | `sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (<reason>); run \`sbx check\` for details` |
-| a Landlock shim failure under `--landlock` (the shim could not apply the rules, could not check the host ABI, or could not exec the payload; issue #19) | 125 | `failed` | `sbx run: landlock: <reason>`. The shim starts with a marker on the status pipe and adds its reason after it, so a payload's own 125 (marker only) is never reported as this one, and a shim that never started is reported by the row above |
-| the Landlock shim did not start under `--landlock` (bwrap could not exec `/proc/self/fd/N`, or the dynamic loader failed before the shim's first act, so the status pipe holds no start marker) | 125 | `failed` | `sbx run: landlock: the shim did not start (rc N)`, where N is bwrap's own rc (1 for bwrap's exec failure, 127 for the loader) |
-| a usage error | 2 | — | clap's message |
-
-The audit row's `outcome` is one of: `exited` (the command ended by itself, or
-was killed by a signal bwrap relayed as 128+N), `signaled` (the sandbox, not
-the command, was killed by a signal sbx did not send), `timeout`, `terminated`
-(sbx received TERM/INT/HUP/QUIT) and `failed` (an sbx failure, including an
-audit write failure). A payload that exits 124, 125 or 128+N is
-indistinguishable from sbx's own codes by exit status alone; the audit
-`outcome` says which it was.
-
-If the sandbox does not report its exit within 5 seconds of the SIGKILL that
-sbx sent at teardown, sbx prints `sbx run: sandbox did not exit within 5s of
-SIGKILL` and keeps the rc it computed. The diagnostic reports that teardown
-took longer than its 5-second budget; it does not change the exit status. A failure
-after the payload started (for example `execvp` of a missing binary, rc 1) keeps
-the status of the failing stage and is printed by that stage.
-
-**Filesystem policy.** `ro` and `rw` paths are bound at the same path inside the
-sandbox. A `deny` entry is an empty `tmpfs` over its path: it hides the path name,
-and only that name. Before the payload starts, `run` checks the host side of every
-path bwrap will resolve under a policy bind (read-only or writable, #39, #40):
-
-- A path that is a symbolic link, is missing, or has the wrong type on the way to
-  a bind dest or a deny entry is refused: rc 125, `sbx run: filesystem path … `,
-  with nothing created outside the session directory and the audit log. Each component is opened without following links, so
-  bwrap never sees one. A `deny` entry under `rw` must already exist as a
-  directory on the host; bwrap would otherwise create it, and its parents, there.
-- A `deny` path that the host reaches through a symbolic link alias of another
-  bind is refused, and so is a bind whose host source is a link into a deny path:
-  either way the mask would not cover that inode.
-- Every directory between an `rw` path and a `deny` entry, or a nested bind (read-only
-  or writable), is pinned with a self-bind, including the parents of nested writable binds. A payload cannot rename or remove a pinned directory
-  (EBUSY), so the mask stays where it was. A rename across a pinned boundary fails
-  with EXDEV: `mv` falls back to copy, but a tool that only calls `rename(2)` sees
-  the error. Pins cost startup time that grows superlinearly with their count: on
-  WSL2, 60 pins add about 17 ms, 300 pins about 180 ms and 900 pins about 1 s. `sbx check`
-  warns above 50 pins (`pin-cost`). Keep deny lists short, and deny a parent instead of
-  many nested entries.
-
-The check runs once, before the spawn. It does not stop a writer that is not a sandbox of
-this exact policy (another policy, an older sbx, a host process, a host bind-mount alias
-of the tree) from changing the tree during the window. That window is a known residual
-on every bwrap version (R26 in `docs/threat-model.md`, Medium when policies share a writable
-tree; bwrap 0.12.0 closes only the dest side, not a swapped bind source): **do not share an
-`rw` tree between policies**, and do not let
-host tools write into an `rw` tree while sandboxes run. A bind whose host source reaches
-another bind\'s tree through a symbolic link is refused (N19): bind the real path. Hard links made on the host to a denied
-file, and host bind-mount aliases, are not detected at run time; `sbx check` warns about
-hard links (`deny-links`).
-
-**Timeouts.** The clock starts when `run` starts, so sandbox setup counts.
-Setup itself is limited to 30 seconds. On timeout or on a signal sbx SIGKILLs
-the whole sandbox at once: the command gets no grace period.
-
-**Signals.** sbx watches SIGTERM, SIGINT, SIGHUP and SIGQUIT. A signal the
-caller left ignored stays ignored. Any other fatal signal (SIGUSR1, SIGALRM…)
-kills sbx with its default action, and the sandbox then dies with it. Job-control
-stop (SIGTSTP) is not handled.
-
-A non-interactive shell starts background jobs (`sbx run … &`) with SIGINT and
-SIGQUIT ignored (POSIX). Those dispositions are inherited, so such a sandbox
-ignores Ctrl-C-style signals as well, like `nohup`. Send SIGTERM, or reset the
-disposition in the script before starting `sbx run`.
-
-**Standard streams.** The payload's stdout and stderr are always pipes, so it
-never sees a terminal on fds 0–2. stdin is inherited when it is not a terminal.
-When it is a terminal that is sbx's foreground group, sbx pumps it. A background
-terminal stdin is `/dev/null`, so a background read cannot stop sbx.
-
-**Output cap.** `limits.output_bytes` bounds stdout and stderr combined. The
-excess is drained and discarded (the command is not killed). When the cap is hit
-sbx prints `sbx run: output truncated at N bytes (limits.output_bytes)` as its
-last line, and the exit row records `output_truncated: true`. If the caller closes
-sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
-
-**Resource limits.** `limits` may also set `processes`, `open_files`,
-`file_bytes` and `address_space_bytes` (positive integers; absent means the
-caller's own limit is inherited). They become `RLIMIT_NPROC`, `RLIMIT_NOFILE`,
-`RLIMIT_FSIZE` and `RLIMIT_AS`, with soft and hard limits both set, so the
-command cannot raise them. `__init` sets them after it creates the sandbox's
-user namespace and right before it execs bwrap. Per limit:
-
-- `processes` counts the sandbox's own processes and threads (Linux 5.14 and
-  later; older kernels count every process of the caller's uid). When sbx runs
-  as root, it is enforced only on Linux 5.17 and later. bwrap uses two of them.
-- `open_files` must not exceed the caller's hard limit (or `fs.nr_open`).
-- `file_bytes` bounds each file, not the total disk use. A write past it fails
-  and the writer gets `SIGXFSZ`.
-- `address_space_bytes` is virtual memory, not resident memory. Runtimes that
-  reserve large address ranges (JVM, V8, Go) need generous values.
-
-bwrap runs under the same limits, so very small values (`processes` below 3,
-a handful of `open_files`, a few MiB of address space) make bwrap itself fail.
-A limit the caller cannot grant fails setup (125, with
-`sbx __init: exec: cannot set limits.<field> …`). These are per-process
-limits, not a cgroup: they do not bound the total memory of all sandboxed
-processes, tmpfs sizes or the total disk use. See
-[R14](docs/threat-model.md#7-residual-risks).
-
-```json
-"limits": { "timeout": "120s", "output_bytes": 10485760,
-            "processes": 256, "open_files": 1024,
-            "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
-```
-
-**cgroup limits (issue #43).** `limits.memory_bytes` and `limits.pids` bound
-the whole sandbox, not each process: they become `memory.max` (with
-`memory.swap.max` 0 where swap is accounted) and `pids.max` on a child cgroup
-that holds `__init`, bwrap and every payload process. Over `memory_bytes` the
-kernel OOM-kills a sandboxed process (typically exit 137); past `pids` a fork
-fails with `EAGAIN`. They need a delegated cgroup v2 that sbx runs in alone,
-for example:
-
-```sh
-systemd-run --user --scope -p Delegate=yes sbx run --policy p.json --session-dir s -- make
-```
-
-sbx then moves itself into a leaf (`sbx-supervisor`), enables the `memory` and
-`pids` controllers for its cgroup's children and creates `sbx-sandbox-<pid>`,
-removed after the run. When the cgroup is not delegated, lacks a controller, or
-holds other processes (sbx's own `--keep-alive` launcher excepted), a run with
-either limit is refused (125, `need a delegated cgroup v2`): the limit is never
-dropped silently. With `memory_bytes`, a host where swap is active but not
-accounted for cgroups (`swapaccount=0`) is refused too, since the limit could
-not keep the sandbox out of swap. sbx checks that its cgroup is writable, not
-who manages it: run as root it can restructure any cgroup it sits in alone, so
-give it a dedicated scope (`Delegate=yes`). With
-`--keep-alive`, each run and each attached call gets its own child cgroup, so
-the limits apply per call; an `sbx attach` needs the same delegation.
-
-**Run-level caps (issue #43).** Three more bounds apply to every run, with no
-policy field:
-
-- **Deny masks are sized.** With bubblewrap 0.10 or later, each `deny` tmpfs is
-  capped at 1 MiB of file data (`--size`), so a payload cannot fill RAM with
-  file contents through a writable mask (the inode count is not capped). A
-  tool that writes more than 1 MiB into a denied directory now gets `ENOSPC`.
-  Older bubblewrap has no `--size`: the masks stay unsized, and
-  `sbx check --policy P --host` warns (`deny-tmpfs-size`).
-- **Concurrent proxy connections.** At most 256 connections are open through the
-  proxies at once (both listeners together); set another value with
-  `sbx run --max-connections N` (1 to 65536). A connection over the cap is
-  closed unread and gets one `deny` audit row whose reason starts with
-  `conn_limit:` (these rows have no budget, unlike `dns` rows). A
-  `--keep-alive` session shares the cap across its calls.
-- **Fake-IP names.** A run maps at most 4096 distinct names (a `--keep-alive`
-  session shares one map across its calls). A new name past that gets
-  NXDOMAIN for every query type, with a `dns` audit row under the run's DNS
-  row budget; names already mapped keep answering.
-
-`sbx check` also reports the host's conntrack table (`conntrack`, report-only).
-The nat redirect in the sandbox needs conntrack; on current kernels each network
-namespace's entries are checked against the host's `nf_conntrack_max`, and they
-use host kernel memory. Disk use in `rw` binds and the session directory is not
-bounded (no quotas; R14).
-
-**Session directory.** `--session-dir` is created with mode 0700 and must be
-owned by the current user. Only one run may use a session at a time: a lock on
-`sbx.lock` inside it is held for the whole run, and a second run fails with
-`session directory is in use`. The directory's mtime is updated at the start and
-the end of every run, which is the activity signal `gc` (#12) reads — see
-[Garbage collection](#garbage-collection).
-
-**Audit log.** `--audit F` appends one JSON object per line to `F`. The file is
-created with mode 0600, must be a regular file (never a symlink, FIFO or
-directory) owned by the current user with a single hard link, and must not be
-inside the session directory or any path the policy mounts (`ro` or `rw`), by
-lexical and by real (symlink-resolved) location. Several runs may share one
-file: each row is appended under an advisory `flock`, and a run that cannot get
-the lock within 250 ms fails closed (125, `audit log write failed: …`). Every row has the
-same keys in the same order:
-
-`ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,
-`port`, `bytes` (`{"up","down"}` on `close`), `reason`, `via`, `verdict`,
-`rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
-`duration_ms`, `output_truncated`, `dns_poisoned`, `net_mode` (`transparent`
-or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
-(setup never completed)) and `dns_suppressed` (the last key).
-
-`dns` rows are rate limited per run, because every DNS datagram is one row: a
-burst of 1000 rows, then 100 rows per second. Rows over the limit are not
-written. The exit row's `dns_suppressed` counts them. The DNS answers
-themselves are not affected. Proxy rows (`connect`, `deny`, `close`) are not
-rate limited.
-
-```json
-{"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}
-{"ts":"2026-10-15T18:23:01.123Z","event":"connect","host":"github.com","sni":"github.com","port":443,"bytes":null,"reason":"allowed github.com via 140.82.121.4:443","via":"transparent","verdict":"allowed","rcode":null,"qtype":null,"client":"10.255.255.1:40000"}
-{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent","dns_suppressed":0}
-```
-
-Rows are in event order: a connection's `connect`, then `deny` (teardown) if
-any, then `close`. The `exit` row is always last. A connection still open when
-the run ends gets no `close` row. The log is not fsynced. If a write fails
-mid-run the run fails closed (rc 125, `sbx run: audit log write failed: …`).
-
-**Network.** Only ports 443 (TLS, SNI-checked) and 80 (HTTP, `Host`-checked)
-are inspected; any other listed port is denied. ECH and GREASE-ECH are denied. In
-transparent mode sbx sets no proxy environment variables. In explicit mode the
-payload gets the proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
-`NO_PROXY` and their lowercase twins) pointing at the explicit listener. The
-explicit proxy's response table is in the `proxy::explicit` module docs (200 for
-an allowed CONNECT; 400, 403, 502 and 504 otherwise).
-
-**Unix sockets under binds (issue #35).** A read-only bind does not block
-`connect(2)` on a unix socket file: `ro` only stops writes to the file itself.
-A policy that binds `/run`, `/var/run`, a directory under `/tmp` (such as
-`/tmp/.X11-unix`) or a home directory therefore hands the payload every socket
-under it, for example `docker.sock` (host root),
-the D-Bus buses, an ssh-agent, or nscd and systemd-resolved (a resolver that
-bypasses the fake-IP DNS). Keep socket directories out of `filesystem.ro` and
-`filesystem.rw`, or mask them with `filesystem.deny`. A bind at exactly `/tmp`,
-`/root`, `/work`, `/proc` or `/dev` is covered by sbx's own mount there, so the
-host sockets under it are not reachable; under `/proc` and `/dev` this holds for
-deeper binds too, since those mounts come after every bind. `sbx check --policy
-P --host` warns about each reachable socket file under a bind (`bind-sockets`),
-and also warns when a directory under a bind can be searched but not listed
-(such as mode 0711), since `connect` needs only search permission and a socket
-inside it stays reachable by name. The
-conformance check `D05` warns about any socket file visible inside the sandbox.
-
-**`/etc/hosts` (issue #35).** The sandbox's `/etc/hosts` is generated, like
-`resolv.conf`, `passwd` and `group`: it holds only `127.0.0.1 localhost` and
-`127.0.1.1 sandbox` (the sandbox hostname). There is no `::1` entry, because
-IPv6 is disabled inside the sandbox. The host's file is never bound, so a host entry cannot pin an
-allowed name to a real address past the fake-IP resolver, and host entries are
-not disclosed. A policy that lists `/etc/hosts` in `filesystem.ro` gets the
-generated file (it mounts last). Names that a host's `/etc/hosts` or Kubernetes
-`hostAliases` define are resolved by the proxy on the host side. They work for
-allowed names only when they map to a public address: the resolved-address guard
-still denies loopback, private, link-local and other special-purpose addresses,
-which is where `hostAliases` usually point.
-
-**Socket families and syscalls (issue #34).** Every `sbx run` installs a seccomp
-filter through bwrap (`--seccomp`), and the payload can create sockets only in
-four families: `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`. Everything else
-fails with `EAFNOSUPPORT` (errno 97): `AF_VSOCK` in particular, which is not
-network-namespaced and reaches the host or hypervisor on VM-backed hosts (WSL2,
-Hyper-V, Kata, Firecracker, cloud VMs), and with it `AF_PACKET`, `AF_XDP`,
-`AF_BLUETOOTH`, `AF_ALG`, `AF_CAN`, `AF_TIPC` and `AF_RDS`. `socketpair(2)` is
-checked the same way. Two behaviour changes follow from the list. `AF_ALG` (the
-kernel crypto API, used by some `openssl` and `cryptsetup` engines) and
-`AF_BLUETOOTH` worked before and now fail. `AF_PACKET` already failed (EPERM) and
-now fails with EAFNOSUPPORT.
-
-The filter also closes the other ways to reach those families:
-
-- **io_uring** (`io_uring_setup`, `io_uring_enter`, `io_uring_register`) returns
-  `ENOSYS`, because `IORING_OP_SOCKET` would create sockets without `socket(2)`.
-  The application sees `ENOSYS` from `io_uring_setup` and falls back: libuv
-  does so on any setup error, and liburing callers can fall back on the error.
-- **32-bit and x32 binaries are unsupported.** The filter checks the audit
-  architecture first, so an i386 or arm32 payload (including the `int 0x80`
-  entry and its `socketcall(2)` path) and an x32-ABI syscall are killed with
-  `SIGSYS`: `sbx run` exits 159 (128+31). Run 64-bit binaries only.
-
-**Syscall deny-list (issue #42).** A conservative set of syscalls fails with
-`EPERM` (errno 1, the answer Docker's default profile gives): the kernel keyring
-(`keyctl`, `add_key`, `request_key`), `bpf`, `perf_event_open`, `userfaultfd`,
-`kexec_load`, `kexec_file_load`, kernel modules (`init_module`, `finit_module`,
-`delete_module`), `open_by_handle_at`, the mount APIs (`mount`, `umount2`,
-`pivot_root`, `open_tree`, `open_tree_attr`, `move_mount`, `fsopen`, `fsconfig`,
-`fsmount`, `fspick`, `mount_setattr`), `quotactl`, `quotactl_fd`, `syslog`,
-`swapon`, `swapoff`, `reboot`, `acct` and, on x86_64, `iopl`, `ioperm` and
-`uselib`. `personality(2)` accepts only Docker's personas
-(`PER_LINUX`, `PER_LINUX32`, `UNAME26` and the query); `ADDR_NO_RANDOMIZE`
-fails, so `setarch -R` fails, gdb warns that it cannot disable address
-randomization (`set disable-randomization off` silences it), and lldb cannot
-launch a process until `settings set target.disable-aslr false` is set. A payload started with a non-default personality (for example
-`sbx run` itself launched under `setarch -R`) cannot write that personality back.
-Behaviour changes: `perf`, `rr`, `bpftool`, `bpftrace`, `dmesg` and `keyctl` fail
-inside the sandbox, and tools that cache credentials in the kernel keyring
-(some Kerberos and `ecryptfs` setups) fall back or fail. `ptrace` stays allowed,
-so `gdb` and `strace` work on processes inside the sandbox.
-
-Netlink sockets are allowed for every protocol (they live in the sandbox's own
-network namespace). Every syscall not named above is allowed: this is a
-deny-list, not a syscall allow-list. If bwrap cannot install the filter, the payload never
-starts and `run` reports bwrap's own failure (rc 1, like any other bwrap setup
-failure), not 125. `run` refuses with rc 125 only when sbx itself cannot prepare
-the filter, for example on an architecture without a program (sbx ships
-x86_64 and aarch64 only). `sbx check` reports the `seccomp` item as FAIL in both
-cases. The integration
-suite (`tests/sandbox_run.rs`, scenarios `seccomp-*`) and the CI musl smoke pin
-these results.
-
-**Landlock layer (issue #19).** `--landlock` adds a Linux Landlock ruleset on top
-of the bwrap sandbox. It is off by default, and with `--landlock off` the bwrap
-command is the same as before. The mode is one of:
-
-- `best-effort`: apply the rules the kernel supports. A kernel without Landlock,
-  or with an older ABI, runs with the subset it has, silently.
-- `require`: apply the full set or refuse. The set needs Landlock ABI 6 (Linux
-  6.12 or later). On an older kernel `run` exits 125 before it starts anything,
-  with `sbx run: landlock require: …` on stderr.
-
-The rules follow the bwrap mount list. Read-only binds, the infra `/etc` set and
-the generated files can be read and executed. Read-write binds, the session
-`work`, `home` and `tmp` leaves, `/proc` and `/dev` can be written. The root
-directory can be listed, but nothing can be created in it. `--landlock-bind-tcp PORT`
-(repeatable; `0` is the kernel's ephemeral range) allows a TCP bind on that port.
-Without a port, binds are denied. The layer also stops the payload from signalling
-processes outside its domain, including bwrap's pid 1 (signal scope, ABI 6).
-
-The layer is a second check on top of the mounts and the network namespace. It
-does not restrict `connect(2)`: egress stays with the network namespace and the
-proxies. It also does not handle abstract-socket scope or `RESOLVE_UNIX`
-(see [threat model](docs/threat-model.md), R6). The shim is sbx's own executable,
-opened by `run` and exec'd inside the sandbox through `/proc/self/fd`. A
-dynamically linked sbx build needs its shared libraries visible inside the sandbox
-when `--landlock` is on. The static musl release does not. This is not checked
-before the run.
-
-Three limits of the layer that operators hit in practice:
-
-- **Deny masks and new directories.** A `deny` entry is a tmpfs over the path and
-  gets no Landlock rule of its own. Under a read-only mount, or outside every
-  mount, the masked directory is therefore not writable (`EACCES`). The same holds
-  for intermediate directories that bwrap creates on the root tmpfs: they are
-  reached only through the root's list-only rule, so they take no entries.
-- **ABI 1 (Linux 5.13 to 5.18).** `LANDLOCK_ACCESS_FS_REFER` is an ABI 2 right and
-  is not handled there, so with `best-effort` on an ABI 1 kernel a rename or hard
-  link across directories fails with `EXDEV`, even inside `/work`. The kernel does
-  this for any ruleset without REFER, and `sbx` does not work around it.
-- **Shim failures are not silent.** The shim writes its reason to a status pipe
-  before it exits 125, and `run` reports it as `failed` (exit-code table above).
-  `best-effort` fails closed when the kernel reports the ruleset as not enforced
-  while the host has Landlock (for example an outer seccomp profile refuses
-  `landlock_*`), instead of running the payload unrestricted.
-
-**Requirements.** Linux ≥ 5.3 (pidfd), bubblewrap ≥ 0.8 (`SBX_BWRAP` overrides
-discovery), and unprivileged user namespaces. Run `sbx check` to see what this
-host provides and what to fix ([Host check](#host-check)). The integration suite
-(`tests/sandbox_run.rs`) runs every scenario; on hosts without bwrap or userns
-it prints SKIP for the sandboxed scenarios.
-
-**Startup overhead (issue #10 AC3).** Measured with
-`hyperfine -N --warmup 10 --runs 100` on the release static-musl build (static-pie,
-as shipped), from a native Linux filesystem, with a user-space bubblewrap 0.9.0
-(`SBX_BWRAP`), the policy `ro ["/usr"]`, transparent mode, empty allow list:
-
-| command | median | p90 |
-|---|---|---|
-| `/usr/bin/bash -c true` | 1.50 ms | 1.76 ms |
-| `sbx run … -- /usr/bin/bash -c true` | 11.15 ms | 12.01 ms |
-
-Overhead ≈ 9.7 ms, under the 25 ms target. Issue #34 (the socket-family seccomp filter) re-measured with the same method on the same host, against the pre-#34 `main` build: mean 11.2 ms versus 10.8 ms (+0.4 ms, within the run-to-run spread of ±0.6–0.8 ms). Measure from a native filesystem:
-on WSL2 the Windows drive (`/mnt/c`, a 9p mount without page caching) adds
-about 14 ms to every exec of the binary (the same build measured there:
-34–37 ms median). A trivial static-pie binary starts in 0.4 ms, and the sbx
-binary starts in 0.6 ms on either PIE or non-PIE builds, so the position-independent
-build is not the cost. CI runs on ext4 and reports the number on every run
-(report-only, with a warning at ≥ 25 ms).
+runs in CI. The offline tiers need no root and never touch the real network;
+`--network` adds real `curl`, `git`, `pip` and `npm` checks. Groups, tiers and
+exit codes: [docs/conformance.md](docs/conformance.md).
 
 ## Persistent sessions
 
-`sbx run --keep-alive` starts a session. The command after `--` is its
-resident, and a holder process stays alive with the session's namespaces, proxies
-and audit writer, so later commands can join it. `sbx attach` runs a command in a
-running session, and `sbx stop` ends it. Use this when a process from one call
-(a dev server, say) must stay reachable from the next. No daemon is needed.
-
-```
-sbx run --keep-alive --policy P --session-dir S -- npm run dev   # returns once the session is up
-sbx attach --policy P --session-dir S -- curl -s http://127.0.0.1:3000/
-sbx stop --session-dir S
-```
-
-- **Opt in.** Plain `sbx run` is unchanged. `--keep-alive` is the only way to
-  create a session. `sbx check` reports whether the host can hold and join a
-  session (the `keep-alive` item, report only: it never changes the exit code).
-- **Same policy.** Attach refuses a policy that is not byte-identical to the
-  session's policy (rc 125, the reason on stderr). Nothing runs in that case.
-- **Each call is a sandbox.** Every attached call gets its own bwrap, with its
-  own pid namespace, mounts and seccomp filter, built as for `sbx run`. Calls
-  and the resident share the session's network namespace, its localhost ports
-  and its abstract unix sockets (their namespace is the network namespace). That
-  sharing is what makes a dev server reachable, and it is a documented exception
-  to isolation (S19, R31).
-- **Landlock.** `run --keep-alive --landlock MODE [--landlock-bind-tcp PORT]…`
-  sets the optional Landlock layer for the resident and for every attached call,
-  through the same code path as `run --landlock`. The settings are the session's:
-  the holder pins them at start, and an attach applies exactly those. `sbx attach`
-  takes no `--landlock` flag (a usage error, rc 2), so an attach cannot weaken the
-  layer. With `--keep-alive`, at most 256 `--landlock-bind-tcp` ports are
-  accepted (rc 2 above that, before anything runs), because the session's
-  settings travel in one control frame. With `--landlock require` (or `best-effort` on Linux 6.12+, Landlock
-  ABI 6), the signal scope adds a second barrier behind the per-call pid namespace
-  (S19): a call cannot signal the resident or another call. The holder can still
-  end a call (on stop, or when the holder dies), because the
-  holder and the attach sit outside every call's Landlock domain (S24).
-- **Lifetime.** `--idle-timeout` (default 15m) ends the session after no call has
-  run for that long. `--max-lifetime` (default 8h) ends it after that long
-  regardless. `--max-lifetime` above 24h is a usage error (rc 2). The resident's
-  exit ends the session too. Each end kills the resident and every running call,
-  writes their exit rows, and removes the control socket. The clock starts when
-  `run --keep-alive` starts, so setup counts toward `--max-lifetime`.
-- **Policy timeout.** The resident is not bound by the policy's `limits.timeout`.
-  Only the session lifetime (`--max-lifetime`) bounds it. Each attached call is
-  bounded by its own `--timeout`, or by `limits.timeout` when that is absent.
-- **Output.** The holder's output (the resident's stdout and stderr) goes to
-  `S/holder.log`, not to the caller, and it is bounded by `limits.output_bytes`.
-  Attached calls print to the caller as in `sbx run`.
-- **Death.** If the holder is killed, the resident and every attached call die
-  too (S20). A later `sbx run --keep-alive` on the same directory starts a new
-  session.
-- **Transparent mode only.** `run --keep-alive` refuses to start a session whose
-  policy is not `transparent` (rc 125, before anything runs). It also refuses a
-  host that falls back to explicit mode, because then no nftables rules exist for
-  an attach to join. Attach keeps its own refusal for a session in that state.
-- **Control socket.** `sbx.ctl` lives in the session directory and is reachable
-  only by the same uid on the host. The sandbox cannot reach it: the session root
-  is not bound (only `work`, `home`, `tmp` and the `etc` files are), and a policy
-  path that is or contains the session directory is refused, lexically by the
-  launch builder and through a symlink by the pre-launch guard, for `run` and for
-  every attach call (R35, closed). A same-uid
-  client can hold the control loop for up to 2 s per connection, in batches of
-  8 connections per wake (R34). Each connection has one 2 s deadline for its
-  request and its reply.
-- **Audit.** With `--audit`, the session writes one file. Each call's exit row
-  carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
-  rows carry no `call_id` (R30). The `dns` rate limit covers the whole session,
-  so only the resident's exit row carries `dns_suppressed`.
-- **Resource limits.** The policy's `limits` RLIMITs apply to every attached
-  call as they apply to the resident.
-
-**Exit codes**
-
-| command | rc | meaning |
-|---|---|---|
-| `run --keep-alive` | 0 | the session is up (the holder keeps running) |
-| `run --keep-alive` | 125 | the session could not start; the reason is on stderr |
-| `run --keep-alive`, `attach` | 2 | usage error (for example `--max-lifetime` above 24h, or more than 256 `--landlock-bind-tcp` ports with `--keep-alive`) |
-| `attach` | the call's own rc | as in `sbx run`: 124 on `--timeout`, 128+N on a signal |
-| `attach` | 125 | refused or failed: no session, a different policy, an explicit-mode session, or the holder exited |
-| `stop` | 0 | the session is stopped, or nothing was running |
-| `stop` | 125 | the holder refused the stop or could not be reached |
-
-## Garbage collection
-
-`sbx gc --older-than D [--dry-run] ROOT` removes the session directories under
-`ROOT` that have been idle for longer than `D`. It is the only command that
-deletes sessions, so it is conservative by design.
-
-- **What counts as a session.** An immediate child of `ROOT` that is a real
-  directory (never a symlink) owned by you, with no group or other write bit,
-  that contains an `sbx.lock` regular file with one link. A directory without
-  `sbx.lock` is not a session: it is skipped, and gc never creates the lock.
-  A session directory must be readable and searchable by its owner: a session
-  with mode `0000` or `0300` is reported (`cannot open`) and left in place.
-- **Reserved names.** A session may not be named like a tombstone
-  (`.sbx-gc.<pid>.<16 hex digits>`). `sbx run` refuses such a `--session-dir`
-  with exit 125 (`has a name reserved for sbx gc tombstones`).
-- **Age.** The directory mtime, read while gc holds the session's lock, with a
-  clock taken at that moment. `run` touches the mtime at start and end, so a
-  session that is running, or that ended recently, is young. A future mtime is
-  kept.
-- **What is never touched.** A locked (live) session; any symlink, at any
-  level (symlinks are removed as links, never followed); entries owned by
-  another user; anything across a mount point (see below).
-- **Delete protocol.** gc takes the session's lock, renames the directory to
-  `ROOT/.sbx-gc.<pid>.<nonce>` (a *tombstone*), empties it, unlinks the lock and
-  removes the tombstone. Concurrent gc processes exclude each other with a
-  `flock` on the directory itself, so a second gc skips an entry the first one
-  is removing and reports it at most once. An interrupted gc leaves a
-  tombstone; the next gc collects it regardless of its age. `run` checks, after
-  it takes the lock, that the session it locked was not tombstoned meanwhile,
-  and refuses (exit 125) if it was.
-- **Mount points.** A bind mount, or a filesystem mounted inside a session, is
-  not descended into. The session directory is moved to a tombstone and emptied
-  up to the mount point; the mounted part and the rest of the tombstone stay
-  where they are, and gc reports `mount point at "<path>"` and the tombstone
-  path (`remainder left at`). Once the mount is gone, the next gc finishes the
-  job. A session directory that is itself a mount point is left in place
-  (`session directory is a mount point`). A bind-mounted file is reported with
-  the same mount-point message, although it is not a directory.
-- **ROOT rules.** ROOT must exist and be a directory. Its final component must
-  not be a symlink. Symlinks in ancestor directories are followed, as with any
-  path you type. A ROOT with a `..` component is refused (the reason is ``must not contain `..` ``). ROOT
-  must be owned by you or by root, and if it is group- or world-writable it must
-  have the sticky bit. `/` is always refused.
-- **Output and exit codes.** One line per collected entry on stdout, in name
-  order: `removed "<path>"`, or `would remove "<path>"` with `--dry-run`.
-  Failures are on stderr as `sbx gc: "<path>": <reason>`. Exit `0`: every
-  eligible session was handled (including "nothing to do"). Exit `1`: ROOT was
-  refused, or a session failed (for example a group-writable session, which is
-  left in place); gc continues with the other sessions and reports the failure
-  at the end. Exit `2`: a usage error (for example `--older-than 0s`). A session
-  that is in use, still young, or being removed by another gc is not a failure
-  and prints nothing.
-- **Messages for hoisted subtrees.** To keep the number of open directories
-  bounded, the walker can move a deep subdirectory up to the top of the
-  session under a name `.sbx-gc-hoist.<N>`. A failure inside such a subtree is
-  reported with that name in its path.
-- **`--dry-run`.** It briefly takes each candidate's lock to check that the
-  session is free, then releases it. A `run` that starts in that instant fails
-  with `session directory is in use` (exit 125) and can be retried. It only
-  checks what is checkable before removing: it cannot predict a failure inside
-  the tree, such as a mount point, an entry owned by another user, or a
-  directory that cannot be read (EACCES) and cannot be repaired. Those show up
-  in a real run.
-- **Limitations (#14).**
-  - NFS `.nfsXXXX` silly-rename files and flock semantics on NFS and 9p are
-    not handled.
-  - A btrfs subvolume has a different `st_dev` and is refused as a mount point.
-  - On kernels older than 5.8 the mount id comes from `name_to_handle_at`
-    instead of `statx`. If ROOT's filesystem does not support file handles
-    (procfs, and overlayfs on some older kernels when it is not exported),
-    the whole ROOT is refused with `cannot stat` and nothing is removed (fail
-    closed). A session on such a filesystem inside a handle-capable ROOT is
-    reported as `cannot stat` and left in place. The `MOUNT_ROOT` attribute is
-    also unavailable there, so the mount-id comparison is the only check.
-  - A process running as your user that writes into a session while gc empties
-    it can make gc fail (`could not empty the directory after N passes`); the
-    tombstone is left for the next gc.
+`sbx run --keep-alive` starts a session whose command stays running (a dev
+server, say), `sbx attach` runs further commands in it, and `sbx stop` ends it.
+`sbx gc` removes idle session directories. See
+[docs/usage.md](docs/usage.md#persistent-sessions).
 
 ## Kubernetes
 
-[docs/kubernetes.md](docs/kubernetes.md) shows how to run sbx in a pod with its own user namespace
-(`hostUsers: false`), without privileged mode or added capabilities: the pod settings sbx needs
-(`procMount: Unmasked`, a Localhost seccomp profile, the AppArmor setting), which `sbx check` item
-fails without each one (AppArmor: not observed), node requirements, Pod Security Admission, and what changes in the threat
-model. The example manifests, image and kind config are in
-[`examples/kubernetes/`](examples/kubernetes/), and the `kubernetes` CI job runs `sbx check` and the
-offline conformance tiers in that pod.
+[docs/kubernetes.md](docs/kubernetes.md) shows how to run sbx in a pod with its
+own user namespace (`hostUsers: false`), without privileged mode or added
+capabilities. The example manifests, image and kind config are in
+[`examples/kubernetes/`](examples/kubernetes/).
 
-## Build
+## TLS termination
 
-Requires Rust ≥ 1.85 via [rustup](https://rustup.rs/):
+The default build passes TLS through. An opt-in build feature terminates TLS
+for named hosts to enforce URL-path rules: see [docs/tls-termination.md](docs/tls-termination.md).
 
-```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl
-# → target/x86_64-unknown-linux-musl/release/sbx
-```
+## Non-goals
 
-The default build has no crypto provider, so its dependency tree is pure Rust.
-The opt-in TLS termination (see [TLS termination](#tls-termination-opt-in-build-feature))
-adds `ring` and a C compiler; build it with `--features tls-termination`.
+- **Not a container runtime.** No images, registries, OCI specs, or
+  long-lived "containers" — one command, one sandbox, one lifetime.
+- **Linux only.** The sandbox is built from Linux kernel features
+  (namespaces, nftables); there are no macOS or Windows plans.
+- **No eBPF cgroup firewall.** Egress filtering uses nftables inside the
+  sandbox's network namespace, which works unprivileged. Why: see the
+  [threat model](docs/threat-model.md#81-why-not-an-ebpf-cgroup-firewall).
+- **No TLS interception in the default build.** The default binary filters on
+  SNI and IP and installs no CA in the sandbox. Why, and the domain-fronting
+  residual this leaves: see the
+  [threat model](docs/threat-model.md#84-why-tls-passthrough-in-v1).
 
-For `aarch64-unknown-linux-musl`, add the target and provide a cross
-linker (the dependency tree is pure Rust, so a stock cross toolchain is
-enough):
+## Documentation
 
-```sh
-rustup target add aarch64-unknown-linux-musl
-sudo apt-get install gcc-aarch64-linux-gnu   # or use cargo-zigbuild
-CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc \
-  cargo build --release --target aarch64-unknown-linux-musl
-```
-
-## MSRV
-
-Rust **1.85**, edition 2024 — recorded in `Cargo.toml` (`rust-version`)
-and enforced by the CI `msrv` job. Bumping the MSRV is a deliberate,
-documented change: if a dependency update breaks the `msrv` job, either
-pin the older version (`cargo update -p <crate> --precise <ver>`) or raise
-`rust-version` with justification.
-
-## Static binaries
-
-Release musl builds are fully static. `file(1)` reports them as
-`static-pie linked` on x86_64 (the host toolchain defaults to PIE) or
-`statically linked` on aarch64 (the cross toolchain links a non-PIE
-executable) — both mean no dynamic loader and no shared-library
-dependencies. CI asserts the spelling-agnostic regex plus the absence of
-a `PT_INTERP` segment (`readelf`), which is architecture-agnostic; `ldd`
-output is informational only, since its wording varies on foreign-arch
-binaries. PIE is kept wherever the toolchain provides it — forcing a
-single spelling would sacrifice ASLR for the sandbox launcher itself.
-
-## Releases
-
-Pushing a `vX.Y.Z` tag that matches `Cargo.toml` runs
-`.github/workflows/release.yml`, which publishes:
-
-- **GitHub Release:** `sbx-X.Y.Z-{x86_64,aarch64}-unknown-linux-musl.tar.gz`
-  (the static binary, LICENSE, README), a `.sha256` per tarball, the wheels
-  and a combined `SHA256SUMS`. Every tarball and wheel carries a build
-  provenance attestation:
-  `gh attestation verify sbx-X.Y.Z-x86_64-unknown-linux-musl.tar.gz --repo vdavamse/sbx`.
-- **PyPI:** [`sbx-bin`](https://pypi.org/project/sbx-bin/), a platform wheel
-  per architecture that bundles the same binary and exposes only
-  `sbx_bin.binary_path()` (the `ripgrep` wheel pattern). Uploaded with
-  trusted publishing (OIDC); no PyPI token exists.
-- **Container image:** `ghcr.io/vdavamse/sbx:X.Y.Z` (amd64 and arm64):
-  Debian slim with `bubblewrap` and `sbx` as the entrypoint, attested by
-  digest. It runs as a non-root user; the container runtime must allow
-  unprivileged user namespaces. (A new GHCR package is private: make it
-  public once after the first release.)
-
-Release artifacts are the default-feature build: pure Rust, no C crypto.
-Opt-in features are never enabled in them. On pull requests that touch the
-pipeline (and on manual dispatch), the workflow is a dry run: it builds and
-checks everything and publishes nothing.
-
-## Development
-
-```sh
-cargo test --locked
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-```
-
-CI (`.github/workflows/ci.yml`) runs lint, MSRV, tests, static musl builds
-for x86_64 + aarch64 (with staticness asserts and a smoke run of the built
-binary), and `cargo deny` (advisories / licenses / bans / sources per
-`deny.toml`).
-
-## License
-
-Apache-2.0 — see [LICENSE](LICENSE).
+- [docs/usage.md](docs/usage.md): `sbx run` in full (exit codes, filesystem
+  rules, limits, audit log, network, seccomp, Landlock), persistent sessions,
+  garbage collection, and how a run works.
+- [docs/host-check.md](docs/host-check.md): the host report and its fixes.
+- [docs/conformance.md](docs/conformance.md): the conformance suite.
+- [docs/kubernetes.md](docs/kubernetes.md): running sbx in a pod.
+- [docs/tls-termination.md](docs/tls-termination.md): the opt-in TLS termination.
+- [docs/building.md](docs/building.md): building, MSRV, static binaries,
+  releases and development.
+- [docs/threat-model.md](docs/threat-model.md): guarantees and residual risks.
 
 ## Security
 
 Sandbox escapes and other vulnerabilities: please report them privately —
-see [SECURITY.md](SECURITY.md).
+see [SECURITY.md](SECURITY.md). Threat model and security guarantees, with the
+residual risks: [docs/threat-model.md](docs/threat-model.md).
 
-Threat model and security guarantees, with the residual risks:
-[docs/threat-model.md](docs/threat-model.md).
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
