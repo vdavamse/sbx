@@ -12,7 +12,8 @@ There is no daemon. The full reference is [docs/usage.md](https://github.com/vda
 skill covers what people get wrong.
 
 Before relying on a host or a policy, run `sbx check --policy P --host`. Exit 0 means
-the policy can run on this host. Exit 1 means it cannot, and the reasons are on stderr.
+the policy can run on this host. Exit 1 means it cannot: the report on stdout marks the
+failing items, and the reasons are on stderr.
 
 ## What the sandbox sees
 
@@ -24,7 +25,7 @@ the policy can run on this host. Exit 1 means it cannot, and the reasons are on 
 | `/tmp` (`$TMPDIR`) | `S/tmp` | writable, and persists with the session (not a fresh tmpfs) |
 | `S` itself, `S/sbx.lock`, `S/sbx.ctl` | — | **not visible**; a policy path that is or contains `S` is refused (125) |
 | `/bin`, `/sbin`, `/lib`, `/lib64` | symlinks to `usr/…` | usable only if `/usr` is bound (and skipped when a bind covers them) |
-| `/etc` | generated | only `passwd`, `group`, `hosts`, `resolv.conf`, plus `ssl`, `ca-certificates`, `alternatives`, `ld.so.cache`, `localtime`, `nsswitch.conf` from the host |
+| `/etc` | generated | `passwd`, `group`, `hosts`, `resolv.conf`, plus `ssl`, `ca-certificates`, `alternatives`, `ld.so.cache`, `localtime`, `nsswitch.conf` from the host, plus any policy bind under `/etc` |
 | `/proc`, `/dev` | fresh | |
 | anything else on the host | — | does not exist; a `deny` entry is an empty tmpfs over its path |
 
@@ -32,13 +33,17 @@ the policy can run on this host. Exit 1 means it cannot, and the reasons are on 
   `rw` paths are owned by you on the host.
 - The environment is cleared except `HOME=/root`, `TMPDIR=/tmp`, a standard `PATH`,
   the names in `env.pass` that are set in the caller's environment, and `env.set`.
+  sbx adds its own variables only in explicit mode (the proxy variables) and with the
+  opt-in [TLS termination](https://github.com/vdavamse/sbx/blob/main/docs/tls-termination.md)
+  build (`SSL_CERT_FILE` and the other CA bundle variables).
 - To keep state between runs, reuse `S`: `/work`, `/root` and `/tmp` persist. A fresh
   `S` gives a clean sandbox.
 
 ## `--cwd` is a sandbox path
 
 `--cwd C` only sets the working directory inside the sandbox. It mounts nothing and
-grants no write access. `C` must exist inside the sandbox: `/work`, a path under `/root`
+grants no write access. `C` must be absolute (a relative one is refused: rc 125,
+`cwd must be absolute`), and it must exist inside the sandbox: `/work`, a path under `/root`
 or `/tmp`, or a path under a policy bind. Otherwise bwrap fails with
 `bwrap: Can't chdir to C: No such file or directory` and **rc 1** (not 125). To work in a
 host project, put the project in `filesystem.rw` (or `ro`) and pass the same path as
@@ -64,7 +69,7 @@ or headless mode.
 |---|---|
 | N | the command exited N |
 | 124 | `--timeout` or `limits.timeout` elapsed; stderr `sbx run: timed out after …` |
-| 125 | sbx itself failed or refused (policy, session, audit path, host); stderr `sbx run: <reason>` |
+| 125 | sbx itself failed or refused (policy, session, audit path, host); stderr `sbx run: <reason>` (`sbx attach: …` for attach) |
 | 128+N | killed by signal N (137 = SIGKILL, for example the OOM killer) |
 | 1 | also bwrap's own setup failure (`bwrap: …` on stderr), for example a bad `--cwd` |
 | 2 | usage error (clap) |
@@ -90,7 +95,7 @@ is in [docs/usage.md, Exit codes](https://github.com/vdavamse/sbx/blob/main/docs
   file you own. Several runs may append to one file.
 
 ```sh
-jq -c 'select(.verdict=="denied") | {event,host,reason}' A     # what was blocked
+jq -c 'select(.verdict=="denied" or .verdict=="teardown") | {event,host,reason}' A  # what was blocked
 tail -n 1 A | jq '{code,outcome,output_truncated}'              # how the run ended
 ```
 

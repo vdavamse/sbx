@@ -38,12 +38,18 @@ const REPO_URL: &str = "https://github.com/vdavamse/sbx/";
 
 /// Messages the skill quotes verbatim (or as a prefix); each must still be
 /// produced somewhere in `src/`.
-const QUOTED_MESSAGES: [&str; 4] = [
+const QUOTED_MESSAGES: [&str; 6] = [
     "session directory is in use",
     "output truncated at",
     "timed out after",
     "is not in the policy allow list",
+    "cwd must be absolute",
+    "sbx run: notice:",
 ];
+
+/// Flags of other programs that the skill mentions (the agent's `--version`,
+/// the wrappers' `--selftest`); every other `--flag` must be an sbx flag.
+const FOREIGN_FLAGS: [&str; 2] = ["--version", "--selftest"];
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
@@ -78,6 +84,7 @@ fn clean_flag(tok: &str) -> Option<&str> {
     let t = t.split('=').next().unwrap_or(t);
     let ok = t.len() > 2
         && t.starts_with("--")
+        && t.as_bytes()[2].is_ascii_lowercase()
         && t[2..]
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
@@ -98,9 +105,14 @@ fn flags_in_docs() -> Vec<(String, String, String)> {
                 if tok.trim_start_matches('`') != "sbx" {
                     continue;
                 }
-                let Some(sub) = toks.get(i + 1).map(|s| s.trim_matches('`')) else {
+                let Some(raw_sub) = toks.get(i + 1) else {
                     continue;
                 };
+                // `sbx attach` closed by a backtick is prose, not a command line.
+                if raw_sub.ends_with('`') && tok.starts_with('`') {
+                    continue;
+                }
+                let sub = raw_sub.trim_matches('`');
                 if !SUBCOMMANDS.contains(&sub) {
                     continue;
                 }
@@ -177,6 +189,23 @@ fn documented_flags_exist() {
             missing.push(format!("{at}: sbx {sub} {flag}"));
         }
     }
+    // Flags in prose (`--cwd C`, `--keep-alive`) are not tied to a subcommand:
+    // each must exist in at least one subcommand's help.
+    for rel in SKILL_FILES {
+        for (idx, line) in read(rel).lines().enumerate() {
+            for tok in line.split_whitespace() {
+                let Some(flag) = clean_flag(tok) else {
+                    continue;
+                };
+                if FOREIGN_FLAGS.contains(&flag) {
+                    continue;
+                }
+                if !helps.iter().any(|(_, h)| has_flag(h, flag)) {
+                    missing.push(format!("{rel}:{}: {flag} (no subcommand has it)", idx + 1));
+                }
+            }
+        }
+    }
     let run_help = help_of("run");
     for rel in WRAPPERS {
         for (idx, line) in read(rel).lines().enumerate() {
@@ -213,16 +242,34 @@ fn slug(heading: &str) -> String {
         .collect()
 }
 
+/// The heading anchors of a Markdown file, skipping fenced code blocks and
+/// adding GitHub's `-1`, `-2`… suffixes for repeated headings.
 fn anchors(rel: &str) -> Vec<String> {
-    read(rel)
-        .lines()
-        .filter_map(|l| {
-            l.trim_start_matches('#')
-                .strip_prefix(' ')
-                .filter(|_| l.starts_with('#'))
-        })
-        .map(slug)
-        .collect()
+    let mut out: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for l in read(rel).lines() {
+        if l.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || !l.starts_with('#') {
+            continue;
+        }
+        let Some(text) = l.trim_start_matches('#').strip_prefix(' ') else {
+            continue;
+        };
+        let base = slug(text);
+        let n = out
+            .iter()
+            .filter(|a| {
+                **a == base
+                    || a.strip_prefix(&format!("{base}-"))
+                        .is_some_and(|r| r.parse::<u32>().is_ok())
+            })
+            .count();
+        out.push(if n == 0 { base } else { format!("{base}-{n}") });
+    }
+    out
 }
 
 #[test]
@@ -309,6 +356,28 @@ fn quoted_messages_exist() {
     }
 }
 
+/// The `"sbx run: …"` prefixes the wrappers parse must still be printed by sbx.
+#[test]
+fn wrapper_parsed_prefixes_exist() {
+    let src = all_src();
+    let mut n = 0;
+    for rel in WRAPPERS {
+        for lit in read(rel).split('"').skip(1).step_by(2) {
+            if let Some(rest) = lit.strip_prefix("sbx run: ") {
+                n += 1;
+                assert!(
+                    src.contains(lit) || src.contains(rest),
+                    "{rel} parses {lit:?}, which sbx no longer prints"
+                );
+            }
+        }
+    }
+    assert!(
+        n >= 4,
+        "expected the wrappers to parse sbx's prefixes, found {n}"
+    );
+}
+
 #[test]
 fn layout_table_lists_infra_etc() {
     let argv = read("src/bwrap/argv.rs");
@@ -317,12 +386,16 @@ fn layout_table_lists_infra_etc() {
         .expect("INFRA_ETC in src/bwrap/argv.rs");
     let list = &argv[start..start + argv[start..].find("];").unwrap()];
     let skill = read("skills/sbx/SKILL.md");
+    let row = skill
+        .lines()
+        .find(|l| l.starts_with("| `/etc` |"))
+        .expect("SKILL.md layout table has an /etc row");
     let paths: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
     assert!(!paths.is_empty());
     for p in paths {
         let name = p.strip_prefix("/etc/").expect("an /etc path");
         assert!(
-            skill.contains(&format!("`{name}`")),
+            row.contains(&format!("`{name}`")),
             "SKILL.md layout table does not list {p}"
         );
     }

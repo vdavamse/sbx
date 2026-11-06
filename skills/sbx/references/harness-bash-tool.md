@@ -34,10 +34,12 @@ Shell state does **not** persist: every call is a new `bash`. A `cd`, an `export
 shell function, or a background job (`server &`) ends with the call, and the sandbox
 kills every remaining process when the call ends. The harness has to carry the state:
 
-- **cwd.** Track it yourself and pass `--cwd`. The wrappers print `$PWD` on a marker
-  line after the command and use it for the next call. `--cwd` must exist inside the
-  sandbox. A missing one fails in bwrap (`bwrap: Can't chdir to …`, rc 1), so reset to
-  `/work` when that happens.
+- **cwd.** Track it yourself and pass `--cwd`. The wrappers set an `EXIT` trap that
+  writes `$PWD` to `/tmp/.sbx-tool-cwd` (that is `S/tmp/.sbx-tool-cwd` on the host), so
+  the cwd survives `exit N` and truncated output. The sandbox controls that file: read
+  it without following symlinks, and accept only a short absolute path. `--cwd` must be
+  absolute and must exist inside the sandbox. A missing one fails in bwrap
+  (`bwrap: Can't chdir to …`, rc 1), so reset to `/work` when that happens.
 - **env.** Keep a map of the variables you want and prepend `export K='v'` lines to the
   script. Secrets belong in `env.pass` in the policy instead (they come from the
   harness's own environment).
@@ -48,6 +50,12 @@ kills every remaining process when the call ends. The harness has to carry the s
   which shares the session's localhost. Run `sbx stop --session-dir S` when the
   conversation ends. The resident's output goes to `S/holder.log`. Keep-alive needs
   network mode `transparent` and the byte-identical policy file for every attach.
+- **Attach is not a drop-in replacement for run.** `sbx attach` takes no `--audit`:
+  every call's rows go to the file given to `run --keep-alive --audit`, and concurrent
+  calls interleave their `exit` rows, which carry a `call_id`. Match a call's exit row
+  by `call_id`, or classify it by rc and stderr alone. Attach's own lines start with
+  `sbx attach: ` (for example `sbx attach: timed out after 1s`). The example wrappers
+  only implement the `run` route.
 
 ## Concurrency
 
@@ -67,18 +75,22 @@ holds `S`, plain `run` on it fails the same way, so use `attach`.
 |---|---|
 | rc N, audit `outcome` `exited` | the command's output and `exit code N` |
 | rc 124, `outcome` `timeout` | "timed out after T and was killed", plus the partial output |
-| rc 125, `outcome` `failed` (stderr `sbx run: …`) | a **sandbox/harness error**, not the command's failure: surface sbx's stderr line, and log it for the operator |
+| rc 125, `outcome` `failed` (stderr `sbx run: …`), or no `exit` row at all | a **sandbox/harness error**, not the command's failure: surface sbx's stderr line, and log it for the operator |
+| `outcome` `terminated` (rc 129–143) | sbx itself got a signal (the harness is shutting down): a sandbox error |
 | rc 1 with stderr `bwrap: …` | a sandbox setup error (usually a stale `--cwd`) |
 | rc 128+N | killed by signal N; 137 is SIGKILL (for example out of memory) |
-| stderr `sbx run: output truncated at N bytes (limits.output_bytes)` or audit `output_truncated: true` | the output is cut, so say so; the command ran to completion |
+| stderr `sbx run: output truncated at N bytes (limits.output_bytes)` or audit `output_truncated: true` | the output is cut, so say so; truncation alone does not stop the command |
 
 - Exit status alone is ambiguous, because a command may exit 124 or 125 itself. The
   audit `exit` row's `outcome` is authoritative, which is why the wrappers always pass
   `--audit` and read the rows appended during the call.
 - Keep sbx's own stderr apart from the command's output. The wrappers run the command as
-  `{ eval "$1"; } 2>&1`, so the command's stdout and stderr reach sbx's stdout
-  interleaved. sbx's stderr then carries only `sbx run: …` / `bwrap: …` lines and the
-  cwd marker.
+  `{ eval "$__sbx_cmd"; } 2>&1`, so the command's stdout and stderr reach sbx's stdout
+  interleaved, and sbx's stderr carries mostly `sbx run: …` and `bwrap: …` lines. It is
+  not a trusted channel: the command can still reach it (bash keeps the original stderr
+  on a spare fd), so classify by the audit `outcome` first and use stderr only to
+  explain. Skip `sbx run: notice: …` lines (a host in explicit-mode fallback prints one
+  on every run).
 - `limits.output_bytes` counts stdout and stderr together. Keep it modest (the model
   cannot use megabytes anyway), and tell the model when output was cut.
 

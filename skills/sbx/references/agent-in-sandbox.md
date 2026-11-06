@@ -22,7 +22,11 @@ paths, and reach the allow-listed hosts.
   },
   "env": {
     "pass": ["ANTHROPIC_API_KEY"],
-    "set": { "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1" }
+    "set": {
+      "SHELL": "/bin/bash",
+      "DISABLE_AUTOUPDATER": "1",
+      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    }
   },
   "limits": { "timeout": "30m", "output_bytes": 10485760 }
 }
@@ -50,11 +54,12 @@ must be under a bound path:
 
 - **Installed under `/usr`** (a distro package, or `npm -g` with prefix `/usr`): binding
   `/usr` is enough.
-- **Native installer** (`~/.local/bin/claude` is a symlink): bind the real directory,
-  for example `readlink -f ~/.local/bin/claude` gives
-  `…/.local/share/claude/versions/X`. Bind that directory `ro` and run the binary by its
-  real path. A policy path that is itself a symlink is refused (rc 125), and a symlink
-  whose target is not bound is dangling inside.
+- **Native installer** (`~/.local/bin/claude` is a symlink): `readlink -f
+  ~/.local/bin/claude` gives the binary itself, for example
+  `…/.local/share/claude/versions/2.1.319` (a file). Bind that file `ro` and run it by
+  that path, as in the template. Binding the symlink works too, but the binary then
+  appears at the link's path. A symlink *inside* a bound tree whose target is not bound
+  dangles.
 - **Node from nvm** (or another per-user runtime): bind its install directory `ro` and
   put its `bin` first in `PATH` through `env.set`, for example
   `"PATH": "/home/me/.nvm/versions/node/v24.1.0/bin:/usr/bin:/bin"`.
@@ -93,6 +98,7 @@ never to your real home directory.
 - **Output.** `limits.output_bytes` caps what reaches your terminal or log. The agent
   keeps running past the cap.
 - **Review.** Use `--audit` with a file outside `S` and outside every bind. Afterwards,
-  `jq 'select(.verdict=="denied")'` lists what the agent tried and was refused.
+  `jq 'select(.verdict=="denied" or .verdict=="teardown")'` lists what the agent tried
+  and was refused.
 - **Cleanup.** `sbx gc --older-than 7d ~/.cache/sbx` removes the idle session
   directories directly under `~/.cache/sbx`.
