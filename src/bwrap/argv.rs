@@ -65,7 +65,9 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use super::Build;
-use super::etc::{DEST_HOME, DEST_TMP, DEST_WORK, SessionLayout, session_layout};
+use super::etc::{
+    DEST_CA_BUNDLE, DEST_CA_CERT, DEST_HOME, DEST_TMP, DEST_WORK, SessionLayout, session_layout,
+};
 use crate::init::consts::{EXPLICIT_TCP_PORT, SANDBOX_ADDR};
 use crate::landlock::{Grant, PathRule};
 use crate::policy::{AbsolutePath, NetworkMode};
@@ -213,7 +215,12 @@ pub(super) fn assemble(input: &Build<'_>) -> (Vec<OsString>, Plan) {
     // The merged mount list (element 6) — computed before the shims
     // because the shim skip rule needs the bind dests.
     let denies = sorted_denies(&input.policy.filesystem.deny);
-    let (mounts, plan) = plan_mounts(&input.policy.filesystem, &layout, &denies);
+    let (mounts, plan) = plan_mounts(
+        &input.policy.filesystem,
+        &layout,
+        &denies,
+        terminates(input.policy),
+    );
 
     // 5. The usr-merge shims (module docs point 8), each skipped when any
     //    bind dest or deny path EQUALS OR IS UNDER its dest
@@ -328,6 +335,23 @@ pub(super) fn assemble(input: &Build<'_>) -> (Vec<OsString>, Plan) {
         }
     }
 
+    // 12b. The trust-store variables for a terminated run (issue #17, D4):
+    //      emitted AFTER the explicit block, so policy env.set cannot point
+    //      the payload at a different trust store. Every common client
+    //      reads one of these: OpenSSL/Python/curl/git/cargo/node variants.
+    if !input.policy.network.mitm_hosts.is_empty() {
+        for (name, value) in [
+            ("SSL_CERT_FILE", DEST_CA_BUNDLE),
+            ("REQUESTS_CA_BUNDLE", DEST_CA_BUNDLE),
+            ("CURL_CA_BUNDLE", DEST_CA_BUNDLE),
+            ("GIT_SSL_CAINFO", DEST_CA_BUNDLE),
+            ("CARGO_HTTP_CAINFO", DEST_CA_BUNDLE),
+            ("NODE_EXTRA_CA_CERTS", DEST_CA_CERT),
+        ] {
+            setenv(&mut argv, name, OsStr::new(value));
+        }
+    }
+
     // 13. The working directory inside the sandbox (the cli.rs --cwd
     //     contract: sandbox-side; default is the session work leaf).
     argv.push(OsString::from("--chdir"));
@@ -422,8 +446,9 @@ fn plan_mounts(
     fs: &crate::policy::Filesystem,
     layout: &SessionLayout,
     denies: &[&str],
+    terminating: bool,
 ) -> (Vec<Mount>, Plan) {
-    let mounts = merged_mounts(fs, layout);
+    let mounts = merged_mounts(fs, layout, terminating);
     let pinned = with_pins(&mounts, denies);
     let pins = pinned.len() - mounts.len();
     let checks = path_checks(&mounts, &pinned, denies);
@@ -455,7 +480,7 @@ pub fn path_plan(policy: &crate::policy::Policy, session_dir: Option<&std::path:
     let denies = sorted_denies(&policy.filesystem.deny);
     let layout =
         session_layout(session_dir.unwrap_or(std::path::Path::new("/nonexistent-sbx-session")));
-    plan_mounts(&policy.filesystem, &layout, &denies).1
+    plan_mounts(&policy.filesystem, &layout, &denies, terminates(policy)).1
 }
 
 /// The deepest mount (last emitted at the deepest dest) STRICTLY above `t`.
@@ -611,7 +636,17 @@ fn at_or_under(path: &str, root: &str) -> bool {
 
 /// The merged, deduped, sorted mount list (module docs point 4; layout
 /// element 6).
-fn merged_mounts(fs: &crate::policy::Filesystem, layout: &SessionLayout) -> Vec<Mount> {
+/// Whether the policy terminates TLS for any host (issue #17), so the run
+/// mounts the per-run trust files.
+fn terminates(policy: &crate::policy::Policy) -> bool {
+    !policy.network.mitm_hosts.is_empty()
+}
+
+fn merged_mounts(
+    fs: &crate::policy::Filesystem,
+    layout: &SessionLayout,
+    terminating: bool,
+) -> Vec<Mount> {
     let mut mounts = Vec::new();
 
     // Prio 0 — the policy lists in written order (ro, then rw). Src ==
@@ -649,6 +684,23 @@ fn merged_mounts(fs: &crate::policy::Filesystem, layout: &SessionLayout) -> Vec<
             dest: dest.to_owned(),
             prio: PRIO_INFRA,
         });
+    }
+
+    // Prio 1 — the per-run trust files (issue #17, D4), only when the policy
+    // terminates TLS. Each is a single public PEM file bound read-only; the
+    // CA key is never in the session directory and never mounted.
+    if terminating {
+        for (src, dest) in [
+            (&layout.ca_cert, DEST_CA_CERT),
+            (&layout.ca_bundle, DEST_CA_BUNDLE),
+        ] {
+            mounts.push(Mount {
+                op: BindOp::Ro,
+                src: src.clone(),
+                dest: dest.to_owned(),
+                prio: PRIO_INFRA,
+            });
+        }
     }
 
     // Prio 2 — the three session leaves, rw (Q7): ONLY the leaves; the

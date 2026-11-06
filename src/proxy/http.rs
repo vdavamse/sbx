@@ -93,6 +93,10 @@
 //!    `100`. HTTP/1.0 is always last, even with `Connection: keep-alive`
 //!    (RFC 9112 App. C.2.2 keep-alive is not supported). The explicit forward
 //!    path is always one request per connection (explicit module docs point 12).
+//!    The TLS-terminated path (crate::tls, proxy module docs point 14)
+//!    applies the point 6 rewrite to the one request it forwards, after its
+//!    own Host and path checks.
+
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::h1::{HeadAccumulator, RequestMeta};
@@ -164,6 +168,18 @@ pub(crate) fn upstream_head(mut head: Vec<u8>, meta: &RequestMeta) -> Vec<u8> {
         head.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
     }
     head
+}
+
+/// Insert [`CONNECTION_CLOSE_HEADER`] before the head's final CRLF
+/// (module docs point 6). `head_end` is the index just past the located
+/// `\r\n\r\n` — always ≥ the 4-byte terminator — so the insertion point is
+/// `head_end - 2`; everything else (request line, client headers,
+/// pipelined body bytes) stays byte-identical. The TLS-terminated path's
+/// one request (issue #17) is always last.
+#[cfg(feature = "tls-termination")]
+pub(crate) fn force_connection_close(buf: &mut Vec<u8>, head_end: usize) {
+    let at = head_end - 2;
+    buf.splice(at..at, CONNECTION_CLOSE_HEADER.iter().copied());
 }
 
 /// The per-request check inputs (issue #8, Q4): the name to match, the

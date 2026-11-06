@@ -53,6 +53,9 @@ netlink-socket2 = { version = "=0.3.5", default-features = false }
 # terminated) and the aarch64 static-musl leg requires a pure-Rust tree (no
 # cc/cmake). Spike-verified on rustc 1.85.0: rustls 0.23.45, MSRV 1.71; floor
 # raised to 0.23.46 for RUSTSEC-2026-0346..0349 (client-side paths, unused here).
+# The crypto provider (ring) is pulled ONLY by the opt-in `tls-termination`
+# feature (issue #17): the default build's tree stays pure Rust (no ring/cc),
+# which the aarch64 static-musl leg depends on.
 rustls = { version = "0.23.46", default-features = false, features = ["std"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
@@ -64,6 +67,29 @@ serde_json = "1.0"
 # ("time"). Spike-verified 1.53.2. The "macros" feature is deliberately OFF
 # (tests hand-roll their block_on).
 tokio = { version = "1.53.2", features = ["rt", "net", "io-util", "time"] }
+
+# Opt-in TLS termination (issue #17, feature `tls-termination`; see the
+# [features] table below). Every crate here is optional and absent from the
+# default build's dependency tree.
+# Per-run ephemeral CA + leaf minting (issue #17, D3). `ring` provider only:
+# the aws-lc-rs default would pull cmake/aws-lc-sys into the feature build.
+# rcgen 0.14 declares rust-version 1.71; NameConstraints are built in.
+rcgen = { version = "=0.14.7", optional = true, default-features = false, features = ["ring", "pem"] }
+# Async TLS server (client-facing termination) and client (upstream, webpki
+# verified) over the ring provider. No aws-lc-rs (see rcgen note above).
+tokio-rustls = { version = "=0.26.6", optional = true, default-features = false, features = ["ring", "tls12"] }
+# Mozilla root store for upstream verification (never disabled). CDLA-Permissive-2.0
+# data license: listed in deny.toml for this feature.
+webpki-roots = { version = "=1.0.11", optional = true }
+# Certificate validity window for the per-run CA and its leaves (rcgen takes
+# time::OffsetDateTime). The same 0.3.45 rcgen already resolves; "std" for now_utc.
+time = { version = "=0.3.45", optional = true, default-features = false, features = ["std"] }
+
+[features]
+# Opt-in TLS termination for hosts with URL-path rules (issue #17). OFF by
+# default: the default binary has no TLS interception and no crypto provider.
+# Build: `cargo build --release --features tls-termination`.
+tls-termination = ["dep:rcgen", "dep:tokio-rustls", "dep:webpki-roots", "dep:time", "rustls/ring"]
 
 # Property tests for the egress matcher/guard (issue #4). Dev-only: never
 # compiled into release binaries; 1.11 declares rust-version 1.85 = MSRV.

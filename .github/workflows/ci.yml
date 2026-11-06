@@ -92,6 +92,64 @@ jobs:
       - name: cargo check on the recorded MSRV
         run: cargo check --locked --all-targets
 
+  # Issue #17: the opt-in `tls-termination` feature. The default jobs above
+  # prove the default tree is pure Rust (no ring/cc); this job proves the
+  # feature build lints, tests and compiles on the recorded MSRV, and that the
+  # default tree still has no ring or cc.
+  tls-termination:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Default tree has no ring or cc (feature off)
+        run: |
+          # `normal,build`: cc is only ever a build dependency (PR #64 m6).
+          if cargo tree -e normal,build --locked | grep -E '(^|[ ])(ring|cc|aws-lc-sys|aws-lc-rs)( |$)'; then
+            echo "FAIL: the default build's normal dependency tree pulls a crypto provider"
+            exit 1
+          fi
+
+      - name: clippy (feature, -D warnings)
+        run: cargo clippy --all-targets --locked --features tls-termination -- -D warnings
+
+      - name: cargo test (feature, lib + threat-model doc + termination CLI)
+        run: |
+          cargo test --locked --features tls-termination --lib
+          cargo test --locked --features tls-termination --test threat_model_doc
+          cargo test --locked --features tls-termination --test termination_cli
+
+  # Issue #17: the feature build on the recorded MSRV (the rustc floor the
+  # `msrv` job pins for the default build).
+  tls-termination-msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo check on the recorded MSRV (feature)
+        run: cargo check --locked --all-targets --features tls-termination
+
   test:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -386,29 +444,8 @@ jobs:
           FAIL=0
           "$BIN" check --conformance --json > conf.json
           RC=$?
-          python3 - conf.json "$RC" <<'PY' || FAIL=1
-          import json, sys
-          r = json.load(open(sys.argv[1]))
-          rc = int(sys.argv[2])
-          assert r["kind"] == "conformance" and r["version"] == 1, r.get("kind")
-          assert r["network_mode"] != "unavailable", r["network_mode"]
-          fails = [c["id"] for c in r["checks"] if c["status"] == "fail"]
-          assert not fails, f"FAIL checks: {fails}"
-          net = {"E01", "E02", "E03", "E04", "E05", "E06"}
-          non_ok = {c["id"]: (c["status"], c.get("skip_kind")) for c in r["checks"] if c["status"] not in ("ok", "warn")}
-          # I04 (foreign uid, issue #18) is an opt-in skip on every host by design.
-          want = {i: ("skip", "opt-in") for i in net | {"I04"}}
-          assert non_ok == want, f"unexpected non-ok set: {non_ok}"
-          offline = [c for c in r["checks"] if c["tier"] in ("host", "lab", "init")]
-          assert len(offline) == 55 + 19 + 1 and all(c["status"] in ("ok", "warn") or c["id"] == "I04" for c in offline), "75 offline checks must pass (I04 an opt-in skip)"
-          assert rc == 0, f"rc {rc} (PR2 expects 0)"
-          PY
-          python3 - conf.json >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json, sys
-          s = json.load(open(sys.argv[1]))["summary"]
-          print("### sbx check --conformance (issue #13)")
-          print(f"{s['ok']} ok, {s['fail']} FAIL, {s['warn']} warn, {s['capability_skips']} capability skip, {s['not_implemented']} not implemented, {s['opt_in_skips']} opt-in, {s['duration_ms']} ms")
-          PY
+          # Shared with the kubernetes job (issue #15): one copy of the expected numbers.
+          python3 -I .github/scripts/assert_conformance.py conf.json "$RC" "sbx check --conformance (issue #13)" || FAIL=1
           exit "$FAIL"
 
       # Issue #11 negative tier (gating): nested inside bwrap --disable-userns,
@@ -579,6 +616,21 @@ jobs:
 
       - name: Build (static musl release)
         run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      # Issue #17 (D7): the feature build must also link statically for both
+      # musl targets. ring compiles C code, and cc-rs otherwise looks for a
+      # musl-prefixed compiler that the runners do not ship (verified: the
+      # build fails with ToolNotFound "x86_64-linux-musl-gcc"). Each leg names
+      # its C compiler explicitly; the x86_64 host gcc compiles ring's C for
+      # the musl target (verified: static-pie output). Separate target dir: the
+      # shipped artifact above stays the default build.
+      - name: Build (static musl release, tls-termination feature)
+        env:
+          CC_x86_64_unknown_linux_musl: gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+        run: >-
+          cargo build --release --locked --features tls-termination
+          --target "${{ matrix.target }}" --target-dir target/tls
 
       - name: Staticness asserts
         run: |
@@ -808,6 +860,222 @@ jobs:
       # committed Cargo.lock. No inputs needed; defaults are exactly the
       # full check on ./Cargo.toml.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+  # Issue #15 (gating): the Kubernetes example (examples/kubernetes/,
+  # docs/kubernetes.md) in a kind cluster with user namespaces. Validates the
+  # manifest, checks the seccomp profile against its pinned upstream, builds the
+  # image from the static musl binary, runs `sbx check`, `--policy --host` and the
+  # offline conformance tiers inside the pod, and proves the guide's "what breaks
+  # without it" rows by removing procMount and the seccomp profile.
+  # Runner uncertainty (not verifiable locally, where the guide was tested on WSL2
+  # with AppArmor off): the runner's AppArmor userns restriction and its
+  # bwrap-userns-restrict profile. Their state is recorded (report-only), then
+  # they are relaxed exactly as the test job relaxes them, before the cluster is
+  # created. Removing appArmorProfile is report-only too (the kind node does not
+  # enforce AppArmor on pods, so it is not an AppArmor-node test).
+  kubernetes:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Pinned tools; the checksums are the projects' published ones.
+      KIND_VERSION: v0.33.0
+      KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+      KUBECTL_VERSION: v1.37.0
+      KUBECTL_SHA256: 6129359f4e1f3848a5572ccb0b26cf28b8ca08cef38c95a765b2f64a2c961a2f
+      KUBECONFORM_VERSION: v0.8.0
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      # yannh/kubernetes-json-schema at a fixed commit (schemas for v1.37.0).
+      SCHEMA_COMMIT: 102361970337d65537d40141dc29b991b8e95786
+      # Upstream of examples/kubernetes/seccomp/sbx-userns.json (derive.py pins
+      # the same commit and the file's SHA-256).
+      SECCOMP_UPSTREAM: https://raw.githubusercontent.com/moby/profiles/245180c51918481c0525424b3ee025d2b435d46c/seccomp/default.json
+      CLUSTER: sbx-ci
+      IMAGE: sbx-k8s-example:dev
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install kind, kubectl and kubeconform (pinned, checksummed)
+        run: |
+          D="$RUNNER_TEMP/k8s-tools"
+          mkdir -p "$D"
+          curl -fsSL --retry 5 -o "$D/kind" "https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION/kind-linux-amd64"
+          echo "$KIND_SHA256  $D/kind" | sha256sum -c
+          curl -fsSL --retry 5 -o "$D/kubectl" "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl"
+          echo "$KUBECTL_SHA256  $D/kubectl" | sha256sum -c
+          curl -fsSL --retry 5 -o "$D/kubeconform.tar.gz" "https://github.com/yannh/kubeconform/releases/download/$KUBECONFORM_VERSION/kubeconform-linux-amd64.tar.gz"
+          echo "$KUBECONFORM_SHA256  $D/kubeconform.tar.gz" | sha256sum -c
+          tar -xzf "$D/kubeconform.tar.gz" -C "$D" kubeconform
+          chmod +x "$D/kind" "$D/kubectl" "$D/kubeconform"
+          echo "$D" >> "$GITHUB_PATH"
+
+      - name: Validate the manifest (kubeconform, strict, Kubernetes 1.37.0)
+        run: |
+          kubeconform -strict -summary -verbose -kubernetes-version 1.37.0 \
+            -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$SCHEMA_COMMIT/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json" \
+            examples/kubernetes/pod.yaml
+
+      - name: The seccomp profile matches its derivation from the pinned upstream
+        run: |
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/default.json" "$SECCOMP_UPSTREAM"
+          python3 -I examples/kubernetes/seccomp/derive.py "$RUNNER_TEMP/default.json" "$RUNNER_TEMP/sbx-userns.json"
+          diff -u examples/kubernetes/seccomp/sbx-userns.json "$RUNNER_TEMP/sbx-userns.json"
+
+      - name: Build sbx (static musl) and the example image
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          CTX=$(mktemp -d)
+          cp target/x86_64-unknown-linux-musl/release/sbx examples/default.json "$CTX"/
+          docker build -f examples/kubernetes/Dockerfile -t "$IMAGE" "$CTX"
+          docker run --rm "$IMAGE" sh -c 'bwrap --version; sbx --version'
+
+      # Same module preload as the test job: the pod shares the runner's kernel
+      # and cannot load modules itself (transparent mode needs the nft redirect).
+      - name: Load the nftables modules on the runner
+        run: |
+          sudo modprobe -a nf_tables nft_fib nft_fib_ipv4 nft_redir nft_cmp \
+            nft_meta nft_immediate nf_nat nft_counter || true
+
+      # Report-only: the runner's AppArmor state before the relaxation below
+      # (evidence for docs/kubernetes.md, "AppArmor"; never fails the job). The
+      # relaxation is not what lets the pod start (a run that relaxed first still
+      # failed); kind's DMI overmounts were the cause, see the next step.
+      - name: "Report: the runner's AppArmor state"
+        continue-on-error: true
+        run: |
+          set +e
+          {
+            echo "### Runner AppArmor state before relaxing it (report-only)"
+            echo '```'
+            echo "apparmor enabled: $(cat /sys/module/apparmor/parameters/enabled 2>&1)"
+            echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>&1)"
+            sudo aa-status 2>/dev/null | grep -iE 'bwrap|unpriv' || echo "no bwrap/unpriv AppArmor profiles listed"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Runner-only, the same relaxation the test job applies before its suites.
+      - name: Relax the runner's AppArmor userns restriction
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict \
+              || echo "::warning::could not unload AppArmor bwrap-userns-restrict"
+          fi
+
+      - name: Create the kind cluster and start the example pod
+        run: |
+          kind create cluster --name "$CLUSTER" --config examples/kubernetes/kind-config.yaml --wait 180s
+          # kind bind-mounts files over /sys/devices/virtual/dmi/id/product_{name,uuid}
+          # in the node when the host has DMI (GitHub runners do; WSL does not). The
+          # kernel lets a user namespace mount a fresh sysfs only when an existing
+          # sysfs mount is fully visible (mnt_already_visible: locked child mounts
+          # only on directories sysfs keeps empty for mounts), so runc's sysfs
+          # mount for a hostUsers: false sandbox fails with EPERM (observed here). Drop those file overmounts in this
+          # single-node CI cluster; the unique product_uuid only matters with
+          # several nodes.
+          NODE="$CLUSTER-control-plane"
+          for _ in 1 2 3 4; do
+            docker exec "$NODE" sh -c 'for m in $(awk "\$5 ~ \"^/sys/devices/virtual/dmi/id/\" {print \$5}" /proc/self/mountinfo); do umount "$m" || true; done'
+          done
+          LEFT=$(docker exec "$NODE" sh -c 'awk "\$5 ~ \"^/sys/devices/virtual/dmi/\"" /proc/self/mountinfo')
+          [ -z "$LEFT" ] || { echo "$LEFT"; echo "FAIL: DMI overmounts are still present in the kind node"; exit 1; }
+          kubectl get --raw /metrics | grep -E 'kubernetes_feature_enabled\{name="(UserNamespacesSupport|ProcMountType)"' || true
+          kind load docker-image "$IMAGE" --name "$CLUSTER"
+          kubectl apply -f examples/kubernetes/pod.yaml
+          kubectl wait --for=condition=Ready pod/sbx-example --timeout=180s \
+            || { kubectl describe pod sbx-example; exit 1; }
+
+      - name: hostUsers is in effect (the pod has its own user namespace)
+        run: |
+          MAP=$(kubectl exec sbx-example -- cat /proc/self/uid_map)
+          echo "$MAP"
+          # The host user namespace maps the whole range from 0: "0 0 4294967295".
+          read -r INSIDE OUTSIDE COUNT <<< "$MAP"
+          [ "$INSIDE" = 0 ] && [ "$OUTSIDE" != 0 ] && [ "$COUNT" = 65536 ] \
+            || { echo "FAIL: the pod is not in its own user namespace"; exit 1; }
+
+      - name: "sbx check in the pod (gating)"
+        run: |
+          set +e
+          FAIL=0
+          kubectl exec sbx-example -- sbx check --json > k8s-check.json
+          python3 -I .github/scripts/k8s_example.py assert-ok k8s-check.json $? || FAIL=1
+          { echo '### sbx check in the example pod (issue #15)'; echo '```'; kubectl exec sbx-example -- sbx check; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+          kubectl exec sbx-example -- sbx check --policy /etc/sbx/default.json --host
+          RC=$?
+          [ "$RC" -eq 0 ] || { echo "FAIL: sbx check --policy /etc/sbx/default.json --host rc $RC"; FAIL=1; }
+          exit "$FAIL"
+
+      - name: "Conformance in the pod (offline tiers, gating)"
+        run: |
+          set +e
+          kubectl exec sbx-example -- sbx check --conformance --json > k8s-conf.json
+          RC=$?
+          python3 -I .github/scripts/assert_conformance.py k8s-conf.json "$RC" "sbx check --conformance in the example pod (issue #15)"
+
+      # The guide's "what breaks without it" table: each pod drops one setting.
+      - name: "Without procMount or the seccomp profile (gating)"
+        run: |
+          set +e
+          FAIL=0
+          for V in no-procmount seccomp-runtimedefault; do
+            python3 -I .github/scripts/k8s_example.py variant "$V" examples/kubernetes/pod.yaml | kubectl apply -f -
+          done
+          for V in no-procmount seccomp-runtimedefault; do
+            kubectl wait --for=condition=Ready "pod/sbx-$V" --timeout=180s || { kubectl describe "pod/sbx-$V"; FAIL=1; }
+          done
+          kubectl exec sbx-no-procmount -- sbx check --json > no-procmount.json
+          python3 -I .github/scripts/k8s_example.py assert-fail no-procmount.json $? netns-ipv6 30 bwrap-run - || FAIL=1
+          kubectl exec sbx-seccomp-runtimedefault -- sbx check --json > seccomp-runtimedefault.json
+          python3 -I .github/scripts/k8s_example.py assert-fail seccomp-runtimedefault.json $? "userns:blocked by a seccomp filter" 1 || FAIL=1
+          exit "$FAIL"
+
+      - name: "Report: without appArmorProfile (report-only)"
+        continue-on-error: true
+        run: |
+          set +e
+          python3 -I .github/scripts/k8s_example.py variant no-apparmor examples/kubernetes/pod.yaml | kubectl apply -f -
+          kubectl wait --for=condition=Ready pod/sbx-no-apparmor --timeout=180s || kubectl describe pod/sbx-no-apparmor
+          echo "pod LSM label: $(kubectl exec sbx-no-apparmor -- cat /proc/self/attr/current 2>&1)" | tee -a "$GITHUB_STEP_SUMMARY"
+          kubectl exec sbx-no-apparmor -- sbx check --json > no-apparmor.json
+          python3 -I .github/scripts/k8s_example.py summary no-apparmor.json "sbx check without appArmorProfile (report-only, issue #15)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Diagnostics only when something above failed (issue #15: the first runner
+      # runs could not start the hostUsers: false pod sandbox, sysfs mount EPERM).
+      - name: "Diagnostics on failure: runner kernel and the kind node's mounts"
+        if: failure()
+        continue-on-error: true
+        run: |
+          set +e
+          {
+            echo "### kubernetes job diagnostics"
+            echo '```'
+            echo "runner kernel: $(uname -r)"
+            NODE="$CLUSTER-control-plane"
+            docker exec "$NODE" uname -r
+            docker exec "$NODE" sh -c 'runc --version; containerd --version' 2>&1
+            echo "--- node mountinfo entries at or under /sys and /proc"
+            docker exec "$NODE" cat /proc/self/mountinfo | awk '$5 ~ "^/(sys|proc)(/|$)"'
+            echo "--- node /proc/sys/user/max_user_namespaces: $(docker exec "$NODE" cat /proc/sys/user/max_user_namespaces)"
+            echo "--- docker info (security options)"
+            docker info --format '{{json .SecurityOptions}} cgroup={{.CgroupVersion}} driver={{.Driver}}'
+            echo "--- kind node container settings"
+            docker inspect "$NODE" --format 'privileged={{.HostConfig.Privileged}} security={{json .HostConfig.SecurityOpt}} cgroupns={{.HostConfig.CgroupnsMode}}'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete the kind cluster
+        if: always()
+        run: kind delete cluster --name "$CLUSTER" || true
 
   # Issue #13 (PR2): the network tier against the real internet (E01-E06). Runs
   # on the nightly schedule, on main and on demand; it is non-gating on pull

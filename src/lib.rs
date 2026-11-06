@@ -88,3 +88,7 @@ pub mod landlock;
 pub mod policy;
 pub mod proxy;
 pub mod run;
+/// Opt-in TLS termination for hosts with URL-path rules (issue #17). Present
+/// only with the `tls-termination` feature.
+#[cfg(feature = "tls-termination")]
+pub mod tls;
