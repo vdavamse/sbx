@@ -81,6 +81,14 @@ each pod (for example `0 3753443328 65536`); in the host user namespace it is `0
 network mode: transparent (policies with network mode transparent, explicit or none can run)
 ```
 
+Newer builds report a twelfth item, the report-only `conntrack` row (issue #43). The CI
+`kubernetes` job observed it ok in the pod on 2026-11-06 (commit 213d73b), with the other 11
+items unchanged:
+
+```
+  ok    conntrack   conntrack table: 0 of 262144 entries in use in this network namespace (report-only; each sandbox namespace may grow to 262144, using host kernel memory)
+```
+
 `sbx check --policy /etc/sbx/default.json --host` reported all nine policy items ok, rc 0:
 
 ```
@@ -461,7 +469,7 @@ image, creates the kind cluster, and checks that `uid_map` is not the host map. 
   [Node requirements](#node-requirements)); without that, the pod sandbox fails to start on
   GitHub runners;
 - gating: `sbx check` (every item except the report-only `landlock` ok, including `keep-alive`;
-  network mode `transparent`),
+  the report-only `conntrack` ok or skip; network mode `transparent`),
   `sbx check --policy /etc/sbx/default.json --host` (rc 0) and `sbx check --conformance` (the same
   `.github/scripts/assert_conformance.py` the test job uses: no FAIL, the 75 offline checks ok or
   warn except `I04`, which is an opt-in skip like `E01` to `E06`, rc 0);
