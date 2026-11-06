@@ -1286,7 +1286,7 @@ pub(crate) async fn handle_connection(
             .await
         }
         // Fail-closed: no verifiable destination ⇒ no traffic. `client` is
-        // NOT moved in this arm — it is dropped at scope end (FIN/RST).
+        // dropped at scope end (FIN/RST), after `record`, as on every arm.
         Err(err) => (
             Decision {
                 client: client_addr,
@@ -1342,11 +1342,14 @@ pub(crate) enum RelayMode {
 /// (module docs point 9 — inspection consumed those bytes FROM the client),
 /// relay, and report a scanner teardown to the sink (a blocked attack must
 /// not be audit-invisible behind its `allowed …` line). Errors are normal
-/// lifecycle — swallowed; the caller's drop closes both sockets.
+/// lifecycle — swallowed. The relay only BORROWS the client: the stream is
+/// dropped (closed) here, after the teardown and close rows are recorded,
+/// so a torn-down attack's row cannot be lost to the payload exiting on
+/// the close (S16).
 pub(crate) async fn relay_tail<C>(
     proxy: &Proxy,
     decision: &Decision,
-    client: C,
+    mut client: C,
     replay: &[u8],
     mode: RelayMode,
     upstream: &mut Upstream,
@@ -1358,14 +1361,14 @@ pub(crate) async fn relay_tail<C>(
         // Explicit-only; the transparent relay never sees this mode.
         // Clean end or transport error: normal relay lifecycle — swallowed.
         RelayMode::CloseOnUpstreamEof => {
-            let _ = relay::relay_until_upstream_eof(client, replay, &mut counted).await;
+            let _ = relay::relay_until_upstream_eof(&mut client, replay, &mut counted).await;
         }
         RelayMode::Scanned { .. } | RelayMode::Plain => {
             let scan_from = match mode {
                 RelayMode::Scanned { scan_from } => Some(scan_from),
                 _ => None,
             };
-            match relay::relay(client, replay, scan_from, &mut counted).await {
+            match relay::relay(&mut client, replay, scan_from, &mut counted).await {
                 Ok(relay::RelayEnd::TornDown(detail)) => proxy.sink.teardown(decision, detail),
                 // Clean end or transport error (EOF/RST/broken pipe): normal relay
                 // lifecycle — swallowed.
@@ -1659,7 +1662,7 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
-    use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::io::{AsyncWriteExt, DuplexStream, duplex};
 
     /// Every wait in these tests is bounded by this deadline.
     const BOUND: Duration = Duration::from_secs(5);
@@ -1886,6 +1889,75 @@ mod tests {
         );
         // up = the replayed first hello only; the withheld second hello is not counted.
         assert_eq!(events[1], format!("closed:{}:0", ch1_len), "{events:?}");
+    }
+
+    /// A sink that, at `teardown`, checks whether the client's far end
+    /// already reads EOF (the proxy closed the client before the row).
+    struct CloseProbeSink {
+        far: Mutex<DuplexStream>,
+        eof_at_teardown: Mutex<Option<bool>>,
+    }
+
+    impl DecisionSink for CloseProbeSink {
+        fn record(&self, _decision: &Decision) {}
+        fn teardown(&self, _decision: &Decision, _detail: &str) {
+            let mut far = self.far.lock().expect("far lock");
+            let mut byte = [0u8; 1];
+            let mut buf = tokio::io::ReadBuf::new(&mut byte);
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let eof = matches!(
+                Pin::new(&mut *far).poll_read(&mut cx, &mut buf),
+                std::task::Poll::Ready(Ok(())) if buf.filled().is_empty()
+            );
+            *self.eof_at_teardown.lock().expect("probe lock") = Some(eof);
+        }
+    }
+
+    #[test]
+    fn teardown_row_precedes_the_client_close() {
+        // S16: the teardown row is recorded while the client is still open; a
+        // payload exiting on the close must not race the row out of the log.
+        let ch2 = tls_hello("allowed.test");
+        let (up_near, _up_far) = duplex(64 * 1024);
+        let mut upstream: Upstream = Box::new(up_near);
+        let (mut client_far, client) = duplex(64 * 1024);
+        let sink = block_on(async {
+            client_far.write_all(&ch2).await.expect("client write");
+            let sink = Arc::new(CloseProbeSink {
+                far: Mutex::new(client_far),
+                eof_at_teardown: Mutex::new(None),
+            });
+            let network = policy::Network {
+                mode: policy::NetworkMode::Transparent,
+                allow: vec![rule("allowed.test")],
+                ports: vec![TLS_PORT],
+            };
+            let proxy = Proxy::new(
+                &network,
+                Arc::new(StaticMap::new(&[(FAKE_IP, "allowed.test")])),
+                sink.clone(),
+                never_connector().0,
+                Limits::default(),
+            );
+            let ch1 = tls_hello("allowed.test");
+            relay_tail(
+                &proxy,
+                &allowed_decision(),
+                client,
+                &ch1,
+                RelayMode::Scanned {
+                    scan_from: ch1.len(),
+                },
+                &mut upstream,
+            )
+            .await;
+            sink
+        });
+        assert_eq!(
+            *sink.eof_at_teardown.lock().expect("probe lock"),
+            Some(false),
+            "the client was closed before the teardown row"
+        );
     }
 
     #[test]

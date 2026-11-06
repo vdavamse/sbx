@@ -1780,7 +1780,9 @@ fn scenario_hostnet_unknown_fake_ip() -> Result<(), String> {
 /// sink, a proxy that closed first would let the client see EOF while the
 /// decision is still unrecorded; in `sbx run` the payload could then exit
 /// and the exit row would end the log before the deny row landed (a CI
-/// flake of `sandbox_run`'s audit-rows scenario). Both listeners.
+/// flake of `sandbox_run`'s audit-rows scenario). The transparent cases
+/// pin the fix; the explicit case is a regression guard (that listener
+/// already recorded before answering).
 fn scenario_hostnet_deny_recorded_before_close() -> Result<(), String> {
     type Case = (
         &'static str,
@@ -1788,22 +1790,43 @@ fn scenario_hostnet_deny_recorded_before_close() -> Result<(), String> {
         &'static [&'static str],
         &'static [(Ipv4Addr, &'static str)],
         fn(u16) -> Vec<u16>,
+        fn(&Rejected) -> bool,
     );
     let cases: [Case; 4] = [
-        ("unknown fake IP", false, &[], &[], |port| vec![port]),
-        ("port denied", false, &[], &[], |_| vec![]),
+        (
+            "unknown fake IP",
+            false,
+            &[],
+            &[],
+            |port| vec![port],
+            |r| matches!(r, Rejected::UnknownFakeIp { .. }),
+        ),
+        (
+            "port denied",
+            false,
+            &[],
+            &[],
+            |_| vec![],
+            |r| matches!(r, Rejected::PortNotAllowed { .. }),
+        ),
         (
             "not allowed",
             false,
             &[ALLOWED],
             &[(Ipv4Addr::LOCALHOST, NOTALLOWED)],
             |port| vec![port],
+            |r| matches!(r, Rejected::NotAllowed { .. }),
         ),
-        ("explicit port denied", true, &[ALLOWED], &[], |_| {
-            vec![443, 80]
-        }),
+        (
+            "explicit port denied",
+            true,
+            &[ALLOWED],
+            &[],
+            |_| vec![443, 80],
+            |r| matches!(r, Rejected::PortNotAllowed { port: 22 }),
+        ),
     ];
-    for (label, explicit, allow, map, ports_fn) in cases {
+    for (label, explicit, allow, map, ports_fn, want) in cases {
         let client = if explicit {
             HostnetClient::Send(connect_head("allowed.test:22"))
         } else {
@@ -1814,11 +1837,9 @@ fn scenario_hostnet_deny_recorded_before_close() -> Result<(), String> {
             ..RecordingSink::default()
         });
         let run = run_hostnet_sink(explicit, allow, map, ports_fn, client, sink)?;
-        if run.decisions.len() != 1 {
-            return Err(format!(
-                "{label}: want one decision, got {:?}",
-                run.decisions
-            ));
+        match run.decisions.as_slice() {
+            [d] if matches!(&d.verdict, Verdict::Denied(r) if want(r)) => {}
+            other => return Err(format!("{label}: unexpected decisions {other:?}")),
         }
         if run.recorded_at_close != 1 {
             return Err(format!(
