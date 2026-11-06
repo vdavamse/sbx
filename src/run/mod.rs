@@ -112,7 +112,7 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::bwrap::etc::session_layout;
+use crate::bwrap::etc::{SessionLayout, session_layout};
 use crate::bwrap::seccomp;
 use crate::bwrap::version::{BwrapStatus, classify_version_output, find_bwrap};
 use crate::bwrap::{Build, build};
@@ -121,7 +121,9 @@ use crate::host::facts::RunFacts;
 use crate::init::fdpass;
 use crate::init::fdpass::{AchievedMode, ListenerFds};
 use crate::policy::Policy;
-use crate::proxy::Proxy;
+use crate::proxy::{Proxy, Terminator};
+#[cfg(feature = "tls-termination")]
+use crate::tls::RunCa;
 use sys::pollfd;
 
 use audit::{AuditLog, exit_row_for, open_audit, ts};
@@ -691,9 +693,19 @@ fn execute(
 
     // S7: env pass-through and the session layout.
     let env = passed_env(&policy, |name| std::env::var_os(name));
-    session_layout(&session)
+    let layout = session_layout(&session);
+    layout
         .materialize()
         .map_err(|err| RunError::new(format!("cannot prepare the session directory: {err}")))?;
+    // S7b (issue #17, D3/D4): the run's TLS termination state, only when the
+    // policy names mitm hosts. The CA key stays in the returned value.
+    // A holder's CA must outlive the whole session (`--max-lifetime`), not its
+    // setup bound (PR #64 review M1).
+    let terminator = prepare_termination(
+        &policy,
+        &layout,
+        ca_lifetime(hold.as_ref().map(|h| h.max), timeout),
+    )?;
 
     // S8: the bwrap info pipe, the seccomp program memfd (issue #34: every
     // launch is filtered; an unsupported arch refuses here, rc 125), and the
@@ -937,13 +949,23 @@ fn execute(
             )))
         })?;
         let host_addrs = crate::egress::HostAddrs::new(host_addrs);
-        let proxy = Proxy::system(
-            &net,
-            map.clone(),
-            audit.clone(),
-            host_addrs,
-            args.max_connections,
-        );
+        let proxy = match terminator {
+            Some(terminator) => Proxy::system_terminating(
+                &net,
+                map.clone(),
+                audit.clone(),
+                terminator,
+                host_addrs,
+                args.max_connections,
+            ),
+            None => Proxy::system(
+                &net,
+                map.clone(),
+                audit.clone(),
+                host_addrs,
+                args.max_connections,
+            ),
+        };
         let dns = DnsServer::new(&net, map.clone(), audit.clone());
         // S16: start the runtime; go only after every task was first-polled.
         let ready = start_net(serve_tasks(fds, proxy, dns), latch.clone()).map_err(|err| {
@@ -1145,6 +1167,90 @@ pub(crate) fn verify_launch(launch: &crate::bwrap::Launch) -> Result<(), RunErro
     Ok(())
 }
 
+/// The host trust bundles, first existing one wins (issue #17, D4). Shared by
+/// Debian/Ubuntu, Fedora/RHEL and Alpine layouts.
+#[cfg(feature = "tls-termination")]
+const HOST_TRUST_BUNDLES: [&str; 3] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+];
+
+/// Build the run's TLS termination state (issue #17, D3/D4) when the policy
+/// names `network.mitm_hosts`: a fresh CA for this run, its certificate and
+/// the host trust roots written into the session directory (public material
+/// only), and the terminator that keeps the key in this process. With no
+/// host bundle present the sandbox trusts the CA alone (documented).
+#[cfg(feature = "tls-termination")]
+fn prepare_termination(
+    policy: &Policy,
+    layout: &SessionLayout,
+    timeout: Duration,
+) -> Result<Option<Arc<Terminator>>, RunError> {
+    if policy.network.mitm_hosts.is_empty() {
+        return Ok(None);
+    }
+    // PR #64 review m5: the CA key lives in this process's memory, so keep it
+    // out of core dumps (and same-uid ptrace attach) from here on. RLIMIT_CORE 0
+    // also stops a root-owned core under `fs.suid_dumpable=2` for handlers that
+    // honor it (systemd-coredump); a pipe handler that ignores it can still
+    // write one, readable by root only.
+    let no_core = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit reads the struct above; prctl takes integers only.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &no_core) } != 0
+        || unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0
+    {
+        return Err(RunError::new(format!(
+            "cannot mark sbx non-dumpable before creating the CA: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let ca = RunCa::generate(&policy.network.mitm_hosts, timeout)
+        .map_err(|err| RunError::new(format!("cannot create the per-run CA: {err}")))?;
+    // PR #64 review m7: without the host's roots the bundle would hold only the
+    // run CA, and every passthrough HTTPS host would fail to verify. Refuse.
+    let Some(mut bundle) = HOST_TRUST_BUNDLES
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .filter(|text| text.contains("-----BEGIN CERTIFICATE-----"))
+    else {
+        return Err(RunError::new(format!(
+            "TLS termination needs the host's CA bundle, and none was found (looked for {})",
+            HOST_TRUST_BUNDLES.join(", ")
+        )));
+    };
+    if !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
+    bundle.push_str(&ca.cert_pem());
+    layout
+        .write_termination_files(&ca.cert_pem(), &bundle)
+        .map_err(|err| RunError::new(format!("cannot write the CA trust files: {err}")))?;
+    let terminator = Terminator::new(ca).map_err(RunError::new)?;
+    Ok(Some(Arc::new(terminator)))
+}
+
+/// How long the run's CA must stay valid (issue #17): the run's timeout, or for a
+/// `--keep-alive` holder its max lifetime (`max`, capped at 24 h by its parser).
+/// `RunCa` adds its slack and its own 24 h cap.
+fn ca_lifetime(hold_max: Option<Duration>, timeout: Duration) -> Duration {
+    hold_max.unwrap_or(timeout)
+}
+
+/// Default build: no policy can name mitm hosts (validation refuses them), so
+/// no termination state exists.
+#[cfg(not(feature = "tls-termination"))]
+fn prepare_termination(
+    _policy: &Policy,
+    _layout: &SessionLayout,
+    _timeout: Duration,
+) -> Result<Option<Arc<Terminator>>, RunError> {
+    Ok(None)
+}
+
 /// Which writable location an audit path collides with (for the pinned messages).
 #[derive(Clone, Copy)]
 enum Writable {
@@ -1265,6 +1371,18 @@ mod tests {
     use super::*;
     use lifecycle::Cause;
     use serve::Fault;
+
+    /// PR #64 review M1: a holder's CA spans the session's max lifetime, not
+    /// the 30 s setup bound; a plain run's spans its timeout.
+    #[test]
+    fn ca_lifetime_covers_a_session_not_its_setup() {
+        let eight_hours = Duration::from_secs(8 * 3600);
+        assert_eq!(ca_lifetime(Some(eight_hours), SETUP_TIMEOUT), eight_hours);
+        assert_eq!(
+            ca_lifetime(None, Duration::from_secs(600)),
+            Duration::from_secs(600)
+        );
+    }
 
     #[test]
     fn run_error_display_is_reason_only() {

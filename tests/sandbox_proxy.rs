@@ -1119,6 +1119,8 @@ fn policy_network(allow: &[&str], ports: &[u16]) -> policy::Network {
             .map(|name| DomainRule::parse(name).expect("fixture name must parse"))
             .collect(),
         ports: ports.to_vec(),
+        mitm_hosts: Vec::new(),
+        paths: Vec::new(),
     }
 }
 

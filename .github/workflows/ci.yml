@@ -92,6 +92,64 @@ jobs:
       - name: cargo check on the recorded MSRV
         run: cargo check --locked --all-targets
 
+  # Issue #17: the opt-in `tls-termination` feature. The default jobs above
+  # prove the default tree is pure Rust (no ring/cc); this job proves the
+  # feature build lints, tests and compiles on the recorded MSRV, and that the
+  # default tree still has no ring or cc.
+  tls-termination:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Default tree has no ring or cc (feature off)
+        run: |
+          # `normal,build`: cc is only ever a build dependency (PR #64 m6).
+          if cargo tree -e normal,build --locked | grep -E '(^|[ ])(ring|cc|aws-lc-sys|aws-lc-rs)( |$)'; then
+            echo "FAIL: the default build's normal dependency tree pulls a crypto provider"
+            exit 1
+          fi
+
+      - name: clippy (feature, -D warnings)
+        run: cargo clippy --all-targets --locked --features tls-termination -- -D warnings
+
+      - name: cargo test (feature, lib + threat-model doc + termination CLI)
+        run: |
+          cargo test --locked --features tls-termination --lib
+          cargo test --locked --features tls-termination --test threat_model_doc
+          cargo test --locked --features tls-termination --test termination_cli
+
+  # Issue #17: the feature build on the recorded MSRV (the rustc floor the
+  # `msrv` job pins for the default build).
+  tls-termination-msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: dtolnay/rust-toolchain@1.85.0
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo check on the recorded MSRV (feature)
+        run: cargo check --locked --all-targets --features tls-termination
+
   test:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
@@ -558,6 +616,21 @@ jobs:
 
       - name: Build (static musl release)
         run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      # Issue #17 (D7): the feature build must also link statically for both
+      # musl targets. ring compiles C code, and cc-rs otherwise looks for a
+      # musl-prefixed compiler that the runners do not ship (verified: the
+      # build fails with ToolNotFound "x86_64-linux-musl-gcc"). Each leg names
+      # its C compiler explicitly; the x86_64 host gcc compiles ring's C for
+      # the musl target (verified: static-pie output). Separate target dir: the
+      # shipped artifact above stays the default build.
+      - name: Build (static musl release, tls-termination feature)
+        env:
+          CC_x86_64_unknown_linux_musl: gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+        run: >-
+          cargo build --release --locked --features tls-termination
+          --target "${{ matrix.target }}" --target-dir target/tls
 
       - name: Staticness asserts
         run: |
