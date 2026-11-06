@@ -402,6 +402,23 @@ jobs:
           RC=$?
           [ "$RC" -eq 0 ] && [ "$OUT" = "denied" ] || { echo "FAIL: landlock smoke rc $RC out: $OUT"; exit 1; }
 
+      # Issue #69: the harness bash-tool wrappers the agent skill points to
+      # (examples/harness/) run their self-tests against the release binary:
+      # exit codes, timeout, output cap, cwd tracking, session persistence and
+      # the "session directory is in use" refusal. Node runs the TypeScript
+      # file through type stripping (Node 22.7 or later), pinned below so the
+      # step does not depend on the runner image's Node.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: "Smoke: harness bash-tool wrappers (release musl)"
+        run: |
+          BIN="$PWD/target/x86_64-unknown-linux-musl/release/sbx"
+          python3 --version
+          python3 examples/harness/sbx_bash_tool.py --selftest "$BIN"
+          node --version
+          node --experimental-strip-types examples/harness/sbx_bash_tool.ts --selftest "$BIN"
+
       # Issue #11: the real `sbx check` on the runner (gating). Every host item
       # must be ok and the network mode transparent — the environment the
       # integration suites assume. The human report goes to the job summary.

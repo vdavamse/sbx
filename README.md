@@ -222,6 +222,20 @@ server, say), `sbx attach` runs further commands in it, and `sbx stop` ends it.
 `sbx gc` removes idle session directories. See
 [docs/usage.md](docs/usage.md#persistent-sessions).
 
+## Agent skill
+
+[`skills/sbx/`](skills/sbx/) is an [Agent Skills](https://agentskills.io) skill
+that teaches an AI agent, or whoever wires one up, how to use sbx: the sandbox's
+filesystem layout, `--cwd`, the missing TTY, exit codes and the audit log. It has
+two use cases: running an agent inside the sandbox, and a harness that wraps its
+bash tool with `sbx run` (with tested Python and TypeScript wrappers in
+[`examples/harness/`](examples/harness/)). Install it by copying the directory:
+
+```sh
+cp -r skills/sbx ~/.claude/skills/sbx      # for every project
+cp -r skills/sbx .claude/skills/sbx        # or for one project
+```
+
 ## Kubernetes
 
 [docs/kubernetes.md](docs/kubernetes.md) shows how to run sbx in a pod with its
@@ -257,6 +271,7 @@ for named hosts to enforce URL-path rules: see [docs/tls-termination.md](docs/tl
 - [docs/conformance.md](docs/conformance.md): the conformance suite.
 - [docs/kubernetes.md](docs/kubernetes.md): running sbx in a pod.
 - [docs/tls-termination.md](docs/tls-termination.md): the opt-in TLS termination.
+- [skills/sbx/](skills/sbx/SKILL.md): the agent skill (see [Agent skill](#agent-skill)).
 - [docs/building.md](docs/building.md): building, MSRV, static binaries,
   releases and development.
 - [docs/threat-model.md](docs/threat-model.md): guarantees and residual risks.
