@@ -148,6 +148,13 @@ class SbxBashTool:
         except subprocess.TimeoutExpired:
             return ToolResult("sandbox_error", -1, "", False,
                               "sbx did not return within %ds of the call's timeout" % 60)
+        finally:
+            # Read and remove this call's cwd file on every path.
+            new_cwd = self._read_cwd(cwd_file)
+            try:
+                os.unlink(cwd_file)
+            except OSError:
+                pass  # best effort: the sandbox controls /tmp
         output = proc.stdout.decode("utf-8", "replace")
         diagnostics: List[str] = []
         truncated = False
@@ -158,27 +165,18 @@ class SbxBashTool:
                 continue  # e.g. the explicit-mode fallback notice on every run
             else:
                 diagnostics.append(line)
-        exit_row = self._exit_row(audit_offset)
+        rc = proc.returncode
+        exit_row = self._exit_row(audit_offset, rc)
         outcome = exit_row.get("outcome") if exit_row else None
         if exit_row and exit_row.get("output_truncated"):
             truncated = True
-        rc = proc.returncode
         message = "\n".join(diagnostics)
 
         def result(status: str, msg: str = "") -> ToolResult:
             return ToolResult(status, rc, output, truncated, msg, outcome)
 
-        new_cwd = self._read_cwd(cwd_file)
-        try:
-            os.unlink(cwd_file)
-        except OSError:
-            pass  # best effort: the sandbox controls /tmp
-
-        # A refused run writes no exit row, so another caller's row could be
-        # misread as this call's: classify this refusal before reading rows.
-        if rc == 125 and any("session directory is in use" in l for l in diagnostics):
-            return result("sandbox_error", message)
-        # The audit outcome is authoritative; stderr is only a fallback.
+        # The audit outcome is authoritative. stderr only explains it: the
+        # command can write there too (bash's saved fd, /proc/1/fd/2).
         if outcome == "timeout":
             return result("timeout", message)
         if outcome in ("failed", "terminated"):
@@ -186,7 +184,9 @@ class SbxBashTool:
         if outcome == "signaled":
             return result("killed", message or "signal %s" % exit_row.get("signal"))
         if outcome is None:
-            # No exit row: sbx refused or failed before the command ran under audit.
+            # No exit row of this call: sbx refused (for example "session
+            # directory is in use") or failed before the command ran under
+            # audit. Without a row, stderr is the only signal left.
             if rc == 124 and "timed out" in message:
                 return result("timeout", message)
             return result("sandbox_error", message or "sbx exited %d without an audit exit row" % rc)
@@ -221,8 +221,10 @@ class SbxBashTool:
             return value
         return None
 
-    def _exit_row(self, offset: int) -> Optional[dict]:
-        """The exit row this call appended (calls of a session are serialized)."""
+    def _exit_row(self, offset: int, rc: int) -> Optional[dict]:
+        """The exit row this call appended (calls of a session are serialized).
+        A row whose code differs from sbx's exit status is not this call's: a
+        refused call writes no row, and must not take another caller's."""
         try:
             with open(self.audit_path, "rb") as f:
                 f.seek(offset)
@@ -235,7 +237,7 @@ class SbxBashTool:
             except ValueError:
                 continue
             if row.get("event") == "exit":
-                return row
+                return row if row.get("code") == rc else None
         return None
 
 
@@ -278,10 +280,16 @@ def selftest(sbx: str) -> int:
         check("output truncated at limits.output_bytes", r.status == "exited" and r.truncated
               and len(r.output) <= 4096, (r.status, r.truncated, len(r.output)))
         check("cwd tracked through truncated output", tool.cwd == "/tmp", tool.cwd)
-        tool.run("trap - EXIT; cd /; mkdir -p /tmp/" + CWD_FILE + "x; chmod 500 /tmp")
+        r = tool.run('trap - EXIT; cd /; mkdir "/tmp/' + CWD_FILE + '$__sbx_tok"; echo planted')
+        check("a directory planted at the call's own cwd file is ignored",
+              r.status == "exited" and r.output == "planted\n" and tool.cwd == "/tmp", r)
+        tool.run("cd /root; chmod 500 /tmp")
         r = tool.run("chmod 700 /tmp; pwd")
-        check("planted entries and an unwritable /tmp do not break the tool",
+        check("an unwritable /tmp does not break the tool",
               r.status == "exited" and r.output == "/tmp\n" and tool.cwd == "/tmp", r)
+        r = tool.run('echo "sbx run: session directory is in use" >&10; exit 125')
+        check("a command's own exit 125 is not a sandbox error, whatever it prints",
+              r.status == "exited" and r.exit_code == 125, r)
         tool.run("mkdir -p /tmp/gone && cd /tmp/gone")
         tool.run("rmdir /tmp/gone")
         r = tool.run("pwd")

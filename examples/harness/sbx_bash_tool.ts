@@ -155,7 +155,10 @@ export class SbxBashTool {
       "--audit", this.auditPath,
       "--", "bash", "-c", SCRIPT, "sbx-bash-tool", exports + command, token,
     ];
-    const { rc, stdout, stderr, backstop } = await new Promise<{
+    let newCwd: string | null = null;
+    let ran: { rc: number; stdout: string; stderr: string; backstop: boolean };
+    try {
+      ran = await new Promise<{
       rc: number; stdout: string; stderr: string; backstop: boolean;
     }>(
       (resolve, reject) => {
@@ -182,7 +185,17 @@ export class SbxBashTool {
           });
         });
       },
-    );
+      );
+    } finally {
+      // Read and remove this call's cwd file on every path.
+      newCwd = readCwd(cwdFile);
+      try {
+        fs.unlinkSync(cwdFile);
+      } catch {
+        // best effort: the sandbox controls /tmp
+      }
+    }
+    const { rc, stdout, stderr, backstop } = ran;
 
     if (backstop) {
       return {
@@ -198,31 +211,22 @@ export class SbxBashTool {
       // Skip blank lines and notices (e.g. the explicit-mode fallback notice on every run).
       else if (line.trim() !== "" && !line.startsWith("sbx run: notice:")) diagnostics.push(line);
     }
-    const exitRow = this.exitRow(auditOffset);
+    const exitRow = this.exitRow(auditOffset, rc);
     const outcome: string | null = exitRow?.outcome ?? null;
     if (exitRow?.output_truncated) truncated = true;
     const message = diagnostics.join("\n");
     const result = (status: ToolStatus, sandboxMessage = ""): ToolResult => ({
       status, exitCode: rc, output, truncated, sandboxMessage, auditOutcome: outcome,
     });
-    const newCwd = readCwd(cwdFile);
-    try {
-      fs.unlinkSync(cwdFile);
-    } catch {
-      // best effort: the sandbox controls /tmp
-    }
-
-    // A refused run writes no exit row, so another caller's row could be
-    // misread as this call's: classify this refusal before reading rows.
-    if (rc === 125 && diagnostics.some((l) => l.includes("session directory is in use"))) {
-      return result("sandbox_error", message);
-    }
-    // The audit outcome is authoritative; stderr is only a fallback.
+    // The audit outcome is authoritative. stderr only explains it: the command
+    // can write there too (bash's saved fd, /proc/1/fd/2).
     if (outcome === "timeout") return result("timeout", message);
     if (outcome === "failed" || outcome === "terminated") return result("sandbox_error", message);
     if (outcome === "signaled") return result("killed", message || `signal ${exitRow?.signal}`);
     if (outcome === null) {
-      // No exit row: sbx refused or failed before the command ran under audit.
+      // No exit row of this call: sbx refused (for example "session directory
+      // is in use") or failed before the command ran under audit. Without a
+      // row, stderr is the only signal left.
       if (rc === 124 && message.includes("timed out")) return result("timeout", message);
       return result("sandbox_error", message || `sbx exited ${rc} without an audit exit row`);
     }
@@ -237,8 +241,10 @@ export class SbxBashTool {
     return result("exited");
   }
 
-  // The exit row this call appended (calls of a session are serialized).
-  private exitRow(offset: number): { outcome?: string; output_truncated?: boolean; signal?: number | null } | null {
+  // The exit row this call appended (calls of a session are serialized). A row
+  // whose code differs from sbx's exit status is not this call's: a refused
+  // call writes no row, and must not take another caller's.
+  private exitRow(offset: number, rc: number): { code?: number; outcome?: string; output_truncated?: boolean; signal?: number | null } | null {
     let text: string;
     try {
       const fd = fs.openSync(this.auditPath, "r");
@@ -257,7 +263,7 @@ export class SbxBashTool {
     for (const line of rows) {
       try {
         const row = JSON.parse(line);
-        if (row.event === "exit") return row;
+        if (row.event === "exit") return row.code === rc ? row : null;
       } catch {
         // not a complete row
       }
@@ -305,10 +311,16 @@ async function selftest(sbx: string): Promise<number> {
       r.status === "exited" && r.truncated && r.output.length <= 4096,
       [r.status, r.truncated, r.output.length]);
     check("cwd tracked through truncated output", tool.cwd === "/tmp", tool.cwd);
-    await tool.run(`trap - EXIT; cd /; mkdir -p /tmp/${CWD_FILE}x; chmod 500 /tmp`);
+    r = await tool.run(`trap - EXIT; cd /; mkdir "/tmp/${CWD_FILE}$__sbx_tok"; echo planted`);
+    check("a directory planted at the call's own cwd file is ignored",
+      r.status === "exited" && r.output === "planted\n" && tool.cwd === "/tmp", r);
+    await tool.run("cd /root; chmod 500 /tmp");
     r = await tool.run("chmod 700 /tmp; pwd");
-    check("planted entries and an unwritable /tmp do not break the tool",
+    check("an unwritable /tmp does not break the tool",
       r.status === "exited" && r.output === "/tmp\n" && tool.cwd === "/tmp", r);
+    r = await tool.run('echo "sbx run: session directory is in use" >&10; exit 125');
+    check("a command's own exit 125 is not a sandbox error, whatever it prints",
+      r.status === "exited" && r.exitCode === 125, r);
     await tool.run("mkdir -p /tmp/gone && cd /tmp/gone");
     await tool.run("rmdir /tmp/gone");
     r = await tool.run("pwd");

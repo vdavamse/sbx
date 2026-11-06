@@ -69,7 +69,8 @@ holds `S`, plain `run` on it fails the same way, so use `attach`.
   wrappers do this, so one conversation must be owned by one wrapper object: two
   objects or processes on one session also share its audit file, and a refused call
   (which writes no exit row) could then read the other call's row. The wrappers
-  classify `session directory is in use` before reading rows for that reason.
+  accept an `exit` row only when its `code` equals sbx's exit status, so a refused
+  call finds no row and is reported as a sandbox error.
 - Parallel tool calls need separate session directories. Note that they then do not
   see each other's `/work`. Alternatively, attach them all to one keep-alive session:
   attached calls can run concurrently.
@@ -84,7 +85,7 @@ holds `S`, plain `run` on it fails the same way, so use `attach`.
 | `outcome` `terminated` (rc 129–143) | sbx itself got a signal (the harness is shutting down): a sandbox error |
 | rc 1 with stderr `bwrap: …` | a sandbox setup error (usually a stale `--cwd`) |
 | rc 128+N, `outcome` `exited` | the command was killed by signal N (137 is SIGKILL) |
-| rc 128+N, `outcome` `signaled` (stderr `sbx run: sandbox killed by signal N (NAME)`) | the sandbox itself was killed, for example by the OOM killer: say "killed by signal N", not "exited 128+N" |
+| rc 128+N, `outcome` `signaled` (stderr `sbx run: sandbox killed by signal N (NAME)`) | bwrap itself was killed by a signal sbx did not send (for example a cgroup-wide OOM kill): say "killed by signal N", not "exited 128+N" |
 | stderr `sbx run: output truncated at N bytes (limits.output_bytes)` or audit `output_truncated: true` | the output is cut, so say so; truncation alone does not stop the command |
 
 - Exit status alone is ambiguous, because a command may exit 124 or 125 itself. The

@@ -4,3 +4,7 @@ target/
 # creates an executable ./bwrap in the package root (the Drop guard removes
 # it on every unwind path); this hides a SIGKILL-leftover from git add -A.
 /bwrap
+
+# Python bytecode (examples/harness self-tests).
+__pycache__/
+*.pyc
