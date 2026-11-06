@@ -63,9 +63,11 @@ def load(path):
 # The `sbx check` items (src/host/mod.rs CapId::ALL), all of which must be present.
 # keep-alive is report-only like landlock, but the example's seccomp profile allows
 # what it needs (pidfd_open, setns), so it must be ok in the pod, as on the runner.
+# conntrack is report-only too: ok, or skip when the pod cannot read the table.
 ITEMS = {
     "userns", "netns", "netns-ipv6", "nft", "fallback",
     "bwrap", "bwrap-run", "bwrap-proc", "seccomp", "landlock", "keep-alive",
+    "conntrack",
 }
 
 
@@ -79,6 +81,7 @@ def assert_ok(path, rc):
         f"{c['id']}={c['status']}"
         for c in r["capabilities"]
         if c["id"] != "landlock" and c["status"] != "ok"
+        and not (c["id"] == "conntrack" and c["status"] == "skip")
     ]
     if rc != 0 or r["network_mode"] != "transparent" or bad:
         print(json.dumps(r, indent=2))
