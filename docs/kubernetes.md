@@ -371,7 +371,8 @@ resolver").
 ## What changes in Kubernetes
 
 The threat model's "host" is the sbx container. The guarantees S1 to S24 are implemented by the
-same code paths in a pod. What was shown in the pod: the offline conformance tiers (host, lab and
+same code paths in a pod. S25 and S26 belong to the opt-in `tls-termination` build feature; the
+example image is built without it, so they were not tested here. What was shown in the pod: the offline conformance tiers (host, lab and
 init) passed. For the persistent-session guarantees, conformance `I01` to `I03`, `I05` and `I06`
 passed in the pod (S17, S19 to S21); S18's `I04` was an opt-in skip, and S22 has no catalog check
 and was not shown. For the Landlock guarantees (S23, S24) only the smoke run under "Optional
