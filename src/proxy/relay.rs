@@ -142,11 +142,12 @@
 //!    `Ok(`[`RelayEnd::TornDown`]`)` carrying the pinned detail (round-2
 //!    review fix: callers never string-match an `io::Error` — transport
 //!    failures are the Result's `Err`, teardowns are the typed arm). The
-//!    caller (`handle_connection`) reports the detail to the
+//!    caller (`relay_tail`) reports the detail to the
 //!    [`crate::proxy::DecisionSink::teardown`] hook — default no-op, #10
 //!    logs it alongside the JSONL row — so a blocked attack is not
 //!    audit-invisible, and otherwise treats the teardown as normal relay
-//!    lifecycle: both sockets drop (FIN/RST). The single
+//!    lifecycle: both sockets drop (FIN/RST) after the teardown and close
+//!    rows, because the relay only borrows the client (S16). The single
 //!    [`crate::proxy::Decision`] was already recorded (Allowed) BEFORE the
 //!    first relay byte; there is NO second record
 //!    (`exactly_one_decision_per_connection` stays true — the teardown
@@ -564,9 +565,9 @@ pub(crate) enum RelayEnd {
 /// Every outcome returns here: a scanner teardown as
 /// `Ok(`[`RelayEnd::TornDown`]`)` with the pinned detail, a clean end as
 /// `Ok(RelayEnd::Finished)`, and a transport failure (replay-write, copy)
-/// as `Err`. The caller (`handle_connection`) reports `TornDown` to the
-/// sink's teardown hook and swallows the rest as normal relay lifecycle,
-/// letting the drop close both sockets.
+/// as `Err`. The caller (`relay_tail`) reports `TornDown` to the sink's
+/// teardown hook and swallows the rest as normal relay lifecycle; it closes
+/// the borrowed client only after the teardown and close rows (S16).
 pub(crate) async fn relay<C, U>(
     client: C,
     replay: &[u8],
@@ -659,7 +660,8 @@ pub(crate) async fn linger_close<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut
 /// request was rewritten to `Connection: close`, so the response's end is
 /// the upstream's EOF. Replays the FULL buffer upstream, then copies both
 /// ways. The client→upstream direction half-closes the upstream on client
-/// EOF; upstream EOF ends the whole exchange (both sockets close).
+/// EOF; upstream EOF ends the whole exchange: the client is shut down and
+/// lingered here, and the caller closes it after the close row.
 pub(crate) async fn relay_until_upstream_eof<C, U>(
     client: C,
     replay: &[u8],
