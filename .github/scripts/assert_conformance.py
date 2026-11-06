@@ -17,8 +17,8 @@ import json
 import os
 import sys
 
-# host 55 + lab 19 + init 1 (update together with the catalog).
-OFFLINE_CHECKS = 55 + 19 + 1
+# host 55 + lab 21 + init 1 (update together with the catalog).
+OFFLINE_CHECKS = 55 + 21 + 1
 NETWORK = {"E01", "E02", "E03", "E04", "E05", "E06"}
 # I04 (foreign uid, issue #18) is an opt-in skip on every host by design.
 OPT_IN_OFFLINE = {"I04"}

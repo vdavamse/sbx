@@ -1,4 +1,4 @@
-//! The conformance catalog: all 81 checks, in report order (issue #13; group I,
+//! The conformance catalog: all 83 checks, in report order (issue #13; group I,
 //! the persistent sessions of issue #18, adds six).
 //!
 //! Pure data plus the selector parser. The ids, group keys, titles and the
@@ -166,8 +166,8 @@ const fn c(
 use Group::{A, B, C, D, E, F, G, H, I};
 use Tier::{Host as Hs, Init as If, Lab as Lb, Network as Nw};
 
-/// The 81 checks, in report order (group, then id).
-pub const CATALOG: [CheckDef; 81] = [
+/// The 83 checks, in report order (group, then id).
+pub const CATALOG: [CheckDef; 83] = [
     c(
         "A01",
         A,
@@ -310,6 +310,20 @@ pub const CATALOG: [CheckDef; 81] = [
         Hs,
         "explicit absolute-form Host mismatch 403, https:// target 400",
         T,
+    ),
+    c(
+        "B11",
+        B,
+        Lb,
+        "bytes after a request body are not forwarded",
+        LAB,
+    ),
+    c(
+        "B12",
+        B,
+        Lb,
+        "explicit: a pipelined follow-up request is not forwarded",
+        LAB,
     ),
     c("C01", C, Hs, "the sandbox network namespace has only lo", T),
     c(
@@ -704,10 +718,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_78_unique_ids_in_group_order() {
-        assert_eq!(CATALOG.len(), 81);
+    fn catalog_has_83_unique_ids_in_group_order() {
+        assert_eq!(CATALOG.len(), 83);
         let ids: BTreeSet<_> = CATALOG.iter().map(|d| d.id).collect();
-        assert_eq!(ids.len(), 81);
+        assert_eq!(ids.len(), 83);
         let mut last = 0usize;
         for d in CATALOG.iter() {
             let g = GROUPS.iter().position(|g| *g == d.group).unwrap();
@@ -726,7 +740,7 @@ mod tests {
     fn tier_counts_match_the_design() {
         let count = |t: Tier| CATALOG.iter().filter(|d| d.tier == t).count();
         assert_eq!(count(Tier::Host), 55);
-        assert_eq!(count(Tier::Lab), 19);
+        assert_eq!(count(Tier::Lab), 21);
         assert_eq!(count(Tier::Init), 1);
         assert_eq!(count(Tier::Network), 6);
     }
@@ -759,10 +773,10 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(text.len(), 81);
+        assert_eq!(text.len(), 83);
         assert!(text[0].starts_with("A01|allow-list|host|allowed name gets an A record"));
         assert!(text[12].starts_with("A13|allow-list|host|exact-only =name"));
-        assert!(text[74].starts_with("H06|secrets|host|"));
+        assert!(text[76].starts_with("H06|secrets|host|"));
         let d11 = text
             .iter()
             .position(|t| t.starts_with("D11|"))
@@ -772,7 +786,7 @@ mod tests {
         assert!(text[d11 + 3].starts_with("D14|isolation|host|"));
         assert!(text[d11 + 4].starts_with("D15|isolation|host|"));
         assert!(text[d11 + 5].starts_with("E01|"));
-        assert!(text[80].starts_with("I06|session|host|max lifetime"));
+        assert!(text[82].starts_with("I06|session|host|max lifetime"));
     }
 
     #[test]
@@ -780,7 +794,7 @@ mod tests {
         let s = |v: &[&str]| select(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
         assert_eq!(s(&["a01"]).unwrap(), BTreeSet::from(["A01"]));
         assert_eq!(s(&["a"]).unwrap().len(), 13);
-        assert_eq!(s(&["SNI-HOST"]).unwrap().len(), 10);
+        assert_eq!(s(&["SNI-HOST"]).unwrap().len(), 12);
         assert_eq!(s(&["allow-list", "H06"]).unwrap().len(), 14);
         assert_eq!(s(&["Z99"]).unwrap_err(), "Z99");
     }

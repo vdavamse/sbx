@@ -95,8 +95,8 @@ resolver, and everything else is dropped. It then launches unmodified `bwrap`
 with the policy's mounts, a cleared environment, no capabilities and user
 namespaces disabled inside the sandbox. The resolver answers only allow-listed
 names. The proxy checks the TLS SNI (port 443) or the HTTP `Host` (port 80)
-against the allow list, dials the real host itself, and passes TLS through
-untouched. With `--audit`, DNS answers, connections and the exit status are
+against the allow list (every HTTP/1 request on port 80, not just the first),
+dials the real host itself, and passes TLS through untouched. With `--audit`, DNS answers, connections and the exit status are
 written to a JSON Lines log.
 
 The details are in [docs/usage.md](docs/usage.md#how-a-run-works). What this
@@ -107,12 +107,13 @@ protects against, and what it does not, is in the
 
 ```
 sbx run --policy policy.json --session-dir DIR [--cwd PATH]
-        [--timeout DURATION] [--audit FILE] [--max-connections N]
+        [--timeout DURATION] [--relay-idle-timeout DURATION] [--audit FILE]
+        [--max-connections N]
         [--landlock off|best-effort|require] [--landlock-bind-tcp PORT]...
         -- COMMAND [ARGS...]
 sbx run --keep-alive --policy policy.json --session-dir DIR
         [--idle-timeout DURATION] [--max-lifetime DURATION]
-        [--audit FILE] -- COMMAND [ARGS...]
+        [--relay-idle-timeout DURATION] [--audit FILE] -- COMMAND [ARGS...]
 sbx attach --policy policy.json --session-dir DIR [--cwd PATH]
         [--timeout DURATION] -- COMMAND [ARGS...]
 sbx stop --session-dir DIR
@@ -129,6 +130,10 @@ greater than zero — a zero `--older-than` cutoff would match every session,
 and a zero `--timeout` is ambiguous. `--timeout` defaults to the policy's
 `limits.timeout`, and the effective timeout is the smaller of the two (the
 CLI value can shorten the policy limit, never extend it).
+`--relay-idle-timeout` (default `300s`) closes a proxied connection after that
+long with no payload byte in either direction, on every relay, long-poll and
+idle WebSocket included; it does nothing in `none` mode and is never capped by
+`limits.timeout`.
 Everything after `--` in `sbx run` is the command, verbatim, including
 hyphenated arguments.
 
@@ -188,6 +193,11 @@ alone, `==name`, `=*.name`, `= name` and `=1.2.3.4` with the same messages as
 any other invalid domain, and any entry whose name normalises to start with `=`
 (for example a fullwidth `＝name`, which is not read as the marker).
 
+`network.ports` is a deny-by-default list. Only 443 (TLS, SNI-checked) and 80
+(HTTP, `Host`-checked) have inspectors. Any other listed port is denied, fail
+closed. That is by design: an opaque TCP pass-through cannot verify the name, so
+it would bypass the allow list.
+
 ## Host check
 
 `sbx check` reports what this host can run, and which fix would unlock more. It
@@ -200,7 +210,7 @@ network modes, JSON output, exit codes and the full fix table are in
 ## Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-81 checks in nine groups, the same code that `cargo test --test conformance`
+83 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The offline tiers need no root and never touch the real network;
 `--network` adds real `curl`, `git`, `pip` and `npm` checks. Groups, tiers and
 exit codes: [docs/conformance.md](docs/conformance.md).

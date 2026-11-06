@@ -1,7 +1,7 @@
 # Conformance
 
 `sbx check --conformance` runs every security guarantee as an executable check:
-81 checks in nine groups, the same code that `cargo test --test conformance`
+83 checks in nine groups, the same code that `cargo test --test conformance`
 runs in CI. The [threat model](threat-model.md) maps each guarantee to the
 checks that prove it, and lists what they do not prove.
 
@@ -58,7 +58,7 @@ A `warn` (D05) means a unix socket file is visible inside the sandbox: a policy
 hazard, not a defect. Find the bind that holds it with
 `sbx check --policy P --host` (the `bind-sockets` item).
 
-**Lab tier.** The 19 lab checks (A02–A06, A12, B01–B09, C02, C07, F02, F04) run
+**Lab tier.** The 21 lab checks (A02–A06, A12, B01–B09, B11, B12, C02, C07, F02, F04) run
 inside a child that unshares user, network and mount namespaces: no root, and
 `lo` gets `9.9.9.9` (the fixture) and the trap addresses. The lab's
 `resolv.conf` and `nsswitch.conf` are bound over the host's (`/etc/hosts` is

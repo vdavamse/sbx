@@ -17,7 +17,7 @@ use super::RunError;
 use super::plan::{exit_reason, outcome_label, outcome_signal};
 use super::serve::{Fault, FaultLatch};
 use crate::dns::{DnsDecision, DnsSink};
-use crate::proxy::{Decision, DecisionSink, Verdict, Via};
+use crate::proxy::{CloseReason, Decision, DecisionSink, Verdict, Via};
 
 #[derive(Serialize)]
 pub(crate) struct Bytes {
@@ -152,10 +152,13 @@ pub(crate) fn teardown_row(ts: String, d: &Decision, detail: &str) -> Row {
     row
 }
 
-/// close: the relay ended; byte counts from the upstream wrapper.
-pub(crate) fn close_row(ts: String, d: &Decision, up: u64, down: u64) -> Row {
+/// close: the segment ended; byte counts from the upstream wrapper. `reason`
+/// is `null` for a natural end and `"idle_timeout"` for the inactivity
+/// watchdog (issue #29, C4).
+pub(crate) fn close_row(ts: String, d: &Decision, up: u64, down: u64, end: CloseReason) -> Row {
     let mut row = proxy_base(ts, "close", d);
     row.bytes = Some(Bytes { up, down });
+    row.reason = end.audit_reason().map(str::to_owned);
     row.verdict = Some("allowed");
     row
 }
@@ -515,7 +518,13 @@ impl DecisionSink for AuditLog {
     }
 
     fn closed(&self, decision: &Decision, up: u64, down: u64) {
-        self.write(&close_row(ts(SystemTime::now()), decision, up, down));
+        // Issue #29 review, round 5: a plain `closed` call is a natural end. The
+        // relay calls `closed_with_reason`, which this sink implements.
+        self.closed_with_reason(decision, up, down, CloseReason::Ended);
+    }
+
+    fn closed_with_reason(&self, decision: &Decision, up: u64, down: u64, end: CloseReason) {
+        self.write(&close_row(ts(SystemTime::now()), decision, up, down, end));
     }
 }
 
@@ -734,9 +743,31 @@ mod tests {
         );
         // (10) close
         assert_eq!(
-            json(&close_row(TS.into(), &tear, 517, 5120)),
+            json(&close_row(TS.into(), &tear, 517, 5120, CloseReason::Ended)),
             format!(
                 "{{\"ts\":\"{TS}\",\"event\":\"close\",\"host\":\"github.com\",\"sni\":\"github.com\",\"port\":443,\"bytes\":{{\"up\":517,\"down\":5120}},\"reason\":null,\"via\":\"transparent\",\"verdict\":\"allowed\",\"rcode\":null,\"qtype\":null,\"client\":\"10.255.255.1:40000\"}}\n"
+            )
+        );
+        // (10b) close after the idle watchdog (issue #29, C4)
+        assert_eq!(
+            json(&close_row(
+                TS.into(),
+                &tear,
+                517,
+                5120,
+                CloseReason::IdleTimeout
+            )),
+            format!(
+                "{{\"ts\":\"{TS}\",\"event\":\"close\",\"host\":\"github.com\",\"sni\":\"github.com\",\"port\":443,\"bytes\":{{\"up\":517,\"down\":5120}},\"reason\":\"idle_timeout\",\"via\":\"transparent\",\"verdict\":\"allowed\",\"rcode\":null,\"qtype\":null,\"client\":\"10.255.255.1:40000\"}}\n"
+            )
+        );
+        // (10c) HTTP-request teardown (issue #29, F3): the same row shape, with
+        // the pinned per-request denial detail.
+        let http_detail = "relay torn down: HTTP request 2 denied: HTTP Host evil.test does not match the DNS-map name allowed.test";
+        assert_eq!(
+            json(&teardown_row(TS.into(), &tear, http_detail)),
+            format!(
+                "{{\"ts\":\"{TS}\",\"event\":\"deny\",\"host\":\"github.com\",\"sni\":\"github.com\",\"port\":443,\"bytes\":null,\"reason\":\"{http_detail}\",\"via\":\"transparent\",\"verdict\":\"teardown\",\"rcode\":null,\"qtype\":null,\"client\":\"10.255.255.1:40000\"}}\n"
             )
         );
         // (11)–(14) exit rows
@@ -991,6 +1022,35 @@ mod tests {
             None,
         ));
         assert!(latch.take().is_none());
+    }
+
+    /// Issue #29 review, round 5: a plain `closed` call writes exactly one close
+    /// row, with a null reason (the natural end).
+    #[test]
+    fn plain_closed_writes_exactly_one_close_row() {
+        let dir = std::env::temp_dir().join(format!("sbx-run-audit-{}-c", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("closed.jsonl");
+        std::fs::remove_file(&path).ok();
+        let latch = FaultLatch::new().expect("latch");
+        let log = AuditLog::new(Some(open_audit(&path).expect("open")), latch);
+        let c = decision(
+            "10.0.0.1:1",
+            transparent("1.2.3.4:80"),
+            Some("a.example"),
+            allowed("a.example", "1.2.3.4:80"),
+        );
+        DecisionSink::closed(&*log, &c, 7, 9);
+        let text = std::fs::read_to_string(&path).expect("read");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("\"event\":\"close\""), "{text}");
+        assert!(lines[0].contains("\"reason\":null"), "{text}");
+        assert!(
+            lines[0].contains("\"bytes\":{\"up\":7,\"down\":9}"),
+            "{text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
