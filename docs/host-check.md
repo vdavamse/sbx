@@ -70,7 +70,8 @@ be masked, and one that sits under a bound path or an sbx-generated `/etc` file
 is flagged), `bind-sockets` (a `warn` listing the unix socket files under
 `filesystem.ro` and `filesystem.rw`, outside `filesystem.deny`; see
 [Unix sockets under binds](usage.md#running-commands)), `mount-chains` (the pre-launch
-verification `run` performs, see [Running commands](usage.md#running-commands), which fails the policy when `run` would refuse),
+verification that `run` performs, which fails the policy when `run` would refuse; see
+[Running commands](usage.md#running-commands)),
 `bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
 paths under its binds), `deny-links` (warns when a file under a deny path has a
 hard link outside it), `pin-cost` (warns above 50 directory pins) and

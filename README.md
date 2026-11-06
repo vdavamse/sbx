@@ -12,8 +12,9 @@ timeout and an audit trail, and tears everything down on exit.
 ## Quick start
 
 You need Linux 5.3 or newer with unprivileged user namespaces, bubblewrap 0.8
-or newer, and Rust 1.85 or newer to build. No release has been tagged yet, so
-build from source:
+or newer, and Rust 1.85 or newer (via rustup) to build. No release has been tagged
+yet, so build from source (x86_64 shown; for aarch64 see
+[docs/building.md](docs/building.md)):
 
 ```sh
 sudo apt-get install bubblewrap          # or point SBX_BWRAP at a bwrap binary
@@ -152,7 +153,7 @@ in [`examples/`](examples/)):
   the allowed ports (443 and 80 are inspected; any other is denied).
 - `env`: `pass` names the caller's variables to inherit; `set` adds fixed
   values. Everything else is cleared, except `HOME`, `PATH` and `TMPDIR`
-  (which `set` can override) and the proxy and CA variables sbx sets itself.
+  (which `pass` or `set` can override) and the proxy and CA variables sbx sets itself.
 - `limits`: `timeout` and `output_bytes`, plus optional per-process limits and
   whole-sandbox cgroup limits (`memory_bytes`, `pids`).
 
