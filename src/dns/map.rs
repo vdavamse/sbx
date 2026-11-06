@@ -95,6 +95,17 @@ impl FakeIpMap {
         Ok(ip_at(index))
     }
 
+    /// Whether `name` is unmapped and the run's cap leaves no room for it
+    /// (issue #43): the resolver then answers NXDOMAIN for every qtype, so
+    /// A and AAAA agree. A poisoned lock reads as `false` (the A path reports
+    /// it as unavailable).
+    pub fn capped_out(&self, name: &Domain) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.index.contains_key(name)
+                && u32::try_from(state.names.len()).map_or(true, |n| n >= self.capacity)
+        })
+    }
+
     /// Test hook: poison the lock (a panic while holding it on another thread),
     /// so callers can pin the fail-closed behaviour from outside this module.
     #[cfg(test)]

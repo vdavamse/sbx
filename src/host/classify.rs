@@ -14,10 +14,10 @@ use crate::bwrap::version::{BWRAP_MIN, BwrapStatus, Unsupported};
 use crate::bwrap::{AliasCheck, PathCheck};
 use crate::init::Stage;
 use crate::init::fdpass::StagedFailure;
-use crate::init::probe::{ProbeReport, ProbeStep, StepStatus};
+use crate::init::probe::{KeepAlivePhase, ProbeReport, ProbeStep, StepStatus};
 use crate::policy::{NetworkMode, Policy};
 
-use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
+use super::facts::{Conntrack, HostFacts, Landlock, ProbeOutcome, RunFacts, SocketScan};
 use super::{
     CapId, Capability, EffectiveMode, PolicyCheck, PolicyItem, REPORT_VERSION, Report, Status,
 };
@@ -141,6 +141,12 @@ const L_DISABLED: (&str, &str) = (
 const KA_PIDFD: (&str, &str) = (
     "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)",
     "run sbx on Linux 5.3 or newer, or give it an outer seccomp profile that allows pidfd_open (Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined)",
+);
+/// The holder stand-in's `unshare(CLONE_NEWUSER|CLONE_NEWNET)` is refused with
+/// EPERM or EACCES: nested namespace creation, not the join.
+const KA_UNSHARE: (&str, &str) = (
+    "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)",
+    "allow unshare(CLONE_NEWUSER|CLONE_NEWNET) for this user (a seccomp or container profile that blocks it; Kubernetes: a Localhost seccomp profile that allows it, or seccompProfile Unconfined; Docker: --security-opt seccomp=unconfined or an equivalent profile), or do not use run --keep-alive",
 );
 const KA_SETNS: (&str, &str) = (
     "an unprivileged setns into a fresh user and network namespace is refused (EPERM or EACCES; keep-alive attaches to a session this way)",
@@ -389,6 +395,38 @@ pub fn landlock_detail(n: u32) -> String {
     text
 }
 
+/// The `conntrack` row (issue #43): report-only, never a mode limit. The
+/// sandbox's nat REDIRECT needs conntrack; its entries live in the sandbox's
+/// own network namespace but cost host kernel memory, and `nf_conntrack_max`
+/// is the limit each namespace's count is checked against (R14).
+pub fn conntrack(c: &Conntrack) -> Capability {
+    let (status, detail) = match (c.count, c.max) {
+        (Some(count), Some(max)) => (
+            Status::Ok,
+            format!(
+                "conntrack table: {count} of {max} entries in use in this network namespace (report-only; each sandbox namespace may grow to {max}, using host kernel memory)"
+            ),
+        ),
+        (None, Some(max)) => (
+            Status::Ok,
+            format!("conntrack limit {max} entries per network namespace (report-only; the count is not readable)"),
+        ),
+        _ => (
+            Status::Skip,
+            "conntrack table not readable (nf_conntrack not loaded or /proc/sys/net/netfilter hidden; report-only)".to_owned(),
+        ),
+    };
+    Capability {
+        id: CapId::Conntrack,
+        status,
+        detail,
+        evidence: None,
+        errno: None,
+        impact: None,
+        fix: None,
+    }
+}
+
 /// The report-only `landlock` item (never limits the network mode).
 pub fn landlock(l: &Landlock) -> Capability {
     let (status, detail, fix) = match l {
@@ -535,15 +573,17 @@ pub fn assemble(facts: &HostFacts) -> Report {
                     "bwrap-proc" => bwrap_step(CapId::BwrapProc, &reason),
                     "bwrap-seccomp" => seccomp_step(&reason),
                     "pidfd-open" => keep_alive_fail(KA_PIDFD, &reason, step.errno),
-                    "keep-alive" => keep_alive_fail(
-                        if is_permission(step.errno) {
-                            KA_SETNS
-                        } else {
-                            KA_OTHER
-                        },
-                        &reason,
-                        step.errno,
-                    ),
+                    // The phase says which child refused: the holder's unshare
+                    // and the joiner's setns have different fixes. A step with
+                    // no phase (not produced by this probe) is not guessed at.
+                    "keep-alive" => {
+                        let pinned = match (step.phase, is_permission(step.errno)) {
+                            (Some(KeepAlivePhase::Holder), true) => KA_UNSHARE,
+                            (Some(KeepAlivePhase::Join), true) => KA_SETNS,
+                            _ => KA_OTHER,
+                        };
+                        keep_alive_fail(pinned, &reason, step.errno)
+                    }
                     name => {
                         let Some(stage) = stage_of(name) else {
                             continue;
@@ -569,6 +609,14 @@ pub fn assemble(facts: &HostFacts) -> Report {
             let userns_failed = slots[index(CapId::Userns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
+            // Keep-alive needs unprivileged user namespaces. When userns failed
+            // at ANY stage (an early netns or listeners EPERM routed to userns by
+            // the AppArmor row included), its own step result is not evidence:
+            // the row is the userns skip, whatever the step reported.
+            if userns_failed {
+                slots[index(CapId::KeepAlive)] =
+                    Some(report_only(skip_row(CapId::KeepAlive, SKIP_USERNS)));
+            }
             let netns_failed = slots[index(CapId::Netns)]
                 .as_ref()
                 .is_some_and(|c| c.status == Status::Fail);
@@ -619,6 +667,7 @@ pub fn assemble(facts: &HostFacts) -> Report {
 
     slots[index(CapId::Bwrap)] = Some(bwrap(&facts.bwrap));
     slots[index(CapId::Landlock)] = Some(landlock(&facts.landlock));
+    slots[index(CapId::Conntrack)] = Some(conntrack(&facts.conntrack));
 
     let capabilities: Vec<Capability> = CapId::ALL
         .iter()
@@ -733,7 +782,8 @@ pub struct Seams<'a> {
 /// [`policy_check`] with explicit seams. Items: `network-mode`, `infra-etc`,
 /// `policy-paths`, `deny-paths`, `bind-sockets` (#35, warns),
 /// `mount-chains` (#39/#40, fails), `pin-cost` (warns above 50 pins),
-/// `bwrap-cve` (warns below 0.12.0), `deny-links` (warns on hard links).
+/// `bwrap-cve` (warns below 0.12.0), `deny-links` (warns on hard links),
+/// `deny-tmpfs-size` (#43, warns below bwrap 0.10 when there are denies).
 /// Only a `Fail` makes the policy not runnable; `Warn` and `Skip` do not.
 pub fn policy_check_with(
     path: &str,
@@ -846,6 +896,7 @@ pub fn policy_check_with(
     checks.push(bwrap_item);
     checks.push(pin_cost_item(plan.pins));
     checks.push(deny_links_item(policy, seams.hard_links));
+    checks.push(deny_tmpfs_item(policy.filesystem.deny.len(), seams.bwrap));
 
     let runnable = checks.iter().all(|c| c.status != Status::Fail);
     PolicyCheck {
@@ -934,6 +985,51 @@ fn bwrap_cve_item(n: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
             "bubblewrap {shown} predates 0.12.0 (CVE-2026-87766) unless your distribution backported the fix; this policy has {n} mount paths under its binds. sbx verifies them before each run, but a concurrent writer can still race that check (0.12.0 closes the dest side only; see R26)"
         ),
         fix: Some("install bubblewrap 0.12.0 or later".to_owned()),
+    }
+}
+
+/// `deny-tmpfs-size` (issue #43, warns, never fails): from bwrap 0.10 sbx
+/// caps each deny `--tmpfs` mask at [`crate::bwrap::DENY_TMPFS_BYTES`];
+/// older bwrap has no `--size`, so a writable mask holds up to half of RAM.
+fn deny_tmpfs_item(denies: usize, bwrap: Option<(u32, u32, u32)>) -> PolicyItem {
+    let Some(version) = bwrap else {
+        return PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Skip,
+            detail: "bubblewrap is not usable on this host, so deny-mask sizing was not checked"
+                .to_owned(),
+            fix: None,
+        };
+    };
+    let shown = format!("{}.{}.{}", version.0, version.1, version.2);
+    if denies == 0 {
+        return PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Ok,
+            detail: "the policy has no deny masks".to_owned(),
+            fix: None,
+        };
+    }
+    match crate::bwrap::deny_tmpfs_size_for(version) {
+        Some(bytes) => PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Ok,
+            detail: format!(
+                "bubblewrap {shown} sizes each of the {denies} deny masks at {} KiB",
+                bytes / 1024
+            ),
+            fix: None,
+        },
+        None => PolicyItem {
+            id: "deny-tmpfs-size",
+            status: Status::Warn,
+            detail: format!(
+                "bubblewrap {shown} predates 0.10 (no --size): the {denies} deny masks are unsized tmpfs, so a payload can fill one up to half of RAM"
+            ),
+            fix: Some(
+                "install bubblewrap 0.10 or later, or set a memory limit (cgroup)".to_owned(),
+            ),
+        },
     }
 }
 
@@ -1530,12 +1626,37 @@ mod tests {
         assert_eq!(apparmor_only.detail, U_APPARMOR.0);
     }
 
+    /// Issue #43: the conntrack row is report-only (no impact, no fix) in
+    /// every state.
+    #[test]
+    fn conntrack_rows() {
+        let both = conntrack(&Conntrack {
+            count: Some(10),
+            max: Some(65_536),
+        });
+        assert_eq!(both.status, Status::Ok);
+        assert!(
+            both.detail
+                .starts_with("conntrack table: 10 of 65536 entries in use")
+        );
+        let max_only = conntrack(&Conntrack {
+            count: None,
+            max: Some(65_536),
+        });
+        assert_eq!(max_only.status, Status::Ok);
+        let none = conntrack(&Conntrack::default());
+        assert_eq!(none.status, Status::Skip);
+        for row in [both, max_only, none] {
+            assert_eq!((row.impact, row.fix), (None, None));
+        }
+    }
+
     #[test]
     fn assemble_all_ok() {
         let report = assemble(&ok_host());
         assert_eq!(report.network_mode, EffectiveMode::Transparent);
         assert_eq!(report.probe_error, None);
-        assert_eq!(report.capabilities.len(), 11);
+        assert_eq!(report.capabilities.len(), 12);
         assert!(report.capabilities.iter().all(|c| c.status == Status::Ok));
         let ids: Vec<CapId> = report.capabilities.iter().map(|c| c.id).collect();
         assert_eq!(ids, CapId::ALL);
@@ -1987,6 +2108,24 @@ mod tests {
     }
 
     #[test]
+    fn deny_tmpfs_size_warns_below_0_10_only_with_denies() {
+        assert_eq!(deny_tmpfs_item(2, Some((0, 9, 0))).status, Status::Warn);
+        assert!(
+            deny_tmpfs_item(2, Some((0, 9, 0)))
+                .detail
+                .contains("predates 0.10 (no --size)")
+        );
+        assert_eq!(deny_tmpfs_item(0, Some((0, 9, 0))).status, Status::Ok);
+        let ok = deny_tmpfs_item(2, Some((0, 10, 0)));
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(
+            ok.detail,
+            "bubblewrap 0.10.0 sizes each of the 2 deny masks at 1024 KiB"
+        );
+        assert_eq!(deny_tmpfs_item(2, None).status, Status::Skip);
+    }
+
+    #[test]
     fn bwrap_cve_warns_below_0_12_only_with_mount_paths() {
         let with_rw = r#"{"version":1,"filesystem":{"ro":["/usr","/tmp/x"],"rw":["/tmp"],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
         let no_rw = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":[],"deny":[]},"network":{"mode":"transparent","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
@@ -2127,7 +2266,7 @@ mod tests {
         let json = r#"{"version":1,"filesystem":{"ro":["/usr"],"rw":["/run"],"deny":["/run/secret"]},"network":{"mode":"explicit","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#;
         let policy = policy_of(json);
         let r = sockets_check(&policy, &no_sockets);
-        assert_eq!(r.checks.len(), 9);
+        assert_eq!(r.checks.len(), 10);
         assert_eq!(r.checks[4].id, "bind-sockets");
         assert_eq!(r.checks[4].status, Status::Ok);
         assert_eq!(
@@ -2276,14 +2415,20 @@ mod tests {
 
     #[test]
     fn keep_alive_join_refusal_is_split_by_errno() {
-        let refused = |errno: i32, reason: &str| {
-            let probe = with_step(
+        // The keep-alive step failed with `errno` in `phase` (or no phase).
+        let refused = |phase: Option<KeepAlivePhase>, errno: i32, reason: &str| {
+            let mut probe = with_step(
                 ok_steps(),
                 "keep-alive",
                 StepStatus::Fail,
                 Some(errno),
                 Some(reason),
             );
+            for step in &mut probe.steps {
+                if step.step == "keep-alive" {
+                    step.phase = phase;
+                }
+            }
             let report = assemble(&host(
                 ProbeOutcome::Ran(probe),
                 bwrap_ok(),
@@ -2291,7 +2436,12 @@ mod tests {
             ));
             keep_alive_of(&report).clone()
         };
-        let eperm = refused(libc::EPERM, "setns into the holder stand-in failed: EPERM");
+        let join = Some(KeepAlivePhase::Join);
+        let eperm = refused(
+            join,
+            libc::EPERM,
+            "setns into the holder stand-in failed: EPERM",
+        );
         assert_eq!(eperm.status, Status::Warn);
         assert_eq!(eperm.detail, KA_SETNS.0);
         assert_eq!(
@@ -2300,11 +2450,88 @@ mod tests {
         );
         assert_eq!(eperm.fix.as_deref(), Some(KA_SETNS.1));
         assert_eq!(eperm.impact, None);
-        let other = refused(libc::ENOSPC, "unshare failed: No space left on device");
+        let other = refused(
+            join,
+            libc::ENOSPC,
+            "setns into the holder stand-in failed: ENOSPC",
+        );
         assert_eq!(other.detail, KA_OTHER.0);
         assert_eq!(other.fix.as_deref(), Some(KA_OTHER.1));
-        let timed_out = refused(0, "the joiner did not answer within 5s");
+        let timed_out = refused(join, 0, "the joiner did not answer within 2s");
         assert_eq!(timed_out.detail, KA_OTHER.0, "no errno is not a permission");
+    }
+
+    #[test]
+    fn keep_alive_holder_unshare_refusal_is_not_a_setns_refusal() {
+        // The holder's unshare EPERM gets its own pinned row, not "allow setns".
+        let refused = |phase: Option<KeepAlivePhase>, errno: i32| {
+            let mut probe = with_step(
+                ok_steps(),
+                "keep-alive",
+                StepStatus::Fail,
+                Some(errno),
+                Some("unshare(CLONE_NEWUSER|CLONE_NEWNET) in the holder stand-in failed: EPERM"),
+            );
+            for step in &mut probe.steps {
+                if step.step == "keep-alive" {
+                    step.phase = phase;
+                }
+            }
+            let report = assemble(&host(
+                ProbeOutcome::Ran(probe),
+                bwrap_ok(),
+                RunFacts::default(),
+            ));
+            keep_alive_of(&report).clone()
+        };
+        let holder = refused(Some(KeepAlivePhase::Holder), libc::EPERM);
+        assert_eq!(holder.status, Status::Warn);
+        assert_eq!(holder.detail, KA_UNSHARE.0);
+        assert_eq!(holder.fix.as_deref(), Some(KA_UNSHARE.1));
+        assert_eq!(holder.impact, None, "report-only");
+        assert_ne!(holder.detail, KA_SETNS.0);
+        let eacces = refused(Some(KeepAlivePhase::Holder), libc::EACCES);
+        assert_eq!(eacces.detail, KA_UNSHARE.0);
+        // A holder refusal that is not a permission is the generic row.
+        let other = refused(Some(KeepAlivePhase::Holder), libc::ENOSPC);
+        assert_eq!(other.detail, KA_OTHER.0);
+        // No phase (a probe that does not say): a permission is not guessed at.
+        let unphased = refused(None, libc::EPERM);
+        assert_eq!(unphased.detail, KA_OTHER.0);
+    }
+
+    #[test]
+    fn keep_alive_joiner_signal_death_is_generic_and_says_the_signal() {
+        // The item-1 case through the classifier: the joiner was killed.
+        let mut probe = with_step(
+            ok_steps(),
+            "keep-alive",
+            StepStatus::Fail,
+            None,
+            Some("the joiner was killed by signal 31 before it answered"),
+        );
+        for step in &mut probe.steps {
+            if step.step == "keep-alive" {
+                step.phase = Some(KeepAlivePhase::Join);
+            }
+        }
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Warn, "never ok");
+        assert_eq!(ka.detail, KA_OTHER.0);
+        assert_eq!(
+            ka.evidence.as_deref(),
+            Some("the joiner was killed by signal 31 before it answered")
+        );
+        assert_eq!(
+            report.network_mode,
+            EffectiveMode::Transparent,
+            "report-only"
+        );
     }
 
     #[test]
@@ -2343,6 +2570,79 @@ mod tests {
         );
     }
 
+    /// `ok_steps()` with one step failed (keeping every other step as it is, so
+    /// the keep-alive steps can report ok on their own).
+    fn with_failed_step(name: &str, errno: i32) -> ProbeReport {
+        let mut probe = ok_steps();
+        for step in &mut probe.steps {
+            if step.step == name {
+                step.status = StepStatus::Fail;
+                step.errno = Some(errno);
+                step.reason = Some(format!("{name} failed"));
+            }
+        }
+        probe
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_a_later_stage() {
+        // AppArmor restricts unprivileged userns, and the netns EPERM is routed
+        // to the userns row (row 1). The keep-alive steps ran and reported ok,
+        // but the item must be the userns skip, not "ok" beside "userns FAIL".
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("netns", libc::EPERM)),
+            bwrap_ok(),
+            sysctls(Some(1), None, None),
+        ));
+        let userns = report
+            .capabilities
+            .iter()
+            .find(|c| c.id == CapId::Userns)
+            .expect("the userns item");
+        assert_eq!(userns.status, Status::Fail, "the routing is unchanged");
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None, "report-only: never limits the mode");
+        assert_eq!(ka.fix, None);
+    }
+
+    #[test]
+    fn keep_alive_is_userns_skipped_when_userns_fails_at_unshare() {
+        // The plain userns failure: keep-alive is the userns skip even when its
+        // own step failed too (the cascade's pidfd refusal, say).
+        let report = assemble(&host(
+            ProbeOutcome::Ran(with_failed_step("unshare", libc::ENOSPC)),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(ka.status, Status::Skip);
+        assert_eq!(ka.detail, SKIP_USERNS);
+        assert_eq!(ka.impact, None);
+
+        let mut probe = with_failed_step("unshare", libc::ENOSPC);
+        for step in &mut probe.steps {
+            if step.step == "pidfd-open" {
+                step.status = StepStatus::Fail;
+                step.errno = Some(libc::ENOSYS);
+                step.reason = Some("pidfd_open failed".to_owned());
+            }
+        }
+        let report = assemble(&host(
+            ProbeOutcome::Ran(probe),
+            bwrap_ok(),
+            RunFacts::default(),
+        ));
+        let ka = keep_alive_of(&report);
+        assert_eq!(
+            ka.status,
+            Status::Skip,
+            "a keep-alive warn is overridden too"
+        );
+        assert_eq!(ka.detail, SKIP_USERNS);
+    }
+
     #[test]
     fn keep_alive_pinned_texts() {
         assert_eq!(
@@ -2353,7 +2653,12 @@ mod tests {
             KA_PIDFD.0,
             "pidfd_open is not available here (ENOSYS below Linux 5.3; keep-alive watches its holder with a pidfd)"
         );
+        assert_eq!(
+            KA_UNSHARE.0,
+            "nested user and network namespace creation is refused (EPERM or EACCES on unshare(CLONE_NEWUSER|CLONE_NEWNET) in keep-alive's holder stand-in: the probe's own namespace was created, so only the nested one is refused, e.g. by an outer seccomp or container profile)"
+        );
         assert_eq!(CapId::KeepAlive.as_str(), "keep-alive");
-        assert_eq!(CapId::ALL.last(), Some(&CapId::KeepAlive));
+        assert_eq!(CapId::ALL[CapId::ALL.len() - 2], CapId::KeepAlive);
+        assert_eq!(CapId::ALL.last(), Some(&CapId::Conntrack));
     }
 }

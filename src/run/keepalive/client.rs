@@ -29,7 +29,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use super::ctl;
-use super::proto::{CallEnd, Reply, Request, SessionLandlock};
+use super::proto::{CallEnd, ProtoError, Reply, Request, SessionLandlock};
 use crate::bwrap::seccomp;
 use crate::bwrap::version::{BwrapStatus, find_bwrap};
 use crate::bwrap::{Build, Launch, build};
@@ -158,8 +158,12 @@ fn execute_attach(args: AttachArgs, t0: Instant) -> Result<Infallible, Early> {
     let self_pidfd = sys::pidfd_open(std::process::id() as libc::pid_t)
         .map_err(|err| RunError::new(format!("cannot open the attach pidfd: {err}")))?;
     let (op, payload) = Request::Attach(policy_bytes).encode();
-    ctl::send_frame(&stream, op, &payload, &[self_pidfd.as_raw_fd()])
-        .map_err(|err| RunError::new(format!("cannot send the attach request: {err:?}")))?;
+    if let Err(err) = ctl::send_frame(&stream, op, &payload, &[self_pidfd.as_raw_fd()]) {
+        if let Some(reason) = early_refusal(&stream, &err) {
+            return Err(RunError::new(format!("session refused the call: {reason}")).into());
+        }
+        return Err(RunError::new(format!("cannot send the attach request: {err:?}")).into());
+    }
     let (frame, fds) = ctl::recv_frame(&stream)
         .map_err(|err| RunError::new(format!("the session did not answer: {err:?}")))?;
     let (id, landlock, mut fds) = match Reply::decode(frame) {
@@ -222,7 +226,7 @@ fn run_call(
     sys::reset_sigchld();
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
-    check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
+    let bwrap_version = check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
     let env = passed_env(policy, |name| std::env::var_os(name));
     let (info_read, info_write) = sys::pipe_cloexec()
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
@@ -250,6 +254,7 @@ fn run_call(
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: layer,
+        deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
     // S8a (#39/#40, N19) on every call: a payload may have planted a link under a
@@ -279,7 +284,10 @@ fn run_call(
         None => None,
     };
     let (stdin, stdin_piped) = stdin_mode();
-    let child = join_command(
+    // Issue #43: the call's cgroup limits. The join execs bwrap at once (no go
+    // byte), so sbx spawns from inside the child cgroup (`spawn_inside`).
+    let limits_cgroup = crate::run::cgroup_for(policy)?;
+    let mut command = join_command(
         JoinFds {
             user: user_fd,
             net: net_fd,
@@ -291,11 +299,34 @@ fn run_call(
             },
         },
         std::process::id(),
+        &crate::init::rlimit::from_limits(&policy.limits),
         &launch,
         stdin,
-    )
-    .spawn()
-    .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    );
+    let spawned = match &limits_cgroup {
+        None => command.spawn(),
+        Some(cg) => {
+            let (spawned, back) = cg
+                .spawn_inside(|| command.spawn())
+                .map_err(|err| RunError::new(err.to_string()))?;
+            match (spawned, back) {
+                (Ok(mut child), Err(err)) => {
+                    // sbx stayed in the sandbox cgroup: refuse rather than
+                    // supervise from inside the limited cgroup.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(RunError::new(err.to_string()).into());
+                }
+                // Both failed: the stuck-in-the-cgroup error is the one to
+                // report (the spawn error is secondary).
+                (Err(_), Err(err)) => return Err(RunError::new(err.to_string()).into()),
+                (spawned, Ok(())) => spawned,
+            }
+        }
+    };
+    let child = spawned.map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    // `limits_cgroup` drops (and removes the child cgroup) at the end of the
+    // call, after teardown; early returns remove it too.
     drop(info_write);
     drop(seccomp_memfd);
     drop(user_ns);
@@ -311,8 +342,16 @@ fn run_call(
     };
     drop(status_write);
 
-    let child_pidfd = sys::pidfd_open(child.id() as libc::pid_t)
-        .map_err(|err| RunError::new(format!("cannot watch sbx __init: {err}")))?;
+    let mut child = child;
+    let child_pidfd = match sys::pidfd_open(child.id() as libc::pid_t) {
+        Ok(fd) => fd,
+        Err(err) => {
+            // Kill and reap before returning, so the call's cgroup can go.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunError::new(format!("cannot watch sbx __init: {err}")).into());
+        }
+    };
     let mut sb = Sandbox {
         bwrap_pid: child.id() as libc::pid_t,
         child,
@@ -324,14 +363,28 @@ fn run_call(
         // The join has no go byte; teardown treats the child as launched.
         go_sent: true,
     };
-    let pumps = Pumps::start(
+    let kill_reap = |sb: &mut Sandbox| {
+        let _ = sb.child.kill();
+        let _ = sb.child.wait();
+    };
+    let pumps = match Pumps::start(
         &mut sb.child,
         OutputBudget::new(policy.limits.output_bytes),
         stdin_piped,
-    )
-    .map_err(|err| RunError::new(format!("cannot start the stdio pumps: {err}")))?;
-    let latch = FaultLatch::new()
-        .map_err(|err| RunError::new(format!("cannot create the fault latch: {err}")))?;
+    ) {
+        Ok(pumps) => pumps,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot start the stdio pumps: {err}")).into());
+        }
+    };
+    let latch = match FaultLatch::new() {
+        Ok(latch) => latch,
+        Err(err) => {
+            kill_reap(&mut sb);
+            return Err(RunError::new(format!("cannot create the fault latch: {err}")).into());
+        }
+    };
     let mut watch = HolderWatch {
         pidfd: holder_pidfd,
     };
@@ -359,9 +412,16 @@ struct JoinShim {
     status: Option<RawFd>,
 }
 
-/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, and
-/// the call's bwrap argv after `--`.
-fn join_command(fds: JoinFds, parent_pid: u32, launch: &Launch, stdin: Stdio) -> Command {
+/// The `__init --join` argv: the namespace descriptors, the kept bwrap fds, the
+/// policy's resource limits (issue #43: a call is limited as the resident is),
+/// and the call's bwrap argv after `--`.
+fn join_command(
+    fds: JoinFds,
+    parent_pid: u32,
+    rlimits: &[crate::init::rlimit::Rlimit],
+    launch: &Launch,
+    stdin: Stdio,
+) -> Command {
     let JoinFds {
         user,
         net,
@@ -389,6 +449,10 @@ fn join_command(fds: JoinFds, parent_pid: u32, launch: &Launch, stdin: Stdio) ->
     if let Some(status) = shim.status {
         argv.push("--status-fd".into());
         argv.push(status.to_string().into());
+    }
+    for limit in rlimits {
+        argv.push("--rlimit".into());
+        argv.push(limit.to_string().into());
     }
     argv.push("--".into());
     argv.extend(launch.argv().iter().cloned());
@@ -477,6 +541,9 @@ fn stop_session(session_dir: PathBuf, answer_wait: Duration) -> Result<(), Strin
         &[],
         Instant::now() + Duration::from_secs(5),
     ) {
+        if let Some(reason) = early_refusal(&stream, &err) {
+            return Err(reason);
+        }
         return Err(format!("cannot send the stop request: {err:?}"));
     }
     // The holder answers after its teardown, which can take a few seconds: the
@@ -488,6 +555,36 @@ fn stop_session(session_dir: PathBuf, answer_wait: Duration) -> Result<(), Strin
         Ok(Reply::Accepted(_, _)) | Err(_) => {
             Err("the session did not confirm the stop".to_owned())
         }
+    }
+}
+
+/// How long a client looks for an early refusal after its send failed.
+pub(crate) const EARLY_REFUSAL_WAIT: Duration = Duration::from_secs(1);
+
+/// The holder may answer and close BEFORE reading the request: a peer of
+/// another uid is refused ("not the session owner") before its frame is read.
+/// The client's send then fails with EPIPE or ECONNRESET, but the refusal is
+/// already queued on the AF_UNIX socket (a peer's close never discards data it
+/// sent), so read it: the caller sees the holder's reason, not a transport
+/// error. Anything else (no frame, not a refusal) is `None`, and the send
+/// error stands.
+fn early_refusal(stream: &UnixStream, err: &ProtoError) -> Option<String> {
+    let ProtoError::Io(io) = err else {
+        return None;
+    };
+    // EPIPE is what Linux reports on the send. ECONNRESET is accepted too: it
+    // is the peer's unread-data reset, and AF_UNIX still delivers the queued
+    // frame before surfacing that error on a read.
+    if !matches!(
+        io.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+    ) {
+        return None;
+    }
+    let (frame, _) = ctl::recv_frame_until(stream, Instant::now() + EARLY_REFUSAL_WAIT).ok()?;
+    match Reply::decode(frame) {
+        Ok(Reply::Refused(reason)) => Some(reason),
+        _ => None,
     }
 }
 
@@ -557,6 +654,10 @@ mod tests {
         let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
         let holder = std::thread::spawn(move || {
             let (conn, _) = listener.accept().expect("the stop connects");
+            // Read the request first, as the real holder does: answering and
+            // closing before the client has sent its Stop races its write
+            // into EPIPE (seen on CI).
+            ctl::recv_frame(&conn).expect("the stop request arrives");
             let (op, payload) = Reply::Refused("session is stopping".into()).encode();
             ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
         });
@@ -564,6 +665,63 @@ mod tests {
         holder.join().expect("the fake holder ends");
         assert_eq!(outcome, Err("session is stopping".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A holder that refuses and closes WITHOUT reading the request (as the
+    /// real holder does for a foreign uid): the client's send hits EPIPE, and
+    /// the queued refusal is still reported.
+    #[test]
+    fn a_refusal_before_the_request_is_read_survives_epipe() {
+        let dir = scratch_session("early");
+        let dirfd = ctl::open_session_dir(&dir).expect("open the session dir");
+        let listener = ctl::bind_ctl(dirfd.as_fd()).expect("bind the control socket");
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (conn, _) = listener.accept().expect("a client connects");
+                let (op, payload) = Reply::Refused("not the session owner".into()).encode();
+                ctl::send_frame(&conn, op, &payload, &[]).expect("answer");
+                // Close without reading anything, then say so.
+                drop(conn);
+                let _ = closed_tx.send(());
+            }
+        });
+
+        // The helper, deterministically: the send happens only after the
+        // holder has dropped its end, so it must fail (EPIPE), and the
+        // refusal queued before the close must be recovered.
+        let client = ctl::connect_ctl(dirfd.as_fd()).expect("connect");
+        closed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the holder closes");
+        let err =
+            ctl::send_frame(&client, b'S', &[], &[]).expect_err("a send to a closed peer fails");
+        assert_eq!(
+            early_refusal(&client, &err).as_deref(),
+            Some("not the session owner")
+        );
+
+        // End to end through stop. Not deterministic about WHICH path runs
+        // (the tiny Stop frame races the holder's close inside stop_session:
+        // either the send succeeds and the normal reply path reads the
+        // refusal, or it fails and early_refusal does), but both must report
+        // the holder's reason. The helper half above pins the EPIPE branch.
+        assert_eq!(
+            stop_session(dir.clone(), Duration::from_secs(10)),
+            Err("not the session owner".to_owned())
+        );
+        holder.join().expect("the fake holder ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Other send errors are not mistaken for a refusal.
+    #[test]
+    fn early_refusal_ignores_other_errors() {
+        let (a, _b) = UnixStream::pair().expect("pair");
+        assert_eq!(early_refusal(&a, &ProtoError::TooLarge(1)), None);
+        assert_eq!(early_refusal(&a, &ProtoError::Eof), None);
+        let refused = ProtoError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(early_refusal(&a, &refused), None);
     }
 
     /// No socket at all is a session that is not running: rc 0.

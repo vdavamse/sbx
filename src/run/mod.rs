@@ -40,9 +40,10 @@
 //!    sees a tty on fds 0–2.
 //! 7. **Audit.** `--audit` writes one JSON object per line (schema: notes §5),
 //!    append-only, 0600, regular file only, never inside the session directory.
-//!    The exit row's last key `net_mode` (issue #11) is the achieved network
-//!    mode (`transparent` or `explicit`), or null when setup never completed.
-//!    A write failure is fail-closed (Q7). The exit row is always last. No fsync.
+//!    The exit row's `net_mode` (issue #11) is the achieved network mode
+//!    (`transparent` or `explicit`), or null when setup never completed; its
+//!    last key `dns_suppressed` (issue #43) counts the `dns` rows the per-run
+//!    rate limit dropped (`audit::DnsBudget`). A write failure is fail-closed (Q7). The exit row is always last. No fsync.
 //! 8. **Supervision.** A failing or panicking network task, a dead network thread
 //!    or an audit failure ends the run with 125 (the latch wakes the main loop).
 //! 9. **Concurrency and session.** Each run has its own netns, DNS pool and
@@ -89,6 +90,7 @@
 //!     [`crate::landlock`] module docs point 9.
 
 mod audit;
+pub(crate) mod cgroup;
 pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
@@ -131,7 +133,7 @@ use plan::{
 };
 use serve::{Fault, FaultLatch, serve_tasks, start_net};
 use session::SessionLock;
-use spawn::{ChildFds, SetupEnd, init_command, wait_for_fds};
+use spawn::{ChildFds, InitFlags, SetupEnd, init_command, wait_for_fds};
 use stdio::{OutputBudget, Pumps};
 
 /// Exit code for GNU-timeout-style timeouts.
@@ -176,6 +178,8 @@ pub struct RunArgs {
     pub idle_timeout: Option<Duration>,
     /// `--max-lifetime` (keep-alive only); None = the 8h default.
     pub max_lifetime: Option<Duration>,
+    /// `--max-connections` (issue #43): the proxies' concurrent-connection cap.
+    pub max_connections: usize,
 }
 
 /// An sbx-detected failure (rc 125). Display is the reason only; the `sbx run: `
@@ -328,7 +332,7 @@ fn conclude_prepare(
 ) -> i32 {
     if let Some(audit) = audit {
         mark_audit_failure(&mut outcome, audit);
-        audit.finish(&exit_row_for(
+        audit.finish(exit_row_for(
             ts(SystemTime::now()),
             &outcome,
             t0.elapsed(),
@@ -416,7 +420,7 @@ fn report_failure(
     call_id: Option<u32>,
 ) -> ExitCode {
     if let Some(audit) = audit {
-        audit.finish(&exit_row_for(
+        audit.finish(exit_row_for(
             ts(SystemTime::now()),
             &Outcome::Failed(reason.to_owned()),
             t0.elapsed(),
@@ -440,6 +444,19 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     "non-string panic payload".to_owned()
 }
 
+/// The sandbox's limited cgroup (issue #43) when the policy sets
+/// `limits.memory_bytes` or `limits.pids`; `None` otherwise. A missing
+/// delegation is a refusal (125), never a silent drop.
+fn cgroup_for(policy: &Policy) -> Result<Option<cgroup::SandboxCgroup>, Early> {
+    let limits = cgroup::CgroupLimits::of(&policy.limits);
+    if !limits.any() {
+        return Ok(None);
+    }
+    cgroup::setup_live(limits)
+        .map(Some)
+        .map_err(|err| RunError::new(err.to_string()).into())
+}
+
 /// The `bwrap --version` gate (S6): the only spawn before the fd window. Bounded
 /// by the run deadline and interruptible by sbx's signals (a slow or hung
 /// `bwrap` must not outlive `--timeout`; the child is killed on overrun).
@@ -448,7 +465,7 @@ fn check_bwrap_version(
     deadline: Instant,
     timeout: Duration,
     signals: &sys::Signals,
-) -> Result<(), Early> {
+) -> Result<(u32, u32, u32), Early> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let mut child = Command::new(bwrap)
@@ -521,10 +538,14 @@ fn check_bwrap_version(
         .map_err(|err| RunError::new(format!("cannot collect bwrap --version: {err}")))?;
     let text = String::from_utf8_lossy(&out).into_owned();
     // The shared gate (issue #11): the refusal text is BwrapStatus's, pinned.
-    match classify_version_output(bwrap, status.success(), status.code(), &text).run_reason() {
-        None => Ok(()),
-        Some(reason) => Err(RunError::new(reason).into()),
-    }
+    // The usable version is returned: the argv depends on it (issue #43,
+    // deny-mask `--size` from bwrap 0.10).
+    let classified = classify_version_output(bwrap, status.success(), status.code(), &text);
+    let BwrapStatus::Ok { version, .. } = classified else {
+        // run_reason() is Some for every non-Ok status.
+        return Err(RunError::new(classified.run_reason().unwrap_or_default()).into());
+    };
+    Ok(version)
 }
 
 /// stdin policy (§8): inherit when not a tty; pump when the tty is ours in the
@@ -666,7 +687,7 @@ fn execute(
     // S6: bwrap discovery and version gate.
     let bwrap = find_bwrap()
         .ok_or_else(|| RunError::new(BwrapStatus::NotFound.run_reason().unwrap_or_default()))?;
-    check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
+    let bwrap_version = check_bwrap_version(&bwrap, deadline, timeout, &signals)?;
 
     // S7: env pass-through and the session layout.
     let env = passed_env(&policy, |name| std::env::var_os(name));
@@ -705,6 +726,7 @@ fn execute(
         info_fd: Some(info_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: landlock_layer,
+        deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
     })
     .map_err(|err| RunError::new(err.to_string()))?;
 
@@ -712,6 +734,11 @@ fn execute(
     // verify_launch). Refusal is 125; nothing is created outside the session
     // directory and the audit log (S5/S7 ran already).
     verify_launch(&launch)?;
+
+    // S8b (issue #43): the cgroup v2 limits. Prepared before the spawn so a
+    // missing delegation refuses (125) before anything runs; the limit is
+    // never dropped silently.
+    let limits_cgroup = cgroup_for(&policy)?;
 
     // S9–S11: the control socketpair and the single spawn window.
     let (parent_end, child_end) = fdpass::control_socketpair()
@@ -737,6 +764,7 @@ fn execute(
         None => None,
     };
     let (stdin, stdin_piped) = stdin_mode();
+    let rlimits = crate::init::rlimit::from_limits(&policy.limits);
     let mut child = init_command(
         ChildFds {
             control: child_fd,
@@ -745,13 +773,29 @@ fn execute(
             exe: exe_fd,
             status: status_fd,
         },
-        policy.network.mode,
-        args.test_break_rules,
+        &InitFlags {
+            min_mode: policy.network.mode,
+            test_break_rules: args.test_break_rules,
+            rlimits: &rlimits,
+        },
         &launch,
         stdin,
     )
     .spawn()
     .map_err(|err| RunError::new(format!("cannot spawn sbx __init: {err}")))?;
+    // S11a (issue #43): __init forks nothing before the go byte, so moving it
+    // now puts bwrap and every payload process in the limited cgroup.
+    if let Some(cg) = &limits_cgroup {
+        if let Err(err) = cg.attach(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RunError::new(err.to_string()).into());
+        }
+    }
+    // `limits_cgroup` is dropped (and the child cgroup removed) explicitly
+    // right after teardown has reaped the tree: this function ends in
+    // `process::exit`, which runs no destructors. Early returns before that
+    // point drop it normally.
     drop(child_end);
     drop(info_write);
     drop(seccomp_memfd);
@@ -893,7 +937,13 @@ fn execute(
             )))
         })?;
         let host_addrs = crate::egress::HostAddrs::new(host_addrs);
-        let proxy = Proxy::system(&net, map.clone(), audit.clone(), host_addrs);
+        let proxy = Proxy::system(
+            &net,
+            map.clone(),
+            audit.clone(),
+            host_addrs,
+            args.max_connections,
+        );
         let dns = DnsServer::new(&net, map.clone(), audit.clone());
         // S16: start the runtime; go only after every task was first-polled.
         let ready = start_net(serve_tasks(fds, proxy, dns), latch.clone()).map_err(|err| {
@@ -953,6 +1003,9 @@ fn execute(
         h.end_calls(keepalive::holder::CALL_GRACE);
     }
     let (mut outcome, end, stragglers) = teardown(sb, cause, pumps);
+    // Issue #43: the tree is reaped; remove the limited cgroup now (the
+    // process::exit below would skip its Drop).
+    drop(limits_cgroup);
     outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`

@@ -50,11 +50,13 @@ pub enum CapId {
     Seccomp,
     Landlock,
     KeepAlive,
+    /// The host conntrack table (issue #43): report-only, never limits.
+    Conntrack,
 }
 
 impl CapId {
     /// Every item, in report order.
-    pub const ALL: [CapId; 11] = [
+    pub const ALL: [CapId; 12] = [
         CapId::Userns,
         CapId::Netns,
         CapId::NetnsIpv6,
@@ -66,6 +68,7 @@ impl CapId {
         CapId::Seccomp,
         CapId::Landlock,
         CapId::KeepAlive,
+        CapId::Conntrack,
     ];
 
     /// The pinned item name.
@@ -82,6 +85,7 @@ impl CapId {
             CapId::Seccomp => "seccomp",
             CapId::Landlock => "landlock",
             CapId::KeepAlive => "keep-alive",
+            CapId::Conntrack => "conntrack",
         }
     }
 }
@@ -296,7 +300,7 @@ pub(crate) mod test_support {
     use crate::bwrap::version::BwrapStatus;
     use crate::init::probe::{PROBE_STEPS, PROBE_VERSION, ProbeReport, ProbeStep, StepStatus};
 
-    use super::facts::{HostFacts, Landlock, ProbeOutcome, RunFacts, Sysctls};
+    use super::facts::{Conntrack, HostFacts, Landlock, ProbeOutcome, RunFacts, Sysctls};
 
     /// Every probe step ok (the H1 fixture).
     pub(crate) fn ok_steps() -> ProbeReport {
@@ -309,6 +313,7 @@ pub(crate) mod test_support {
                     status: StepStatus::Ok,
                     errno: None,
                     reason: None,
+                    phase: None,
                 })
                 .collect(),
         }
@@ -369,6 +374,10 @@ pub(crate) mod test_support {
             landlock: Landlock::Abi(4),
             bwrap,
             probe,
+            conntrack: Conntrack {
+                count: Some(312),
+                max: Some(262_144),
+            },
         }
     }
 

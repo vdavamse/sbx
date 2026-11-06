@@ -378,9 +378,11 @@ fn seccomp_item_ok() -> Result<(), String> {
 
 /// Issue #18: where unprivileged user namespaces work, the `keep-alive` item is
 /// ok (a pidfd, and a same-uid setns into a fresh user and network namespace).
-/// The gate is the userns item, so this runs on a host without bwrap (this
-/// developer host: the probe needs no bwrap for these steps) and in CI's nested
-/// tier alike; the item never limits the network mode, so rc is not checked.
+/// The gate is `Gate::Userns`, so the scenario runs on a host without bwrap
+/// (this developer host: the probe needs no bwrap for these steps) and skips
+/// where userns is unavailable. CI's nested `--disable-userns` tier is one
+/// such host, so it skips there, not runs. The item never limits the network
+/// mode, so rc is not checked.
 fn keep_alive_item_ok() -> Result<(), String> {
     let (_, report) = sbx_json(&["check", "--json"])?;
     let ka = item(&report, "keep-alive")?;
@@ -570,7 +572,9 @@ fn nested_no_userns() -> Result<(), String> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|c| c["status"] == "skip")
+        // conntrack (#43) is report-only and reads /proc/sys/net/netfilter,
+        // which depends on the namespace sbx check runs in: not counted.
+        .filter(|c| c["status"] == "skip" && c["id"] != "conntrack")
         .count();
     // Seven since #34: the `seccomp` item is skipped too (its probe step
     // needs bwrap-run, which cannot start without user namespaces). Eight since

@@ -252,6 +252,16 @@ fn scenarios() -> Vec<Scenario> {
             run: scenario_fail_break_rules,
         },
         Scenario {
+            name: "rlimits-applied",
+            gate: Gate::Userns,
+            run: scenario_rlimits_applied,
+        },
+        Scenario {
+            name: "fail-rlimit-above-hard",
+            gate: Gate::Userns,
+            run: scenario_fail_rlimit_above_hard,
+        },
+        Scenario {
             name: "usage-contract",
             gate: Gate::Always,
             run: scenario_usage_contract,
@@ -1253,6 +1263,77 @@ fn scenario_fail_exec() -> Result<(), String> {
     Ok(())
 }
 
+/// Issue #43: `--rlimit NAME=VALUE` limits reach the payload with soft ==
+/// hard. A `/bin/sh` payload prints its own `/proc/self/limits` rows (shell
+/// builtins only); whitespace is normalised before matching.
+fn scenario_rlimits_applied() -> Result<(), String> {
+    let script = format!(
+        "while read -r line; do case $line in \
+         'Max processes'*|'Max open files'*|'Max file size'*|'Max address space'*) \
+         echo \"{MARKER} $line\";; esac; done < /proc/self/limits"
+    );
+    let payload: Vec<OsString> = ["/bin/sh", "-c", &script]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    let args = [
+        "--rlimit",
+        "nproc=50",
+        "--rlimit",
+        "nofile=64",
+        "--rlimit",
+        "fsize=4096",
+        "--rlimit",
+        "as=4294967296",
+    ];
+    let sp = spawn_init("rlimits", &args, &payload)?;
+    let fds = recv_fds(&sp)?;
+    send_go(&sp)?;
+    let out = finish(sp, "rlimits payload")?;
+    drop(fds);
+    if out.rc != 0 {
+        return Err(format!(
+            "payload rc {} (expected 0)\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.rc, out.stdout, out.stderr
+        ));
+    }
+    let rows: Vec<String> = out
+        .stdout
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    for want in [
+        "Max processes 50 50 processes",
+        "Max open files 64 64 files",
+        "Max file size 4096 4096 bytes",
+        "Max address space 4294967296 4294967296 bytes",
+    ] {
+        let line = format!("{MARKER} {want}");
+        if !rows.contains(&line) {
+            return Err(format!(
+                "missing limit row {line:?}\n--- stdout ---\n{}",
+                out.stdout
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Issue #43: a limit the caller cannot grant (above its hard limit; for
+/// NOFILE `1 << 40` is also above `fs.nr_open`, whose kernel maximum is
+/// about 2^31 (INT_MAX rounded down to a multiple of BITS_PER_LONG), so even
+/// root is refused)
+/// fails setup closed — staged `exec`, payload never started.
+fn scenario_fail_rlimit_above_hard() -> Result<(), String> {
+    let too_big = format!("nofile={}", 1u64 << 40);
+    let sp = spawn_init("marker", &["--rlimit", &too_big], &payload_self()?)?;
+    let fds = recv_fds(&sp)?;
+    send_go(&sp)?;
+    let out = finish(sp, "fail-rlimit child")?;
+    drop(fds);
+    assert_staged_failure(&out, "sbx __init: exec: cannot set limits.open_files")
+}
+
 /// AC (Q4(a)): the hidden --test-break-rules flag makes the kernel reject
 /// the batch (ENOENT on the nonexistent chain) and roll everything back
 /// (F6) — staged nft-load rc 1, payload never starts. The fresh netns dies
@@ -1392,6 +1473,7 @@ fn run_full_chain(exe: &Path, deps_dir: &str, bwrap: &Path, session: &Path) -> R
         info_fd: None,
         seccomp_fd,
         landlock: None,
+        deny_tmpfs_size: None,
     };
     let launch = sbx::bwrap::build(&input).map_err(|e| format!("build: {e}"))?;
 

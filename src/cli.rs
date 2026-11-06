@@ -33,6 +33,16 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::policy::NetworkMode;
 
+/// `--max-connections`: an integer from 1 to 65536 (issue #43). 0 would
+/// refuse every connection; above 65536 the cap no longer bounds anything
+/// the proxy can hold (one fd per side).
+fn parse_max_connections(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if (1..=65536).contains(&n) => Ok(n),
+        _ => Err(format!("{s:?} is not a connection count from 1 to 65536")),
+    }
+}
+
 /// Parse a positive human-readable duration (`120s`, `7d`, `500ms`, ...) for clap.
 ///
 /// Wraps [`humantime::parse_duration`] and additionally rejects zero: a zero
@@ -158,6 +168,11 @@ pub enum Cmd {
         /// ephemeral range). Without a port, binds are denied.
         #[arg(long = "landlock-bind-tcp", value_name = "PORT", value_parser = clap::value_parser!(u16))]
         landlock_bind_tcp: Vec<u16>,
+
+        /// Concurrent proxied connections for this run (issue #43); excess
+        /// connections are refused and audited with reason `conn_limit`.
+        #[arg(long, value_name = "N", default_value_t = crate::proxy::DEFAULT_MAX_CONNECTIONS, value_parser = parse_max_connections)]
+        max_connections: usize,
     },
 
     /// Run a command in a persistent session started with `run --keep-alive`
@@ -381,11 +396,18 @@ pub enum Cmd {
         #[arg(long, value_name = "MODE", hide = true, value_parser = parse_network_mode)]
         min_mode: Option<NetworkMode>,
 
+        /// (hidden) A resource limit to apply right before the exec, `NAME=VALUE`
+        /// (repeatable; NAME is nproc, nofile, fsize or as).
+        //
+        // Issue #43: `run` forwards the policy's optional `limits` fields here.
+        #[arg(long, value_name = "NAME=VALUE", hide = true, value_parser = crate::init::rlimit::parse)]
+        rlimit: Vec<crate::init::rlimit::Rlimit>,
+
         /// (hidden) Host capability probe for `sbx check`: run the setup stages
         /// and the nested bwrap launches, print one JSON line, exit 0.
         //
         // Issue #11 (T3/T4). Conflicts with every pipeline argument.
-        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "cmd"])]
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "rlimit", "cmd"])]
         probe: bool,
 
         /// (hidden, with --probe) The bwrap binary the probe launches.
@@ -601,6 +623,7 @@ pub fn run() -> ExitCode {
             test_break_rules,
             landlock,
             landlock_bind_tcp,
+            max_connections,
         } => crate::run::run(crate::run::RunArgs {
             policy,
             session_dir,
@@ -614,6 +637,7 @@ pub fn run() -> ExitCode {
             keep_alive,
             idle_timeout,
             max_lifetime,
+            max_connections,
         }),
         Cmd::Landlock {
             exe_fd,
@@ -686,6 +710,7 @@ pub fn run() -> ExitCode {
             parent_pid,
             min_mode,
             test_break_rules,
+            rlimit,
             probe,
             bwrap,
             cmd,
@@ -708,6 +733,7 @@ pub fn run() -> ExitCode {
                 parent_pid,
                 min_mode: min_mode.unwrap_or(NetworkMode::Transparent),
                 test_break_rules,
+                rlimits: rlimit,
                 cmd,
             })
         }
@@ -2003,6 +2029,34 @@ mod tests {
                 assert_eq!(ops, "{}");
             }
             other => panic!("expected the probe role, got {other:?}"),
+        }
+    }
+
+    /// Issue #43: `--max-connections` defaults to 256 and accepts 1..=65536.
+    #[test]
+    fn run_max_connections_flag() {
+        let base = ["sbx", "run", "--policy", "p.json", "--session-dir", "/s"];
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<&str> = base.to_vec();
+            argv.extend_from_slice(extra);
+            argv.extend_from_slice(&["--", "true"]);
+            Cli::try_parse_from(argv)
+        };
+        let max_of = |cli: Cli| match cli.command {
+            Cmd::Run {
+                max_connections, ..
+            } => max_connections,
+            _ => panic!("not run"),
+        };
+        assert_eq!(max_of(parse(&[]).expect("default")), 256);
+        assert_eq!(max_of(parse(&["--max-connections", "1"]).expect("1")), 1);
+        assert_eq!(
+            max_of(parse(&["--max-connections", "65536"]).expect("max")),
+            65536
+        );
+        for bad in ["0", "65537", "-1", "x"] {
+            let err = parse(&["--max-connections", bad]).expect_err(bad);
+            assert_eq!(err.exit_code(), 2, "{bad}");
         }
     }
 }

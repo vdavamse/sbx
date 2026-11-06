@@ -204,8 +204,8 @@ parts of the optional layer the kernel provides, see **Landlock layer** under [R
 and `keep-alive` (report only: a pidfd of this process and an unprivileged `setns`
 into a fresh user and network namespace, the two things `run --keep-alive` and
 `attach` need; see [Persistent sessions](#persistent-sessions)). A `keep-alive`
-failure is a `warn` and never limits the network mode, as `landlock` does, so a
-host that runs plain sandboxes still exits 0.
+failure is a `warn`. Like `landlock`, it is report only: it never limits the
+network mode, so a host that runs plain sandboxes still exits 0.
 An item is `ok`, `FAIL` (with the evidence and a `fix:` line), `skip` (not probed because an item it depends on
 failed, with the reason), or `warn` (a degraded but working state, with a fix).
 
@@ -235,8 +235,9 @@ is flagged), `bind-sockets` (a `warn` listing the unix socket files under
 verification of `run` below, which fails the policy when `run` would refuse),
 `bwrap-cve` (warns when bwrap is older than 0.12.0 and the policy has mount
 paths under its binds), `deny-links` (warns when a file under a deny path has a
-hard link outside it) and `pin-cost` (warns above 50 directory pins). A `warn`
-does not stop the policy from running.
+hard link outside it), `pin-cost` (warns above 50 directory pins) and
+`deny-tmpfs-size` (warns when bwrap is older than 0.10 and the policy has deny
+masks, which then stay unsized). A `warn` does not stop the policy from running.
 
 **JSON.** `sbx check --json` prints the same report as a JSON object with
 `"version": 1`: `network_mode`, `runnable_modes`, `probe_error` and one object per
@@ -276,12 +277,14 @@ setup is in [docs/kubernetes.md](docs/kubernetes.md)):
 | `mount-chains` | a path bwrap resolves under a policy bind is a symbolic link, is missing or has the wrong type, or a deny path is reachable through a host symlink alias | remove the symbolic link, create the directory on the host, or move the entry out of the `rw` path (the message names the component) |
 | `bwrap-cve` | bwrap is older than 0.12.0 and the policy has mount paths under its binds (a warning; the run still starts) | install bubblewrap 0.12.0 or later (CVE-2026-87766); a distribution backport is not visible in the version string |
 | `deny-links` | a regular file under a deny path has a hard link outside it (a warning) | remove the extra hard link, or deny the other name as well |
+| `deny-tmpfs-size` | bubblewrap is older than 0.10, so the deny masks are unsized tmpfs (a warning; from 0.10 each mask is capped at 1 MiB) | install bubblewrap 0.10 or later, or run under a memory limit |
 | `pin-cost` | the policy needs more than 50 directory pins (a warning): each pin is an extra bind, and startup grows superlinearly with the count | keep the deny list short, or deny a parent directory instead of many nested entries |
 | `bwrap-run` | bwrap cannot apply `--disable-userns` because `/proc/sys` is read-only | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `bwrap-run` | bwrap cannot start a sandbox inside the sbx namespaces | allow `mount` and `pivot_root` inside nested user namespaces (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` and `appArmorProfile` Unconfined) |
 | `bwrap-proc` | bwrap cannot mount a fresh `/proc` (a masked `/proc`, typical in containers) | `procMount: Unmasked` (Kubernetes) or `systempaths=unconfined` (Docker) |
 | `seccomp` | bwrap cannot install sbx's socket-family seccomp filter (no `CONFIG_SECCOMP_FILTER`, or an outer policy that forbids `prctl(PR_SET_SECCOMP)` / `seccomp(2)`) | no program exists for this architecture (sbx ships the filter for x86_64 and aarch64 only); otherwise a kernel built with `CONFIG_SECCOMP_FILTER=y`, and an outer seccomp or container profile that allows `prctl(PR_SET_SECCOMP)` and `seccomp(2)` (Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined) |
 | `keep-alive` | `pidfd_open` is refused (ENOSYS below Linux 5.3, or an outer seccomp profile) (report only) | run sbx on Linux 5.3 or newer; Kubernetes: a Localhost seccomp profile that allows `pidfd_open`, or `seccompProfile` Unconfined |
+| `keep-alive` | the holder stand-in's `unshare(CLONE_NEWUSER\|CLONE_NEWNET)` is refused (EPERM or EACCES). The probe's own namespace was created, so only the nested user and network namespaces are refused; report only | allow nested `unshare(CLONE_NEWUSER)` and `unshare(CLONE_NEWNET)` for this user (a seccomp or container profile that blocks them; Kubernetes: a Localhost seccomp profile that allows them, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | an unprivileged `setns` into a fresh user and network namespace is refused (EPERM or EACCES; report only) | allow `setns(CLONE_NEWUSER)` and `setns(CLONE_NEWNET)` for this user (a container seccomp profile often blocks `setns`; Kubernetes: a Localhost seccomp profile that allows it, or `seccompProfile` Unconfined; Docker: `--security-opt seccomp=unconfined`), or do not use `run --keep-alive` |
 | `keep-alive` | the holder stand-in cannot be started, or the join fails for another reason (report only) | allow unprivileged user and network namespaces and `setns` for this user, or do not use `run --keep-alive`; plain `sbx run` does not need them |
 | `landlock` | Landlock is not supported (report only) | none needed today; kernels 5.13 or newer built with `CONFIG_SECURITY_LANDLOCK=y` provide it |
@@ -472,6 +475,87 @@ sbx prints `sbx run: output truncated at N bytes (limits.output_bytes)` as its
 last line, and the exit row records `output_truncated: true`. If the caller closes
 sbx's stdout, the command gets EPIPE or SIGPIPE, as with a plain pipe.
 
+**Resource limits.** `limits` may also set `processes`, `open_files`,
+`file_bytes` and `address_space_bytes` (positive integers; absent means the
+caller's own limit is inherited). They become `RLIMIT_NPROC`, `RLIMIT_NOFILE`,
+`RLIMIT_FSIZE` and `RLIMIT_AS`, with soft and hard limits both set, so the
+command cannot raise them. `__init` sets them after it creates the sandbox's
+user namespace and right before it execs bwrap. Per limit:
+
+- `processes` counts the sandbox's own processes and threads (Linux 5.14 and
+  later; older kernels count every process of the caller's uid). When sbx runs
+  as root, it is enforced only on Linux 5.17 and later. bwrap uses two of them.
+- `open_files` must not exceed the caller's hard limit (or `fs.nr_open`).
+- `file_bytes` bounds each file, not the total disk use. A write past it fails
+  and the writer gets `SIGXFSZ`.
+- `address_space_bytes` is virtual memory, not resident memory. Runtimes that
+  reserve large address ranges (JVM, V8, Go) need generous values.
+
+bwrap runs under the same limits, so very small values (`processes` below 3,
+a handful of `open_files`, a few MiB of address space) make bwrap itself fail.
+A limit the caller cannot grant fails setup (125, with
+`sbx __init: exec: cannot set limits.<field> …`). These are per-process
+limits, not a cgroup: they do not bound the total memory of all sandboxed
+processes, tmpfs sizes or the total disk use. See
+[R14](docs/threat-model.md#7-residual-risks).
+
+```json
+"limits": { "timeout": "120s", "output_bytes": 10485760,
+            "processes": 256, "open_files": 1024,
+            "file_bytes": 1073741824, "address_space_bytes": 8589934592 }
+```
+
+**cgroup limits (issue #43).** `limits.memory_bytes` and `limits.pids` bound
+the whole sandbox, not each process: they become `memory.max` (with
+`memory.swap.max` 0 where swap is accounted) and `pids.max` on a child cgroup
+that holds `__init`, bwrap and every payload process. Over `memory_bytes` the
+kernel OOM-kills a sandboxed process (typically exit 137); past `pids` a fork
+fails with `EAGAIN`. They need a delegated cgroup v2 that sbx runs in alone,
+for example:
+
+```sh
+systemd-run --user --scope -p Delegate=yes sbx run --policy p.json --session-dir s -- make
+```
+
+sbx then moves itself into a leaf (`sbx-supervisor`), enables the `memory` and
+`pids` controllers for its cgroup's children and creates `sbx-sandbox-<pid>`,
+removed after the run. When the cgroup is not delegated, lacks a controller, or
+holds other processes (sbx's own `--keep-alive` launcher excepted), a run with
+either limit is refused (125, `need a delegated cgroup v2`): the limit is never
+dropped silently. With `memory_bytes`, a host where swap is active but not
+accounted for cgroups (`swapaccount=0`) is refused too, since the limit could
+not keep the sandbox out of swap. sbx checks that its cgroup is writable, not
+who manages it: run as root it can restructure any cgroup it sits in alone, so
+give it a dedicated scope (`Delegate=yes`). With
+`--keep-alive`, each run and each attached call gets its own child cgroup, so
+the limits apply per call; an `sbx attach` needs the same delegation.
+
+**Run-level caps (issue #43).** Three more bounds apply to every run, with no
+policy field:
+
+- **Deny masks are sized.** With bubblewrap 0.10 or later, each `deny` tmpfs is
+  capped at 1 MiB of file data (`--size`), so a payload cannot fill RAM with
+  file contents through a writable mask (the inode count is not capped). A
+  tool that writes more than 1 MiB into a denied directory now gets `ENOSPC`.
+  Older bubblewrap has no `--size`: the masks stay unsized, and
+  `sbx check --policy P --host` warns (`deny-tmpfs-size`).
+- **Concurrent proxy connections.** At most 256 connections are open through the
+  proxies at once (both listeners together); set another value with
+  `sbx run --max-connections N` (1 to 65536). A connection over the cap is
+  closed unread and gets one `deny` audit row whose reason starts with
+  `conn_limit:` (these rows have no budget, unlike `dns` rows). A
+  `--keep-alive` session shares the cap across its calls.
+- **Fake-IP names.** A run maps at most 4096 distinct names (a `--keep-alive`
+  session shares one map across its calls). A new name past that gets
+  NXDOMAIN for every query type, with a `dns` audit row under the run's DNS
+  row budget; names already mapped keep answering.
+
+`sbx check` also reports the host's conntrack table (`conntrack`, report-only).
+The nat redirect in the sandbox needs conntrack; on current kernels each network
+namespace's entries are checked against the host's `nf_conntrack_max`, and they
+use host kernel memory. Disk use in `rw` binds and the session directory is not
+bounded (no quotas; R14).
+
 **Session directory.** `--session-dir` is created with mode 0700 and must be
 owned by the current user. Only one run may use a session at a time: a lock on
 `sbx.lock` inside it is held for the whole run, and a second run fails with
@@ -491,14 +575,20 @@ same keys in the same order:
 `ts`, `event` (`dns` | `connect` | `deny` | `close` | `exit`), `host`, `sni`,
 `port`, `bytes` (`{"up","down"}` on `close`), `reason`, `via`, `verdict`,
 `rcode`, `qtype`, `client`. The `exit` row adds `code`, `outcome`, `signal`,
-`duration_ms`, `output_truncated`, `dns_poisoned` and `net_mode` (`transparent`
+`duration_ms`, `output_truncated`, `dns_poisoned`, `net_mode` (`transparent`
 or `explicit`: the network mode the run got, or `null` when `__init` never reported a mode
-(setup never completed); `net_mode` is the last key).
+(setup never completed)) and `dns_suppressed` (the last key).
+
+`dns` rows are rate limited per run, because every DNS datagram is one row: a
+burst of 1000 rows, then 100 rows per second. Rows over the limit are not
+written. The exit row's `dns_suppressed` counts them. The DNS answers
+themselves are not affected. Proxy rows (`connect`, `deny`, `close`) are not
+rate limited.
 
 ```json
 {"ts":"2026-10-15T18:23:01.123Z","event":"dns","host":"github.com","sni":null,"port":null,"bytes":null,"reason":"answered github.com A 198.18.0.1","via":null,"verdict":"answered","rcode":0,"qtype":1,"client":"10.255.255.1:41000"}
 {"ts":"2026-10-15T18:23:01.123Z","event":"connect","host":"github.com","sni":"github.com","port":443,"bytes":null,"reason":"allowed github.com via 140.82.121.4:443","via":"transparent","verdict":"allowed","rcode":null,"qtype":null,"client":"10.255.255.1:40000"}
-{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent"}
+{"ts":"2026-10-15T18:23:01.123Z","event":"exit","host":null,"sni":null,"port":null,"bytes":null,"reason":"command exited with status 0","via":null,"verdict":null,"rcode":null,"qtype":null,"client":null,"code":0,"outcome":"exited","signal":null,"duration_ms":1234,"output_truncated":false,"dns_poisoned":false,"net_mode":"transparent","dns_suppressed":0}
 ```
 
 Rows are in event order: a connection's `connect`, then `deny` (teardown) if
@@ -731,7 +821,10 @@ sbx stop --session-dir S
   request and its reply.
 - **Audit.** With `--audit`, the session writes one file. Each call's exit row
   carries `call_id`, and the resident's exit row has `call_id` 0. Proxy and DNS
-  rows carry no `call_id` (R30).
+  rows carry no `call_id` (R30). The `dns` rate limit covers the whole session,
+  so only the resident's exit row carries `dns_suppressed`.
+- **Resource limits.** The policy's `limits` RLIMITs apply to every attached
+  call as they apply to the resident.
 
 **Exit codes**
 

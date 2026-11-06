@@ -139,7 +139,12 @@ pub(crate) fn explicit_response(verdict: &Verdict, tunnel_open: bool) -> Option<
             | Rejected::NotTls { .. }
             | Rejected::HelloTooLarge { .. }
             | Rejected::HelloMalformed { .. } => Some(RESPONSE_400),
-            Rejected::OriginalDst { .. } | Rejected::Eof | Rejected::DecisionTimeout { .. } => None,
+            // ConnLimit (#43): refused at accept and closed unread; no head
+            // was read, so no HTTP status is owed.
+            Rejected::OriginalDst { .. }
+            | Rejected::Eof
+            | Rejected::DecisionTimeout { .. }
+            | Rejected::ConnLimit { .. } => None,
         },
         Verdict::Error(failed) => match failed {
             Failed::Resolve { .. } | Failed::EmptyResolve { .. } | Failed::Connect { .. } => {

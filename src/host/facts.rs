@@ -19,7 +19,9 @@ use crate::init::probe::{PROBE_STEPS, PROBE_VERSION, ProbeReport};
 /// wedged binary).
 pub const BWRAP_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The probe bound: above two nested bwrap launches (5 s each) plus setup.
+/// The probe bound: above its bounded steps, three nested bwrap launches (5 s
+/// each) and the keep-alive step (2 s), 17 s in all (`init::probe`, "Budget").
+/// Pinned by `probe_step_bounds_fit_the_probe_budget`.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `landlock_create_ruleset` flag that returns the ABI version (`<linux/landlock.h>`;
@@ -139,6 +141,32 @@ pub struct HostFacts {
     pub landlock: Landlock,
     pub bwrap: BwrapStatus,
     pub probe: ProbeOutcome,
+    pub conntrack: Conntrack,
+}
+
+const SYSCTL_CONNTRACK_COUNT: &str = "/proc/sys/net/netfilter/nf_conntrack_count";
+const SYSCTL_CONNTRACK_MAX: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
+
+/// The conntrack table as this process's network namespace sees it (issue
+/// #43, report-only). `None` = unreadable (the `nf_conntrack` module is not
+/// loaded, or `/proc/sys/net/netfilter` is hidden).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Conntrack {
+    /// `nf_conntrack_count`: entries in this network namespace.
+    pub count: Option<i64>,
+    /// `nf_conntrack_max`: the limit each network namespace is checked against.
+    pub max: Option<i64>,
+}
+
+impl Conntrack {
+    /// Read both sysctls.
+    pub fn read() -> Self {
+        let get = |path: &str| fs::read_to_string(path).ok().and_then(|t| parse_sysctl(&t));
+        Self {
+            count: get(SYSCTL_CONNTRACK_COUNT),
+            max: get(SYSCTL_CONNTRACK_MAX),
+        }
+    }
 }
 
 /// Gathering options (CLI hidden flag, Q6 precedent).
@@ -163,6 +191,7 @@ pub fn gather(opts: &GatherOptions) -> HostFacts {
         landlock,
         bwrap,
         probe,
+        conntrack: Conntrack::read(),
     }
 }
 
@@ -532,6 +561,29 @@ pub fn socket_scan_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #18 follow-up: every bounded probe step, summed, stays below the
+    /// probe budget with room to spare. The steps are the nested bwrap launches
+    /// and the keep-alive step; PROBE_TIMEOUT itself is not raised.
+    #[test]
+    fn probe_step_bounds_fit_the_probe_budget() {
+        use crate::init::probe::{
+            BWRAP_PROBE_LAUNCHES, BWRAP_PROBE_TIMEOUT, KEEP_ALIVE_PROBE_TIMEOUT,
+        };
+        const MIN_MARGIN: Duration = Duration::from_secs(3);
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(20), "pinned budget");
+        assert_eq!(BWRAP_PROBE_LAUNCHES, 3);
+        assert_eq!(KEEP_ALIVE_PROBE_TIMEOUT, Duration::from_secs(2));
+        let bounded = BWRAP_PROBE_TIMEOUT * BWRAP_PROBE_LAUNCHES + KEEP_ALIVE_PROBE_TIMEOUT;
+        assert_eq!(bounded, Duration::from_secs(17));
+        assert!(
+            bounded + MIN_MARGIN <= PROBE_TIMEOUT,
+            "step bounds {}s leave less than {}s of the {}s probe budget",
+            bounded.as_secs(),
+            MIN_MARGIN.as_secs(),
+            PROBE_TIMEOUT.as_secs()
+        );
+    }
 
     /// Issue #35: sockets under a root are found, deny-masked subtrees and
     /// symlinks are not followed, overlapping roots are walked once.

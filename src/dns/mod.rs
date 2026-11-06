@@ -98,14 +98,19 @@ const RECV_BACKOFF_MAX: Duration = Duration::from_millis(100);
 /// Per-run resource limits. The default is the full pool (Q5); tests shrink it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DnsLimits {
-    /// Most distinct names a run may allocate before new names are refused.
+    /// Most distinct names a run may allocate before new names get NXDOMAIN.
     pub max_names: u32,
 }
+
+/// Default of [`DnsLimits::max_names`] (issue #43): far above what a build
+/// or an agent resolves in one run, far below the 131,070-address pool, so
+/// a payload cannot grow the map without bound.
+pub const DEFAULT_MAX_NAMES: u32 = 4096;
 
 impl Default for DnsLimits {
     fn default() -> Self {
         Self {
-            max_names: FAKE_POOL_SIZE,
+            max_names: DEFAULT_MAX_NAMES,
         }
     }
 }
@@ -290,7 +295,9 @@ impl DnsDropped {
 /// Infrastructure failures.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DnsFailed {
-    /// The pool is full: REFUSED for a new name (Q4).
+    /// The run's name cap ([`DnsLimits::max_names`]) is reached: NXDOMAIN for
+    /// a new name (issue #43; was REFUSED). Names already mapped keep
+    /// answering. The `dns` audit row goes through the run's DNS row budget.
     PoolExhausted,
     /// The map's lock is poisoned: REFUSED (Q11).
     MapUnavailable,
@@ -304,7 +311,9 @@ impl DnsFailed {
     /// The pinned reason text.
     pub fn reason(&self) -> String {
         match self {
-            DnsFailed::PoolExhausted => "fake-IP pool 198.18.0.0/15 exhausted".to_owned(),
+            DnsFailed::PoolExhausted => {
+                "fake-IP name cap reached: no new names in this run".to_owned()
+            }
             DnsFailed::MapUnavailable => "fake-IP map unavailable (lock poisoned)".to_owned(),
             DnsFailed::Encode { detail } => format!("DNS response encoding failed: {detail}"),
             DnsFailed::Internal => {
@@ -316,7 +325,8 @@ impl DnsFailed {
     /// The rcode sent for this failure, `None` when no reply goes out.
     pub fn rcode(&self) -> Option<u16> {
         match self {
-            DnsFailed::PoolExhausted | DnsFailed::MapUnavailable => Some(5),
+            DnsFailed::PoolExhausted => Some(3),
+            DnsFailed::MapUnavailable => Some(5),
             DnsFailed::Encode { .. } | DnsFailed::Internal => None,
         }
     }
@@ -449,6 +459,15 @@ impl DnsServer {
                 None,
             );
         }
+        // Issue #43: past the run's name cap an unmapped name is NXDOMAIN for
+        // every qtype, so an AAAA (NODATA otherwise) cannot contradict the A.
+        if self.map.capped_out(&name) {
+            return (
+                DnsVerdict::Error(DnsFailed::PoolExhausted),
+                ResponseCode::NXDomain,
+                None,
+            );
+        }
         if !wire::is_a_query(&parsed.query) {
             let qtype = question.qtype;
             return (
@@ -465,7 +484,7 @@ impl DnsServer {
             ),
             Err(AllocError::Exhausted) => (
                 DnsVerdict::Error(DnsFailed::PoolExhausted),
-                ResponseCode::Refused,
+                ResponseCode::NXDomain,
                 None,
             ),
             Err(AllocError::Unavailable) => (
@@ -801,13 +820,22 @@ mod tests {
         }
     }
 
+    /// Issue #43: the per-run name cap defaults to 4096, under the pool.
+    #[test]
+    fn default_name_cap_is_4096() {
+        assert_eq!(DnsLimits::default().max_names, 4096);
+    }
+
+    // The cap must stay below the pool, or it would not bound anything.
+    const _: () = assert!(DEFAULT_MAX_NAMES < FAKE_POOL_SIZE);
+
     #[test]
     fn dns_failed_reasons_pinned() {
         assert_eq!(
             DnsFailed::PoolExhausted.reason(),
-            "fake-IP pool 198.18.0.0/15 exhausted"
+            "fake-IP name cap reached: no new names in this run"
         );
-        assert_eq!(DnsFailed::PoolExhausted.rcode(), Some(5));
+        assert_eq!(DnsFailed::PoolExhausted.rcode(), Some(3));
         assert_eq!(
             DnsFailed::MapUnavailable.reason(),
             "fake-IP map unavailable (lock poisoned)"
@@ -877,7 +905,7 @@ mod tests {
             Some(16)
         );
         assert_eq!(DnsVerdict::Dropped(DnsDropped::NotAQuery).rcode(), None);
-        assert_eq!(DnsVerdict::Error(DnsFailed::PoolExhausted).rcode(), Some(5));
+        assert_eq!(DnsVerdict::Error(DnsFailed::PoolExhausted).rcode(), Some(3));
         assert_eq!(DnsVerdict::Error(DnsFailed::Internal).rcode(), None);
     }
 
@@ -1138,7 +1166,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustion_refused_pinned_reason_existing_keep_answering() {
+    fn name_cap_nxdomain_pinned_reason_existing_keep_answering() {
         let limits = DnsLimits { max_names: 2 };
         let (server, _map, _sink) = server_with(&["allowed.test"], limits);
         let names = ["a.allowed.test", "b.allowed.test", "c.allowed.test"];
@@ -1146,11 +1174,34 @@ mod tests {
         let (b, _) = handle(&server, &a_query(21, names[1]));
         let (c, reply) = handle(&server, &a_query(22, names[2]));
         assert_eq!(c.verdict, DnsVerdict::Error(DnsFailed::PoolExhausted));
-        assert_eq!(c.reason(), "fake-IP pool 198.18.0.0/15 exhausted");
-        assert_eq!(rcode_of(&reply.expect("reply")), 5);
+        assert_eq!(
+            c.reason(),
+            "fake-IP name cap reached: no new names in this run"
+        );
+        assert_eq!(rcode_of(&reply.expect("reply")), 3);
         let (again, _) = handle(&server, &a_query(23, names[0]));
         assert_eq!(again.verdict, a.verdict, "existing mapping keeps answering");
         assert!(matches!(b.verdict, DnsVerdict::Answered { .. }));
+    }
+
+    /// Review of #65: past the cap, every qtype of an unmapped name is
+    /// NXDOMAIN (an AAAA must not answer NODATA while the A says the name
+    /// does not exist); a mapped name's AAAA stays NODATA.
+    #[test]
+    fn name_cap_nxdomain_for_every_qtype() {
+        let limits = DnsLimits { max_names: 1 };
+        let (server, _map, _sink) = server_with(&["allowed.test"], limits);
+        let (first, _) = handle(&server, &a_query(30, "a.allowed.test"));
+        assert!(matches!(first.verdict, DnsVerdict::Answered { .. }));
+        let (aaaa, reply) = handle(&server, &query(31, &dotted("b.allowed.test"), 28, 1, None));
+        assert_eq!(aaaa.verdict, DnsVerdict::Error(DnsFailed::PoolExhausted));
+        assert_eq!(rcode_of(&reply.expect("reply")), 3);
+        let (mapped, reply) = handle(&server, &query(32, &dotted("a.allowed.test"), 28, 1, None));
+        assert!(
+            matches!(mapped.verdict, DnsVerdict::NoData { .. }),
+            "{mapped:?}"
+        );
+        assert_eq!(rcode_of(&reply.expect("reply")), 0);
     }
 
     #[test]
