@@ -3,6 +3,10 @@
 #
 #   bench/srt-compare/setup.sh            # once: fetch pinned sbx and srt
 #   bench/srt-compare/run.sh [OUT]        # default OUT: ./srt-compare-results
+#   ONLY=latency bench/srt-compare/run.sh OUT   # host.txt and latency.txt only
+#
+# Startup latency is sensitive to other load on the host: re-record it alone
+# with ONLY=latency on an idle machine (the bare `true` row shows the noise).
 #
 # Tool paths come from TOOLS/tools.env (written by setup.sh; TOOLS defaults to
 # ${TMPDIR:-/tmp}/sbx-srt-tools) or from SBX, SRT_CLI, SOCAT, RG in the
@@ -88,7 +92,7 @@ DECOY=$!
 # probe it would read "blocked" for nothing.
 fail() { echo "run.sh: $*" >&2; exit 1; }
 [[ $LPORT =~ ^[0-9]+$ ]] || fail "the loopback listener did not start"
-curl -s -m 5 "http://127.0.0.1:$LPORT/" | grep -q HOST-LOOPBACK || fail "the loopback listener does not answer"
+curl -s -m 5 --noproxy '*' "http://127.0.0.1:$LPORT/" | grep -q HOST-LOOPBACK || fail "the loopback listener does not answer"
 "$PY" -I "$HERE/probe.py" abstract "sbx-bench-$TOKEN" >/dev/null || fail "the abstract socket does not answer"
 sleep 0.2
 tr '\0' ' ' <"/proc/$DECOY/cmdline" 2>/dev/null | grep -q "sbx-bench-decoy-$TOKEN" || fail "the decoy process is not running"
@@ -154,7 +158,8 @@ run_srt() {
   (cd "$RW" && TMPDIR=$SRT_TMPDIR timeout 90 node "$SRT_CLI" --debug --settings "${SRT_CONF:-$WORK/srt.json}" -c "$script") \
     >"$f.out" 2>"$f.err"
   local rc=$?
-  grep -v '^\[SandboxDebug\]' "$f.err" | grep -E '^(Error|Fatal)' >>"$f.out"
+  # srt's own failures and bwrap's (an execvp that fails) are not prefixed.
+  grep -v '^\[SandboxDebug\]' "$f.err" | grep -E '^(Error|Fatal|Failed|Process|bwrap)' >>"$f.out"
   grep '^\[SandboxDebug\]' "$f.err" | sed 's/^\[SandboxDebug\] //' |
     grep -E 'Connection (blocked|allowed)|config rule|denying|resolved|HTTP request blocked|violation|refus' |
     sort -u >"$f.log"
@@ -165,8 +170,8 @@ run_srt() {
 esc() { sed -e 's/|/\\|/g' | tr '\n' ' ' | cut -c1-220; }
 
 scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex]
-  # With deny-regex the failure-word needs proof: the tool's log must match
-  # the regex (an explicit deny). A failed script without it is "unverified",
+  # With deny-regex the failure-word needs proof: the tool's log or the
+  # script's output must match the regex (an explicit deny). A failed script without it is "unverified",
   # because the target may simply not have answered.
   # With host-path the verdict is taken on the host: success-word when the
   # path is a non-empty file there after the run. A write that succeeded
@@ -183,7 +188,7 @@ scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex
     rc=$?
     word=$(sed -n 's/^OUTCOME=//p' "$f.out" | tail -1)
     [[ -z $word ]] && word="error(rc=$rc)"
-    if [[ -n $denyre && $word == "$bad" ]] && ! grep -qE "$denyre" "$f.log"; then
+    if [[ -n $denyre && $word == "$bad" ]] && ! grep -qE "$denyre" "$f.log" "$f.out"; then
       word=unverified
     fi
     if [[ -n $hostpath && ( $word == "$ok" || $word == "$bad" ) ]]; then
@@ -203,6 +208,7 @@ scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex
 
 : >"$OUT/evidence.md"
 
+if [[ ${ONLY:-all} != latency ]]; then
 # ---------------------------------------------------------------- network
 scen N1  "HTTPS to the allowed name (baseline)" allowed BROKEN \
   'c https://example.com/'
@@ -257,7 +263,7 @@ scen N8c "git over ssh to the allowed name, port 22" LEAKED blocked \
 scen N8d "UDP datagram to the allowed name, port 443" LEAKED blocked \
   'P udp example.com 443'
 scen N8e "UDP datagram to an IP literal (1.1.1.1:443, no DNS needed)" LEAKED blocked \
-  'P udp 1.1.1.1 443'
+  'P udp 1.1.1.1 443' "" 'RESULT=no-send'
 
 # ---------------------------------------------------------------- filesystem / process
 scen F1 "write inside the rw dir (baseline)" allowed BROKEN \
@@ -290,15 +296,19 @@ scen F10 "plant a shell rc file in the rw dir (.bashrc)" planted blocked \
 # ---------------------------------------------------------------- srt defaults
 # Two srt settings this comparison turns on to match the sbx policy. Here is
 # what each scenario does without them; the verdict is read from srt's log.
-variant() { # ID "title" python-edit 'script' log|out regex match-word other-word
+variant() { # ID "title" python-edit 'script' log|out regex match-word other-word [other-regex]
   # The word is match-word when the regex matches srt's log (log) or the
-  # script's output (out) and srt logged no deny; other-word otherwise.
-  local id=$1 title=$2 edit=$3 body=$4 src=$5 re=$6 yes=$7 no=$8 f=$OUT/raw/$1.srt word
+  # script's output (out) and srt logged no deny. Otherwise it is other-word;
+  # with other-regex, other-word needs that regex in the output or the log,
+  # and the row is "unclear" without it (srt may not have run the script).
+  local id=$1 title=$2 edit=$3 body=$4 src=$5 re=$6 yes=$7 no=$8 nore=${9:-} f=$OUT/raw/$1.srt word
   "$PY" -I -c "import json,sys; c=json.load(open(sys.argv[1])); $edit; json.dump(c,open(sys.argv[2],'w'),indent=1)" \
     "$WORK/srt.json" "$WORK/srt-$id.json"
   SRT_CONF=$WORK/srt-$id.json run_srt "$f" "$PRELUDE
 $body"
-  if grep -qE "$re" "$f.$src" && ! grep -qE 'blocked|denying' "$f.log"; then word=$yes; else word=$no; fi
+  if grep -qE "$re" "$f.$src" && ! grep -qE 'blocked|denying' "$f.log"; then word=$yes
+  elif [[ -z $nore ]] || grep -qE "$nore" "$f.out" "$f.log"; then word=$no
+  else word=unclear; fi
   printf '%s\t%s\t%s\t%s\n' "$id" "$title" "n/a" "$word" | tee -a "$OUT/variants.tsv"
   { echo "### $id $title — srt"; echo; echo '```'; echo "\$ $body"; echo "--- output"; head -8 "$f.out";
     echo "--- srt log"; head -8 "$f.log"; echo '```'; echo; } >>"$OUT/evidence.md"
@@ -312,14 +322,21 @@ variant V2 "srt without deniedResolvedAddresses, name resolving to 10.0.0.1" \
   'c["network"].pop("deniedResolvedAddresses")' \
   'c -m 8 https://10.0.0.1.nip.io/' \
   log 'Allowed by config rule: 10.0.0.1.nip.io' dialed refused
-variant V3 "srt with denyRead [\"/\"] (allowRead as in the policy), HTTPS to the allowed name" \
-  'c["filesystem"]["denyRead"]=["/"]' \
+variant V3 "srt with denyRead [\"/\"] and /usr re-allowed, HTTPS to the allowed name" \
+  'c["filesystem"]["denyRead"]=["/"]; c["filesystem"]["allowRead"]+=["/usr"]' \
   'c https://example.com/' \
-  out 'http=200' works broken
-variant V4 "srt without /etc/passwd, /etc/group, /etc/hosts readable, git over ssh" \
-  'c["filesystem"]["allowRead"]=[p for p in c["filesystem"]["allowRead"] if p not in ("/etc/passwd","/etc/group","/etc/hosts")]' \
-  'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes" git ls-remote ssh://git@example.com/x.git' \
-  out 'No user exists|getaddrinfo\("localhost"' broken works
+  out 'http=200' works broken 'http=000'
+variant V3b "as V3, with /tmp (srt's bridge sockets) also re-allowed" \
+  'c["filesystem"]["denyRead"]=["/"]; c["filesystem"]["allowRead"]+=["/usr", "/tmp"]' \
+  'c https://example.com/' \
+  out 'http=200' works broken 'http=000'
+GITSSH='GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes" git ls-remote ssh://git@example.com/x.git'
+variant V4a "srt without /etc/passwd and /etc/group readable, git over ssh" \
+  'c["filesystem"]["allowRead"]=[p for p in c["filesystem"]["allowRead"] if p not in ("/etc/passwd","/etc/group")]' \
+  "$GITSSH" out 'No user exists' broken works 'denying: example.com:22'
+variant V4b "srt without /etc/hosts readable, git over ssh" \
+  'c["filesystem"]["allowRead"]=[p for p in c["filesystem"]["allowRead"] if p != "/etc/hosts"]' \
+  "$GITSSH" out 'getaddrinfo\("localhost"' broken works 'denying: example.com:22'
 
 # Did a sandbox write leave the canaries on the host? (checked here, outside)
 {
@@ -381,7 +398,10 @@ s="$s; attach curl of the resident: $("$SBX" attach --policy "$WORK/sbx.json" --
 erg E9 "persistent session (sbx run --keep-alive, then attach true)" "$s" \
   "not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls)"
 
+fi # ONLY != latency
+
 # ---------------------------------------------------------------- startup latency
+cd "$RW" || exit 1   # both tools run with the rw dir as cwd
 {
   echo "startup latency, 20 runs of true, median (ms):"
   if command -v hyperfine >/dev/null; then
@@ -400,7 +420,7 @@ erg E9 "persistent session (sbx run --keep-alive, then attach true)" "$s" \
       "node $SRT_CLI --version" \
       "env TMPDIR=$SRT_TMPDIR node $SRT_CLI --settings $WORK/srt-empty.json -- /usr/bin/true" >/dev/null 2>"$WORK/hf.err" ||
       { echo "hyperfine failed:"; cat "$WORK/hf.err"; }
-    "$PY" -I -c '
+    [[ -s $WORK/hf.json && -s $WORK/hf2.json ]] && "$PY" -I -c '
 import json, sys
 names = ["bare true", "sbx run", "srt", "node -e 0", "srt --version", "srt, empty policy"]
 rows = json.load(open(sys.argv[1]))["results"] + json.load(open(sys.argv[2]))["results"]
@@ -423,6 +443,10 @@ for r, n in zip(rows, names):
   fi
 } | tee "$OUT/latency.txt"
 cd "$HERE" || exit 1
+if [[ ${ONLY:-all} == latency ]]; then
+  find "$OUT" -type f -exec sed -i -e "s#$WORK#<WORK>#g" -e "s#$TOOLS#<TOOLS>#g" -e "s#$REALHOME/#<HOME>/#g" {} +
+  exit 0
+fi
 
 # ---------------------------------------------------------------- footprint
 {
