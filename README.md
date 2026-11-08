@@ -11,13 +11,57 @@ timeout and an audit trail, and tears everything down on exit.
 
 ## Quick start
 
-You need Linux 5.3 or newer with unprivileged user namespaces, bubblewrap 0.8
-or newer, and Rust 1.85 or newer (via rustup) to build. No release has been tagged
-yet, so build from source (x86_64 shown; for aarch64 see
-[docs/building.md](docs/building.md)):
+You need Linux 5.3 or newer with unprivileged user namespaces and
+bubblewrap 0.8 or newer:
 
 ```sh
 sudo apt-get install bubblewrap          # or point SBX_BWRAP at a bwrap binary
+```
+
+Then install `sbx` in one of these ways. Every build is the same fully static
+binary for x86_64 or aarch64 Linux.
+
+**Release binary** (recommended):
+
+```sh
+V=0.1.0; A=$(uname -m)                   # x86_64 or aarch64
+U=https://github.com/vdavamse/sbx/releases/download/v$V/sbx-$V-$A-unknown-linux-musl.tar.gz
+curl -fsSLO "$U" && curl -fsSL "$U.sha256" | sha256sum -c
+tar xzf "sbx-$V-$A-unknown-linux-musl.tar.gz"
+sudo install "sbx-$V-$A-unknown-linux-musl/sbx" /usr/local/bin/
+```
+
+Every release file also carries a build provenance attestation:
+`gh attestation verify sbx-$V-$A-unknown-linux-musl.tar.gz --repo vdavamse/sbx`.
+All releases are on the [Releases page](https://github.com/vdavamse/sbx/releases).
+
+**PyPI** ([`sbx-bin`](https://pypi.org/project/sbx-bin/)): the wheel bundles the
+same binary and exposes only its path, so call it from Python or link it onto
+your `PATH`:
+
+```sh
+pip install sbx-bin
+ln -s "$(python3 -c 'import sbx_bin; print(sbx_bin.binary_path())')" ~/.local/bin/sbx
+```
+
+```python
+import subprocess, sbx_bin
+subprocess.run([sbx_bin.binary_path(), "check"], check=True)
+```
+
+**Container image** (`ghcr.io/vdavamse/sbx`, amd64 and arm64): Debian slim
+with bubblewrap, `sbx` as the entrypoint, and a non-root user. The container
+runtime must allow unprivileged user namespaces; see
+[docs/kubernetes.md](docs/kubernetes.md).
+
+```sh
+docker run --rm ghcr.io/vdavamse/sbx:0.1.0 check
+```
+
+**From source** (Rust 1.85 or newer; for aarch64 see
+[docs/building.md](docs/building.md)):
+
+```sh
 git clone https://github.com/vdavamse/sbx && cd sbx
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
