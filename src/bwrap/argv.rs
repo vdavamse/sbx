@@ -8,8 +8,10 @@
 //!  2  --unshare-user --unshare-pid --unshare-ipc --unshare-uts
 //!     --unshare-cgroup-try                        ← never --unshare-net
 //!  3  --disable-userns --cap-drop ALL --die-with-parent --new-session
-//!     --hostname sandbox [--info-fd N] --seccomp S
+//!     --hostname sandbox [--info-fd N] [--json-status-fd J] --seccomp S
 //!                                                ← `--info-fd` iff Build.info_fd;
+//!                                                  `--json-status-fd` iff
+//!                                                  Build.json_status_fd (#74);
 //!                                                  `--seccomp` always (issue #34)
 //!  4  --clearenv
 //!  5  --symlink usr/bin /bin      ┐ the four usr-merge shims, in this
@@ -199,6 +201,13 @@ pub(super) fn assemble(input: &Build<'_>) -> (Vec<OsString>, Plan) {
     //     Emitted only when `info_fd` is Some; row 15 validated N > 2.
     if let Some(fd) = input.info_fd {
         argv.push(OsString::from("--info-fd"));
+        argv.push(OsString::from(fd.to_string()));
+    }
+    // 3a'. `--json-status-fd J` (issue #74): bwrap reports the command's exit
+    //     code here only when its exec succeeded. Emitted only when
+    //     `json_status_fd` is Some; row 24 validated it.
+    if let Some(fd) = input.json_status_fd {
+        argv.push(OsString::from("--json-status-fd"));
         argv.push(OsString::from(fd.to_string()));
     }
     // 3b. `--seccomp S` (issue #34): bwrap reads the socket-family filter
@@ -966,6 +975,7 @@ mod tests {
             cwd,
             passed_env,
             info_fd: None,
+            json_status_fd: None,
             seccomp_fd: SECCOMP_FD,
             landlock: None,
             deny_tmpfs_size: None,
@@ -996,6 +1006,7 @@ mod tests {
                 cwd: None,
                 passed_env: &env,
                 info_fd: None,
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: None,
                 deny_tmpfs_size: size,
@@ -1165,6 +1176,7 @@ mod tests {
             cwd: None,
             passed_env: &env,
             info_fd: Some(9),
+            json_status_fd: None,
             seccomp_fd: SECCOMP_FD,
             landlock: None,
             deny_tmpfs_size: None,
@@ -1184,6 +1196,43 @@ mod tests {
     }
 
     #[test]
+    fn golden_json_status_fd_after_info_fd() {
+        // Issue #74: `Some(13)` == the info-fd golden with `--json-status-fd 13`
+        // right after `--info-fd 9`, every other element identical.
+        let policy = example("default.json");
+        let env = env_map(&[("LANG", "C.UTF-8")]);
+        let command = os(&["/bin/echo", "hi"]);
+        let input = |json_status_fd| Build {
+            policy: &policy,
+            session_dir: Path::new(SESSION_DIR),
+            bwrap_path: Path::new(BWRAP),
+            command: &command,
+            cwd: None,
+            passed_env: &env,
+            info_fd: Some(9),
+            json_status_fd,
+            seccomp_fd: SECCOMP_FD,
+            landlock: None,
+            deny_tmpfs_size: None,
+        };
+        let argv = |json| {
+            build(&input(json))
+                .expect("golden inputs must build")
+                .argv()
+                .to_vec()
+        };
+        let base = argv(None);
+        let with = argv(Some(13));
+        let info = base
+            .iter()
+            .position(|a| a == "--info-fd")
+            .expect("--info-fd present");
+        let mut expected = base.clone();
+        expected.splice(info + 2..info + 2, os(&["--json-status-fd", "13"]));
+        assert_eq!(with, expected);
+    }
+
+    #[test]
     fn golden_seccomp_after_info_fd() {
         // Issue #34: `--seccomp S` follows `--info-fd N` (and is directly
         // after `--hostname sandbox` when no info fd is given), and the
@@ -1200,6 +1249,7 @@ mod tests {
                 cwd: None,
                 passed_env: &env,
                 info_fd,
+                json_status_fd: None,
                 seccomp_fd,
                 landlock: None,
                 deny_tmpfs_size: None,
@@ -2029,6 +2079,7 @@ mod tests {
                 cwd: None,
                 passed_env: &env,
                 info_fd: None,
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock,
                 deny_tmpfs_size: None,
@@ -2119,6 +2170,7 @@ mod tests {
                 cwd: None,
                 passed_env: &BTreeMap::new(),
                 info_fd: Some(7),
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: Some(crate::landlock::Layer {
                     mode: crate::landlock::Mode::BestEffort,
@@ -2153,6 +2205,7 @@ mod tests {
                 cwd: None,
                 passed_env: &BTreeMap::new(),
                 info_fd: None,
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: Some(crate::landlock::Layer {
                     mode: crate::landlock::Mode::BestEffort,
@@ -2418,6 +2471,7 @@ mod tests {
                 cwd: None,
                 passed_env: &empty,
                 info_fd,
+                json_status_fd: None,
                 seccomp_fd,
                 landlock: None,
                 deny_tmpfs_size: None,
@@ -2462,6 +2516,7 @@ mod tests {
                 cwd: None,
                 passed_env: &empty,
                 info_fd,
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: None,
                 deny_tmpfs_size: None,
@@ -2818,6 +2873,7 @@ mod tests {
                 cwd: None,
                 passed_env: &empty,
                 info_fd: None,
+                json_status_fd: None,
                 seccomp_fd: SECCOMP_FD,
                 landlock: None,
                 deny_tmpfs_size: None,

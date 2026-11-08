@@ -24,6 +24,8 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 | Situation | rc | audit `outcome` | stderr (sbx's own line) |
 |---|---|---|---|
 | the command exits N | N | `exited` | none |
+| the command is not found in the sandbox (ENOENT: not on the sandbox's `PATH`, the path does not exist there, or the file exists but its `#!` interpreter or dynamic loader is not in the sandbox) | 127 | `exec_failed` | `sbx run: command not found in the sandbox: CMD`, after bwrap's `bwrap: execvp CMD: No such file or directory` (`sbx __landlock: …` under `--landlock`) |
+| the command is found but cannot be executed (a directory, a file without the execute bit, or any other exec error) | 126 | `exec_failed` | `sbx run: command not executable in the sandbox: CMD (Permission denied)`, with the exec error in parentheses, after bwrap's own `bwrap: execvp …` line (`sbx __landlock: …` under `--landlock`) |
 | the command is killed by a signal (bwrap reports it as 128+N) | 128+N | `exited` | none |
 | the sandbox itself is killed by a signal sbx did not send (for example the OOM killer; 137 for SIGKILL) | 128+N | `signaled` | `sbx run: sandbox killed by signal N (NAME)` |
 | `--timeout` / policy `limits.timeout` elapsed | 124 | `timeout` | `sbx run: timed out after 90s` |
@@ -31,24 +33,40 @@ sbx's transparent proxy, explicit proxy and fake-IP DNS resolver.
 | an sbx failure (policy, mode, session, audit, bwrap, setup, network, audit write) | 125 | `failed` | `sbx run: <reason>` |
 | the host cannot provide the policy's network mode, or cannot run sandboxes | 125 | `failed` | `sbx run: policy requires network mode <mode> but this host provides only explicit: <reason>; fix: <fix>; run \`sbx check\` for a full host report` (or `… but this host cannot run sandboxes: …`); the staged line of `__init` comes first |
 | the explicit fallback ran (the nft redirect is unavailable, the policy is `explicit` or `none`) | the command's own | the command's | `sbx run: notice: running in network mode explicit because the nftables NAT redirect is unavailable (<reason>); run \`sbx check\` for details` |
-| a Landlock shim failure under `--landlock` (the shim could not apply the rules, could not check the host ABI, or could not exec the payload) | 125 | `failed` | `sbx run: landlock: <reason>`. The shim starts with a marker on the status pipe and adds its reason after it, so a payload's own 125 (marker only) is never reported as this one, and a shim that never started is reported by the row above |
+| a Landlock shim failure under `--landlock` (the shim could not apply the rules or could not check the host ABI; a payload it cannot exec is 127 or 126, as above) | 125 | `failed` | `sbx run: landlock: <reason>`. The shim starts with a marker on the status pipe and adds its reason after it, so a payload's own 125 (marker only) is never reported as this one, and a shim that never started is reported by the row above |
 | the Landlock shim did not start under `--landlock` (bwrap could not exec `/proc/self/fd/N`, or the dynamic loader failed before the shim's first act, so the status pipe holds no start marker) | 125 | `failed` | `sbx run: landlock: the shim did not start (rc N)`, where N is bwrap's own rc (1 for bwrap's exec failure, 127 for the loader) |
 | a usage error | 2 | — | clap's message |
 
 The audit row's `outcome` is one of: `exited` (the command ended by itself, or
 was killed by a signal bwrap relayed as 128+N), `signaled` (the sandbox, not
 the command, was killed by a signal sbx did not send), `timeout`, `terminated`
-(sbx received TERM/INT/HUP/QUIT) and `failed` (an sbx failure, including an
-audit write failure). A payload that exits 124, 125 or 128+N is
+(sbx received TERM/INT/HUP/QUIT), `failed` (an sbx failure, including an
+audit write failure) and `exec_failed` (the command could not be executed, rc
+127 or 126). A payload that exits 124, 125, 126, 127 or 128+N is
 indistinguishable from sbx's own codes by exit status alone; the audit
 `outcome` says which it was.
+
+**How an exec failure is detected.** bwrap execs the command itself and exits 1
+when that fails, so sbx asks bwrap for its exec status (`--json-status-fd`):
+bwrap reports the command's exit code there only after a successful exec (every
+supported version, 0.8 and later). A run is `exec_failed` only when bwrap
+exited 1, reported no exit code, and its last stderr line is `bwrap: execvp
+CMD: <error>`. `No such file or directory` is 127, any other error 126 (the
+shell convention). A command that runs always gets its exit code reported, so
+a command that exits 1, 126 or 127 itself, or prints bwrap's line, keeps
+`exited`. A bwrap failure before the exec (for example a bad `--cwd`) is not an
+exec failure and keeps bwrap's rc 1. Under `--landlock` the shim execs the
+command and reports the exec error through its status pipe instead. sbx does
+not run the command through a shell, and it does not look the command up
+before the run.
 
 If the sandbox does not report its exit within 5 seconds of the SIGKILL that
 sbx sent at teardown, sbx prints `sbx run: sandbox did not exit within 5s of
 SIGKILL` and keeps the rc it computed. The diagnostic reports that teardown
-took longer than its 5-second budget; it does not change the exit status. A failure
-after the payload started (for example `execvp` of a missing binary, rc 1) keeps
-the status of the failing stage and is printed by that stage.
+took longer than its 5-second budget; it does not change the exit status. A bwrap
+failure before the command runs (for example `Can't chdir` for a bad `--cwd`,
+rc 1) keeps bwrap's status and is printed by bwrap; only a failed exec of the
+command itself becomes 127 or 126.
 
 **Filesystem policy.** `ro` and `rw` paths are bound at the same path inside the
 sandbox. A `deny` entry is an empty `tmpfs` over its path: it hides the path name,

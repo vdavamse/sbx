@@ -36,9 +36,11 @@
 //!    `tmp/` leaves), and there is no *filesystem* fd-passing
 //!    (`--ro-bind-data` is impossible: #5's `fd_hygiene` closes every fd
 //!    not explicitly kept before exec — hence on-disk synthetic files, Q6).
-//!    The fds bwrap receives are the info pipe (`--info-fd`) and the seccomp
-//!    program memfd (`--seccomp`, issue #34), both consumed by bwrap before
-//!    the payload runs. With `--landlock` (issue #19) the command is the
+//!    The fds bwrap receives are the info pipe (`--info-fd`), the exec status
+//!    pipe (`--json-status-fd`, issue #74: bwrap's pid 2 closes it before the
+//!    exec, and the monitor writes the command's exit code there) and the
+//!    seccomp program memfd (`--seccomp`, issue #34); the payload holds none of
+//!    them. With `--landlock` (issue #19) the command is the
 //!    Landlock shim, exec'd through sbx's own executable fd (`--exe-fd`) and
 //!    reporting through the status pipe (`--status-fd`). bwrap never reads
 //!    either: it only inherits them, and the shim closes the executable fd
@@ -81,8 +83,10 @@
 //!    --unshare-ipc --unshare-uts --unshare-cgroup-try` (never host
 //!    `/proc`; `cgroup-try` tolerates hosts without a cgroup ns) and
 //!    `--disable-userns --cap-drop ALL --die-with-parent --new-session
-//!    --hostname sandbox [--info-fd N]` (`--info-fd` only when
-//!    `Build::info_fd` is set — issue #10's pid-1 discovery, Q13) and
+//!    --hostname sandbox [--info-fd N] [--json-status-fd J]` (`--info-fd`
+//!    only when `Build::info_fd` is set — issue #10's pid-1 discovery, Q13;
+//!    `--json-status-fd` only when `Build::json_status_fd` is set — issue
+//!    #74's exec status) and
 //!    `--seccomp S` ALWAYS (issues #34/#42: the socket-family filter and
 //!    syscall deny-list, see [`seccomp`]; bwrap installs it as the last step
 //!    before exec in both pid 1 and the payload).
@@ -217,6 +221,13 @@ pub struct Build<'a> {
     /// `--info-fd n` (bwrap writes `{"child-pid": …}` there after clone); the fd
     /// must survive into bwrap — `sbx __init --keep-fd n`. Must be > 2 (row 15).
     pub info_fd: Option<RawFd>,
+    /// `sbx run`'s exec status pipe write end (issue #74). `Some(n)` emits
+    /// `--json-status-fd n`: bwrap writes `{"child-pid": …}` there after clone
+    /// and `{"exit-code": …}` at exit, the latter only when its exec of the
+    /// command succeeded (see `run::exec_status`). Like `info_fd`, the fd must
+    /// survive into bwrap (`sbx __init --json-status-fd n`). Must be > 2 and
+    /// differ from every other fd of the launch (row 24).
+    pub json_status_fd: Option<RawFd>,
     /// The socket-family seccomp program fd (issue #34): the sealed memfd
     /// from [`seccomp::program_memfd`]. Required, not optional — every
     /// launch is filtered by construction. Emitted as `--seccomp n`
@@ -562,6 +573,30 @@ pub fn build(input: &Build<'_>) -> Result<Launch, BwrapError> {
             )));
         }
     }
+    // Row 24 (issue #74): the exec status fd, when given, must be above the
+    // std streams and differ from every other fd bwrap or the shim receives.
+    if let Some(fd) = input.json_status_fd {
+        if fd <= 2 {
+            return Err(BwrapError(format!(
+                "json status fd must be greater than 2 (got {fd})"
+            )));
+        }
+        let layer = input
+            .landlock
+            .as_ref()
+            .filter(|layer| layer.mode != crate::landlock::Mode::Off);
+        let others = [
+            ("info", input.info_fd),
+            ("seccomp", Some(input.seccomp_fd)),
+            ("exe", layer.map(|l| l.exe_fd)),
+            ("status", layer.map(|l| l.status_fd)),
+        ];
+        if let Some((role, _)) = others.iter().find(|(_, other)| *other == Some(fd)) {
+            return Err(BwrapError(format!(
+                "json status fd must differ from the {role} fd (got {fd})"
+            )));
+        }
+    }
     // The argv layout itself has no failure modes (module docs point 1) —
     // but the assembly output gets one final sweep before it is trusted.
     let (argv, plan) = argv::assemble(input);
@@ -878,6 +913,7 @@ mod tests {
             cwd: None,
             passed_env,
             info_fd: None,
+            json_status_fd: None,
             seccomp_fd: BASE_SECCOMP_FD,
             landlock: None,
             deny_tmpfs_size: None,
@@ -1109,6 +1145,26 @@ mod tests {
         assert_eq!(err(&sec), "seccomp fd must differ from the info fd (got 9)");
         sec.info_fd = Some(8);
         assert!(build(&sec).is_ok());
+
+        // Row 24 (issue #74): the json status fd must be above the std streams
+        // and distinct from the info and seccomp fds.
+        let mut json = base_input(&policy, &command, &no_env);
+        json.info_fd = Some(8);
+        json.seccomp_fd = 9;
+        json.json_status_fd = Some(2);
+        assert_eq!(err(&json), "json status fd must be greater than 2 (got 2)");
+        json.json_status_fd = Some(8);
+        assert_eq!(
+            err(&json),
+            "json status fd must differ from the info fd (got 8)"
+        );
+        json.json_status_fd = Some(9);
+        assert_eq!(
+            err(&json),
+            "json status fd must differ from the seccomp fd (got 9)"
+        );
+        json.json_status_fd = Some(10);
+        assert!(build(&json).is_ok());
     }
 
     #[test]
@@ -1276,6 +1332,7 @@ mod termination_argv_tests {
             cwd: None,
             passed_env: &env,
             info_fd: None,
+            json_status_fd: None,
             seccomp_fd: 10,
             landlock: None,
             deny_tmpfs_size: None,

@@ -88,7 +88,15 @@ fn run_role(role: &str, args: &[OsString]) -> u8 {
             .to_owned()
     };
     match role {
-        "exit" => arg(0).parse::<u8>().unwrap_or(1),
+        // Optional words after the code go to stderr as one line (issue #74:
+        // a payload that prints bwrap's own exec-failure line).
+        "exit" => {
+            if args.len() > 1 {
+                let words: Vec<String> = (1..args.len()).map(arg).collect();
+                eprintln!("{}", words.join(" "));
+            }
+            arg(0).parse::<u8>().unwrap_or(1)
+        }
         // #34: raw socket-family and io_uring probes (see `sockets_role`).
         "sockets" => sockets_role(),
         // #34: this process's and pid 1's Seccomp mode, and its fd set.
@@ -1100,9 +1108,9 @@ fn scenarios() -> Vec<Scenario> {
             run: audit_write_fail_closed,
         },
         Scenario {
-            name: "payload-not-found-rc1",
+            name: "payload-not-found-127",
             gate: Bwrap,
-            run: payload_not_found_rc1,
+            run: payload_not_found_127,
         },
         Scenario {
             name: "audit-write-fail-after-main-loop-125",
@@ -1320,16 +1328,316 @@ fn scenarios() -> Vec<Scenario> {
             run: landlock_exe_fd_closed,
         },
         Scenario {
-            name: "landlock-payload-not-found-125",
+            name: "landlock-payload-not-found-127",
             gate: Bwrap,
-            run: landlock_payload_not_found_125,
+            run: landlock_payload_not_found_127,
         },
         Scenario {
             name: "landlock-payload-own-125",
             gate: Bwrap,
             run: landlock_payload_own_125,
         },
+        Scenario {
+            name: "exec-failure-transparent",
+            gate: Bwrap,
+            run: exec_failure_transparent,
+        },
+        Scenario {
+            name: "exec-failure-explicit",
+            gate: Bwrap,
+            run: exec_failure_explicit,
+        },
+        Scenario {
+            name: "exec-failure-none",
+            gate: Bwrap,
+            run: exec_failure_none,
+        },
+        Scenario {
+            name: "exec-failure-not-setup",
+            gate: Bwrap,
+            run: exec_failure_not_setup,
+        },
+        Scenario {
+            name: "exec-failure-attach",
+            gate: Bwrap,
+            run: exec_failure_attach,
+        },
     ]
+}
+
+// ---- Exec failure (issue #74) ----------------------------------------------
+
+/// One command and how its run must end: rc, audit outcome, and sbx's own
+/// stderr line after the `sbx run:` / `sbx attach:` prefix (`None`: no sbx
+/// line at all).
+struct ExecCase {
+    cmd: Vec<OsString>,
+    rc: i32,
+    outcome: &'static str,
+    line: Option<String>,
+}
+
+/// The issue #74 acceptance set. `dir/ro` holds a file without the execute
+/// bit; the policy binds `dir/ro` read-only (see [`exec_policy`]).
+fn exec_cases(dir: &Path) -> Vec<ExecCase> {
+    use std::os::unix::fs::PermissionsExt;
+    let ro = dir.join("ro");
+    fs::create_dir_all(&ro).expect("ro dir");
+    let noexec = ro.join("noexec");
+    fs::write(&noexec, "echo hi\n").expect("write noexec");
+    fs::set_permissions(&noexec, fs::Permissions::from_mode(0o644)).expect("chmod noexec");
+    let noexec = noexec.to_string_lossy().into_owned();
+    let exe = payload_exe().to_string_lossy().into_owned();
+    let exited = |code: i32, extra: &[&str]| {
+        let mut args = vec![code.to_string()];
+        args.extend(extra.iter().map(|w| (*w).to_owned()));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        ExecCase {
+            cmd: payload(&args),
+            rc: code,
+            outcome: "exited",
+            line: None,
+        }
+    };
+    vec![
+        // Not found: a bare name (PATH search) and an absolute path.
+        ExecCase {
+            cmd: vec!["sbx-no-such-command".into()],
+            rc: 127,
+            outcome: "exec_failed",
+            line: Some("command not found in the sandbox: sbx-no-such-command".into()),
+        },
+        ExecCase {
+            cmd: vec!["/nonexistent-sbx-payload".into()],
+            rc: 127,
+            outcome: "exec_failed",
+            line: Some("command not found in the sandbox: /nonexistent-sbx-payload".into()),
+        },
+        // Found but not executable: a file without the execute bit, a directory.
+        ExecCase {
+            cmd: vec![noexec.clone().into()],
+            rc: 126,
+            outcome: "exec_failed",
+            line: Some(format!(
+                "command not executable in the sandbox: {noexec} (Permission denied)"
+            )),
+        },
+        ExecCase {
+            cmd: vec!["/work".into()],
+            rc: 126,
+            outcome: "exec_failed",
+            line: Some("command not executable in the sandbox: /work (Permission denied)".into()),
+        },
+        // A command that exits 1, 126 or 127 by itself is unchanged.
+        exited(1, &[]),
+        exited(126, &[]),
+        exited(127, &[]),
+        // ...even when it prints bwrap's exec-failure line for itself: bwrap
+        // reported its exit code, so it ran.
+        exited(
+            1,
+            &[&format!("bwrap: execvp {exe}: No such file or directory")],
+        ),
+    ]
+}
+
+fn exec_policy(dir: &Path, mode: &'static str) -> PathBuf {
+    let mut pol = Pol::new("exit");
+    pol.mode = mode;
+    pol.ro_extra = vec![dir.join("ro").to_string_lossy().into_owned()];
+    pol.write(dir)
+}
+
+/// Checks one finished run (or call) against its case: rc, sbx's line and the
+/// audit row's `code`, `outcome` and `reason`.
+fn expect_exec_case(
+    case: &ExecCase,
+    done: &Done,
+    prefix: &str,
+    row: &serde_json::Value,
+) -> Result<(), String> {
+    let what = format!("{:?}", case.cmd);
+    expect_rc(done, case.rc).map_err(|e| format!("{what}: {e}"))?;
+    match &case.line {
+        Some(line) => {
+            expect_stderr(done, &format!("{prefix} {line}\n"))
+                .map_err(|e| format!("{what}: {e}"))?;
+            if row["reason"] != line.as_str() {
+                return Err(format!(
+                    "{what}: exit row reason {}, want {line:?}",
+                    row["reason"]
+                ));
+            }
+        }
+        None => {
+            if done.stderr.contains(prefix) {
+                return Err(format!("{what}: unexpected sbx line: {:?}", done.stderr));
+            }
+        }
+    }
+    if row["code"] != case.rc || row["outcome"] != case.outcome {
+        return Err(format!(
+            "{what}: exit row code {} outcome {}, want {} {}",
+            row["code"], row["outcome"], case.rc, case.outcome
+        ));
+    }
+    Ok(())
+}
+
+/// Every case under `sbx run` in one network mode.
+fn exec_failure_run(mode: &'static str) -> Result<(), String> {
+    let dir = scratch(&format!("exec-{mode}"));
+    let policy = exec_policy(&dir, mode);
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.to_string_lossy().into_owned();
+    let result = exec_cases(&dir).iter().try_for_each(|case| {
+        let args = sbx_args(
+            &policy,
+            &dir.join("s"),
+            &["--audit", audit_arg.as_str()],
+            &case.cmd,
+        );
+        let done = run_sbx(&args)?;
+        let rows = read_audit(&audit)?;
+        let row = rows.last().ok_or("the audit log has no rows")?;
+        expect_exec_case(case, &done, "sbx run:", row)
+    });
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// #74: under `sbx run` in the transparent mode, a missing command is 127, a
+/// non-executable one 126, and a command's own 1/126/127 passes through.
+fn exec_failure_transparent() -> Result<(), String> {
+    exec_failure_run("transparent")
+}
+
+/// #74: the same in the explicit mode.
+fn exec_failure_explicit() -> Result<(), String> {
+    exec_failure_run("explicit")
+}
+
+/// #74: the same in the `none` mode.
+fn exec_failure_none() -> Result<(), String> {
+    exec_failure_run("none")
+}
+
+/// #74: what is not an exec failure stays as it was, and the detection does not
+/// depend on the output cap. A bwrap setup failure (a bad `--cwd`) keeps
+/// bwrap's rc 1 and `exited`; a missing command under a 5-byte output cap is
+/// still 127 (the pump keeps bwrap's line before the cap).
+fn exec_failure_not_setup() -> Result<(), String> {
+    let dir = scratch("exec-setup");
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.to_string_lossy().into_owned();
+    let last_row = || -> Result<serde_json::Value, String> {
+        read_audit(&audit)?
+            .pop()
+            .ok_or_else(|| "the audit log has no rows".to_owned())
+    };
+    let policy = Pol::new("exit").write(&dir);
+    let args = sbx_args(
+        &policy,
+        &dir.join("s"),
+        &["--cwd", "/nonexistent-cwd", "--audit", audit_arg.as_str()],
+        &payload(&["0"]),
+    );
+    let setup = run_sbx(&args).and_then(|done| {
+        expect_rc(&done, 1)?;
+        expect_stderr(&done, "bwrap: Can't chdir")?;
+        let row = last_row()?;
+        if row["outcome"] != "exited" || row["code"] != 1 {
+            return Err(format!("setup failure row: {row}"));
+        }
+        Ok(())
+    });
+    let mut capped = Pol::new("exit");
+    capped.output_bytes = 5;
+    let capped = capped.write(&dir);
+    let result = setup.and_then(|()| {
+        let args = sbx_args(
+            &capped,
+            &dir.join("s"),
+            &["--audit", audit_arg.as_str()],
+            &["sbx-no-such-command".into()],
+        );
+        let done = run_sbx(&args)?;
+        expect_rc(&done, 127)?;
+        let row = last_row()?;
+        if row["outcome"] != "exec_failed" {
+            return Err(format!("capped run row: {row}"));
+        }
+        Ok(())
+    });
+    let _ = fs::remove_dir_all(&dir);
+    result
+}
+
+/// #74: the same for calls attached to a persistent session (real bwrap); each
+/// call's exit row carries its own code and outcome.
+fn exec_failure_attach() -> Result<(), String> {
+    let dir = scratch("exec-attach");
+    let policy = exec_policy(&dir, "transparent");
+    // Before the launch: the cases create `dir/ro`, which the policy binds.
+    let cases = exec_cases(&dir);
+    let session = dir.join("s");
+    let audit = dir.join("audit.jsonl");
+    let audit_arg = audit.to_string_lossy().into_owned();
+    let launch = sbx_args(
+        &policy,
+        &session,
+        &[
+            "--keep-alive",
+            "--idle-timeout",
+            "60s",
+            "--audit",
+            audit_arg.as_str(),
+        ],
+        &["sleep".into(), "300".into()],
+    );
+    let started = run_sbx(&launch).and_then(|done| expect_rc(&done, 0));
+    // Every call first, then `stop`: the holder writes a call's exit row after
+    // the call returns, and a stop that returns has written them all.
+    let mut dones = Vec::new();
+    let calls = started.and_then(|()| {
+        cases.iter().try_for_each(|case| {
+            let mut args: Vec<OsString> = vec![
+                "attach".into(),
+                "--policy".into(),
+                policy.clone().into(),
+                "--session-dir".into(),
+                session.clone().into(),
+                "--".into(),
+            ];
+            args.extend(case.cmd.iter().cloned());
+            dones.push(run_sbx(&args)?);
+            Ok(())
+        })
+    });
+    let stopped = run_sbx(&["stop".into(), "--session-dir".into(), session.into()]);
+    let result = calls
+        .and_then(|()| stopped.and_then(|done| expect_rc(&done, 0)))
+        .and_then(|()| {
+            let rows = read_audit(&audit)?;
+            cases
+                .iter()
+                .zip(&dones)
+                .enumerate()
+                .try_for_each(|(i, (case, done))| {
+                    let row = rows
+                        .iter()
+                        .find(|r| r["event"] == "exit" && r["call_id"] == i + 1)
+                        .ok_or(format!(
+                            "no exit row for call {} (rc {}, stderr {:?})",
+                            i + 1,
+                            done.rc,
+                            done.stderr
+                        ))?;
+                    expect_exec_case(case, done, "sbx attach:", row)
+                })
+        });
+    let _ = fs::remove_dir_all(&dir);
+    result
 }
 
 // ---- Landlock layer (issue #19) ---------------------------------------------
@@ -1514,12 +1822,13 @@ fn landlock_exe_fd_closed() -> Result<(), String> {
     Ok(())
 }
 
-/// #19 round 2 (M1): a shim failure is not the payload's own exit 125. A missing
-/// payload under `--landlock` exits 125 with the `sbx run: landlock:` line, and
-/// the audit outcome is `failed` (the status pipe carries the reason).
-fn landlock_payload_not_found_125() -> Result<(), String> {
+/// #19 round 2 (M1) and #74: the shim's exec failure is not the payload's own
+/// exit. A missing payload under `--landlock` exits 127 with the `sbx run:
+/// command not found in the sandbox:` line, and the audit outcome is
+/// `exec_failed` (the status pipe carries the rc and the reason).
+fn landlock_payload_not_found_127() -> Result<(), String> {
     if sbx::landlock::kernel_abi() < 1 {
-        println!("SKIP landlock-payload-not-found-125: the kernel has no Landlock");
+        println!("SKIP landlock-payload-not-found-127: the kernel has no Landlock");
         return Ok(());
     }
     let dir = scratch("landlock-missing");
@@ -1534,17 +1843,22 @@ fn landlock_payload_not_found_125() -> Result<(), String> {
         &cmd,
     );
     let done = run_sbx(&args)?;
-    let result = expect_rc(&done, 125)
-        .and_then(|()| expect_stderr(&done, "sbx run: landlock: cannot exec"))
+    let result = expect_rc(&done, 127)
+        .and_then(|()| {
+            expect_stderr(
+                &done,
+                "sbx run: command not found in the sandbox: /nonexistent-sbx-landlock-payload",
+            )
+        })
         .and_then(|()| {
             let rows = read_audit(&audit)?;
             let exit = rows.last().ok_or("the audit log has no rows")?;
-            if exit["outcome"] == "failed" {
+            if exit["outcome"] == "exec_failed" && exit["code"] == 127 {
                 Ok(())
             } else {
                 Err(format!(
-                    "exit row outcome is {}, want failed",
-                    exit["outcome"]
+                    "exit row outcome {} code {}, want exec_failed 127",
+                    exit["outcome"], exit["code"]
                 ))
             }
         });
@@ -3141,15 +3455,20 @@ fn audit_write_fail_closed() -> Result<(), String> {
     expect_stderr(&done, "sbx run: audit log write failed:")
 }
 
-fn payload_not_found_rc1() -> Result<(), String> {
+/// #74: bwrap's own exec-failure line still reaches the caller, followed by
+/// sbx's, and the rc is 127 (no longer bwrap's 1).
+fn payload_not_found_127() -> Result<(), String> {
     let dir = scratch("nf");
     let policy = Pol::new("exit").write(&dir);
     let cmd = vec![OsString::from("/nonexistent")];
     let args = sbx_args(&policy, &dir.join("s"), &[], &cmd);
     let done = run_sbx(&args)?;
     let _ = fs::remove_dir_all(&dir);
-    expect_rc(&done, 1)?;
-    expect_stderr(&done, "bwrap: execvp /nonexistent")
+    expect_rc(&done, 127)?;
+    expect_stderr(
+        &done,
+        "bwrap: execvp /nonexistent: No such file or directory\nsbx run: command not found in the sandbox: /nonexistent\n",
+    )
 }
 
 fn session_mtime_touched() -> Result<(), String> {

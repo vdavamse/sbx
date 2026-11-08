@@ -354,6 +354,9 @@ pub struct InitArgs {
     pub fd: RawFd,
     /// The bwrap info pipe to keep across the exec (`--keep-fd`, issue #10).
     pub keep_fd: Option<RawFd>,
+    /// The bwrap exec status pipe to keep across the exec (`--json-status-fd`,
+    /// issue #74).
+    pub json_status_fd: Option<RawFd>,
     /// The sealed seccomp-program memfd to keep for bwrap (`--seccomp-fd`,
     /// issue #34). Optional for direct `__init` callers; `run` always passes it.
     pub seccomp_fd: Option<RawFd>,
@@ -442,6 +445,9 @@ fn pipeline(args: &InitArgs) -> Result<(), InitError> {
             args.seccomp_fd,
             args.exe_fd,
         )?; // Stage::Control (issue #19 M1)
+    }
+    if let Some(json) = args.json_status_fd {
+        validate_json_status_fd(json, ControlFd::plain(fd), args, None)?; // Stage::Control (issue #74)
     }
     // m4: the exe and status fds are only meaningful inside the shim's own argv.
     validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?; // Stage::Control
@@ -563,6 +569,9 @@ fn join_pipeline(args: &InitArgs, user: RawFd, net: RawFd) -> Result<(), InitErr
             ));
         }
     }
+    if let Some(json) = args.json_status_fd {
+        validate_json_status_fd(json, ControlFd::join_user(user), args, Some(net))?;
+    }
     validate_shim_command(&args.cmd, args.exe_fd, args.status_fd)?;
     crate::run::keepalive::join::join_namespaces(user, net).map_err(|err| {
         InitError::new(Stage::Netns, format!("join the session namespaces: {err}"))
@@ -612,14 +621,17 @@ fn validate_ns_fd(fd: RawFd, kind: &str) -> Result<(), InitError> {
     Ok(())
 }
 
-/// The fds that survive [`fd_hygiene`] on purpose (issue #10, #34 and #19): the
-/// bwrap info pipe, the seccomp program memfd and, with `--landlock`, sbx's own
-/// executable for the shim. The first two are consumed by bwrap before the
-/// payload runs; the executable is closed by the shim itself. All were
-/// validated in the control stage.
+/// The fds that survive [`fd_hygiene`] on purpose (issue #10, #34, #19 and #74):
+/// the bwrap info pipe, the exec status pipe, the seccomp program memfd and,
+/// with `--landlock`, sbx's own executable for the shim. bwrap consumes the
+/// info pipe and the memfd before the payload runs and keeps the exec status
+/// pipe out of the payload (its pid 2 closes it before the exec); the
+/// executable is closed by the shim itself. All were validated in the control
+/// stage.
 fn keep_set(args: &InitArgs) -> Vec<RawFd> {
     args.keep_fd
         .into_iter()
+        .chain(args.json_status_fd)
         .chain(args.seccomp_fd)
         .chain(args.exe_fd)
         .chain(args.status_fd)
@@ -949,8 +961,8 @@ fn bwrap_separator(argv: &[OsString]) -> Option<usize> {
             | "--die-with-parent"
             | "--new-session"
             | "--clearenv" => 0,
-            "--cap-drop" | "--hostname" | "--info-fd" | "--seccomp" | "--proc" | "--dev"
-            | "--tmpfs" | "--chdir" => 1,
+            "--cap-drop" | "--hostname" | "--info-fd" | "--json-status-fd" | "--seccomp"
+            | "--proc" | "--dev" | "--tmpfs" | "--chdir" => 1,
             "--ro-bind" | "--bind" | "--symlink" | "--setenv" => 2,
             _ => return None,
         };
@@ -1040,6 +1052,54 @@ fn validate_keep_fd(keep: RawFd, control: ControlFd) -> Result<(), InitError> {
     let flags = unsafe { libc::fcntl(keep, libc::F_GETFL) };
     if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
         return Err(fail(format!("--keep-fd {keep} is not open for writing")));
+    }
+    Ok(())
+}
+
+/// Issue #74: `--json-status-fd` is the bwrap exec status pipe `run` hands
+/// through. The same shape as `--keep-fd` (a pipe open for writing, above stdio),
+/// and distinct from the control fd, `net` (the join form's `--join-net`) and
+/// every other kept fd.
+fn validate_json_status_fd(
+    json: RawFd,
+    control: ControlFd,
+    args: &InitArgs,
+    net: Option<RawFd>,
+) -> Result<(), InitError> {
+    let fail = |reason: String| InitError::new(Stage::Control, reason);
+    if json <= 2 {
+        return Err(fail(format!(
+            "--json-status-fd {json} must be greater than 2"
+        )));
+    }
+    let others = [
+        (control.flag, Some(control.fd)),
+        ("--join-net", net),
+        ("--keep-fd", args.keep_fd),
+        ("--seccomp-fd", args.seccomp_fd),
+        ("--exe-fd", args.exe_fd),
+        ("--status-fd", args.status_fd),
+    ];
+    if let Some((flag, _)) = others.iter().find(|(_, other)| *other == Some(json)) {
+        return Err(fail(format!(
+            "--json-status-fd {json} must differ from {flag}"
+        )));
+    }
+    // SAFETY: fstat/fcntl on a number we were handed; the result is only read.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(json, &mut st) } != 0 {
+        return Err(fail(format!(
+            "--json-status-fd {json} is not a valid file descriptor (EBADF)"
+        )));
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Err(fail(format!("--json-status-fd {json} is not a pipe")));
+    }
+    let flags = unsafe { libc::fcntl(json, libc::F_GETFL) };
+    if flags < 0 || flags & libc::O_ACCMODE != libc::O_WRONLY {
+        return Err(fail(format!(
+            "--json-status-fd {json} is not open for writing"
+        )));
     }
     Ok(())
 }
@@ -1217,6 +1277,7 @@ mod tests {
             join: None,
             fd,
             keep_fd,
+            json_status_fd: None,
             seccomp_fd: None,
             exe_fd: None,
             status_fd: None,
@@ -1422,6 +1483,55 @@ mod tests {
             err.starts_with("sbx __init: control: parent process changed before setup"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn validate_json_status_fd_table() {
+        // Issue #74: the keep-fd shape, plus distinctness from every kept fd.
+        let mut args = args(999, Some(50), None);
+        args.seccomp_fd = Some(51);
+        let msg = |json: RawFd, args: &InitArgs, net: Option<RawFd>| {
+            validate_json_status_fd(json, ControlFd::plain(999), args, net)
+                .expect_err("must reject")
+                .to_string()
+        };
+        assert_eq!(
+            msg(2, &args, None),
+            "sbx __init: control: --json-status-fd 2 must be greater than 2"
+        );
+        for (fd, flag) in [(999, "--fd"), (50, "--keep-fd"), (51, "--seccomp-fd")] {
+            assert_eq!(
+                msg(fd, &args, None),
+                format!("sbx __init: control: --json-status-fd {fd} must differ from {flag}")
+            );
+        }
+        assert_eq!(
+            msg(52, &args, Some(52)),
+            "sbx __init: control: --json-status-fd 52 must differ from --join-net"
+        );
+        assert_eq!(
+            msg(998, &args, None),
+            "sbx __init: control: --json-status-fd 998 is not a valid file descriptor (EBADF)"
+        );
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        assert_eq!(
+            msg(rd, &args, None),
+            format!("sbx __init: control: --json-status-fd {rd} is not open for writing")
+        );
+        assert!(validate_json_status_fd(wr, ControlFd::plain(999), &args, None).is_ok());
+        assert!(
+            keep_set(&InitArgs {
+                json_status_fd: Some(wr),
+                ..args.clone()
+            })
+            .contains(&wr)
+        );
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
     }
 
     #[test]

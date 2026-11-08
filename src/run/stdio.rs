@@ -26,6 +26,10 @@ pub(crate) struct OutputBudget {
     /// The last byte written to the diagnostic sink (stderr, or the shared sink).
     /// Writes to a shared sink are serialised under this lock, so it is exact.
     tail: Mutex<Option<u8>>,
+    /// The last bytes read from the child's stderr, forwarded or not (issue #74:
+    /// bwrap's `execvp` diagnostic, see `exec_status`). At most
+    /// `exec_status::STDERR_TAIL_BYTES`.
+    stderr_tail: Mutex<Vec<u8>>,
 }
 
 impl OutputBudget {
@@ -36,6 +40,7 @@ impl OutputBudget {
             closed: AtomicBool::new(false),
             shared: AtomicBool::new(false),
             tail: Mutex::new(None),
+            stderr_tail: Mutex::new(Vec::new()),
         })
     }
 
@@ -90,6 +95,26 @@ impl OutputBudget {
             Err(TryLockError::WouldBlock) => return true,
         };
         matches!(*tail, Some(last) if last != b'\n')
+    }
+
+    /// Keeps the last `STDERR_TAIL_BYTES` of what the stderr pump read.
+    fn record_stderr(&self, data: &[u8]) {
+        let cap = super::exec_status::STDERR_TAIL_BYTES;
+        let mut tail = self
+            .stderr_tail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        tail.extend_from_slice(&data[data.len().saturating_sub(cap)..]);
+        let excess = tail.len().saturating_sub(cap);
+        tail.drain(..excess);
+    }
+
+    /// The bytes [`Self::record_stderr`] kept.
+    fn stderr_tail(&self) -> Vec<u8> {
+        self.stderr_tail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_shared(&self) {
@@ -167,6 +192,10 @@ pub(crate) fn pump(src: OwnedFd, dst: RawFd, budget: Arc<OutputBudget>, done: mp
         if budget.is_closed() {
             break; // the run is concluding: forward nothing more (m8)
         }
+        // Before the grant: a capped run still keeps bwrap's last line (#74).
+        if dst == 2 {
+            budget.record_stderr(&buf[..n]);
+        }
         let grant = budget.take(n as u64) as usize;
         // Caller side gone: stop and drop the read end, so the payload sees EPIPE.
         if grant > 0 && budget.forward(dst, &buf[..grant]).is_err() {
@@ -193,12 +222,14 @@ fn pump_stdin(dst: OwnedFd) {
 }
 
 /// What the pumps forwarded, as the end of the run needs it.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct PumpEnd {
     /// The output cap was hit.
     pub truncated: bool,
     /// The forwarded stderr ends mid-line.
     pub stderr_partial: bool,
+    /// The last bytes the stderr pump read (issue #74, `exec_status`).
+    pub stderr_tail: Vec<u8>,
 }
 
 /// The running pumps. The stdin pump is never joined (it may sit in read(0)).
@@ -268,6 +299,7 @@ impl Pumps {
         PumpEnd {
             truncated: self.budget.truncated(),
             stderr_partial: self.budget.sink_partial(),
+            stderr_tail: self.budget.stderr_tail(),
         }
     }
 }

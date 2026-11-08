@@ -74,6 +74,7 @@ pub(crate) fn exit_code(o: &Outcome) -> i32 {
         Outcome::Signaled(sig) | Outcome::Terminated(sig) => 128 + sig,
         Outcome::TimedOut(_) => EXIT_TIMEOUT,
         Outcome::Failed(_) => EXIT_FAILURE,
+        Outcome::ExecFailed { code, .. } => *code,
     }
 }
 
@@ -115,7 +116,7 @@ pub(crate) fn exit_reason(o: &Outcome) -> String {
             format!("timed out after {}", humantime::format_duration(*limit))
         }
         Outcome::Terminated(sig) => format!("terminated by {}", named_signal(*sig)),
-        Outcome::Failed(reason) => reason.clone(),
+        Outcome::Failed(reason) | Outcome::ExecFailed { reason, .. } => reason.clone(),
     }
 }
 
@@ -136,6 +137,7 @@ pub(crate) fn outcome_label(o: &Outcome) -> &'static str {
         Outcome::TimedOut(_) => "timeout",
         Outcome::Terminated(_) => "terminated",
         Outcome::Failed(_) => "failed",
+        Outcome::ExecFailed { .. } => "exec_failed",
     }
 }
 
@@ -243,6 +245,13 @@ mod tests {
         assert_eq!(exit_code(&Outcome::Terminated(3)), 131);
         assert_eq!(exit_code(&Outcome::Terminated(15)), 143);
         assert_eq!(exit_code(&Outcome::Failed("x".into())), 125);
+        for code in [126, 127] {
+            let o = Outcome::ExecFailed {
+                code,
+                reason: "x".into(),
+            };
+            assert_eq!(exit_code(&o), code);
+        }
     }
 
     #[test]
@@ -302,6 +311,18 @@ mod tests {
             sbx_diagnostic(&Outcome::Failed("bwrap not found".into())).as_deref(),
             Some("sbx run: bwrap not found")
         );
+        let missing = Outcome::ExecFailed {
+            code: 127,
+            reason: "command not found in the sandbox: rg".into(),
+        };
+        assert_eq!(
+            sbx_diagnostic(&missing).as_deref(),
+            Some("sbx run: command not found in the sandbox: rg")
+        );
+        assert_eq!(
+            exit_reason(&missing),
+            "command not found in the sandbox: rg"
+        );
     }
 
     #[test]
@@ -311,6 +332,12 @@ mod tests {
         assert_eq!(outcome_label(&Outcome::TimedOut(Duration::ZERO)), "timeout");
         assert_eq!(outcome_label(&Outcome::Terminated(2)), "terminated");
         assert_eq!(outcome_label(&Outcome::Failed(String::new())), "failed");
+        let exec = Outcome::ExecFailed {
+            code: 126,
+            reason: String::new(),
+        };
+        assert_eq!(outcome_label(&exec), "exec_failed");
+        assert_eq!(outcome_signal(&exec), None);
         assert_eq!(outcome_signal(&Outcome::Terminated(15)), Some(15));
         assert_eq!(outcome_signal(&Outcome::Signaled(9)), Some(9));
         assert_eq!(outcome_signal(&Outcome::Exited(1)), None);

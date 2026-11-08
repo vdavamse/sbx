@@ -353,6 +353,14 @@ pub enum Cmd {
         #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
         keep_fd: Option<RawFd>,
 
+        /// (hidden) The bwrap `--json-status-fd` pipe write end `run` hands through.
+        //
+        // Issue #74: bwrap reports the command's exit code there only after a
+        // successful exec. Validated in the control stage
+        // (init::validate_json_status_fd), kept through fd hygiene like --keep-fd.
+        #[arg(long, value_name = "FD", hide = true, value_parser = parse_control_fd)]
+        json_status_fd: Option<RawFd>,
+
         /// (hidden) The sealed memfd holding sbx's seccomp program, handed to bwrap
         /// as `--seccomp` (issue #34).
         //
@@ -413,7 +421,7 @@ pub enum Cmd {
         /// and the nested bwrap launches, print one JSON line, exit 0.
         //
         // Issue #11 (T3/T4). Conflicts with every pipeline argument.
-        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "rlimit", "cmd"])]
+        #[arg(long, hide = true, conflicts_with_all = ["fd", "keep_fd", "json_status_fd", "seccomp_fd", "exe_fd", "status_fd", "parent_pid", "min_mode", "rlimit", "cmd"])]
         probe: bool,
 
         /// (hidden, with --probe) The bwrap binary the probe launches.
@@ -712,6 +720,7 @@ pub fn run() -> ExitCode {
             join_user,
             join_net,
             keep_fd,
+            json_status_fd,
             seccomp_fd,
             exe_fd,
             status_fd,
@@ -735,6 +744,7 @@ pub fn run() -> ExitCode {
                 fd: fd.unwrap_or(-1),
                 join,
                 keep_fd,
+                json_status_fd,
                 seccomp_fd,
                 exe_fd,
                 status_fd,

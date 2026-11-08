@@ -21,7 +21,9 @@
 //!    before anything is spawned), and the shim enforces again. A shim failure
 //!    of any other kind also fails closed: rc 125 with `sbx __landlock:
 //!    <reason>` on stderr and in the status pipe (point 9), and the payload
-//!    never runs.
+//!    never runs. A payload the shim cannot exec is not a shim failure (issue
+//!    #74): the shim exits 127 (not found) or 126 (not executable), as a shell
+//!    would, and reports `exec-failed RC REASON` ([`EXEC_FAILED_PREFIX`]).
 //! 4. **Rules mirror the mount list (D5).** [`PathRule`]s are derived from the
 //!    same merged mount list `bwrap::build` emits (`bwrap::argv`), and they name
 //!    the paths the payload SEES, the sandbox-side destinations, because the
@@ -58,7 +60,9 @@
 //!    [`shim`] runs (a clap error, bwrap's exec of the shim failing, the dynamic
 //!    loader failing) leaves a pipe with no marker, which `run` reports as "the
 //!    shim did not start". On success the exec closes the write end, and the pipe
-//!    holds the marker only.
+//!    holds the marker only. An exec failure of the payload adds
+//!    [`EXEC_FAILED_PREFIX`], the rc and the reason after the marker, and `run`
+//!    reports it as the outcome `exec_failed` (issue #74).
 //! 10. **Host ABI check (round 2, m1).** `--host-abi` is the ABI `run` saw
 //!     ([`host_abi`]). A best-effort ruleset that the kernel reports as NOT
 //!     enforced while the host has Landlock fails closed ([`enforcement_failure`]),
@@ -394,6 +398,24 @@ fn report_failure(status_fd: RawFd, reason: &str) -> ExitCode {
     ExitCode::from(crate::run::EXIT_FAILURE as u8)
 }
 
+/// The payload could not be executed (issue #74): the reason goes to stderr and,
+/// after [`EXEC_FAILED_PREFIX`] and the rc, to the status pipe, and the shim
+/// exits with that rc (127 or 126), as a shell would.
+fn report_exec_failure(status_fd: RawFd, code: i32, reason: &str) -> ExitCode {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "sbx __landlock: {reason}");
+    write_status(
+        status_fd,
+        format!("{EXEC_FAILED_PREFIX}{code} {reason}").as_bytes(),
+    );
+    ExitCode::from(code as u8)
+}
+
+/// The status-pipe prefix of an exec failure (issue #74): `exec-failed RC
+/// REASON` after the marker. [`decode_status`] reads it as
+/// [`StatusReport::ExecFailed`].
+pub const EXEC_FAILED_PREFIX: &str = "exec-failed ";
+
 /// The first bytes the shim writes to its status pipe (issue #19 round 3, item 2),
 /// before anything else. They prove the shim started, so a failure before
 /// [`shim`] runs (a clap error, bwrap's own exec of the shim failing, a dynamic
@@ -409,6 +431,9 @@ pub enum StatusReport {
     Started,
     /// The marker, then the shim's failure reason.
     Failed(String),
+    /// The marker, then [`EXEC_FAILED_PREFIX`]: the shim could not exec the
+    /// payload (issue #74). `code` is 127 or 126, the shim's own rc.
+    ExecFailed { code: i32, reason: String },
 }
 
 /// Decodes the status pipe's bytes (module docs point 9). Pure: empty bytes and
@@ -422,6 +447,16 @@ pub fn decode_status(bytes: &[u8]) -> StatusReport {
             let rest = rest.trim();
             if rest.is_empty() {
                 StatusReport::Started
+            } else if let Some((code, reason)) = rest
+                .strip_prefix(EXEC_FAILED_PREFIX)
+                .and_then(|r| r.split_once(' '))
+                .and_then(|(code, reason)| Some((code.parse::<i32>().ok()?, reason)))
+                .filter(|(code, _)| matches!(code, 126 | 127))
+            {
+                StatusReport::ExecFailed {
+                    code,
+                    reason: reason.to_owned(),
+                }
             } else {
                 StatusReport::Failed(rest.to_owned())
             }
@@ -517,7 +552,8 @@ pub fn shim(args: ShimArgs) -> ExitCode {
     }
     match exec_command(&args.cmd) {
         Ok(never) => match never {},
-        Err(reason) => report_failure(args.status_fd, &reason),
+        Err(ExecError::Exec { code, reason }) => report_exec_failure(args.status_fd, code, &reason),
+        Err(ExecError::Other(reason)) => report_failure(args.status_fd, &reason),
     }
 }
 
@@ -565,23 +601,44 @@ fn is_executable_file(path: &Path) -> bool {
         && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
 }
 
+/// Why [`exec_command`] returned.
+#[derive(Debug)]
+enum ExecError {
+    /// `execvp` itself failed (issue #74): the rc (127 not found, 126 not
+    /// executable) and the reason, as `run::exec_status::exec_failure` words them.
+    Exec { code: i32, reason: String },
+    /// The argv could not be prepared for `execvp`.
+    Other(String),
+}
+
+/// The `strerror` text of an OS error, without std's ` (os error N)` suffix.
+fn errno_text(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
+}
+
 /// `execvp` the payload argv (PATH search, like `__init`'s exec). Returns only
-/// on failure, as the reason text.
+/// on failure.
 ///
 /// m3: glibc's `execvp` runs a file that has no shebang and is not a binary
 /// through `/bin/sh` (ENOEXEC fallback); musl's does not. The fallback is added
 /// here so both libcs behave alike: on ENOEXEC the shim execs `/bin/sh <path>
 /// <args…>`. The fallback lives in this exec path only.
-fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, String> {
+fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, ExecError> {
     let argv0 = cmd
         .first()
-        .ok_or_else(|| "no payload command given".to_owned())?;
+        .ok_or_else(|| ExecError::Other("no payload command given".to_owned()))?;
     let c_argv: Vec<CString> = cmd
         .iter()
         .map(|arg| CString::new(arg.as_bytes()))
         .collect::<Result<_, _>>()
         .map_err(|_| {
-            format!("cannot exec {argv0:?}: a payload argument contains an interior NUL byte")
+            ExecError::Other(format!(
+                "cannot exec {argv0:?}: a payload argument contains an interior NUL byte"
+            ))
         })?;
     let ptrs: Vec<*const libc::c_char> = c_argv
         .iter()
@@ -598,13 +655,17 @@ fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, String> {
     // the call, which returns only on failure.
     unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
     let mut err = std::io::Error::last_os_error();
+    // The first exec decides "not found": a failed `/bin/sh` fallback below is
+    // still a command that was found.
+    let not_found = err.raw_os_error() == Some(libc::ENOENT);
     if err.raw_os_error() == Some(libc::ENOEXEC) {
         if let Some(program) = resolve_program(argv0) {
             // `/bin/sh <path> <args…>`: the same arguments the payload gets, with
             // the program's path as the script.
             let sh = CString::new("/bin/sh").expect("no NUL in a literal");
-            let script = CString::new(program.as_os_str().as_bytes())
-                .map_err(|_| format!("cannot exec {argv0:?}: interior NUL byte"))?;
+            let script = CString::new(program.as_os_str().as_bytes()).map_err(|_| {
+                ExecError::Other(format!("cannot exec {argv0:?}: interior NUL byte"))
+            })?;
             let mut sh_argv: Vec<*const libc::c_char> = vec![sh.as_ptr(), script.as_ptr()];
             sh_argv.extend(c_argv.iter().skip(1).map(|s| s.as_ptr()));
             sh_argv.push(std::ptr::null());
@@ -613,11 +674,8 @@ fn exec_command(cmd: &[OsString]) -> Result<std::convert::Infallible, String> {
             err = std::io::Error::last_os_error();
         }
     }
-    Err(match err.raw_os_error() {
-        Some(libc::ENOENT) => format!("cannot exec {argv0:?}: not found"),
-        Some(libc::EACCES) => format!("cannot exec {argv0:?}: permission denied"),
-        _ => format!("cannot exec {argv0:?}: {err}"),
-    })
+    let (code, reason) = crate::run::exec_status::exec_failure(argv0, not_found, &errno_text(&err));
+    Err(ExecError::Exec { code, reason })
 }
 
 #[cfg(test)]
@@ -931,6 +989,27 @@ mod tests {
         );
         // A reason with the marker but no trailing newline still decodes.
         assert_eq!(
+            decode_status(
+                format!(
+                    "{STATUS_MARKER}{EXEC_FAILED_PREFIX}127 command not found in the sandbox: rg\n"
+                )
+                .as_bytes()
+            ),
+            StatusReport::ExecFailed {
+                code: 127,
+                reason: "command not found in the sandbox: rg".to_owned()
+            }
+        );
+        // Issue #74: only 126 and 127 are exec failures; anything else is a reason.
+        assert_eq!(
+            decode_status(format!("{STATUS_MARKER}{EXEC_FAILED_PREFIX}1 x").as_bytes()),
+            StatusReport::Failed(format!("{EXEC_FAILED_PREFIX}1 x"))
+        );
+        assert_eq!(
+            decode_status(format!("{STATUS_MARKER}{EXEC_FAILED_PREFIX}127").as_bytes()),
+            StatusReport::Failed(format!("{EXEC_FAILED_PREFIX}127"))
+        );
+        assert_eq!(
             decode_status(format!("{STATUS_MARKER}boom").as_bytes()),
             StatusReport::Failed("boom".to_owned())
         );
@@ -1047,5 +1126,26 @@ mod tests {
         });
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(rc, 7, "the script must have run under the shell");
+    }
+
+    #[test]
+    fn exec_failure_is_127_or_126() {
+        // Issue #74: a missing payload is 127, a directory (EACCES) is 126. The
+        // child reports 99 if the failure is not an exec failure.
+        for (name, want) in [("/sbx-no-such-payload-for-shim-test", 127), ("/", 126)] {
+            let cmd = vec![OsString::from(name)];
+            let rc = in_child(move || match exec_command(&cmd) {
+                Ok(never) => match never {},
+                Err(ExecError::Exec { code, .. }) => code,
+                Err(ExecError::Other(_)) => 99,
+            });
+            assert_eq!(rc, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn errno_text_drops_the_os_error_suffix() {
+        let err = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(errno_text(&err), "Permission denied");
     }
 }

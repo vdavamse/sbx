@@ -26,10 +26,12 @@
 //!    rc 125 with the shared classifier's text and the `sbx check` hint, and an
 //!    explicit fallback prints one notice and is recorded as `net_mode`.)
 //! 4. **Exit codes.** The command's own code; 124 timeout; 125 sbx failure;
-//!    128+N terminated by signal N (sbx's own signal or a signalled payload that
-//!    bwrap relayed); 2 usage (clap). A policy whose network mode the host
-//!    cannot provide is 125 (issue #11). A payload that itself exits 124/125 is
-//!    indistinguishable by rc alone — the audit `outcome` disambiguates.
+//!    127 command not found and 126 command not executable (issue #74, outcome
+//!    `exec_failed`, see [`exec_status`]); 128+N terminated by signal N (sbx's
+//!    own signal or a signalled payload that bwrap relayed); 2 usage (clap). A
+//!    policy whose network mode the host cannot provide is 125 (issue #11). A
+//!    payload that itself exits 124/125/126/127 is indistinguishable by rc alone
+//!    — the audit `outcome` disambiguates.
 //! 5. **Signals.** SIGTERM, SIGINT, SIGHUP and SIGQUIT are collected by signalfd
 //!    (no handlers). A signal the caller left ignored stays ignored. On receipt the
 //!    sandbox is SIGKILLed at once and sbx exits 128+N without re-raising.
@@ -83,6 +85,9 @@
 //!       dynamic loader did), so the outcome is `failed` with `sbx run: landlock:
 //!       the shim did not start (rc N)`, rc 125;
 //!     - marker and reason: `failed` with `sbx run: landlock: <reason>`, rc 125;
+//!     - marker and an exec failure (issue #74): the shim could not exec the
+//!       payload and exited 127 or 126, so the outcome is `exec_failed` with the
+//!       shim's reason, the same as a run without the layer;
 //!     - marker only: the shim started and nothing failed, so the outcome is
 //!       unchanged, whatever the payload did (its own 125 included).
 //!
@@ -91,6 +96,7 @@
 
 mod audit;
 pub(crate) mod cgroup;
+pub(crate) mod exec_status;
 pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
@@ -223,6 +229,10 @@ pub enum Outcome {
     Terminated(i32),
     /// An sbx-detected failure; the text is the reason.
     Failed(String),
+    /// The command could not be executed in the sandbox (issue #74): 127 when
+    /// it was not found, 126 when it was found but not executable. The text
+    /// is the reason.
+    ExecFailed { code: i32, reason: String },
 }
 
 /// The CLI seam. Pre-spawn failures return 125; every path after the `__init`
@@ -715,6 +725,9 @@ fn execute(
     // launch argv.
     let (info_read, info_write) = sys::pipe_cloexec()
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
+    // Issue #74: bwrap's exec status pipe, read after teardown (exec_status).
+    let (json_read, json_write) = sys::pipe_cloexec()
+        .map_err(|err| RunError::new(format!("cannot create the exec status pipe: {err}")))?;
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     // S8b (issue #19): with the Landlock layer on, sbx's own executable is opened
@@ -739,6 +752,7 @@ fn execute(
         cwd: args.cwd.as_deref(),
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
+        json_status_fd: Some(json_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: landlock_layer,
         deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
@@ -762,6 +776,8 @@ fn execute(
         .map_err(|err| RunError::new(format!("cannot prepare the control socket: {err}")))?;
     let info_fd = sys::clear_cloexec(info_write.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
+    let json_fd = sys::clear_cloexec(json_write.as_fd())
+        .map_err(|err| RunError::new(format!("cannot prepare the exec status pipe: {err}")))?;
     let seccomp_fd = sys::clear_cloexec(seccomp_memfd.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     let exe_fd = match &exe_file {
@@ -784,6 +800,7 @@ fn execute(
         ChildFds {
             control: child_fd,
             info: info_fd,
+            json_status: Some(json_fd),
             seccomp: seccomp_fd,
             exe: exe_fd,
             status: status_fd,
@@ -813,6 +830,7 @@ fn execute(
     // point drop it normally.
     drop(child_end);
     drop(info_write);
+    drop(json_write);
     drop(seccomp_memfd);
     drop(exe_file);
     // The write end lives on in __init, bwrap and the shim only; sbx keeps just the
@@ -1035,6 +1053,7 @@ fn execute(
     // Issue #43: the tree is reaped; remove the limited cgroup now (the
     // process::exit below would skip its Drop).
     drop(limits_cgroup);
+    outcome = exec_status_outcome(outcome, &json_read, &end, &args.cmd, args.landlock);
     outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`
@@ -1114,6 +1133,28 @@ pub(crate) fn landlock_layer(
     }
 }
 
+/// The outcome after bwrap's exec status pipe is read (issue #74, see
+/// `exec_status`): a command bwrap could not exec ends as `ExecFailed` (127 or
+/// 126) instead of bwrap's own rc 1. With a Landlock layer bwrap execs the shim,
+/// which reports its own exec failure ([`landlock_status_outcome`]).
+pub(crate) fn exec_status_outcome(
+    outcome: Outcome,
+    json_read: &OwnedFd,
+    end: &stdio::PumpEnd,
+    cmd: &[OsString],
+    landlock: crate::landlock::Mode,
+) -> Outcome {
+    let argv0 = (landlock == crate::landlock::Mode::Off)
+        .then(|| cmd.first())
+        .flatten();
+    exec_status::classify(
+        outcome,
+        Some(exec_status::read(json_read)),
+        &end.stderr_tail,
+        argv0.map(OsString::as_os_str),
+    )
+}
+
 /// The outcome after the shim's status pipe is read (issue #19 M1 and round 3
 /// item 2): the pipe says whether the shim started and whether it failed. It ends
 /// the run as `failed` only when the payload's own outcome is not already one.
@@ -1121,6 +1162,13 @@ pub(crate) fn landlock_status_outcome(mut outcome: Outcome, status: Option<&Owne
     if let Some(bytes) = status.and_then(read_status) {
         match crate::landlock::decode_status(&bytes) {
             crate::landlock::StatusReport::Started => {}
+            // Issue #74: the shim's exec of the payload failed and the shim
+            // exited with that rc (127 or 126); anything else keeps its outcome.
+            crate::landlock::StatusReport::ExecFailed { code, reason } => {
+                if outcome == Outcome::Exited(code) {
+                    outcome = Outcome::ExecFailed { code, reason };
+                }
+            }
             crate::landlock::StatusReport::Failed(reason) => {
                 if !matches!(outcome, Outcome::Failed(_)) {
                     outcome = Outcome::Failed(format!("landlock: {reason}"));

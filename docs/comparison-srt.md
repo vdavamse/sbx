@@ -203,7 +203,7 @@ so an embedder pays the proxy start once. The CLI pays it on every call.
 | E4 | SIGTERM to the tool | 143, `sbx run: terminated by SIGTERM` | **0**. srt exits 0 when its child dies of SIGINT or SIGTERM (`src/cli.ts`), so a cancelled command reads as a success |
 | E5 | malformed policy | 125, the parse error | 1, `Refusing to run with the built-in defaults…` |
 | E6 | sandbox cannot start (no bwrap) | 125 | 1 |
-| E7 | command not found | **1** (`bwrap: execvp …`), the same as a command that exits 1 | **127**, from the `bash -c` that srt always runs |
+| E7 | command not found | **127**, `sbx run: command not found in the sandbox: …`, audit outcome `exec_failed` (126 for a command that is found but not executable). The measured run predates #74 and got 1 (`bwrap: execvp …`), the same as a command that exits 1 | **127**, from the `bash -c` that srt always runs |
 | E8 | 5 MB of output | capped at `limits.output_bytes` (1 MiB here): `sbx run: output truncated at 1048576 bytes (limits.output_bytes)`, and `output_truncated: true` in the audit | not capped (5000000 bytes) |
 | E9 | persistent session | `run --keep-alive` and `attach` (an attach of `true` in tens of ms). An attached `curl` reached the resident's HTTP server on 127.0.0.1 (`http=200`): the calls share localhost | none in the CLI. The library keeps proxies across calls, but each command is a new sandbox |
 
@@ -236,7 +236,8 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
   second per command, and one
   static binary against a node runtime plus three tools.
 - **Harness contract.** A timeout, an output cap, distinct exit codes for
-  sandbox failures (125) and signals (143), a JSON audit row for each network
+  sandbox failures (125), signals (143) and commands that cannot be executed
+  (127 and 126, as srt's shell gives), a JSON audit row for each network
   decision, and persistent sessions.
 
 ## Where srt wins
@@ -266,8 +267,6 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
   sbx's TLS termination is a build-time option with URL-path rules
   ([TLS termination](tls-termination.md)). It has no credential injection and
   no live policy update.
-- **Missing commands exit 127** (E7), as a shell does. Under `sbx run` the
-  exit is bwrap's 1.
 
 ## Where neither helps
 

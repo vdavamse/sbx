@@ -29,6 +29,8 @@ use crate::policy::NetworkMode;
 pub(crate) struct ChildFds {
     pub control: RawFd,
     pub info: RawFd,
+    /// The bwrap exec status pipe write end (issue #74, `--json-status-fd`).
+    pub json_status: Option<RawFd>,
     pub seccomp: RawFd,
     pub exe: Option<RawFd>,
     /// The shim's status pipe write end (issue #19 M1); with `exe`, only under `--landlock`.
@@ -46,13 +48,14 @@ pub(crate) struct InitFlags<'a> {
 }
 
 /// The re-exec argv after the program:
-/// `__init --fd C --keep-fd I --seccomp-fd S [--exe-fd E] [--status-fd T]
+/// `__init --fd C --keep-fd I [--json-status-fd J] --seccomp-fd S [--exe-fd E] [--status-fd T]
 /// --parent-pid P --min-mode M [--rlimit NAME=VALUE]… [--test-break-rules] --
 /// <argv…>` (issue #11: `M` is the policy's mode — the weakest mode `__init` may
 /// fall back to; issue #34: `S` is the sealed seccomp-program memfd `__init`
 /// verifies and hands to bwrap; issue #19: `E` is sbx's own executable, and
 /// round 3 adds `T`, the shim's status pipe write end; both are passed only
-/// under `--landlock`; issue #43: one `--rlimit` per policy resource limit).
+/// under `--landlock`; issue #43: one `--rlimit` per policy resource limit;
+/// issue #74: `J` is bwrap's `--json-status-fd` pipe write end).
 pub(crate) fn init_argv(
     fds: ChildFds,
     parent_pid: u32,
@@ -65,9 +68,13 @@ pub(crate) fn init_argv(
         fds.control.to_string().into(),
         "--keep-fd".into(),
         fds.info.to_string().into(),
-        "--seccomp-fd".into(),
-        fds.seccomp.to_string().into(),
     ];
+    if let Some(json) = fds.json_status {
+        argv.push("--json-status-fd".into());
+        argv.push(json.to_string().into());
+    }
+    argv.push("--seccomp-fd".into());
+    argv.push(fds.seccomp.to_string().into());
     if let Some(exe) = fds.exe {
         argv.push("--exe-fd".into());
         argv.push(exe.to_string().into());
@@ -378,6 +385,7 @@ mod tests {
             cwd: None,
             passed_env: &Default::default(),
             info_fd: Some(9),
+            json_status_fd: None,
             seccomp_fd: 11,
             landlock: None,
             deny_tmpfs_size: None,
@@ -387,6 +395,7 @@ mod tests {
         let fds = ChildFds {
             control: 7,
             info: 9,
+            json_status: None,
             seccomp: 11,
             exe: None,
             status: None,
@@ -473,6 +482,58 @@ mod tests {
     }
 
     #[test]
+    fn init_argv_json_status_fd_follows_keep_fd() {
+        // Issue #74: `--json-status-fd J` sits between `--keep-fd` and
+        // `--seccomp-fd`.
+        let launch = crate::bwrap::build(&crate::bwrap::Build {
+            policy: &crate::policy::Policy::from_json_str(
+                r#"{"version":1,"filesystem":{"ro":[],"rw":[],"deny":[]},"network":{"mode":"none","allow":[],"ports":[]},"env":{"pass":[],"set":{}},"limits":{"timeout":"1s","output_bytes":1000}}"#,
+            )
+            .expect("policy"),
+            session_dir: std::path::Path::new("/var/lib/sbx-test/s1"),
+            bwrap_path: std::path::Path::new("/usr/bin/bwrap"),
+            command: &["/bin/true".into()],
+            cwd: None,
+            passed_env: &Default::default(),
+            info_fd: Some(9),
+            json_status_fd: Some(10),
+            seccomp_fd: 11,
+            landlock: None,
+            deny_tmpfs_size: None,
+        })
+        .expect("builds");
+        let fds = ChildFds {
+            control: 7,
+            info: 9,
+            json_status: Some(10),
+            seccomp: 11,
+            exe: None,
+            status: None,
+        };
+        let flags = InitFlags {
+            min_mode: NetworkMode::None,
+            test_break_rules: false,
+            rlimits: &[],
+        };
+        let argv = init_argv(fds, 4242, &flags, &launch);
+        assert_eq!(
+            &argv[..9],
+            [
+                "__init",
+                "--fd",
+                "7",
+                "--keep-fd",
+                "9",
+                "--json-status-fd",
+                "10",
+                "--seccomp-fd",
+                "11",
+            ]
+            .map(OsString::from)
+        );
+    }
+
+    #[test]
     fn init_argv_exe_fd_follows_seccomp_fd() {
         // Issue #19: `--exe-fd E` sits between `--seccomp-fd S` and
         // `--parent-pid`, and is absent unless the Landlock layer is on (the
@@ -488,6 +549,7 @@ mod tests {
             cwd: None,
             passed_env: &Default::default(),
             info_fd: Some(9),
+            json_status_fd: None,
             seccomp_fd: 11,
             landlock: None,
             deny_tmpfs_size: None,
@@ -496,6 +558,7 @@ mod tests {
         let fds = ChildFds {
             control: 7,
             info: 9,
+            json_status: None,
             seccomp: 11,
             exe: Some(12),
             status: None,
