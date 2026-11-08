@@ -319,6 +319,9 @@ for named hosts to enforce URL-path rules: see [docs/tls-termination.md](docs/tl
 - [docs/building.md](docs/building.md): building, MSRV, static binaries,
   releases and development.
 - [docs/threat-model.md](docs/threat-model.md): guarantees and residual risks.
+- [docs/comparison-srt.md](docs/comparison-srt.md): sbx measured against
+  Anthropic's sandbox-runtime (srt), with the runner in
+  [bench/srt-compare/](bench/srt-compare/README.md).
 
 ## Security
 
