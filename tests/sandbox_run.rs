@@ -4557,7 +4557,8 @@ fn protect_script(p: &std::path::Display<'_>) -> String {
          if echo '[core]' >> {p}/.git/config 2>/dev/null; then echo CONFIG_WRITTEN; else echo CONFIG_BLOCKED; fi; \
          if echo pwned > {p}/sub/.git/hooks/post-checkout 2>/dev/null; then echo NESTED_PLANTED; else echo NESTED_BLOCKED; fi; \
          if echo ok > {p}/out.txt 2>/dev/null; then echo RW_OK; else echo RW_FAILED; fi; \
-         if rmdir {p}/.bashrc 2>/dev/null; then echo PLACEHOLDER_REMOVED; else echo PLACEHOLDER_KEPT; fi"
+         if rmdir {p}/.bashrc 2>/dev/null; then echo PLACEHOLDER_REMOVED; else echo PLACEHOLDER_KEPT; fi; \
+         echo /tmp/evil > {p}/.git/commondir 2>/dev/null; true"
     )
 }
 
@@ -4609,6 +4610,12 @@ fn protect_f9_f10_blocked() -> Result<(), String> {
     if session.join("protect.list").exists() {
         return Err("the placeholder list outlived the run".into());
     }
+    // A commondir planted in the protected .git is renamed aside, with a
+    // warning (it would point host git at another hooks and config).
+    if t.proj.join(".git/commondir").exists() {
+        return Err("the planted commondir is still active".into());
+    }
+    expect_stderr(&done, "sbx: warning: the sandbox created")?;
     Ok(())
 }
 

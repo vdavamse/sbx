@@ -1,12 +1,15 @@
 //! `filesystem.protect` (issue #73, threat-model R7): read-only binds over the
 //! files inside an `rw` path that run later on the host.
 //!
-//! 1. **Scan.** Before every launch (`run`, the keep-alive holder, every
-//!    `attach` call) each policy `rw` path that is a directory is scanned: the
-//!    path itself and the real directories up to [`SEARCH_DEPTH`] levels below
-//!    it (srt's `mandatoryDenySearchDepth`). The scan does not follow symlinks
-//!    and does not enter `.git` or `node_modules` directories, deny paths,
-//!    other policy bind dests or protected directories. It visits at most
+//! 1. **Scan.** Before a `run` or a keep-alive holder launches, each policy
+//!    `rw` path that is a directory is scanned: the path itself and the real
+//!    directories up to [`SEARCH_DEPTH`] levels below it (srt's
+//!    `mandatoryDenySearchDepth`). The scan does not follow symlinks and does
+//!    not enter `.git` or `node_modules` directories (point 5 looks into
+//!    `.git`), deny paths, other policy bind dests or protected directories.
+//!    It skips an unreadable directory owned by another user (the payload
+//!    cannot change it either) and refuses an unreadable one of this user (the
+//!    payload could `chmod` it to hide it from a later scan). It visits at most
 //!    [`SCAN_BUDGET`] directories per `rw` path and refuses the run past that.
 //! 2. **Targets.** For each entry, the walk stops at the first component that
 //!    is missing or is not a directory. An existing path is a target: it is
@@ -31,9 +34,28 @@
 //!    creating them. After a crash, the next run in that session directory
 //!    and `sbx gc` remove the listed ones that still carry the marker, and any
 //!    later launch that finds a marked placeholder adopts it and removes it at
-//!    its end. Residuals: a crash between `mkdir` and the mtime reset leaves
-//!    an unmarked empty directory; flock does not work on some network
-//!    filesystems (the gc residuals).
+//!    its end. A placeholder is locked before it is marked, so no cleanup can
+//!    take it in between. Residuals: a crash between `mkdir` and the mark
+//!    leaves an unmarked empty directory; a user's own empty directory with
+//!    mtime 0 at a protected name is taken for a placeholder; flock does not
+//!    work on some network filesystems (the gc residuals).
+//! 5. **Git directories.** In every real `.git` directory the scan reaches,
+//!    the existing `commondir` and `gitdir` files of each linked worktree
+//!    (`.git/worktrees/*/`) and the `hooks/`, `config` and `commondir` of each
+//!    submodule git directory (`.git/modules/**`, a directory with a `HEAD`)
+//!    are targets too: each of them redirects or runs host git. A `commondir`
+//!    cannot be pre-empted with a placeholder (git refuses a directory there),
+//!    so a `commondir` that appears during the run in a git directory that had
+//!    none is renamed aside at the end, with a warning.
+//! 6. **Keep-alive sessions.** The holder saves its target list in
+//!    `<session>/protect.paths`, and every `attach` call binds exactly that
+//!    list instead of scanning again. A scan of a tree the resident writes
+//!    would let the resident choose new nested binds and pins and race them
+//!    between the guard and bwrap; with the saved list every launch of the
+//!    session has the binds the resident already has mounted and pinned (the
+//!    same-policy invariant of R26). A call creates and removes nothing.
+//!    Two concurrent `run`s of one policy on one tree do not share a list: that
+//!    race stays open (threat-model R7, R26).
 
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr};
@@ -53,6 +75,8 @@ pub(crate) const SEARCH_DEPTH: usize = 3;
 pub(crate) const SCAN_BUDGET: usize = 20_000;
 /// The placeholder list inside the session directory.
 pub(crate) const MANIFEST: &str = "protect.list";
+/// A keep-alive holder's protected paths, inside the session directory.
+pub(crate) const PATHS: &str = "protect.paths";
 /// The largest manifest that is read back (a corrupt one is ignored past it).
 const MANIFEST_MAX: u64 = 1 << 20;
 /// Directories the scan never enters: `.git` holds no protected entry of its
@@ -80,13 +104,14 @@ fn parse_entries(list: &[String]) -> Vec<Entry> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Found {
     Existing(PathBuf),
-    Missing(PathBuf),
+    /// A missing top-level entry: (the rw path, the placeholder path).
+    Missing(PathBuf, PathBuf),
 }
 
 impl Found {
     fn path(&self) -> &Path {
         match self {
-            Found::Existing(p) | Found::Missing(p) => p,
+            Found::Existing(p) | Found::Missing(_, p) => p,
         }
     }
 }
@@ -107,6 +132,11 @@ pub(crate) struct Protected {
     paths: Vec<AbsolutePath>,
     held: Vec<Held>,
     manifest: Option<(PathBuf, File)>,
+    /// Git directories that had no `commondir` at the scan (module docs
+    /// point 5).
+    gitdirs: Vec<PathBuf>,
+    /// The session's saved path list (a keep-alive holder), removed at release.
+    saved: Option<PathBuf>,
 }
 
 impl Protected {
@@ -129,6 +159,45 @@ impl Protected {
             drop(file);
             let _ = std::fs::remove_file(path);
         }
+        if let Some(path) = self.saved.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        for gitdir in self.gitdirs.drain(..) {
+            block_commondir(&gitdir);
+        }
+    }
+
+    fn empty() -> Self {
+        Protected {
+            paths: Vec::new(),
+            held: Vec::new(),
+            manifest: None,
+            gitdirs: Vec::new(),
+            saved: None,
+        }
+    }
+
+    /// A keep-alive holder saves its protected paths in the session directory
+    /// (module docs point 6); every attach call binds exactly these.
+    pub(crate) fn save(&mut self, session: &Path) -> Result<(), String> {
+        let path = session.join(PATHS);
+        let mut bytes = Vec::new();
+        for p in &self.paths {
+            bytes.extend_from_slice(p.as_str().as_bytes());
+            bytes.push(0);
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|err| format!("cannot write {path:?}: {err}"))?;
+        file.write_all(&bytes)
+            .map_err(|err| format!("cannot write {path:?}: {err}"))?;
+        self.saved = Some(path);
+        Ok(())
     }
 
     fn record(&mut self, session: Option<&Path>, path: &Path) -> Result<(), String> {
@@ -165,11 +234,7 @@ impl Drop for Protected {
 /// session's manifest when `session` is given), and every placeholder found or
 /// created is locked shared.
 pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protected, String> {
-    let mut out = Protected {
-        paths: Vec::new(),
-        held: Vec::new(),
-        manifest: None,
-    };
+    let mut out = Protected::empty();
     let entries = parse_entries(&policy.filesystem.protect_entries());
     if entries.is_empty() {
         return Ok(out);
@@ -184,7 +249,14 @@ pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protect
     let denies: Vec<&str> = fs.deny.iter().map(AbsolutePath::as_str).collect();
     let mut found: Vec<Found> = Vec::new();
     for root in &fs.rw {
-        scan_root(root.as_str(), &entries, &binds, &denies, &mut found)?;
+        scan_root(
+            root.as_str(),
+            &entries,
+            &binds,
+            &denies,
+            &mut found,
+            &mut out.gitdirs,
+        )?;
     }
     for item in found {
         let path = item.path().to_path_buf();
@@ -203,9 +275,9 @@ pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protect
                     out.held.push(adopt(&path)?);
                 }
             }
-            Found::Missing(_) => {
+            Found::Missing(root, _) => {
                 out.record(session, &path)?;
-                match create(&path)? {
+                match create(&root, &path)? {
                     Some(held) => out.held.push(held),
                     // Created concurrently: someone else's now, or a
                     // placeholder of a concurrent run.
@@ -227,6 +299,82 @@ pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protect
     Ok(out)
 }
 
+/// The protected paths of a keep-alive session, for an attach call (module
+/// docs point 6): the holder's saved list, not a new scan, so every launch of
+/// the session has the same nested binds and pins as the resident. Each path
+/// must lie inside one of the policy's `rw` paths. A call creates and removes
+/// nothing.
+pub(crate) fn load(policy: &Policy, session: &Path) -> Result<Protected, String> {
+    let mut out = Protected::empty();
+    if policy.filesystem.protect_entries().is_empty() {
+        return Ok(out);
+    }
+    let path = session.join(PATHS);
+    let fail = |err: io::Error| {
+        format!("cannot read the session's protected paths {path:?}: {err}; restart the session")
+    };
+    let dir = open_dir(session).map_err(fail)?;
+    let name = cstring(PATHS.as_bytes()).map_err(fail)?;
+    // SAFETY: valid dir fd and NUL-terminated name; a successful call returns
+    // a fresh fd.
+    let raw = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(fail(io::Error::last_os_error()));
+    }
+    // SAFETY: `raw` is a fresh descriptor returned by openat.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let st = fstat(fd.as_fd()).map_err(fail)?;
+    if st.st_mode & libc::S_IFMT != libc::S_IFREG || st.st_size as u64 > MANIFEST_MAX {
+        return Err(fail(io::Error::from_raw_os_error(libc::EINVAL)));
+    }
+    let mut bytes = Vec::new();
+    File::from(fd).read_to_end(&mut bytes).map_err(fail)?;
+    for item in bytes.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        let text = std::str::from_utf8(item)
+            .map_err(|_| fail(io::Error::from_raw_os_error(libc::EINVAL)))?;
+        let abs = AbsolutePath::from_built(text.to_owned()).map_err(|err| {
+            format!("the session's protected path {text:?} is invalid: {err}; restart the session")
+        })?;
+        let inside = policy
+            .filesystem
+            .rw
+            .iter()
+            .any(|rw| abs.as_path() != rw.as_path() && abs.as_path().starts_with(rw.as_path()));
+        if !inside {
+            return Err(format!(
+                "the session's protected path {text:?} is not inside an rw path of the policy; restart the session"
+            ));
+        }
+        out.paths.push(abs);
+    }
+    Ok(out)
+}
+
+/// Module docs point 5: a `commondir` file that appeared in a git directory
+/// during the run would make host git take its hooks and config from
+/// elsewhere. It is renamed aside, with a warning.
+fn block_commondir(gitdir: &Path) {
+    let path = gitdir.join("commondir");
+    if std::fs::symlink_metadata(&path).is_err() {
+        return;
+    }
+    let aside = gitdir.join(format!("commondir.sbx-blocked.{}", std::process::id()));
+    match std::fs::rename(&path, &aside) {
+        Ok(()) => eprintln!(
+            "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks and read config from another directory; renamed it to {aside:?}"
+        ),
+        Err(err) => eprintln!(
+            "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks and read config from another directory, and sbx could not rename it ({err}); remove it before running git there"
+        ),
+    }
+}
+
 /// Segment-exact "equals or is under" on lexically canonical paths.
 fn at_or_under(path: &Path, root: &str) -> bool {
     path.starts_with(root)
@@ -246,6 +394,7 @@ fn scan_root(
     binds: &[&str],
     denies: &[&str],
     out: &mut Vec<Found>,
+    gitdirs: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     // A missing or non-directory rw path has nothing to scan; bwrap and the
     // guard report a missing one.
@@ -269,22 +418,42 @@ fn scan_root(
                 "the filesystem.protect scan of {root:?} found more than {SCAN_BUDGET} directories within {SEARCH_DEPTH} levels; bind a narrower rw path, or set filesystem.protect to [] to turn the protection off"
             ));
         }
+        let push = |found: Found, out: &mut Vec<Found>| {
+            if !skipped(found.path()) && !out.iter().any(|f| f.path() == found.path()) {
+                out.push(found);
+            }
+        };
         for entry in entries {
             if let Some(found) = resolve(&dir, entry, depth == 0)? {
-                if !skipped(found.path()) && !out.iter().any(|f| f.path() == found.path()) {
-                    out.push(found);
-                }
+                push(found, out);
+            }
+        }
+        let gitdir = dir.join(".git");
+        if is_real_dir(&gitdir) && !is_marked(&gitdir) && !skipped(&gitdir) {
+            let mut extra = Vec::new();
+            git_extras(&gitdir, &mut extra, gitdirs)?;
+            for found in extra {
+                push(found, out);
             }
         }
         if depth == SEARCH_DEPTH {
             continue;
         }
         let mut children: Vec<PathBuf> = Vec::new();
-        let reader = std::fs::read_dir(&dir).map_err(|err| {
-            format!(
-                "cannot scan {dir:?} for filesystem.protect: {err}; fix the permissions, or set filesystem.protect to [] to turn the protection off"
-            )
-        })?;
+        let reader = match std::fs::read_dir(&dir) {
+            Ok(reader) => reader,
+            // Another user's unreadable directory (a container volume): the
+            // payload runs as this user and cannot change it either. One of
+            // our own could be chmod'ed back by the payload, so it refuses.
+            Err(err) if err.kind() == io::ErrorKind::PermissionDenied && !owned(&dir) => {
+                continue;
+            }
+            Err(err) => {
+                return Err(format!(
+                    "cannot scan {dir:?} for filesystem.protect: {err}; fix the permissions, or set filesystem.protect to [] to turn the protection off"
+                ));
+            }
+        };
         for child in reader {
             let child = child.map_err(|err| format!("cannot scan {dir:?}: {err}"))?;
             // DirEntry::file_type does not follow a symlink.
@@ -310,6 +479,99 @@ fn scan_root(
     Ok(())
 }
 
+fn owned(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == euid)
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// Directories of a git directory that hold no protected file of their own.
+const GIT_BULK: [&str; 4] = ["objects", "refs", "logs", "lfs"];
+
+/// The git directories inside `.git` (module docs point 5): a linked
+/// worktree's admin directory under `worktrees/` (its `commondir` and `gitdir`
+/// redirect host git) and every submodule git directory under `modules/`
+/// (its `hooks/`, `config` and `commondir`). Existing ones only. `gitdirs`
+/// collects the git directories without a `commondir`.
+fn git_extras(
+    gitdir: &Path,
+    out: &mut Vec<Found>,
+    gitdirs: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let existing = |path: PathBuf, out: &mut Vec<Found>| -> Result<(), String> {
+        match std::fs::symlink_metadata(&path) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("cannot inspect protected path {path:?}: {err}")),
+            Ok(meta) if meta.file_type().is_symlink() => Err(symlink_error(&path)),
+            Ok(_) => {
+                out.push(Found::Existing(path));
+                Ok(())
+            }
+        }
+    };
+    let children = |dir: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        v.sort();
+        v
+    };
+    if !gitdir.join("commondir").exists() {
+        gitdirs.push(gitdir.to_path_buf());
+    }
+    for admin in children(&gitdir.join("worktrees")) {
+        existing(admin.join("commondir"), out)?;
+        existing(admin.join("gitdir"), out)?;
+    }
+    // Submodule git directories nest (`modules/a/modules/b`); a directory
+    // with a HEAD file is one.
+    let mut queue: VecDeque<(PathBuf, usize)> = children(&gitdir.join("modules"))
+        .into_iter()
+        .map(|d| (d, 1))
+        .collect();
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        visited += 1;
+        if visited > SCAN_BUDGET {
+            return Err(format!(
+                "the filesystem.protect scan of {gitdir:?} found more than {SCAN_BUDGET} submodule directories; set filesystem.protect to [] to turn the protection off"
+            ));
+        }
+        let is_gitdir = dir.join("HEAD").is_file();
+        if is_gitdir {
+            for name in ["hooks", "config", "commondir"] {
+                existing(dir.join(name), out)?;
+            }
+            if !dir.join("commondir").exists() {
+                gitdirs.push(dir.clone());
+            }
+        }
+        if depth >= 2 * SEARCH_DEPTH {
+            continue;
+        }
+        for child in children(&dir) {
+            let name = child
+                .file_name()
+                .map(|n| n.as_bytes().to_vec())
+                .unwrap_or_default();
+            if is_gitdir && (name == b"hooks" || GIT_BULK.iter().any(|b| name == b.as_bytes())) {
+                continue;
+            }
+            queue.push_back((child, depth + 1));
+        }
+    }
+    Ok(())
+}
+
 /// One entry under one directory (module docs point 2).
 fn resolve(dir: &Path, entry: &Entry, top: bool) -> Result<Option<Found>, String> {
     let mut path = dir.to_path_buf();
@@ -318,7 +580,7 @@ fn resolve(dir: &Path, entry: &Entry, top: bool) -> Result<Option<Found>, String
         path.push(comp);
         match std::fs::symlink_metadata(&path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(top.then_some(Found::Missing(path)));
+                return Ok(top.then(|| Found::Missing(dir.to_path_buf(), path)));
             }
             // A component below a non-directory is not a path at all.
             Err(err) if err.raw_os_error() == Some(libc::ENOTDIR) => return Ok(None),
@@ -433,11 +695,29 @@ fn split(path: &Path) -> io::Result<(OwnedFd, CString)> {
     Ok((open_dir(parent)?, cstring(name.as_bytes())?))
 }
 
-/// Creates a placeholder at `path` and locks it shared. `None`: the name
-/// appeared since the scan.
-fn create(path: &Path) -> Result<Option<Held>, String> {
+/// The parent of `path` (inside the rw path `root`), opened from `root`
+/// component by component without following a symlink, and the last name.
+fn split_under(root: &Path, path: &Path) -> io::Result<(OwnedFd, CString)> {
+    let rel = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let comps: Vec<&OsStr> = rel.iter().collect();
+    let Some((last, dirs)) = comps.split_last() else {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    };
+    let mut dir = open_dir(root)?;
+    for comp in dirs {
+        dir = open_child_dir(dir.as_fd(), &cstring(comp.as_bytes())?)?;
+    }
+    Ok((dir, cstring(last.as_bytes())?))
+}
+
+/// Creates a placeholder at `path` (inside the rw path `root`) and locks it
+/// shared before marking it, so no cleanup can take it in between. `None`:
+/// the name appeared since the scan.
+fn create(root: &Path, path: &Path) -> Result<Option<Held>, String> {
     let fail = |err: io::Error| format!("cannot create the placeholder {path:?}: {err}");
-    let (parent, name) = split(path).map_err(fail)?;
+    let (parent, name) = split_under(root, path).map_err(fail)?;
     // SAFETY: valid dir fd and NUL-terminated name.
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
         let err = io::Error::last_os_error();
@@ -447,6 +727,7 @@ fn create(path: &Path) -> Result<Option<Held>, String> {
         return Err(fail(err));
     }
     let fd = open_child_dir(parent.as_fd(), &name).map_err(fail)?;
+    flock(fd.as_fd(), libc::LOCK_SH).map_err(fail)?;
     let zero = [libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -458,7 +739,6 @@ fn create(path: &Path) -> Result<Option<Held>, String> {
         unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
         return Err(fail(err));
     }
-    flock(fd.as_fd(), libc::LOCK_SH).map_err(fail)?;
     let st = fstat(fd.as_fd()).map_err(fail)?;
     Ok(Some(Held {
         parent,
@@ -598,14 +878,22 @@ fn scan_for_test(policy: &Policy) -> Result<Vec<(String, bool)>, String> {
         .collect();
     let denies: Vec<&str> = fs.deny.iter().map(AbsolutePath::as_str).collect();
     let mut found = Vec::new();
+    let mut gitdirs = Vec::new();
     for root in &fs.rw {
-        scan_root(root.as_str(), &entries, &binds, &denies, &mut found)?;
+        scan_root(
+            root.as_str(),
+            &entries,
+            &binds,
+            &denies,
+            &mut found,
+            &mut gitdirs,
+        )?;
     }
     Ok(found
         .into_iter()
         .map(|f| match f {
             Found::Existing(p) => (p.to_string_lossy().into_owned(), true),
-            Found::Missing(p) => (p.to_string_lossy().into_owned(), false),
+            Found::Missing(_, p) => (p.to_string_lossy().into_owned(), false),
         })
         .collect())
 }
@@ -784,6 +1072,82 @@ mod tests {
         assert!(!root.join(".bashrc").exists());
         assert!(root.join(".zshrc/keep").exists());
         assert!(!session.join(MANIFEST).exists());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&session);
+    }
+
+    #[test]
+    fn submodule_and_worktree_git_dirs_are_targets() {
+        let root = scratch("gitdirs");
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config"), "").unwrap();
+        std::fs::create_dir_all(git.join("worktrees/w")).unwrap();
+        std::fs::write(git.join("worktrees/w/commondir"), "../..\n").unwrap();
+        std::fs::write(git.join("worktrees/w/gitdir"), "/x/.git\n").unwrap();
+        let sub = git.join("modules/lib");
+        std::fs::create_dir_all(sub.join("hooks")).unwrap();
+        std::fs::create_dir_all(sub.join("objects/aa")).unwrap();
+        std::fs::write(sub.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(sub.join("config"), "").unwrap();
+        let nested = sub.join("modules/inner");
+        std::fs::create_dir_all(nested.join("hooks")).unwrap();
+        std::fs::write(nested.join("HEAD"), "x\n").unwrap();
+        let found = rel(&scan_for_test(&policy(&root, None, "")).unwrap(), &root);
+        for want in [
+            ".git/worktrees/w/commondir",
+            ".git/worktrees/w/gitdir",
+            ".git/modules/lib/hooks",
+            ".git/modules/lib/config",
+            ".git/modules/lib/modules/inner/hooks",
+        ] {
+            assert!(found.contains(&(want.into(), true)), "{want}: {found:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_new_commondir_is_renamed_aside() {
+        let root = scratch("commondir");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let pol = policy(&root, Some(r#"[".git/hooks/"]"#), "");
+        let mut prot = prepare(&pol, None).unwrap();
+        std::fs::write(root.join(".git/commondir"), "/evil\n").unwrap();
+        prot.release();
+        assert!(!root.join(".git/commondir").exists());
+        let aside = std::fs::read_dir(root.join(".git"))
+            .unwrap()
+            .flatten()
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("commondir.sbx-blocked.")
+            });
+        assert!(aside, "renamed aside, not deleted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attach_list_round_trips_and_is_validated() {
+        let root = scratch("saved");
+        let session = scratch("saved-session");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let pol = policy(&root, Some(r#"[".git/hooks/",".bashrc"]"#), "");
+        let mut prot = prepare(&pol, Some(&session)).unwrap();
+        prot.save(&session).unwrap();
+        let loaded = load(&pol, &session).unwrap();
+        assert_eq!(loaded.paths, prot.paths);
+        assert!(loaded.held.is_empty() && loaded.gitdirs.is_empty());
+        // A path outside the policy's rw paths is refused.
+        std::fs::write(session.join(PATHS), b"/etc/shadow\0").unwrap();
+        let err = load(&pol, &session).err().expect("refused");
+        assert!(err.contains("is not inside an rw path"), "{err}");
+        // A protecting policy needs the list.
+        std::fs::remove_file(session.join(PATHS)).unwrap();
+        assert!(load(&pol, &session).is_err());
+        // The opt-out needs nothing.
+        assert!(load(&policy(&root, Some("[]"), ""), &session).is_ok());
+        prot.release();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&session);
     }

@@ -1025,6 +1025,10 @@ fn protect_placeholders_live_with_the_session() {
         "the resident created the placeholders"
     );
     assert!(session.join("protect.list").exists(), "and listed them");
+    assert!(
+        session.join("protect.paths").exists(),
+        "the holder saved its protected paths for attach calls"
+    );
     let call = with_policy("attach", &[], &["true"]);
     assert!(call.status.success(), "attach: {}", text(&call.stderr));
     assert!(
@@ -1035,6 +1039,7 @@ fn protect_placeholders_live_with_the_session() {
     assert!(!placeholder.exists(), "stop removed the placeholders");
     assert!(!proj.join(".vscode").exists());
     assert!(!session.join("protect.list").exists());
+    assert!(!session.join("protect.paths").exists());
     let names: Vec<String> = fs::read_dir(&proj)
         .expect("read proj")
         .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())

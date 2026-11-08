@@ -740,6 +740,10 @@ fn execute(
     // session's manifest and removed after teardown (or by the drop on an early
     // return).
     let mut protected = protect::prepare(&policy, Some(&session)).map_err(RunError::new)?;
+    // A holder saves the list: its attach calls bind exactly these paths.
+    if hold.is_some() {
+        protected.save(&session).map_err(RunError::new)?;
+    }
     let launch_policy = protected.apply(&policy);
     let launch = build(&Build {
         policy: &launch_policy,

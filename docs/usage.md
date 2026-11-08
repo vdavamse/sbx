@@ -99,10 +99,20 @@ is the one Anthropic's sandbox-runtime (srt) uses:
 
 - **Where.** At the top level of each `rw` path and in its real directories up to 3
   levels below (`rw/a/b/c/.git/hooks`, as srt). The scan follows no symbolic link and
-  does not enter `.git` or `node_modules` directories, `deny` paths or other policy
-  binds. A worktree's `.git` file is protected itself. Each protected path is a nested
+  does not enter `node_modules` directories, `deny` paths or other policy binds. It
+  skips an unreadable directory that belongs to another user (a container volume), and
+  refuses one of yours. A worktree's `.git` file is protected itself. Inside each
+  `.git`, the existing submodule git directories (`.git/modules/…`: `hooks/`, `config`,
+  `commondir`) and linked worktrees (`.git/worktrees/*/commondir` and `gitdir`) are
+  protected too. A `commondir` file that the payload creates in a git directory would
+  make host git take its hooks and config from elsewhere; sbx renames it aside when the
+  run ends and prints `sbx: warning: the sandbox created …`. Each protected path is a nested
   read-only bind, so the directories on the way to it are pinned (see above): the
   payload cannot rename them away, and each pin costs startup time like any other.
+- **Sessions.** `run --keep-alive` scans when the session starts, and every `attach`
+  call binds the paths the session saved instead of scanning again (a scan of a tree
+  the resident writes would let it pick the binds of the next call). A protected path
+  the resident creates during the session is protected from the next session on.
 - **Missing entries.** At the top level, a missing entry gets an empty, read-only
   placeholder directory for the run (at its first missing component: `.git` when there
   is no `.git`). It stops the payload from creating the file, and git ignores empty
@@ -117,7 +127,11 @@ is the one Anthropic's sandbox-runtime (srt) uses:
   with `error: could not write config file .git/config: Device or resource busy`.
   `git commit`, `git checkout`, `git fetch` and other commands that do not write the
   config keep working. Tools that read a placeholder (an editor reading `.mcp.json`)
-  get `EISDIR`.
+  get `EISDIR`. With `rw` on a home directory, a missing `~/.gitconfig` becomes a
+  placeholder for the run, and host git warns `unable to access … Is a directory` until
+  the run ends: bind the project, not the home directory. A user's own empty directory
+  at a protected name with a 1970-01-01 modification time is taken for a placeholder and
+  removed.
 - **Refusals.** A protected name that is a symbolic link is refused (rc 125,
   `sbx run: protected path … is a symbolic link; sbx cannot bind it read-only`), and so
   is a scan of more than 20 000 directories in one `rw` path.
