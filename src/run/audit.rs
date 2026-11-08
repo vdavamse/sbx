@@ -1235,6 +1235,10 @@ mod tests {
             Outcome::TimedOut(Duration::from_secs(2)),
             Outcome::Terminated(15),
             Outcome::Failed("boom".to_owned()),
+            Outcome::ExecFailed {
+                code: 127,
+                reason: "command not found in the sandbox: rg".to_owned(),
+            },
         ];
         for o in outcomes {
             let plain = serde_json::to_value(exit_row_for(

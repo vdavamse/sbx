@@ -230,6 +230,9 @@ fn run_call(
     let env = passed_env(policy, |name| std::env::var_os(name));
     let (info_read, info_write) = sys::pipe_cloexec()
         .map_err(|err| RunError::new(format!("cannot create the info pipe: {err}")))?;
+    // Issue #74: bwrap's exec status pipe, read after teardown as `run` reads it.
+    let (json_read, json_write) = sys::pipe_cloexec()
+        .map_err(|err| RunError::new(format!("cannot create the exec status pipe: {err}")))?;
     let seccomp_memfd = seccomp::program_memfd()
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     // The session's Landlock layer (issue #56 with #18): the same setup, the same
@@ -252,6 +255,7 @@ fn run_call(
         cwd: args.cwd.as_deref(),
         passed_env: &env,
         info_fd: Some(info_write.as_raw_fd()),
+        json_status_fd: Some(json_write.as_raw_fd()),
         seccomp_fd: seccomp_memfd.as_raw_fd(),
         landlock: layer,
         deny_tmpfs_size: crate::bwrap::deny_tmpfs_size_for(bwrap_version),
@@ -263,6 +267,8 @@ fn run_call(
 
     let info_fd = sys::clear_cloexec(info_write.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the info pipe: {err}")))?;
+    let json_fd = sys::clear_cloexec(json_write.as_fd())
+        .map_err(|err| RunError::new(format!("cannot prepare the exec status pipe: {err}")))?;
     let seccomp_fd = sys::clear_cloexec(seccomp_memfd.as_fd())
         .map_err(|err| RunError::new(format!("cannot prepare the seccomp filter: {err}")))?;
     let user_fd = sys::clear_cloexec(user_ns.as_fd())
@@ -292,6 +298,7 @@ fn run_call(
             user: user_fd,
             net: net_fd,
             info: info_fd,
+            json_status: json_fd,
             seccomp: seccomp_fd,
             shim: JoinShim {
                 exe: exe_fd,
@@ -328,6 +335,7 @@ fn run_call(
     // `limits_cgroup` drops (and removes the child cgroup) at the end of the
     // call, after teardown; early returns remove it too.
     drop(info_write);
+    drop(json_write);
     drop(seccomp_memfd);
     drop(user_ns);
     drop(net_ns);
@@ -390,7 +398,10 @@ fn run_call(
     };
     let cause = supervise(&mut sb, &signals, &latch, deadline, timeout, &mut watch);
     let (outcome, end, stragglers) = teardown(sb, cause, Some(pumps));
-    // The shim's status pipe, read as `run` reads it (issue #19 M1).
+    // bwrap's exec status (issue #74) and the shim's status pipe (issue #19 M1),
+    // read as `run` reads them.
+    let outcome =
+        crate::run::exec_status_outcome(outcome, &json_read, &end, &args.cmd, landlock.mode);
     let outcome = crate::run::landlock_status_outcome(outcome, status_read.as_ref());
     Ok((outcome, end, stragglers))
 }
@@ -401,6 +412,8 @@ struct JoinFds {
     user: RawFd,
     net: RawFd,
     info: RawFd,
+    /// bwrap's `--json-status-fd` pipe write end (issue #74).
+    json_status: RawFd,
     seccomp: RawFd,
     shim: JoinShim,
 }
@@ -426,6 +439,7 @@ fn join_command(
         user,
         net,
         info,
+        json_status,
         seccomp,
         shim,
     } = fds;
@@ -437,6 +451,8 @@ fn join_command(
         net.to_string().into(),
         "--keep-fd".into(),
         info.to_string().into(),
+        "--json-status-fd".into(),
+        json_status.to_string().into(),
         "--seccomp-fd".into(),
         seccomp.to_string().into(),
         "--parent-pid".into(),

@@ -70,13 +70,17 @@ or headless mode.
 | N | the command exited N |
 | 124 | `--timeout` or `limits.timeout` elapsed; stderr `sbx run: timed out after …` |
 | 125 | sbx itself failed or refused (policy, session, audit path, host); stderr `sbx run: <reason>` (`sbx attach: …` for attach) |
+| 127 | the command was not found in the sandbox; stderr `sbx run: command not found in the sandbox: CMD` |
+| 126 | the command was found but cannot be executed (a directory, no execute bit); stderr `sbx run: command not executable in the sandbox: CMD (…)` |
 | 128+N | killed by signal N (137 = SIGKILL, for example the OOM killer) |
 | 1 | also bwrap's own setup failure (`bwrap: …` on stderr), for example a bad `--cwd` |
 | 2 | usage error (clap) |
 
-A command can exit 124, 125 or 128+N by itself. Only the `outcome` of the audit `exit` row
-(`exited`, `timeout`, `failed`, `signaled`, `terminated`) tells them apart. bwrap's rc 1
-has outcome `exited`, like a command exiting 1: only its `bwrap: ` stderr line tells it apart. The full table
+A command can exit 124, 125, 126, 127 or 128+N by itself. Only the `outcome` of the audit
+`exit` row (`exited`, `timeout`, `failed`, `signaled`, `terminated`, `exec_failed`) tells them
+apart: a command that could not be executed has outcome `exec_failed`. A bwrap setup failure
+(rc 1) has outcome `exited`, like a command exiting 1: only its `bwrap: ` stderr line tells it
+apart. The full table
 is in [docs/usage.md, Exit codes](https://github.com/vdavamse/sbx/blob/main/docs/usage.md#running-commands).
 
 ## Network

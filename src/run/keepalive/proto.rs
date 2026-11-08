@@ -14,7 +14,11 @@
 //!    `D` done, `R` refused (a reason, cut to [`MAX_REASON`]).
 //! 4. **Outcome vocabulary.** A call's outcome is one of [`OUTCOMES`], the same
 //!    words the audit exit row uses (`run` module docs point 7), so the holder
-//!    writes them verbatim.
+//!    writes them verbatim. `exec_failed` joined the set with issue #74: a
+//!    holder started by an older sbx drops a call end that carries it as
+//!    malformed, and records the call when it reaps it, with that fallback's
+//!    outcome (the call's rc is unaffected). Restart such sessions after an
+//!    upgrade.
 
 use std::io;
 
@@ -26,7 +30,14 @@ pub(crate) const MAX_FRAME: usize = MAX_POLICY_BYTES;
 /// The longest refusal reason sent (longer reasons are cut at a char boundary).
 pub(crate) const MAX_REASON: usize = 512;
 /// The call outcomes a `CallEnd` may carry (the audit exit-row vocabulary).
-pub(crate) const OUTCOMES: [&str; 5] = ["exited", "signaled", "timeout", "terminated", "failed"];
+pub(crate) const OUTCOMES: [&str; 6] = [
+    "exited",
+    "signaled",
+    "timeout",
+    "terminated",
+    "failed",
+    "exec_failed",
+];
 
 /// The fixed part of a call end: call id, rc, duration, flags, outcome length.
 const CALL_END_FIXED: usize = 4 + 4 + 8 + 1 + 1;

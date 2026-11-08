@@ -83,6 +83,7 @@ holds `S`, plain `run` on it fails the same way, so use `attach`.
 | rc 124, `outcome` `timeout` | "timed out after T and was killed", plus the partial output |
 | rc 125, `outcome` `failed` (stderr `sbx run: …`), or no `exit` row at all | a **sandbox/harness error**, not the command's failure: surface sbx's stderr line, and log it for the operator |
 | `outcome` `terminated` (rc 129–143) | sbx itself got a signal (the harness is shutting down): a sandbox error |
+| rc 127 or 126, `outcome` `exec_failed` (stderr `sbx run: command not found in the sandbox: …` / `… not executable …`) | the command's failure, not a sandbox error: the tool (or its `#!` interpreter) is not in the sandbox, or the file cannot be executed. The wrappers run `bash -c`, so they see this only when `bash` itself is missing |
 | rc 1 with stderr `bwrap: …` | a sandbox setup error (usually a stale `--cwd`) |
 | rc 128+N, `outcome` `exited` | the command was killed by signal N (137 is SIGKILL) |
 | rc 128+N, `outcome` `signaled` (stderr `sbx run: sandbox killed by signal N (NAME)`) | bwrap itself was killed by a signal sbx did not send (for example a cgroup-wide OOM kill): say "killed by signal N", not "exited 128+N" |
