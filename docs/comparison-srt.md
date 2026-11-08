@@ -36,18 +36,26 @@ Everything else is denied. The files are in
 The two models differ, so an equal policy needs care:
 
 - **Reads.** sbx mounts only what the policy lists, so reads are denied by
-  default. srt reads everything by default, and the policy denies regions. The
-  natural srt equivalent, `denyRead: ["/"]` with `allowRead` for `/usr`, broke
-  every proxied connection in srt 0.0.81 (`curl: (56) Proxy CONNECT
-  aborted`). The `/tmp` mask also hides srt's own bridge socket
-  (`/tmp/claude-http-*.sock`). The srt policy therefore denies each top-level
-  directory except `/usr`, `/tmp`, `/proc`, `/dev` and `/sys`, and re-allows
-  `/etc/ssl` plus the `/etc` files sbx binds for its own use (`passwd`,
-  `group`, `hosts`, `nsswitch.conf`, `ld.so.cache`, `localtime`,
-  `alternatives`, `ca-certificates`). Without `/etc/passwd`, ssh fails with
-  `No user exists for uid 1000`. Without `/etc/hosts`, the `socat` in srt's
-  `GIT_SSH_COMMAND` cannot resolve `localhost`. sbx generates its own
-  `passwd`, `group`, `hosts` and `resolv.conf` instead.
+  default. srt reads everything by default, and the policy denies regions.
+  The direct srt equivalent, `denyRead: ["/"]`, cannot be used with srt's
+  proxy (variant V3: `curl: (56) Proxy CONNECT aborted`). The deny masks
+  `/tmp`, where srt keeps the bridge socket the in-sandbox socat connects to
+  (`/tmp/claude-http-*.sock`). That is a consequence of the configuration,
+  not a defect in srt's proxy.
+  The srt policy therefore denies `/home`, `/root`, `/mnt`, `/opt`, `/srv`,
+  `/var`, `/etc`, `/run`, `/boot`, `/media`, `/snap`, `/init` and
+  `/lost+found`. It re-allows `/etc/ssl` and the `/etc` files sbx binds for
+  its own use: `passwd`, `group`, `hosts`, `nsswitch.conf`, `ld.so.cache`,
+  `localtime`, `alternatives` and `ca-certificates`. Without `passwd` and
+  `hosts`, git over ssh breaks under srt (variant V4: `No user exists for uid
+  1000`, and the `socat` in srt's `GIT_SSH_COMMAND` cannot resolve
+  `localhost`). sbx generates its own `passwd`, `group`, `hosts` and
+  `resolv.conf` instead.
+  **What stays readable under srt and not under sbx:** all of the host's
+  `/tmp`, including the benchmark's work directory and other users' temporary
+  files, and the tools directory (srt's own package and socat have to be
+  readable inside). The merged-usr links (`/bin`, `/lib`, `/lib64`, `/sbin`)
+  are readable under both, since they lead into `/usr`.
 - **Names.** sbx `=example.com` and srt `example.com:443` both mean the exact
   name. A bare sbx `example.com` also covers subdomains, and a bare srt
   `example.com` allows every port (variant V1 below).
@@ -71,7 +79,11 @@ Outcome words: `allowed`/`works` (the permitted action succeeded),
 `blocked`/`fails-closed` (the action did not reach its target), `LEAKED`
 (it reached a denied target), `planted` (it wrote a file that the host runs
 later), and `passed-uninspected` (the bytes reached the allowed upstream, and
-the part that differed was encrypted).
+the part that differed was encrypted). A row whose target cannot answer (N6)
+counts as `blocked` only when the tool logged an explicit deny, and is
+`unverified` otherwise. The runner checks first that its own fixtures (the
+loopback listener, the abstract socket, the decoy process) answer from the
+host.
 
 ### Network
 
@@ -101,14 +113,17 @@ the part that differed was encrypted).
 | N8a | git over HTTPS to the allowed name | allowed | allowed | both reach the server (`repository … not found`) |
 | N8b | ssh to the allowed name, port 22 | blocked | blocked | sbx: `port 22 is not in the policy port list`. srt: plain ssh has no route |
 | N8c | git over ssh, port 22 | blocked | blocked | srt routes git's ssh through its proxy (`GIT_SSH_COMMAND`) and denies it: `No matching rule, denying: example.com:22` |
-| N8d | UDP datagram to the allowed name, port 443 | blocked | blocked | sbx: `sendto` gets `EPERM`. srt: no network |
+| N8d | UDP datagram to the allowed name, port 443 | blocked | blocked | sbx: `sendto` gets `EPERM`. srt: fails at DNS, so this row does not test UDP there |
+| N8e | UDP datagram to 1.1.1.1:443 (no DNS) | blocked | blocked | sbx: `EPERM`. srt: `Network is unreachable` |
 
-The two srt settings the benchmark turns on to match sbx, shown off:
+srt with the benchmark policy changed in one place each:
 
 | ID | case | srt |
 |---|---|---|
 | V1 | allow entry without `:port` (`example.com`), git over ssh | dialed: `Allowed by config rule: example.com:22` |
 | V2 | no `deniedResolvedAddresses`, name resolving to 10.0.0.1 | dialed: `Allowed by config rule: 10.0.0.1.nip.io:443`, then a connect timeout |
+| V3 | `denyRead: ["/"]`, HTTPS to the allowed name | broken: `curl: (56) Proxy CONNECT aborted` |
+| V4 | `/etc/passwd`, `/etc/group` and `/etc/hosts` not readable, git over ssh | broken: `No user exists for uid 1000` |
 
 ### Filesystem and processes
 
@@ -121,7 +136,7 @@ The two srt settings the benchmark turns on to match sbx, shown off:
 | F5 | list `~/.ssh` | blocked | blocked | srt: only because the policy denies `/home`. srt with no settings file reads everything |
 | F6 | read secrets from the environment | **blocked** | **LEAKED** | srt printed both canaries (`SBX_BENCH_SECRET`, `AWS_SECRET_ACCESS_KEY`) |
 | F7 | see a host process in `/proc` | blocked | blocked | both have a pid namespace (3 pids visible) |
-| F8 | read the host `/etc/passwd` | blocked | LEAKED | srt needs the host file for ssh and socat (above). sbx generates one |
+| F8 | read the host `/etc/passwd` | blocked | LEAKED | Caused by the benchmark's srt policy, which has to allow the host file for ssh and socat (V4). sbx generates one |
 | F9 | plant `.git/hooks/pre-commit` in the rw checkout | **planted** | **blocked** | sbx: the hook is on the host with `echo pwned` in it. srt: `Read-only file system` (a mandatory deny path) |
 | F10 | plant `.bashrc` in the rw dir | **planted** | **blocked** | srt: `Permission denied` |
 
@@ -129,14 +144,22 @@ The two srt settings the benchmark turns on to match sbx, shown off:
 
 | | sbx | srt |
 |---|---|---|
-| startup, median of 20 runs of `true` (hyperfine) | **11.5 ms** (min 10.8, max 12.8) | 406 ms (min 295, max 467) |
+| startup, median of 20 runs of `true` (hyperfine) | **44.6 ms** (min 36.4, max 67.9) | 512 ms (min 401, max 621) |
 | what is installed | one static binary, 6.4 MB, plus bubblewrap | node 22.12+ (the node binary is 122 MB), the npm package (19 MB of `node_modules`), socat (448 KB), ripgrep (5.1 MB), bubblewrap |
 | root, setuid, daemon | none of them. It needs unprivileged user namespaces | none of them. It needs unprivileged user namespaces (Ubuntu 24.04 with AppArmor's userns restriction needs a sysctl or a profile, per srt's README) |
 
-Of srt's 406 ms, starting node takes 19 ms, and loading the CLI
-(`srt --version`) takes 158 ms. A run with an empty policy takes about 290 ms,
-which adds starting the proxies and the socat bridges. The benchmark policy
-adds the deny-path scan. Both tools ran from a native filesystem. srt's
+The host was busy with other work during the recorded run: a bare `true`
+took a median of 2.3 ms, where it takes about 0.5 ms on this machine idle. All
+the times above are inflated by that contention, and the ratio between the
+two tools is what to read from them. For an idle host, [Usage](usage.md)
+reports `sbx run … -- bash -c true` at 11.15 ms median (`hyperfine --runs
+100`, from a native filesystem).
+
+The same run measured where srt's time goes: starting node takes 39 ms, and
+loading the CLI (`srt --version`) takes 226 ms. A run with an empty policy
+takes 454 ms, which adds starting the proxies and the socat bridges and
+srt's scan for its mandatory deny paths. Both tools ran from a native
+filesystem, with the rw directory as the working directory. srt's
 library (`SandboxManager`) starts the proxies once and wraps many commands,
 so an embedder pays the proxy start once. The CLI pays it on every call.
 
@@ -170,8 +193,8 @@ so an embedder pays the proxy start once. The CLI pays it on every call.
 | E5 | malformed policy | 125, the parse error | 1, `Refusing to run with the built-in defaults…` |
 | E6 | sandbox cannot start (no bwrap) | 125 | 1 |
 | E7 | command not found | **1** (`bwrap: execvp …`), the same as a command that exits 1 | **127**, from the `bash -c` that srt always runs |
-| E8 | 5 MB of output | capped at `limits.output_bytes` (1 MiB here), with a notice line and `output_truncated` in the audit | not capped |
-| E9 | persistent session | `run --keep-alive` and `attach`: 10 ms per attach, with shared localhost | none in the CLI. The library keeps proxies across calls, but each command is a new sandbox |
+| E8 | 5 MB of output | capped at `limits.output_bytes` (1 MiB here): `sbx run: output truncated at 1048576 bytes (limits.output_bytes)`, and `output_truncated: true` in the audit | not capped (5000000 bytes) |
+| E9 | persistent session | `run --keep-alive` and `attach` (an attach of `true` in tens of ms). An attached `curl` reached the resident's HTTP server on 127.0.0.1 (`http=200`): the calls share localhost | none in the CLI. The library keeps proxies across calls, but each command is a new sandbox |
 
 srt reports each of its own failures before or around a run as 1, so a
 harness cannot tell a sandbox failure from a command that exits 1. sbx uses 125 for its own failures. srt
@@ -194,10 +217,11 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
 - **Safer defaults.** Reads are denied unless mounted, the environment is
   empty unless passed (F6), private ranges are denied for every name (V2),
   ports are a separate list (V1), and the sandbox gets a generated
-  `/etc/passwd` and `/etc/hosts` (F8). Each srt gap above has a setting that
-  closes it, except that srt cannot pass an empty environment. An operator has
-  to know each setting.
-- **Startup and footprint.** 11.5 ms against 406 ms per command, and one
+  `/etc/passwd` and `/etc/hosts`. srt has to be given the host's files for
+  ssh to work (F8, V4). Each srt network gap above has a setting that closes
+  it. srt cannot pass an empty environment, and denying `/tmp` hides its
+  bridge socket (V3). An operator has to know each setting.
+- **Startup and footprint.** 44.6 ms against 512 ms per command, and one
   static binary against a node runtime plus three tools.
 - **Harness contract.** A timeout, an output cap, distinct exit codes for
   sandbox failures (125) and signals (143), a JSON audit row for each network
@@ -207,10 +231,11 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
 
 - **Platforms.** srt runs on macOS (`sandbox-exec`), on Linux, and on Windows
   (alpha, through a dedicated user account and WFP filters). sbx is Linux-only.
-- **Maturity.** srt is the sandbox behind Claude Code's sandboxing. It has 77
-  published versions on npm and a CI suite run against several bubblewrap
-  versions (0.4.1, the one Ubuntu ships, and 0.12.0). sbx 0.1.0 is its first
-  release.
+- **Maturity.** srt is the sandbox behind Claude Code's sandboxing. npm
+  listed 77 published versions on 2026-11-08 (recorded by `setup.sh`). Per
+  its README, its CI runs the whole suite against the bubblewrap Ubuntu ships
+  and against 0.12.0, and the mount-plan suites against 0.4.1 as well. sbx
+  0.1.0 is its first release.
 - **Auto-run files in writable paths.** srt makes `.git/hooks`,
   `.git/config`, shell rc files, `.gitconfig`, `.mcp.json`, `.vscode/` and
   similar paths read-only inside every writable directory by default (F9,
@@ -246,8 +271,8 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
 
 ## Limits of this comparison
 
-- One host (WSL2) and one recorded run. The final probe set ran three times,
-  and every run gave the same verdict for every row.
+- One host (WSL2) and one recorded run. Earlier runs of the same probes during
+  development gave the same verdicts, but only this run is committed.
   Kernel, bubblewrap and distribution differences can change results,
   especially for srt's Ubuntu AppArmor note and for sbx's nftables
   requirement.

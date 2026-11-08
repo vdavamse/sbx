@@ -19,8 +19,12 @@ that a copy inside a writable path can be rewritten by a sandboxed command.
 srt's Linux dependencies (`socat`, `ripgrep`) come from the host when present.
 Otherwise they are unpacked from the Debian/Ubuntu packages with
 `apt-get download`, which needs no root. Set `SBX_VERSION` or `SRT_VERSION` to
-compare other releases. Tools go to `${TMPDIR:-/tmp}/sbx-srt-tools` by
-default; keep them on a native filesystem (on WSL2 not under `/mnt/c`).
+compare other releases. Each version gets its own directory
+(`TOOLS/sbx-<version>`, `TOOLS/srt-<version>`), `tools.env` points at the
+last call's versions, and `TOOLS/srt-<version>/provenance.txt` records the
+npm integrity and the resolved dependency tree. Tools go to
+`${TMPDIR:-/tmp}/sbx-srt-tools` by default; keep them on a native filesystem
+(on WSL2 not under `/mnt/c`).
 
 `run.sh` needs bash, curl, git, ssh, `/usr/bin/python3`, node >= 22.12,
 bubblewrap, unprivileged user namespaces, and outbound HTTPS to example.com,
@@ -46,8 +50,14 @@ startup numbers). `sbx check` must report network mode `transparent`.
   socket calls that ignore proxy variables.
 - **Host fixtures.** The runner starts a listener on a random 127.0.0.1 port
   and on an abstract unix socket, a `sleep` decoy process, and two canary
-  secrets in the environment. It removes them on exit, together with any
-  canary file a sandbox managed to write (one is aimed at `$HOME`).
+  secrets in the environment. It checks from the host that each fixture
+  answers, and stops if one does not. It removes them on exit (also on
+  Ctrl-C), together with any canary file a sandbox managed to write (one is
+  aimed at `$HOME`). F5 is `n/a` on a host without `~/.ssh`.
+- **Variants.** V1 to V4 run srt with the policy changed in one place, to
+  show what each srt-specific setting is for.
+- **Redaction.** The run's paths appear as `<WORK>`, `<TOOLS>` and `<HOME>`
+  in the output, and `host.txt` records the runner's git revision.
 - **Ergonomics.** Exit codes for a normal exit, a signal, a timeout, SIGTERM to
   the tool, a bad policy, a missing bwrap and a missing command. Also output
   limits and persistent sessions.
@@ -61,6 +71,8 @@ startup numbers). `sbx check` must report network mode `transparent`.
 | `allowed` / `works` | the permitted action succeeded |
 | `BROKEN` | a permitted baseline failed (the run is not valid) |
 | `blocked` / `fails-closed` / `refused` | the action did not reach its target |
+| `unverified` | the action failed, but its target cannot answer and the tool logged no deny (N6) |
+| `broken` | a variant made a working action fail (V3, V4) |
 | `LEAKED` / `planted` | the action reached a target the policy denies, or wrote a file that runs later on the host |
 | `passed-uninspected` | the bytes reached the allowed upstream, and the tool could not see the part that differed (the encrypted `Host`) |
 | `dialed` | srt's proxy accepted the destination and dialed it (variants V1, V2) |

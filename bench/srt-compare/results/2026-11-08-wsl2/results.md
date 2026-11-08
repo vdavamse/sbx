@@ -1,17 +1,20 @@
 # sbx vs srt: results
 
 ```
-date:     2026-11-08T15:04:29Z
+date:     2026-11-08T15:23:56Z
 kernel:   Linux 6.18.54.1-microsoft-standard-WSL2 x86_64
 distro:   Ubuntu 24.04.2 LTS
 bwrap:    bubblewrap 0.9.0
 node:     v24.1.0
 sbx:      sbx 0.1.0 (8fefdff1d13d34d0…)
-srt:      0.0.81 (npm sha512-bjHDu87gjIR7+Oxy9jPiK3v8CvSELCzfpXa3fjqfSKdvlZET2iF51xcXILWPayTpowB3xtZeQVf2JR916nVW/w==)
+srt:      0.0.81
 srt tag:  c40cf14a65d025e3cd27f071f13a73c12b3b1f92
 socat:    1.8.0.0
 ripgrep:  ripgrep 14.1.0
 sbx check: network mode: transparent (policies with network mode transparent, explicit or none can run)
+runner:   7f990fb (modified)
+srt npm integrity: sha512-bjHDu87gjIR7+Oxy9jPiK3v8CvSELCzfpXa3fjqfSKdvlZET2iF51xcXILWPayTpowB3xtZeQVf2JR916nVW/w==
+srt npm published versions on 2026-11-08: 77
 ```
 
 | ID | scenario | sbx | srt |
@@ -34,13 +37,14 @@ sbx check: network mode: transparent (policies with network mode transparent, ex
 | N6b | allowed name resolving to 169.254.169.254 | blocked | blocked |
 | N6c | allowed name resolving to 10.0.0.1 (RFC1918) | blocked | blocked |
 | N7a | host loopback service, raw connect to 127.0.0.1 | blocked | blocked |
-| N7b | host loopback service through the proxy (curl --noproxy '') | blocked | blocked |
+| N7b | host loopback service by IP, proxy variables honoured (curl --noproxy '') | blocked | blocked |
 | N7c | host loopback service by name (localhost) | blocked | blocked |
 | N7d | host abstract unix socket | blocked | blocked |
 | N8a | git over HTTPS to the allowed name | allowed | allowed |
 | N8b | ssh to the allowed name, port 22 | blocked | blocked |
 | N8c | git over ssh to the allowed name, port 22 | blocked | blocked |
 | N8d | UDP datagram to the allowed name, port 443 | blocked | blocked |
+| N8e | UDP datagram to an IP literal (1.1.1.1:443, no DNS needed) | blocked | blocked |
 | F1 | write inside the rw dir (baseline) | allowed | allowed |
 | F2 | write outside the rw dir (host /tmp) | blocked | blocked |
 | F3 | write into the host $HOME | blocked | blocked |
@@ -48,7 +52,7 @@ sbx check: network mode: transparent (policies with network mode transparent, ex
 | F5 | list ~/.ssh (names only) | blocked | blocked |
 | F6 | read secrets from the environment | blocked | LEAKED |
 | F7 | see a host process (/proc) | blocked | blocked |
-| F8 | read the host /etc/passwd | blocked | LEAKED |
+| F8 | read the host /etc/passwd (the srt policy has to allow it, see V4) | blocked | LEAKED |
 | F9 | plant a git hook in the rw checkout (.git/hooks/pre-commit) | planted | blocked |
 | F10 | plant a shell rc file in the rw dir (.bashrc) | planted | blocked |
 
@@ -58,26 +62,31 @@ sbx check: network mode: transparent (policies with network mode transparent, ex
 |---|---|---|
 | V1 | srt allow entry without :port, then git over ssh (port 22) | dialed |
 | V2 | srt without deniedResolvedAddresses, name resolving to 10.0.0.1 | dialed |
+| V3 | srt with denyRead ["/"] (allowRead as in the policy), HTTPS to the allowed name | broken |
+| V4 | srt without /etc/passwd, /etc/group, /etc/hosts readable, git over ssh | broken |
 
 ## Ergonomics
 
 | ID | case | sbx | srt |
 |---|---|---|---|
-| E1 | command exits 7 | `rc=7 t=10ms  ` | `rc=7 t=340ms  ` |
-| E2 | command killed by its own SIGKILL | `rc=137 t=10ms  ` | `rc=137 t=230ms  ` |
+| E1 | command exits 7 | `rc=7 t=20ms  ` | `rc=7 t=310ms  ` |
+| E2 | command killed by its own SIGKILL | `rc=137 t=10ms  ` | `rc=137 t=410ms  ` |
 | E3 | timeout 2 s (sbx --timeout; srt has no timeout, so coreutils timeout) | `rc=124 t=2010ms sbx run: timed out after 2s leftover: 0 ` | `rc=124 t=2020ms  leftover: 0 ` |
 | E4 | SIGTERM to the tool during a run | `sbx run: terminated by SIGTERM rc=143 leftover: 0 ` | `rc=0 leftover: 0 ` |
-| E5 | malformed policy file | `rc=125 t=10ms sbx run: EOF while parsing an object at line 2 column 0 ` | `rc=1 t=150ms Refusing to run with the built-in defaults, which would drop this file's rules (its denyRead, allowRead and credential entries included). ` |
-| E6 | sandbox cannot start (bwrap missing) | `rc=125 t=0ms sbx run: cannot run "/no/such/bwrap" --version: No such file or directory (os error 2) ` | `rc=1 t=200ms Error: Sandbox dependencies not available: bubblewrap (bwrap) not executable at /no/such/bwrap ` |
-| E7 | command not found | `rc=1 t=20ms bwrap: execvp /no/such/cmd: No such file or directory ` | `rc=127 t=330ms /usr/bin/bash: line 1: /no/such/cmd: No such file or directory ` |
-| E8 | 5 MB of output (the sbx policy caps output at 1 MiB) | `bytes=1048576 ` | `bytes=5000000 ` |
-| E9 | persistent session (sbx run --keep-alive, then attach true) | `start: rc=0 t=10ms ; attach: rc=0 t=10ms  ` | `not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls) ` |
+| E5 | malformed policy file | `rc=125 t=10ms sbx run: EOF while parsing an object at line 2 column 0 ` | `rc=1 t=340ms Refusing to run with the built-in defaults, which would drop this file's rules (its denyRead, allowRead and credential entries included). ` |
+| E6 | sandbox cannot start (bwrap missing) | `rc=125 t=0ms sbx run: cannot run "/no/such/bwrap" --version: No such file or directory (os error 2) ` | `rc=1 t=300ms Error: Sandbox dependencies not available: bubblewrap (bwrap) not executable at /no/such/bwrap ` |
+| E7 | command not found | `rc=1 t=20ms bwrap: execvp /no/such/cmd: No such file or directory ` | `rc=127 t=530ms /usr/bin/bash: line 1: /no/such/cmd: No such file or directory ` |
+| E8 | 5 MB of output (the sbx policy caps output at 1 MiB) | `bytes=1048576 sbx run: output truncated at 1048576 bytes (limits.output_bytes); audit output_truncated=true ` | `bytes=5000000 ` |
+| E9 | persistent session (sbx run --keep-alive, then attach true) | `start: rc=0 t=10ms ; attach: rc=0 t=20ms ; attach curl of the resident: http=200 ` | `not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls) ` |
 
 ```
 startup latency, 20 runs of true, median (ms):
-  bare true  median     0.5  min     0.5  max     0.7  (n=20)
-  sbx run    median    11.5  min    10.8  max    12.8  (n=20)
-  srt        median   405.7  min   295.2  max   467.1  (n=20)
+  bare true         median     2.3  min     2.0  max     3.2  (n=20)
+  sbx run           median    44.6  min    36.4  max    67.9  (n=20)
+  srt               median   512.5  min   401.3  max   620.7  (n=20)
+  node -e 0         median    39.1  min    25.6  max    90.1  (n=20)
+  srt --version     median   225.9  min   184.2  max   340.6  (n=20)
+  srt, empty policy median   454.0  min   318.1  max   658.6  (n=20)
 install footprint:
   sbx binary:        6.4M  (ELF 64-bit LSB pie executable, x86-64)
   srt package:       19M node_modules (5 top-level entries)
@@ -254,7 +263,7 @@ bash: line 1: /dev/tcp/www.google.com/80: Invalid argument
 ```
 $ P tcp 1.1.1.1 443 one.one.one.one
 --- output (rc=0)
-RESULT=no-handshake peer=1.1.1.1 sni=one.one.one.one SSLEOFError(Exec format error)
+RESULT=no-handshake peer=1.1.1.1 sni=one.one.one.one SSLEOFError([SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000))
 --- sbx log
 deny denied host=None sni=None port=443: unknown fake IP 1.1.1.1 (no DNS-map entry)
 exit code=0 outcome=exited
@@ -362,7 +371,7 @@ Allowed by config rule: example.com:443
 ```
 $ P tcp example.com 443 www.cloudflare.com
 --- output (rc=0)
-RESULT=no-handshake peer=198.18.0.1 sni=www.cloudflare.com SSLEOFError(Exec format error)
+RESULT=no-handshake peer=198.18.0.1 sni=www.cloudflare.com SSLEOFError([SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1000))
 --- sbx log
 dns answered host=example.com sni=None port=None: answered example.com A 198.18.0.1
 dns nodata host=example.com sni=None port=None: NODATA for example.com type 28 (A only)
@@ -483,7 +492,7 @@ CONNECT tunnel failed: Connection to 10.0.0.1.nip.io blocked: resolved to a list
 ### N7a host loopback service, raw connect to 127.0.0.1 — sbx
 
 ```
-$ P tcp 127.0.0.1 44419
+$ P tcp 127.0.0.1 57613
 --- output (rc=0)
 RESULT=no-connect ConnectionRefusedError(Connection refused)
 --- sbx log
@@ -493,40 +502,40 @@ exit code=0 outcome=exited
 ### N7a host loopback service, raw connect to 127.0.0.1 — srt
 
 ```
-$ P tcp 127.0.0.1 44419
+$ P tcp 127.0.0.1 57613
 --- output (rc=0)
 RESULT=no-connect ConnectionRefusedError(Connection refused)
 --- srt log
 ```
 
-### N7b host loopback service through the proxy (curl --noproxy '') — sbx
+### N7b host loopback service by IP, proxy variables honoured (curl --noproxy '') — sbx
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:44419/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:57613/
 --- output (rc=0)
-curl: (7) Failed to connect to 127.0.0.1 port 44419 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 57613 after 0 ms: Couldn't connect to server
 --- sbx log
 exit code=0 outcome=exited
 ```
 
-### N7b host loopback service through the proxy (curl --noproxy '') — srt
+### N7b host loopback service by IP, proxy variables honoured (curl --noproxy '') — srt
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:44419/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:57613/
 --- output (rc=0)
 Connection blocked by network allowlist
 --- srt log
-HTTP request blocked to 127.0.0.1:44419
-No matching rule, denying: 127.0.0.1:44419
+HTTP request blocked to 127.0.0.1:57613
+No matching rule, denying: 127.0.0.1:57613
 [proxy] deny: Connection blocked by network allowlist
 ```
 
 ### N7c host loopback service by name (localhost) — sbx
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:44419/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:57613/
 --- output (rc=0)
-curl: (7) Failed to connect to localhost port 44419 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to localhost port 57613 after 0 ms: Couldn't connect to server
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -534,21 +543,21 @@ exit code=0 outcome=exited
 ### N7c host loopback service by name (localhost) — srt
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:44419/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:57613/
 --- output (rc=0)
 Connection blocked by network allowlist
 --- srt log
-HTTP request blocked to localhost:44419
-No matching rule, denying: localhost:44419
+HTTP request blocked to localhost:57613
+No matching rule, denying: localhost:57613
 [proxy] deny: Connection blocked by network allowlist
 ```
 
 ### N7d host abstract unix socket — sbx
 
 ```
-$ P abstract sbx-bench-25993933
+$ P abstract sbx-bench-db222a64
 --- output (rc=0)
-RESULT=no-connect @sbx-bench-25993933 ConnectionRefusedError(Connection refused)
+RESULT=no-connect @sbx-bench-db222a64 ConnectionRefusedError(Connection refused)
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -556,7 +565,7 @@ exit code=0 outcome=exited
 ### N7d host abstract unix socket — srt
 
 ```
-$ P abstract sbx-bench-25993933
+$ P abstract sbx-bench-db222a64
 --- output (rc=0)
 RESULT=no-socket socket(AF_UNIX) PermissionError(Operation not permitted)
 --- srt log
@@ -588,7 +597,7 @@ Allowed by config rule: example.com:443
 ### N8b ssh to the allowed name, port 22 — sbx
 
 ```
-$ RE="SSH-|Permission denied|Host key" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true
+$ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true
 --- output (rc=0)
 Connection closed by 198.18.0.1 port 22
 --- sbx log
@@ -601,7 +610,7 @@ exit code=0 outcome=exited
 ### N8b ssh to the allowed name, port 22 — srt
 
 ```
-$ RE="SSH-|Permission denied|Host key" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true
+$ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true
 --- output (rc=0)
 ssh: Could not resolve hostname example.com: Temporary failure in name resolution
 --- srt log
@@ -610,9 +619,10 @@ ssh: Could not resolve hostname example.com: Temporary failure in name resolutio
 ### N8c git over ssh to the allowed name, port 22 — sbx
 
 ```
-$ RE="SSH-|Permission denied|Host key" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
+$ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
 --- output (rc=0)
-Connection closed by 198.18.0.1 port 22
+kex_exchange_identification: read: Connection reset by peer
+Connection reset by 198.18.0.1 port 22
 fatal: Could not read from remote repository.
 
 Please make sure you have the correct access rights
@@ -627,9 +637,9 @@ exit code=0 outcome=exited
 ### N8c git over ssh to the allowed name, port 22 — srt
 
 ```
-$ RE="SSH-|Permission denied|Host key" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
+$ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
 --- output (rc=0)
-2026/11/08 15:04:42 socat[8] E CONNECT example.com:22: host is not on the allow list
+2026/11/08 15:24:27 socat[8] E CONNECT example.com:22: host is not on the allow list
 Connection closed by UNKNOWN port 65535
 fatal: Could not read from remote repository.
 
@@ -660,10 +670,29 @@ RESULT=no-send gaierror(Unknown error -3)
 --- srt log
 ```
 
+### N8e UDP datagram to an IP literal (1.1.1.1:443, no DNS needed) — sbx
+
+```
+$ P udp 1.1.1.1 443
+--- output (rc=0)
+RESULT=no-send PermissionError(Operation not permitted)
+--- sbx log
+exit code=0 outcome=exited
+```
+
+### N8e UDP datagram to an IP literal (1.1.1.1:443, no DNS needed) — srt
+
+```
+$ P udp 1.1.1.1 443
+--- output (rc=0)
+RESULT=no-send OSError(Network is unreachable)
+--- srt log
+```
+
 ### F1 write inside the rw dir (baseline) — sbx
 
 ```
-$ echo ok > '$WORK/rw/inside' && cat '$WORK/rw/inside'
+$ echo ok > '<WORK>/rw/inside' && cat '<WORK>/rw/inside'
 --- output (rc=0)
 ok
 --- sbx log
@@ -673,7 +702,7 @@ exit code=0 outcome=exited
 ### F1 write inside the rw dir (baseline) — srt
 
 ```
-$ echo ok > '$WORK/rw/inside' && cat '$WORK/rw/inside'
+$ echo ok > '<WORK>/rw/inside' && cat '<WORK>/rw/inside'
 --- output (rc=0)
 ok
 --- srt log
@@ -682,28 +711,28 @@ ok
 ### F2 write outside the rw dir (host /tmp) — sbx
 
 ```
-$ echo canary > '$WORK/outside-canary'
+$ echo canary > '<WORK>/outside-canary'
 --- output (rc=0)
 --- sbx log
 exit code=0 outcome=exited
-host: write succeeded inside, but $WORK/outside-canary is not on the host (the sandbox has its own mount there)
+host: write succeeded inside, but <WORK>/outside-canary is not on the host (the sandbox has its own mount there)
 ```
 
 ### F2 write outside the rw dir (host /tmp) — srt
 
 ```
-$ echo canary > '$WORK/outside-canary'
+$ echo canary > '<WORK>/outside-canary'
 --- output (rc=0)
-/usr/bin/bash: line 11: $WORK/outside-canary: Read-only file system
+/usr/bin/bash: line 11: <WORK>/outside-canary: Read-only file system
 --- srt log
 ```
 
 ### F3 write into the host $HOME — sbx
 
 ```
-$ echo canary > '~/.sbx-bench-canary-25993933'
+$ echo canary > '<HOME>/.sbx-bench-canary-db222a64'
 --- output (rc=0)
-/usr/bin/bash: line 11: ~/.sbx-bench-canary-25993933: No such file or directory
+/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-db222a64: No such file or directory
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -711,18 +740,18 @@ exit code=0 outcome=exited
 ### F3 write into the host $HOME — srt
 
 ```
-$ echo canary > '~/.sbx-bench-canary-25993933'
+$ echo canary > '<HOME>/.sbx-bench-canary-db222a64'
 --- output (rc=0)
-/usr/bin/bash: line 11: ~/.sbx-bench-canary-25993933: No such file or directory
+/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-db222a64: No such file or directory
 --- srt log
 ```
 
 ### F4 write to /usr — sbx
 
 ```
-$ echo canary > /usr/sbx-bench-25993933
+$ echo canary > /usr/sbx-bench-db222a64
 --- output (rc=0)
-/usr/bin/bash: line 11: /usr/sbx-bench-25993933: Read-only file system
+/usr/bin/bash: line 11: /usr/sbx-bench-db222a64: Read-only file system
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -730,18 +759,18 @@ exit code=0 outcome=exited
 ### F4 write to /usr — srt
 
 ```
-$ echo canary > /usr/sbx-bench-25993933
+$ echo canary > /usr/sbx-bench-db222a64
 --- output (rc=0)
-/usr/bin/bash: line 11: /usr/sbx-bench-25993933: Read-only file system
+/usr/bin/bash: line 11: /usr/sbx-bench-db222a64: Read-only file system
 --- srt log
 ```
 
 ### F5 list ~/.ssh (names only) — sbx
 
 ```
-$ n=$(ls -A '~/.ssh' 2>&1) && echo "listed $(echo "$n" | grep -c .) entries" || { echo "$n"; false; }
+$ n=$(ls -A '<HOME>/.ssh' 2>&1) && echo "listed $(echo "$n" | grep -c .) entries" || { echo "$n"; false; }
 --- output (rc=0)
-ls: cannot access '~/.ssh': No such file or directory
+ls: cannot access '<HOME>/.ssh': No such file or directory
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -749,9 +778,9 @@ exit code=0 outcome=exited
 ### F5 list ~/.ssh (names only) — srt
 
 ```
-$ n=$(ls -A '~/.ssh' 2>&1) && echo "listed $(echo "$n" | grep -c .) entries" || { echo "$n"; false; }
+$ n=$(ls -A '<HOME>/.ssh' 2>&1) && echo "listed $(echo "$n" | grep -c .) entries" || { echo "$n"; false; }
 --- output (rc=0)
-ls: cannot access '~/.ssh': No such file or directory
+ls: cannot access '<HOME>/.ssh': No such file or directory
 --- srt log
 ```
 
@@ -769,15 +798,15 @@ exit code=0 outcome=exited
 ```
 $ printenv SBX_BENCH_SECRET && printenv AWS_SECRET_ACCESS_KEY
 --- output (rc=0)
-canary-25993933
-canary-aws-25993933
+canary-db222a64
+canary-aws-db222a64
 --- srt log
 ```
 
 ### F7 see a host process (/proc) — sbx
 
 ```
-$ m=sbx-bench-decoy; m=$m-25993933; n=0; f=1
+$ m=sbx-bench-decoy; m=$m-db222a64; n=0; f=1
    for p in /proc/[0-9]*; do n=$((n+1)); case "$(tr '\0' ' ' <$p/cmdline 2>/dev/null)" in *"$m"*) f=0; echo "found $p";; esac; done
    echo "visible pids: $n"; exit $f
 --- output (rc=0)
@@ -789,7 +818,7 @@ exit code=0 outcome=exited
 ### F7 see a host process (/proc) — srt
 
 ```
-$ m=sbx-bench-decoy; m=$m-25993933; n=0; f=1
+$ m=sbx-bench-decoy; m=$m-db222a64; n=0; f=1
    for p in /proc/[0-9]*; do n=$((n+1)); case "$(tr '\0' ' ' <$p/cmdline 2>/dev/null)" in *"$m"*) f=0; echo "found $p";; esac; done
    echo "visible pids: $n"; exit $f
 --- output (rc=0)
@@ -797,7 +826,7 @@ visible pids: 3
 --- srt log
 ```
 
-### F8 read the host /etc/passwd — sbx
+### F8 read the host /etc/passwd (the srt policy has to allow it, see V4) — sbx
 
 ```
 $ grep '^[^:]*:[^:]*:1000:' /etc/passwd | cut -d: -f1,3 | sed 's/^[^:]*/<host user>/' | grep .
@@ -806,7 +835,7 @@ $ grep '^[^:]*:[^:]*:1000:' /etc/passwd | cut -d: -f1,3 | sed 's/^[^:]*/<host us
 exit code=0 outcome=exited
 ```
 
-### F8 read the host /etc/passwd — srt
+### F8 read the host /etc/passwd (the srt policy has to allow it, see V4) — srt
 
 ```
 $ grep '^[^:]*:[^:]*:1000:' /etc/passwd | cut -d: -f1,3 | sed 's/^[^:]*/<host user>/' | grep .
@@ -818,38 +847,38 @@ $ grep '^[^:]*:[^:]*:1000:' /etc/passwd | cut -d: -f1,3 | sed 's/^[^:]*/<host us
 ### F9 plant a git hook in the rw checkout (.git/hooks/pre-commit) — sbx
 
 ```
-$ echo 'echo pwned' > '$WORK/rw/.git/hooks/pre-commit'
+$ echo 'echo pwned' > '<WORK>/rw/.git/hooks/pre-commit'
 --- output (rc=0)
 --- sbx log
 exit code=0 outcome=exited
-host: $WORK/rw/.git/hooks/pre-commit written (echo pwned)
+host: <WORK>/rw/.git/hooks/pre-commit written (echo pwned)
 ```
 
 ### F9 plant a git hook in the rw checkout (.git/hooks/pre-commit) — srt
 
 ```
-$ echo 'echo pwned' > '$WORK/rw/.git/hooks/pre-commit'
+$ echo 'echo pwned' > '<WORK>/rw/.git/hooks/pre-commit'
 --- output (rc=0)
-/usr/bin/bash: line 11: $WORK/rw/.git/hooks/pre-commit: Read-only file system
+/usr/bin/bash: line 11: <WORK>/rw/.git/hooks/pre-commit: Read-only file system
 --- srt log
 ```
 
 ### F10 plant a shell rc file in the rw dir (.bashrc) — sbx
 
 ```
-$ echo 'echo pwned' >> '$WORK/rw/.bashrc'
+$ echo 'echo pwned' >> '<WORK>/rw/.bashrc'
 --- output (rc=0)
 --- sbx log
 exit code=0 outcome=exited
-host: $WORK/rw/.bashrc written (echo pwned)
+host: <WORK>/rw/.bashrc written (echo pwned)
 ```
 
 ### F10 plant a shell rc file in the rw dir (.bashrc) — srt
 
 ```
-$ echo 'echo pwned' >> '$WORK/rw/.bashrc'
+$ echo 'echo pwned' >> '<WORK>/rw/.bashrc'
 --- output (rc=0)
-/usr/bin/bash: line 11: $WORK/rw/.bashrc: Permission denied
+/usr/bin/bash: line 11: <WORK>/rw/.bashrc: Permission denied
 --- srt log
 ```
 
@@ -858,7 +887,7 @@ $ echo 'echo pwned' >> '$WORK/rw/.bashrc'
 ```
 $ GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes -o ConnectTimeout=8" timeout 20 git ls-remote ssh://git@example.com/x.git
 --- output
-2026/11/08 15:04:49 socat[6] E CONNECT example.com:22: Bad Gateway
+2026/11/08 15:24:35 socat[6] E CONNECT example.com:22: Bad Gateway
 Connection closed by UNKNOWN port 65535
 fatal: Could not read from remote repository.
 
@@ -877,5 +906,26 @@ curl: (28) Connection timed out after 8000 milliseconds
 connect=000 http=000 ip=::1
 --- srt log
 Allowed by config rule: 10.0.0.1.nip.io:443
+```
+
+### V3 srt with denyRead ["/"] (allowRead as in the policy), HTTPS to the allowed name — srt
+
+```
+$ c https://example.com/
+--- output
+--- srt log
+```
+
+### V4 srt without /etc/passwd, /etc/group, /etc/hosts readable, git over ssh — srt
+
+```
+$ GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes" git ls-remote ssh://git@example.com/x.git
+--- output
+No user exists for uid 1000
+fatal: Could not read from remote repository.
+
+Please make sure you have the correct access rights
+and the repository exists.
+--- srt log
 ```
 

@@ -12,15 +12,18 @@
     ]
   },
   "filesystem": {
-    "denyRead": ["/home", "/root", "/mnt", "/opt", "/srv", "/var", "/etc", "/boot", "/media", "/snap"],
+    "denyRead": [
+      "/home", "/root", "/mnt", "/opt", "/srv", "/var", "/etc", "/run", "/boot",
+      "/media", "/snap", "/init", "/lost+found"
+    ],
     "allowRead": [
       "/etc/ssl", "/etc/ca-certificates", "/etc/alternatives", "/etc/ld.so.cache",
       "/etc/localtime", "/etc/nsswitch.conf", "/etc/passwd", "/etc/group", "/etc/hosts",
-      "$WORK/rw", "$TOOLS"
+      "<WORK>/rw", "<TOOLS>"
     ],
-    "allowWrite": ["$WORK/rw"],
+    "allowWrite": ["<WORK>/rw"],
     "denyWrite": []
   },
-  "socatPath": "$TOOLS/prefix/usr/bin/socat",
-  "ripgrep": { "command": "$TOOLS/prefix/usr/bin/rg" }
+  "socatPath": "<TOOLS>/prefix/usr/bin/socat",
+  "ripgrep": { "command": "<TOOLS>/prefix/usr/bin/rg" }
 }

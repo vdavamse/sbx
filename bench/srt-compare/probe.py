@@ -30,8 +30,11 @@ def out(word, detail, ok):
 
 
 def err(e):
+    # An SSLError's errno is an OpenSSL code, not an errno: print the error.
     name = getattr(e, "errno", None)
-    return f"{type(e).__name__}({os.strerror(name) if isinstance(name, int) else e})"
+    if isinstance(name, int) and not isinstance(e, ssl.SSLError):
+        return f"{type(e).__name__}({os.strerror(name)})"
+    return f"{type(e).__name__}({e})"
 
 
 def tcp(host, port, sni=None):

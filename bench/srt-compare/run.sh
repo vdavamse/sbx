@@ -32,6 +32,16 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/sbx-srt-work.XXXXXX")
 RW=$WORK/rw
 TOKEN=$(od -An -N4 -tx4 /dev/urandom | tr -d ' ')
 REALHOME=$HOME
+pids=()
+cleanup() {
+  for p in ${pids[@]+"${pids[@]}"}; do kill "$p" 2>/dev/null; done
+  "$SBX" stop --session-dir "$WORK/sess-ka" >/dev/null 2>&1
+  rm -f "$REALHOME/.sbx-bench-canary-$TOKEN" "/usr/sbx-bench-$TOKEN" 2>/dev/null
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mkdir -p "$RW" "$OUT/raw"
 OUT=$(cd "$OUT" && pwd)
 rm -f "$OUT"/raw/* "$OUT/results.tsv"
@@ -48,13 +58,6 @@ AUDIT=$WORK/audit.jsonl
 : >"$AUDIT"
 
 # ---------------------------------------------------------------- host side
-pids=()
-cleanup() {
-  for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-  rm -f "$REALHOME/.sbx-bench-canary-$TOKEN"
-  rm -rf "$WORK"
-}
-trap cleanup EXIT
 
 # A host service on loopback and on an abstract unix socket, each answering
 # with a marker the probes look for.
@@ -79,6 +82,16 @@ for _ in $(seq 50); do [[ -s $WORK/listener.port ]] && break; sleep 0.1; done
 LPORT=$(cat "$WORK/listener.port")
 bash -c "exec -a sbx-bench-decoy-$TOKEN sleep 900" &
 pids+=($!)
+DECOY=$!
+
+# Positive controls: each fixture must answer from the host, or the rows that
+# probe it would read "blocked" for nothing.
+fail() { echo "run.sh: $*" >&2; exit 1; }
+[[ $LPORT =~ ^[0-9]+$ ]] || fail "the loopback listener did not start"
+curl -s -m 5 "http://127.0.0.1:$LPORT/" | grep -q HOST-LOOPBACK || fail "the loopback listener does not answer"
+"$PY" -I "$HERE/probe.py" abstract "sbx-bench-$TOKEN" >/dev/null || fail "the abstract socket does not answer"
+sleep 0.2
+tr '\0' ' ' <"/proc/$DECOY/cmdline" 2>/dev/null | grep -q "sbx-bench-decoy-$TOKEN" || fail "the decoy process is not running"
 export SBX_BENCH_SECRET=canary-$TOKEN AWS_SECRET_ACCESS_KEY=canary-aws-$TOKEN
 
 # ---------------------------------------------------------------- host info
@@ -89,11 +102,13 @@ export SBX_BENCH_SECRET=canary-$TOKEN AWS_SECRET_ACCESS_KEY=canary-aws-$TOKEN
   echo "bwrap:    $(bwrap --version 2>&1)"
   echo "node:     $(node --version)"
   echo "sbx:      $("$SBX" --version) ($(sha256sum "$SBX" | cut -c1-16)…)"
-  echo "srt:      $(node "$SRT_CLI" --version) (npm $(cat "$TOOLS/srt/integrity.txt" 2>/dev/null || echo '?'))"
+  echo "srt:      $(node "$SRT_CLI" --version)"
   echo "srt tag:  $(git ls-remote https://github.com/anthropics/sandbox-runtime "refs/tags/v$(node "$SRT_CLI" --version)" 2>/dev/null | cut -c1-40)"
   echo "socat:    $("$SOCAT" -V 2>/dev/null | sed -n 's/^socat version \([^ ]*\).*/\1/p')"
   echo "ripgrep:  $("$RG" --version | head -1)"
   echo "sbx check: $("$SBX" check 2>&1 | grep '^network mode')"
+  echo "runner:   $(git -C "$HERE" rev-parse --short HEAD 2>/dev/null)$(git -C "$HERE" status --porcelain -- . 2>/dev/null | grep -q . && echo ' (modified)')"
+  [[ -f ${SRT_DIR:-$TOOLS/srt}/provenance.txt ]] && sed -n '1,2p' "${SRT_DIR:-$TOOLS/srt}/provenance.txt" | sed 's/^/srt npm /'
 } >"$OUT/host.txt"
 cat "$OUT/host.txt"
 
@@ -149,13 +164,16 @@ run_srt() {
 
 esc() { sed -e 's/|/\\|/g' | tr '\n' ' ' | cut -c1-220; }
 
-scen() { # ID "title" success-word failure-word 'script' [host-path]
+scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex]
+  # With deny-regex the failure-word needs proof: the tool's log must match
+  # the regex (an explicit deny). A failed script without it is "unverified",
+  # because the target may simply not have answered.
   # With host-path the verdict is taken on the host: success-word when the
   # path is a non-empty file there after the run. A write that succeeded
   # inside but landed elsewhere (sbx's /tmp is the session's own tmp
   # directory) is the failure-word, and so is the empty placeholder file srt
   # leaves for a mandatory deny.
-  local id=$1 title=$2 ok=$3 bad=$4 body=$5 hostpath=${6:-} tool f word rc
+  local id=$1 title=$2 ok=$3 bad=$4 body=$5 hostpath=${6:-} denyre=${7:-} tool f word rc
   local script="$PRELUDE
 ( $body ); r=\$?; if [ \$r = 0 ]; then echo OUTCOME=$ok; else echo OUTCOME=$bad; fi"
   local row="$id	$title"
@@ -165,7 +183,10 @@ scen() { # ID "title" success-word failure-word 'script' [host-path]
     rc=$?
     word=$(sed -n 's/^OUTCOME=//p' "$f.out" | tail -1)
     [[ -z $word ]] && word="error(rc=$rc)"
-    if [[ -n $hostpath ]]; then
+    if [[ -n $denyre && $word == "$bad" ]] && ! grep -qE "$denyre" "$f.log"; then
+      word=unverified
+    fi
+    if [[ -n $hostpath && ( $word == "$ok" || $word == "$bad" ) ]]; then
       if [[ -s $hostpath ]]; then
         word=$ok; echo "host: $hostpath written ($(head -c 40 "$hostpath"))" >>"$f.log"; rm -f "$hostpath"
       else
@@ -211,15 +232,17 @@ scen N5b "fronting: raw TLS to the allowed name with a foreign SNI" LEAKED block
   'P tcp example.com 443 www.cloudflare.com'
 scen N5c "fronting: SNI of the allowed name, foreign Host header" passed-uninspected stopped \
   'c https://example.com/ -H "Host: www.cloudflare.com"'
+# Nothing answers at these addresses, so the verdict needs the tool's deny.
+DIALDENY='denied dial|blocked: resolved to'
 scen N6a "allowed name resolving to 127.0.0.1 (127.0.0.1.nip.io)" LEAKED blocked \
-  'c https://127.0.0.1.nip.io/'
+  'c https://127.0.0.1.nip.io/' "" "$DIALDENY"
 scen N6b "allowed name resolving to 169.254.169.254" LEAKED blocked \
-  'c https://169.254.169.254.nip.io/'
+  'c https://169.254.169.254.nip.io/' "" "$DIALDENY"
 scen N6c "allowed name resolving to 10.0.0.1 (RFC1918)" LEAKED blocked \
-  'c https://10.0.0.1.nip.io/'
+  'c https://10.0.0.1.nip.io/' "" "$DIALDENY"
 scen N7a "host loopback service, raw connect to 127.0.0.1" LEAKED blocked \
   "P tcp 127.0.0.1 $LPORT"
-scen N7b "host loopback service through the proxy (curl --noproxy '')" LEAKED blocked \
+scen N7b "host loopback service by IP, proxy variables honoured (curl --noproxy '')" LEAKED blocked \
   "RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:$LPORT/"
 scen N7c "host loopback service by name (localhost)" LEAKED blocked \
   "RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:$LPORT/"
@@ -228,11 +251,13 @@ scen N7d "host abstract unix socket" LEAKED blocked \
 scen N8a "git over HTTPS to the allowed name" allowed blocked \
   'RE="not found|404|did not send" GIT_TERMINAL_PROMPT=0 show git ls-remote https://example.com/x.git'
 scen N8b "ssh to the allowed name, port 22" LEAKED blocked \
-  'RE="SSH-|Permission denied|Host key" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true'
+  'RE="SSH-2\.0|Permission denied \(publickey|Host key verification" show ssh -F /dev/null -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null git@example.com true'
 scen N8c "git over ssh to the allowed name, port 22" LEAKED blocked \
-  'RE="SSH-|Permission denied|Host key" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git'
+  'RE="SSH-2\.0|Permission denied \(publickey|Host key verification" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git'
 scen N8d "UDP datagram to the allowed name, port 443" LEAKED blocked \
   'P udp example.com 443'
+scen N8e "UDP datagram to an IP literal (1.1.1.1:443, no DNS needed)" LEAKED blocked \
+  'P udp 1.1.1.1 443'
 
 # ---------------------------------------------------------------- filesystem / process
 scen F1 "write inside the rw dir (baseline)" allowed BROKEN \
@@ -243,15 +268,19 @@ scen F3 "write into the host \$HOME" LEAKED blocked \
   "echo canary > '$REALHOME/.sbx-bench-canary-$TOKEN'" "$REALHOME/.sbx-bench-canary-$TOKEN"
 scen F4 "write to /usr" LEAKED blocked \
   "echo canary > /usr/sbx-bench-$TOKEN" "/usr/sbx-bench-$TOKEN"
+if [[ -d $REALHOME/.ssh ]]; then
 scen F5 "list ~/.ssh (names only)" LEAKED blocked \
   "n=\$(ls -A '$REALHOME/.ssh' 2>&1) && echo \"listed \$(echo \"\$n\" | grep -c .) entries\" || { echo \"\$n\"; false; }"
+else
+  printf 'F5\tlist ~/.ssh (names only)\tn/a (no ~/.ssh on this host)\tn/a (no ~/.ssh on this host)\n' | tee -a "$OUT/results.tsv"
+fi
 scen F6 "read secrets from the environment" LEAKED blocked \
   'printenv SBX_BENCH_SECRET && printenv AWS_SECRET_ACCESS_KEY'
 scen F7 "see a host process (/proc)" LEAKED blocked \
   "m=sbx-bench-decoy; m=\$m-$TOKEN; n=0; f=1
    for p in /proc/[0-9]*; do n=\$((n+1)); case \"\$(tr '\\0' ' ' <\$p/cmdline 2>/dev/null)\" in *\"\$m\"*) f=0; echo \"found \$p\";; esac; done
    echo \"visible pids: \$n\"; exit \$f"
-scen F8 "read the host /etc/passwd" LEAKED blocked \
+scen F8 "read the host /etc/passwd (the srt policy has to allow it, see V4)" LEAKED blocked \
   "grep '^[^:]*:[^:]*:$(id -u):' /etc/passwd | cut -d: -f1,3 | sed 's/^[^:]*/<host user>/' | grep ."
 scen F9 "plant a git hook in the rw checkout (.git/hooks/pre-commit)" planted blocked \
   "echo 'echo pwned' > '$RW/.git/hooks/pre-commit'" "$RW/.git/hooks/pre-commit"
@@ -261,13 +290,15 @@ scen F10 "plant a shell rc file in the rw dir (.bashrc)" planted blocked \
 # ---------------------------------------------------------------- srt defaults
 # Two srt settings this comparison turns on to match the sbx policy. Here is
 # what each scenario does without them; the verdict is read from srt's log.
-variant() { # ID "title" python-edit 'script' log-regex-meaning-dialed
-  local id=$1 title=$2 edit=$3 body=$4 re=$5 f=$OUT/raw/$1.srt word
+variant() { # ID "title" python-edit 'script' log|out regex match-word other-word
+  # The word is match-word when the regex matches srt's log (log) or the
+  # script's output (out) and srt logged no deny; other-word otherwise.
+  local id=$1 title=$2 edit=$3 body=$4 src=$5 re=$6 yes=$7 no=$8 f=$OUT/raw/$1.srt word
   "$PY" -I -c "import json,sys; c=json.load(open(sys.argv[1])); $edit; json.dump(c,open(sys.argv[2],'w'),indent=1)" \
     "$WORK/srt.json" "$WORK/srt-$id.json"
   SRT_CONF=$WORK/srt-$id.json run_srt "$f" "$PRELUDE
 $body"
-  if grep -qE "$re" "$f.log" && ! grep -qE 'blocked|denying' "$f.log"; then word=dialed; else word=refused; fi
+  if grep -qE "$re" "$f.$src" && ! grep -qE 'blocked|denying' "$f.log"; then word=$yes; else word=$no; fi
   printf '%s\t%s\t%s\t%s\n' "$id" "$title" "n/a" "$word" | tee -a "$OUT/variants.tsv"
   { echo "### $id $title — srt"; echo; echo '```'; echo "\$ $body"; echo "--- output"; head -8 "$f.out";
     echo "--- srt log"; head -8 "$f.log"; echo '```'; echo; } >>"$OUT/evidence.md"
@@ -276,11 +307,19 @@ $body"
 variant V1 "srt allow entry without :port, then git over ssh (port 22)" \
   'c["network"]["allowedDomains"]=[d.split(":")[0] for d in c["network"]["allowedDomains"]]' \
   'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes -o ConnectTimeout=8" timeout 20 git ls-remote ssh://git@example.com/x.git' \
-  'Allowed by config rule: example.com:22'
+  log 'Allowed by config rule: example.com:22' dialed refused
 variant V2 "srt without deniedResolvedAddresses, name resolving to 10.0.0.1" \
   'c["network"].pop("deniedResolvedAddresses")' \
   'c -m 8 https://10.0.0.1.nip.io/' \
-  'Allowed by config rule: 10.0.0.1.nip.io' 
+  log 'Allowed by config rule: 10.0.0.1.nip.io' dialed refused
+variant V3 "srt with denyRead [\"/\"] (allowRead as in the policy), HTTPS to the allowed name" \
+  'c["filesystem"]["denyRead"]=["/"]' \
+  'c https://example.com/' \
+  out 'http=200' works broken
+variant V4 "srt without /etc/passwd, /etc/group, /etc/hosts readable, git over ssh" \
+  'c["filesystem"]["allowRead"]=[p for p in c["filesystem"]["allowRead"] if p not in ("/etc/passwd","/etc/group","/etc/hosts")]' \
+  'GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes" git ls-remote ssh://git@example.com/x.git' \
+  out 'No user exists|getaddrinfo\("localhost"' broken works
 
 # Did a sandbox write leave the canaries on the host? (checked here, outside)
 {
@@ -328,15 +367,19 @@ erg E6 "sandbox cannot start (bwrap missing)" \
   "$(TMPDIR=$SRT_TMPDIR rcof node "$SRT_CLI" --settings "$WORK/srt-nobwrap.json" -c true)"
 erg E7 "command not found" \
   "$(rcof sbxr -- /no/such/cmd)" "$(rcof srtr -- /no/such/cmd)"
+e8=$(sbxr --audit "$WORK/e8.jsonl" -- /usr/bin/head -c 5000000 /dev/zero 2>"$WORK/e8.err" | wc -c)
 erg E8 "5 MB of output (the sbx policy caps output at 1 MiB)" \
-  "bytes=$(sbxr -- /usr/bin/head -c 5000000 /dev/zero 2>/dev/null | wc -c)" \
+  "bytes=$e8 $(tail -1 "$WORK/e8.err"); audit output_truncated=$(grep -o '"output_truncated":[a-z]*' "$WORK/e8.jsonl" | cut -d: -f2)" \
   "bytes=$(srtr -c 'head -c 5000000 /dev/zero' 2>/dev/null | wc -c)"
-s="start: $(rcof "$SBX" run --keep-alive --policy "$WORK/sbx.json" --session-dir "$WORK/sess-ka" -- /usr/bin/sleep 300)"
+# The resident serves the rw dir on the session's loopback; an attached call
+# fetches from it, which shows the calls share localhost.
+s="start: $(rcof "$SBX" run --keep-alive --policy "$WORK/sbx.json" --session-dir "$WORK/sess-ka" --cwd "$RW" -- /usr/bin/python3 -m http.server 8765 --bind 127.0.0.1)"
 s="$s; attach: $(rcof "$SBX" attach --policy "$WORK/sbx.json" --session-dir "$WORK/sess-ka" -- /usr/bin/true)"
+sleep 1
+s="$s; attach curl of the resident: $("$SBX" attach --policy "$WORK/sbx.json" --session-dir "$WORK/sess-ka" -- /usr/bin/curl -s -o /dev/null -w 'http=%{http_code}' http://127.0.0.1:8765/probe.py 2>&1)"
 "$SBX" stop --session-dir "$WORK/sess-ka" >/dev/null 2>&1
 erg E9 "persistent session (sbx run --keep-alive, then attach true)" "$s" \
   "not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls)"
-cd "$HERE" || exit 1
 
 # ---------------------------------------------------------------- startup latency
 {
@@ -345,33 +388,47 @@ cd "$HERE" || exit 1
     hyperfine -N --warmup 3 --runs 20 --export-json "$WORK/hf.json" \
       "/usr/bin/true" \
       "$SBX run --policy $WORK/sbx.json --session-dir $WORK/sess --cwd $RW -- /usr/bin/true" \
-      "env TMPDIR=$SRT_TMPDIR node $SRT_CLI --settings $WORK/srt.json -- /usr/bin/true" >/dev/null 2>&1
+      "env TMPDIR=$SRT_TMPDIR node $SRT_CLI --settings $WORK/srt.json -- /usr/bin/true" >/dev/null 2>"$WORK/hf.err" ||
+      { echo "hyperfine failed:"; cat "$WORK/hf.err"; }
+    # Where srt's time goes: node itself, loading the CLI, and a run with an
+    # empty policy (proxies and bridges, no deny-path work).
+    printf '%s\n' '{"network":{"allowedDomains":[],"deniedDomains":[]},"filesystem":{"denyRead":[],"allowWrite":[],"denyWrite":[]}}' |
+      "$PY" -I -c 'import json,sys; c=json.load(sys.stdin); c["socatPath"]=sys.argv[1]; c["ripgrep"]={"command":sys.argv[2]}; json.dump(c,open(sys.argv[3],"w"))' \
+        "$SOCAT" "$RG" "$WORK/srt-empty.json"
+    hyperfine -N --warmup 3 --runs 20 --export-json "$WORK/hf2.json" \
+      "node -e 0" \
+      "node $SRT_CLI --version" \
+      "env TMPDIR=$SRT_TMPDIR node $SRT_CLI --settings $WORK/srt-empty.json -- /usr/bin/true" >/dev/null 2>"$WORK/hf.err" ||
+      { echo "hyperfine failed:"; cat "$WORK/hf.err"; }
     "$PY" -I -c '
 import json, sys
-for r, n in zip(json.load(open(sys.argv[1]))["results"], ["bare true", "sbx run", "srt"]):
+names = ["bare true", "sbx run", "srt", "node -e 0", "srt --version", "srt, empty policy"]
+rows = json.load(open(sys.argv[1]))["results"] + json.load(open(sys.argv[2]))["results"]
+for r, n in zip(rows, names):
     t = sorted(r["times"] if "times" in r else [m["time_wall_clock"]["value"] for m in r["measurements"]])
     med = (t[len(t) // 2] + t[(len(t) - 1) // 2]) / 2
-    print("  %-10s median %7.1f  min %7.1f  max %7.1f  (n=%d)" % (n, med * 1e3, t[0] * 1e3, t[-1] * 1e3, len(t)))
-' "$WORK/hf.json"
+    print("  %-17s median %7.1f  min %7.1f  max %7.1f  (n=%d)" % (n, med * 1e3, t[0] * 1e3, t[-1] * 1e3, len(t)))
+' "$WORK/hf.json" "$WORK/hf2.json"
   else
     for name in sbx srt; do
       ts=()
       for _ in $(seq 20); do
-        t0=$(date +%s%N)
-        if [[ $name == sbx ]]; then "$SBX" run --policy "$WORK/sbx.json" --session-dir "$WORK/sess" -- /usr/bin/true
+        t0=$(up)
+        if [[ $name == sbx ]]; then "$SBX" run --policy "$WORK/sbx.json" --session-dir "$WORK/sess" --cwd "$RW" -- /usr/bin/true
         else TMPDIR=$SRT_TMPDIR node "$SRT_CLI" --settings "$WORK/srt.json" -- /usr/bin/true; fi
-        ts+=($((($(date +%s%N) - t0) / 1000)))
+        ts+=($((($(up) - t0) * 10)))
       done
-      printf '  %-10s median %7.1f\n' "$name" "$(printf '%s\n' "${ts[@]}" | sort -n | sed -n 10p | awk '{print $1/1000}')"
+      printf '  %-10s median %5d (10 ms resolution, /proc/uptime)\n' "$name" "$(printf '%s\n' "${ts[@]}" | sort -n | sed -n 10p)"
     done
   fi
 } | tee "$OUT/latency.txt"
+cd "$HERE" || exit 1
 
 # ---------------------------------------------------------------- footprint
 {
   echo "install footprint:"
   echo "  sbx binary:        $(du -h "$SBX" | cut -f1)  ($(file -b "$SBX" | cut -d, -f1-2))"
-  echo "  srt package:       $(du -sh "$TOOLS/srt/node_modules" | cut -f1) node_modules ($(ls "$TOOLS/srt/node_modules" | wc -l) top-level entries)"
+  echo "  srt package:       $(du -sh "${SRT_CLI%/node_modules/*}/node_modules" | cut -f1) node_modules ($(ls "${SRT_CLI%/node_modules/*}/node_modules" | wc -l) top-level entries)"
   echo "  node runtime:      $(du -h "$(readlink -f "$(command -v node)")" | cut -f1) ($(node --version))"
   echo "  socat:             $(du -hL "$SOCAT" | cut -f1)   ripgrep: $(du -hL "$RG" | cut -f1)"
   echo "  bwrap:             $(du -h "$(command -v bwrap)" | cut -f1) $(stat -c '%A %U' "$(command -v bwrap)") (setuid: $([[ -u $(command -v bwrap) ]] && echo yes || echo no))"
@@ -405,6 +462,8 @@ for r, n in zip(json.load(open(sys.argv[1]))["results"], ["bare true", "sbx run"
   echo
   cat "$OUT/evidence.md"
 } >"$OUT/results.md"
-# Local paths are noise in a shared report.
-find "$OUT" -type f -exec sed -i -e "s#$WORK#\$WORK#g" -e "s#$TOOLS#\$TOOLS#g" -e "s#$REALHOME#~#g" {} +
+# Local paths are noise in a shared report. The placeholders cannot be read
+# as shell syntax, and HOME is replaced only as a path prefix, so a policy
+# entry such as "/root" survives when HOME=/root.
+find "$OUT" -type f -exec sed -i -e "s#$WORK#<WORK>#g" -e "s#$TOOLS#<TOOLS>#g" -e "s#$REALHOME/#<HOME>/#g" {} +
 echo "wrote $OUT/results.md"
