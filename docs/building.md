@@ -62,8 +62,7 @@ Pushing a `vX.Y.Z` tag that matches `Cargo.toml` runs
 - **Container image:** `ghcr.io/vdavamse/sbx:X.Y.Z` (amd64 and arm64):
   Debian slim with `bubblewrap` and `sbx` as the entrypoint, attested by
   digest. It runs as a non-root user; the container runtime must allow
-  unprivileged user namespaces. (A new GHCR package is private: make it
-  public once after the first release.)
+  unprivileged user namespaces.
 
 Release artifacts are the default-feature build: pure Rust, no C crypto.
 Opt-in features are never enabled in them. On pull requests that touch the
