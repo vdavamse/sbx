@@ -20,7 +20,10 @@
 //!    follow it). Targets under a deny path or a nested policy bind are left
 //!    to those.
 //! 3. **Placeholders.** A missing component at the top level of an `rw` path
-//!    gets a placeholder: an empty directory with mtime 0 (the marker), bound
+//!    gets a placeholder: an empty directory with mtime 0 (the marker), built
+//!    under a temporary `.sbx-protect.<pid>.<n>` name, locked, marked, and
+//!    renamed into place without replacing anything (so a placeholder is never
+//!    seen unmarked or unlocked at the protected name), and bound
 //!    read-only like a target. A directory also stands in for a missing file:
 //!    git ignores empty directories, so a placeholder never shows up as an
 //!    untracked file that an agent could commit. Below the top level, missing
@@ -36,17 +39,20 @@
 //!    later launch that finds a marked placeholder adopts it and removes it at
 //!    its end. A placeholder is locked before it is marked, so no cleanup can
 //!    take it in between. Residuals: a crash between `mkdir` and the mark
-//!    leaves an unmarked empty directory; a user's own empty directory with
+//!    leaves an unmarked empty `.sbx-protect.*` directory; a user's own empty directory with
 //!    mtime 0 at a protected name is taken for a placeholder; flock does not
 //!    work on some network filesystems (the gc residuals).
 //! 5. **Git directories.** In every real `.git` directory the scan reaches,
 //!    the existing `commondir` and `gitdir` files of each linked worktree
 //!    (`.git/worktrees/*/`) and the `hooks/`, `config` and `commondir` of each
 //!    submodule git directory (`.git/modules/**`, a directory with a `HEAD`)
-//!    are targets too: each of them redirects or runs host git. A `commondir`
-//!    cannot be pre-empted with a placeholder (git refuses a directory there),
-//!    so a `commondir` that appears during the run in a git directory that had
-//!    none is renamed aside at the end, with a warning.
+//!    are targets too, and so is every existing `config.worktree`: each of
+//!    them redirects or runs host git. A symlinked `worktrees` or `modules` is
+//!    refused. A `commondir` or `config.worktree` cannot be pre-empted with a
+//!    placeholder (git refuses a directory there), so one that appears during
+//!    the run in a git directory that had none is renamed aside at the end,
+//!    through the directory fd held since the scan, with a warning. This runs
+//!    only when the list protects something under `.git`.
 //! 6. **Keep-alive sessions.** The holder saves its target list in
 //!    `<session>/protect.paths`, and every `attach` call binds exactly that
 //!    list instead of scanning again. A scan of a tree the resident writes
@@ -116,6 +122,19 @@ impl Found {
     }
 }
 
+/// The files whose appearance in a git directory redirects host git: a
+/// `commondir` (hooks and config from another directory) and a
+/// `config.worktree` (read on top of `config` with `extensions.worktreeConfig`).
+const GIT_REDIRECTS: [&str; 2] = ["commondir", "config.worktree"];
+
+/// A git directory, held open from the scan (so a later swap of its path for
+/// a symlink cannot redirect the check), and the [`GIT_REDIRECTS`] it lacked.
+struct Watched {
+    path: PathBuf,
+    fd: OwnedFd,
+    absent: Vec<&'static str>,
+}
+
 /// A placeholder this launch holds a shared lock on.
 struct Held {
     parent: OwnedFd,
@@ -132,9 +151,9 @@ pub(crate) struct Protected {
     paths: Vec<AbsolutePath>,
     held: Vec<Held>,
     manifest: Option<(PathBuf, File)>,
-    /// Git directories that had no `commondir` at the scan (module docs
-    /// point 5).
-    gitdirs: Vec<PathBuf>,
+    /// Git directories that lacked a redirecting file at the scan (module
+    /// docs point 5).
+    gitdirs: Vec<Watched>,
     /// The session's saved path list (a keep-alive holder), removed at release.
     saved: Option<PathBuf>,
 }
@@ -162,8 +181,8 @@ impl Protected {
         if let Some(path) = self.saved.take() {
             let _ = std::fs::remove_file(path);
         }
-        for gitdir in self.gitdirs.drain(..) {
-            block_commondir(&gitdir);
+        for watched in self.gitdirs.drain(..) {
+            block_redirects(&watched);
         }
     }
 
@@ -276,8 +295,10 @@ pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protect
                 }
             }
             Found::Missing(root, _) => {
+                let tmp = temp_name(&path);
+                out.record(session, &tmp)?;
                 out.record(session, &path)?;
-                match create(&root, &path)? {
+                match create(&root, &path, &tmp)? {
                     Some(held) => out.held.push(held),
                     // Created concurrently: someone else's now, or a
                     // placeholder of a concurrent run.
@@ -356,22 +377,68 @@ pub(crate) fn load(policy: &Policy, session: &Path) -> Result<Protected, String>
     Ok(out)
 }
 
-/// Module docs point 5: a `commondir` file that appeared in a git directory
-/// during the run would make host git take its hooks and config from
-/// elsewhere. It is renamed aside, with a warning.
-fn block_commondir(gitdir: &Path) {
-    let path = gitdir.join("commondir");
-    if std::fs::symlink_metadata(&path).is_err() {
+/// Module docs point 5: a [`GIT_REDIRECTS`] file that appeared in a git
+/// directory during the run would make host git run hooks or read config the
+/// payload chose. It is renamed aside within the directory held open since
+/// the scan (never through its path), with a warning.
+fn block_redirects(watched: &Watched) {
+    for name in &watched.absent {
+        let Ok(cname) = cstring(name.as_bytes()) else {
+            continue;
+        };
+        if fstatat_nofollow(watched.fd.as_fd(), &cname).is_err() {
+            continue;
+        }
+        let path = watched.path.join(name);
+        let aside_name = format!("{name}.sbx-blocked.{}", std::process::id());
+        let aside = watched.path.join(&aside_name);
+        let Ok(caside) = cstring(aside_name.as_bytes()) else {
+            continue;
+        };
+        match crate::gc::sys::renameat2_noreplace(
+            watched.fd.as_fd(),
+            &cname,
+            watched.fd.as_fd(),
+            &caside,
+        ) {
+            Ok(()) => eprintln!(
+                "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks or read config the sandbox chose; renamed it to {aside:?}"
+            ),
+            Err(err) => eprintln!(
+                "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks or read config the sandbox chose, and sbx could not rename it ({err}); remove it before running git there"
+            ),
+        }
+    }
+}
+
+/// Holds `dir` (a git directory) open and records which [`GIT_REDIRECTS`] it
+/// lacks.
+fn watch(dir: &Path, gitdirs: &mut Vec<Watched>) {
+    let Ok(c) = cstring(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: NUL-terminated path; a successful call returns a fresh fd.
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
         return;
     }
-    let aside = gitdir.join(format!("commondir.sbx-blocked.{}", std::process::id()));
-    match std::fs::rename(&path, &aside) {
-        Ok(()) => eprintln!(
-            "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks and read config from another directory; renamed it to {aside:?}"
-        ),
-        Err(err) => eprintln!(
-            "sbx: warning: the sandbox created {path:?}, which would make git on the host run hooks and read config from another directory, and sbx could not rename it ({err}); remove it before running git there"
-        ),
+    // SAFETY: `raw` is a fresh descriptor returned by open.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let absent: Vec<&'static str> = GIT_REDIRECTS
+        .into_iter()
+        .filter(|n| cstring(n.as_bytes()).is_ok_and(|c| fstatat_nofollow(fd.as_fd(), &c).is_err()))
+        .collect();
+    if !absent.is_empty() {
+        gitdirs.push(Watched {
+            path: dir.to_path_buf(),
+            fd,
+            absent,
+        });
     }
 }
 
@@ -394,7 +461,7 @@ fn scan_root(
     binds: &[&str],
     denies: &[&str],
     out: &mut Vec<Found>,
-    gitdirs: &mut Vec<PathBuf>,
+    gitdirs: &mut Vec<Watched>,
 ) -> Result<(), String> {
     // A missing or non-directory rw path has nothing to scan; bwrap and the
     // guard report a missing one.
@@ -429,7 +496,10 @@ fn scan_root(
             }
         }
         let gitdir = dir.join(".git");
-        if is_real_dir(&gitdir) && !is_marked(&gitdir) && !skipped(&gitdir) {
+        let guards_git = entries
+            .iter()
+            .any(|e| e.comps.first().is_some_and(|c| c == ".git"));
+        if guards_git && is_real_dir(&gitdir) && !is_marked(&gitdir) && !skipped(&gitdir) {
             let mut extra = Vec::new();
             git_extras(&gitdir, &mut extra, gitdirs)?;
             for found in extra {
@@ -496,12 +566,14 @@ const GIT_BULK: [&str; 4] = ["objects", "refs", "logs", "lfs"];
 /// The git directories inside `.git` (module docs point 5): a linked
 /// worktree's admin directory under `worktrees/` (its `commondir` and `gitdir`
 /// redirect host git) and every submodule git directory under `modules/`
-/// (its `hooks/`, `config` and `commondir`). Existing ones only. `gitdirs`
-/// collects the git directories without a `commondir`.
+/// (its `hooks/`, `config` and `commondir`), plus every `config.worktree`.
+/// Existing ones only. `gitdirs` collects the git directories that lack a
+/// [`GIT_REDIRECTS`] file. A symlinked `worktrees` or `modules` is refused.
+/// Runs only when the list protects something under `.git`.
 fn git_extras(
     gitdir: &Path,
     out: &mut Vec<Found>,
-    gitdirs: &mut Vec<PathBuf>,
+    gitdirs: &mut Vec<Watched>,
 ) -> Result<(), String> {
     let existing = |path: PathBuf, out: &mut Vec<Found>| -> Result<(), String> {
         match std::fs::symlink_metadata(&path) {
@@ -514,6 +586,15 @@ fn git_extras(
             }
         }
     };
+    // `worktrees` and `modules` themselves: read_dir would follow a link.
+    let sub = |name: &str| -> Result<PathBuf, String> {
+        let path = gitdir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => Err(symlink_error(&path)),
+            _ => Ok(path),
+        }
+    };
+    // Children found through DirEntry::file_type, which does not follow links.
     let children = |dir: &Path| -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
             .into_iter()
@@ -525,16 +606,17 @@ fn git_extras(
         v.sort();
         v
     };
-    if !gitdir.join("commondir").exists() {
-        gitdirs.push(gitdir.to_path_buf());
-    }
-    for admin in children(&gitdir.join("worktrees")) {
-        existing(admin.join("commondir"), out)?;
-        existing(admin.join("gitdir"), out)?;
+    existing(gitdir.join("config.worktree"), out)?;
+    watch(gitdir, gitdirs);
+    for admin in children(&sub("worktrees")?) {
+        for name in ["commondir", "gitdir", "config.worktree"] {
+            existing(admin.join(name), out)?;
+        }
+        watch(&admin, gitdirs);
     }
     // Submodule git directories nest (`modules/a/modules/b`); a directory
     // with a HEAD file is one.
-    let mut queue: VecDeque<(PathBuf, usize)> = children(&gitdir.join("modules"))
+    let mut queue: VecDeque<(PathBuf, usize)> = children(&sub("modules")?)
         .into_iter()
         .map(|d| (d, 1))
         .collect();
@@ -548,12 +630,10 @@ fn git_extras(
         }
         let is_gitdir = dir.join("HEAD").is_file();
         if is_gitdir {
-            for name in ["hooks", "config", "commondir"] {
+            for name in ["hooks", "config", "commondir", "config.worktree"] {
                 existing(dir.join(name), out)?;
             }
-            if !dir.join("commondir").exists() {
-                gitdirs.push(dir.clone());
-            }
+            watch(&dir, gitdirs);
         }
         if depth >= 2 * SEARCH_DEPTH {
             continue;
@@ -712,31 +792,66 @@ fn split_under(root: &Path, path: &Path) -> io::Result<(OwnedFd, CString)> {
     Ok((dir, cstring(last.as_bytes())?))
 }
 
-/// Creates a placeholder at `path` (inside the rw path `root`) and locks it
-/// shared before marking it, so no cleanup can take it in between. `None`:
-/// the name appeared since the scan.
-fn create(root: &Path, path: &Path) -> Result<Option<Held>, String> {
+/// The temporary name a placeholder is built under, next to its final name.
+fn temp_name(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    path.with_file_name(format!(
+        ".sbx-protect.{}.{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Creates a placeholder at `path` (inside the rw path `root`): built under
+/// the temporary name `tmp`, locked shared and marked there, then renamed into
+/// place without replacing anything, so an unmarked or unlocked placeholder is
+/// never visible at the protected name. `None`: the name appeared since the
+/// scan.
+fn create(root: &Path, path: &Path, tmp: &Path) -> Result<Option<Held>, String> {
     let fail = |err: io::Error| format!("cannot create the placeholder {path:?}: {err}");
     let (parent, name) = split_under(root, path).map_err(fail)?;
+    let tmp_name = cstring(
+        tmp.file_name()
+            .ok_or_else(|| fail(io::Error::from_raw_os_error(libc::EINVAL)))?
+            .as_bytes(),
+    )
+    .map_err(fail)?;
     // SAFETY: valid dir fd and NUL-terminated name.
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
-        let err = io::Error::last_os_error();
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), tmp_name.as_ptr(), 0o755) } != 0 {
+        return Err(fail(io::Error::last_os_error()));
+    }
+    let discard = |parent: &OwnedFd| {
+        // SAFETY: valid dir fd and NUL-terminated name.
+        unsafe { libc::unlinkat(parent.as_raw_fd(), tmp_name.as_ptr(), libc::AT_REMOVEDIR) };
+    };
+    let built = (|| -> io::Result<OwnedFd> {
+        let fd = open_child_dir(parent.as_fd(), &tmp_name)?;
+        flock(fd.as_fd(), libc::LOCK_SH)?;
+        let zero = [libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }; 2];
+        // SAFETY: valid fd and a two-element timespec array.
+        if unsafe { libc::futimens(fd.as_raw_fd(), zero.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd)
+    })();
+    let fd = match built {
+        Ok(fd) => fd,
+        Err(err) => {
+            discard(&parent);
+            return Err(fail(err));
+        }
+    };
+    if let Err(err) =
+        crate::gc::sys::renameat2_noreplace(parent.as_fd(), &tmp_name, parent.as_fd(), &name)
+    {
+        discard(&parent);
         if err.raw_os_error() == Some(libc::EEXIST) {
             return Ok(None);
         }
-        return Err(fail(err));
-    }
-    let fd = open_child_dir(parent.as_fd(), &name).map_err(fail)?;
-    flock(fd.as_fd(), libc::LOCK_SH).map_err(fail)?;
-    let zero = [libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    }; 2];
-    // SAFETY: valid fd and a two-element timespec array.
-    if unsafe { libc::futimens(fd.as_raw_fd(), zero.as_ptr()) } != 0 {
-        let err = io::Error::last_os_error();
-        // SAFETY: valid dir fd and NUL-terminated name.
-        unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
         return Err(fail(err));
     }
     let st = fstat(fd.as_fd()).map_err(fail)?;
@@ -1124,6 +1239,33 @@ mod tests {
                     .starts_with("commondir.sbx-blocked.")
             });
         assert!(aside, "renamed aside, not deleted");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_worktree_is_protected_or_renamed_and_links_are_refused() {
+        let root = scratch("cfgwt");
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("hooks")).unwrap();
+        std::fs::write(git.join("config.worktree"), "").unwrap();
+        let found = rel(&scan_for_test(&policy(&root, None, "")).unwrap(), &root);
+        assert!(
+            found.contains(&(".git/config.worktree".into(), true)),
+            "{found:?}"
+        );
+        // A new config.worktree in a git dir that had none is renamed aside.
+        std::fs::remove_file(git.join("config.worktree")).unwrap();
+        let mut prot = prepare(&policy(&root, Some(r#"[".git/hooks/"]"#), ""), None).unwrap();
+        std::fs::write(git.join("config.worktree"), "[core]\n").unwrap();
+        prot.release();
+        assert!(!git.join("config.worktree").exists());
+        // Without a .git entry in the list, sbx leaves .git alone.
+        let found = scan_for_test(&policy(&root, Some(r#"[".bashrc"]"#), "")).unwrap();
+        assert!(!found.iter().any(|(p, _)| p.contains("/.git")), "{found:?}");
+        // A symlinked modules directory is refused, not followed.
+        std::os::unix::fs::symlink("/usr", git.join("modules")).unwrap();
+        let err = scan_for_test(&policy(&root, None, "")).unwrap_err();
+        assert!(err.contains("is a symbolic link"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

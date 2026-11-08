@@ -1235,6 +1235,16 @@ fn scenarios() -> Vec<Scenario> {
             run: protect_symlink_125,
         },
         Scenario {
+            name: "protect-refused-launch-cleans-up",
+            gate: Bwrap,
+            run: protect_refused_launch_cleans_up,
+        },
+        Scenario {
+            name: "protect-attach-blocked",
+            gate: Bwrap,
+            run: protect_attach_blocked,
+        },
+        Scenario {
             name: "pin-legit-deny-depth2-fresh-and-reused",
             gate: Bwrap,
             run: pin_legit_deny_depth2_fresh_and_reused,
@@ -4647,6 +4657,84 @@ fn protect_symlink_125() -> Result<(), String> {
     t.outside_untouched()?;
     if t.proj.join(".vscode").exists() {
         return Err("a placeholder outlived the refused run".into());
+    }
+    Ok(())
+}
+
+fn protect_refused_launch_cleans_up() -> Result<(), String> {
+    // The placeholders exist before the guard runs; a launch the guard refuses
+    // (a planted link on the way to a nested ro bind) must not leave them.
+    let t = protect_tree("protect-refused")?;
+    std::os::unix::fs::symlink(&t.outside, t.proj.join("a")).map_err(|e| e.to_string())?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.ro_extra = vec![t.proj.join("a/ro").display().to_string()];
+    let session = t.session();
+    let args = sbx_args(&pol.write(&t.dir), &session, &[], &sh("true"));
+    expect_refusal(&args, "symbolic link")?;
+    t.outside_untouched()?;
+    let names = entries(&t.proj)?;
+    if names != [".git", "a", "sub"] {
+        return Err(format!("host tree after the refused run: {names:?}"));
+    }
+    if session.join("protect.list").exists() {
+        return Err("the placeholder list outlived the refused run".into());
+    }
+    Ok(())
+}
+
+fn protect_attach_blocked() -> Result<(), String> {
+    // A keep-alive session: an attach call binds the holder's protected paths,
+    // so F9 and F10 fail in the call too, and stop leaves nothing behind.
+    let t = protect_tree("protect-attach")?;
+    let pol = t.policy(&[&t.proj], &[], &[]);
+    let policy = pol.write(&t.dir);
+    let session = t.session();
+    let start = sbx_args(
+        &policy,
+        &session,
+        &["--keep-alive", "--idle-timeout", "60s"],
+        &[OsString::from("/bin/sleep"), OsString::from("300")],
+    );
+    let resident = run_sbx(&start)?;
+    expect_rc(&resident, 0)?;
+    let p = t.proj.display();
+    let attach: Vec<OsString> = [
+        "attach".into(),
+        "--policy".into(),
+        policy.clone().into_os_string(),
+        "--session-dir".into(),
+        session.clone().into_os_string(),
+        "--".into(),
+    ]
+    .into_iter()
+    .chain(sh(&protect_script(&p)))
+    .collect();
+    let call = run_sbx(&attach);
+    let stop = run_sbx(&[
+        "stop".into(),
+        "--session-dir".into(),
+        session.clone().into_os_string(),
+    ]);
+    let call = call?;
+    expect_rc(&stop?, 0)?;
+    expect_rc(&call, 0)?;
+    for want in [
+        "F9_BLOCKED",
+        "F10_BLOCKED",
+        "CONFIG_BLOCKED",
+        "NESTED_BLOCKED",
+        "RW_OK",
+    ] {
+        if !call.stdout.contains(want) {
+            return Err(format!("attach call: missing {want}: {:?}", call.stdout));
+        }
+    }
+    if t.proj.join(".git/hooks/pre-commit").exists() {
+        return Err("an attach call planted a git hook on the host".into());
+    }
+    let names = entries(&t.proj)?;
+    if names != [".git", "out.txt", "sub"] {
+        return Err(format!("host tree after stop: {names:?}"));
     }
     Ok(())
 }

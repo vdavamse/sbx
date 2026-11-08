@@ -102,11 +102,14 @@ is the one Anthropic's sandbox-runtime (srt) uses:
   does not enter `node_modules` directories, `deny` paths or other policy binds. It
   skips an unreadable directory that belongs to another user (a container volume), and
   refuses one of yours. A worktree's `.git` file is protected itself. Inside each
-  `.git`, the existing submodule git directories (`.git/modules/…`: `hooks/`, `config`,
-  `commondir`) and linked worktrees (`.git/worktrees/*/commondir` and `gitdir`) are
-  protected too. A `commondir` file that the payload creates in a git directory would
-  make host git take its hooks and config from elsewhere; sbx renames it aside when the
-  run ends and prints `sbx: warning: the sandbox created …`. Each protected path is a nested
+  `.git` (when the list protects something under `.git`), the existing submodule git
+  directories (`.git/modules/…`: `hooks/`, `config`, `commondir`), linked worktrees
+  (`.git/worktrees/*/commondir` and `gitdir`) and every `config.worktree` are protected
+  too, and a symlinked `.git/modules` or `.git/worktrees` is refused. A `commondir` or
+  `config.worktree` file that the payload creates in a git directory would make host git
+  take its hooks and config from elsewhere; sbx renames it aside when the run ends and
+  prints `sbx: warning: the sandbox created …`. A `core.hooksPath` that points into the
+  tree (husky's `.husky/_`) is not covered: add that directory to the list. Each protected path is a nested
   read-only bind, so the directories on the way to it are pinned (see above): the
   payload cannot rename them away, and each pin costs startup time like any other.
 - **Sessions.** `run --keep-alive` scans when the session starts, and every `attach`

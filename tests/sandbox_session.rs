@@ -979,10 +979,11 @@ fn holder_kill_paths_work_under_the_session_landlock_layer() {
 }
 
 /// Issue #73: the resident's `filesystem.protect` placeholders live as long as
-/// the session. An attached call holds them too and leaves them to the
-/// resident; `sbx stop` returns after they and the placeholder list are gone.
-/// (The shim runs no bwrap, so this pins the lifecycle, not the read-only
-/// binds: `tests/sandbox_run.rs` `protect-f9-f10-blocked` covers those.)
+/// the session. An attached call binds the holder's saved list and creates or
+/// removes nothing; `sbx stop` returns after the placeholders, the placeholder
+/// list and the saved list are gone. (The shim runs no bwrap, so this pins the
+/// lifecycle, not the read-only binds: `tests/sandbox_run.rs`
+/// `protect-attach-blocked` covers those for attach calls.)
 #[test]
 fn protect_placeholders_live_with_the_session() {
     let dir = scratch("protect");
