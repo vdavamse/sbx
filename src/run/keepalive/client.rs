@@ -244,8 +244,14 @@ fn run_call(
     let setup = crate::run::landlock_setup(landlock.mode)?;
     let layer =
         crate::run::landlock_layer(&setup.exe, &setup.status, landlock.mode, &landlock.bind_tcp);
+    // Issue #73: every call scans the rw paths again (the resident may have
+    // created a nested checkout since the session started). A call does not
+    // own the session lock, so it keeps no manifest: the placeholders it holds
+    // are the resident's or are removed when this function returns.
+    let protected = crate::run::protect::prepare(policy, None).map_err(RunError::new)?;
+    let launch_policy = protected.apply(policy);
     let launch: Launch = build(&Build {
-        policy,
+        policy: &launch_policy,
         session_dir: session,
         bwrap_path: &bwrap,
         command: &args.cmd,

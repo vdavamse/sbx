@@ -977,3 +977,68 @@ fn holder_kill_paths_work_under_the_session_landlock_layer() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Issue #73: the resident's `filesystem.protect` placeholders live as long as
+/// the session. An attached call holds them too and leaves them to the
+/// resident; `sbx stop` returns after they and the placeholder list are gone.
+/// (The shim runs no bwrap, so this pins the lifecycle, not the read-only
+/// binds: `tests/sandbox_run.rs` `protect-f9-f10-blocked` covers those.)
+#[test]
+fn protect_placeholders_live_with_the_session() {
+    let dir = scratch("protect");
+    let Some(shim) = skip_or(&dir, "protect-placeholders-session") else {
+        return;
+    };
+    let proj = dir.join("proj");
+    fs::create_dir_all(proj.join(".git/hooks")).expect("proj");
+    let policy = dir.join("policy.json");
+    fs::write(
+        &policy,
+        format!(
+            r#"{{"version":1,"filesystem":{{"ro":["/usr"],"rw":[{:?}],"deny":[]}},"network":{{"mode":"transparent","allow":[],"ports":[443]}},"env":{{"pass":[],"set":{{}}}},"limits":{{"timeout":"60s","output_bytes":65536}}}}"#,
+            proj.display().to_string()
+        ),
+    )
+    .expect("policy");
+    let session = dir.join("s");
+    let with_policy = |sub: &str, extra: &[&str], cmd: &[&str]| {
+        let mut c = sbx(&shim);
+        c.arg(sub)
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--session-dir")
+            .arg(&session)
+            .args(extra)
+            .arg("--")
+            .args(cmd);
+        c.output().expect("run sbx")
+    };
+    let out = with_policy(
+        "run",
+        &["--keep-alive", "--idle-timeout", "60s"],
+        &["sleep", "300"],
+    );
+    assert!(out.status.success(), "launch: {}", text(&out.stderr));
+    let placeholder = proj.join(".bashrc");
+    assert!(
+        placeholder.is_dir(),
+        "the resident created the placeholders"
+    );
+    assert!(session.join("protect.list").exists(), "and listed them");
+    let call = with_policy("attach", &[], &["true"]);
+    assert!(call.status.success(), "attach: {}", text(&call.stderr));
+    assert!(
+        placeholder.is_dir(),
+        "an attached call leaves the resident's placeholders in place"
+    );
+    assert!(stop(&shim, &session).status.success(), "stop");
+    assert!(!placeholder.exists(), "stop removed the placeholders");
+    assert!(!proj.join(".vscode").exists());
+    assert!(!session.join("protect.list").exists());
+    let names: Vec<String> = fs::read_dir(&proj)
+        .expect("read proj")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [".git"], "nothing else is left in the rw tree");
+    let _ = fs::remove_dir_all(&dir);
+}

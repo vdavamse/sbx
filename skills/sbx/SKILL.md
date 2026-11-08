@@ -38,6 +38,17 @@ failing items, and the reasons are on stderr.
   build (`SSL_CERT_FILE` and the other CA bundle variables).
 - To keep state between runs, reuse `S`: `/work`, `/root` and `/tmp` persist. A fresh
   `S` gives a clean sandbox.
+- Inside every `rw` path, files that run later on the host are **read-only** by default
+  (`filesystem.protect`): `.git/hooks/`, `.git/config`, shell rc files, `.gitconfig`,
+  `.gitmodules`, `.mcp.json`, `.vscode/`, `.idea/`, `.claude/commands/`,
+  `.claude/agents/`, `.ripgreprc`, up to 3 levels deep. A missing one shows up as an
+  empty read-only directory for the run. So `git config`, `git remote add` and
+  `git init` in the project fail with
+  `error: could not write config file .git/config: Device or resource busy`: run them on
+  the host before or after, or set `"protect": []` in `filesystem` to turn this off. A
+  protected name that is a symlink refuses the run (rc 125,
+  `protected path … is a symbolic link; sbx cannot bind it read-only`). See
+  [Protected paths](https://github.com/vdavamse/sbx/blob/main/docs/usage.md#running-commands).
 
 ## `--cwd` is a sandbox path
 

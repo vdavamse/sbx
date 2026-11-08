@@ -83,6 +83,60 @@ another bind\'s tree through a symbolic link is refused (N19): bind the real pat
 file, and host bind-mount aliases, are not detected at run time; `sbx check` warns about
 hard links (`deny-links`).
 
+**Protected paths (`filesystem.protect`).** Some files inside an `rw` tree run later on
+the host without anyone running them from the tree: a git hook runs at the next
+`git commit`, a `core.fsmonitor` line in `.git/config` runs at every `git status` (a
+git-aware shell prompt is enough), and editors and agents load their project config
+when they open the folder. sbx binds these read-only inside every `rw` path, by default
+and on every launch (`run`, `run --keep-alive` and each `attach` call). The default list
+is the one Anthropic's sandbox-runtime (srt) uses:
+
+```text
+.bashrc .bash_profile .zshrc .zprofile .profile .gitconfig .gitmodules
+.git/hooks/ .git/config .ripgreprc .mcp.json .vscode/ .idea/
+.claude/commands/ .claude/agents/
+```
+
+- **Where.** At the top level of each `rw` path and in its real directories up to 3
+  levels below (`rw/a/b/c/.git/hooks`, as srt). The scan follows no symbolic link and
+  does not enter `.git` or `node_modules` directories, `deny` paths or other policy
+  binds. A worktree's `.git` file is protected itself. Each protected path is a nested
+  read-only bind, so the directories on the way to it are pinned (see above): the
+  payload cannot rename them away, and each pin costs startup time like any other.
+- **Missing entries.** At the top level, a missing entry gets an empty, read-only
+  placeholder directory for the run (at its first missing component: `.git` when there
+  is no `.git`). It stops the payload from creating the file, and git ignores empty
+  directories, so it never shows up in `git status` or a `git add -A`. sbx removes the
+  placeholders when the run ends. While the run lasts they are visible on the host
+  (`ls -a`). A placeholder is an empty directory with a 1970-01-01 modification time; one
+  left behind by a crash is removed by the next run in the same session directory, by
+  `sbx gc` when it collects that session, or by the next launch that scans the tree.
+  Below the top level, missing entries are not protected.
+- **What breaks.** With `.git/config` read-only, `git config`, `git remote add`,
+  `git branch --set-upstream-to` and `git init` in the `rw` path fail inside the sandbox
+  with `error: could not write config file .git/config: Device or resource busy`.
+  `git commit`, `git checkout`, `git fetch` and other commands that do not write the
+  config keep working. Tools that read a placeholder (an editor reading `.mcp.json`)
+  get `EISDIR`.
+- **Refusals.** A protected name that is a symbolic link is refused (rc 125,
+  `sbx run: protected path … is a symbolic link; sbx cannot bind it read-only`), and so
+  is a scan of more than 20 000 directories in one `rw` path.
+
+The list is replaced by an explicit one; `"@default"` stands for the default list.
+Run git commands that rewrite the config on the host, or turn the protection off:
+
+```json
+"filesystem": { "ro": ["/usr"], "rw": ["/home/me/project"], "deny": [],
+                "protect": ["@default", "Makefile", ".envrc", ".github/"] }
+
+"filesystem": { "ro": ["/usr"], "rw": ["/home/me/project"], "deny": [],
+                "protect": [] }
+```
+
+This does not make `rw` safe (R7 in [the threat model](threat-model.md)): a `Makefile`,
+an `.envrc`, `package.json` scripts and CI files still run when someone runs them, and the
+default list does not cover them. Review the diff before running host tooling on it.
+
 **Timeouts.** The clock starts when `run` starts, so sandbox setup counts.
 Setup itself is limited to 30 seconds. On timeout or on a signal sbx SIGKILLs
 the whole sandbox at once: the command gets no grace period.
@@ -504,6 +558,10 @@ deletes sessions, so it is conservative by design.
 - **What is never touched.** A locked (live) session; any symlink, at any
   level (symlinks are removed as links, never followed); entries owned by
   another user; anything across a mount point (see below).
+- **Protect placeholders.** Before it removes a session, gc removes the
+  `filesystem.protect` placeholders a crashed run of that session listed in
+  `protect.list`: only empty directories with the placeholder mark (a 1970-01-01
+  modification time) that no running sandbox holds.
 - **Delete protocol.** gc takes the session's lock, renames the directory to
   `ROOT/.sbx-gc.<pid>.<nonce>` (a *tombstone*), empties it, unlinks the lock and
   removes the tombstone. Concurrent gc processes exclude each other with a

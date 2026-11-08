@@ -130,6 +130,13 @@ impl AbsolutePath {
     pub(crate) fn new_unchecked(s: String) -> Self {
         Self(s)
     }
+
+    /// A path built inside sbx (a `filesystem.protect` target: an `rw` path
+    /// joined with validated components), held to the same rule as a policy
+    /// path.
+    pub(crate) fn from_built(s: String) -> Result<Self, String> {
+        check_path(&s).map(|()| Self(s))
+    }
 }
 
 // Value-level rules, enforced at deserialization so rejections carry serde's
@@ -509,6 +516,127 @@ pub struct Filesystem {
 
     /// Paths that must never be visible, even inside an `ro`/`rw` mount.
     pub deny: Vec<AbsolutePath>,
+
+    /// Files and directories that sbx binds read-only inside every `rw` path,
+    /// at its top level and up to 3 directory levels below, because they run
+    /// later on the host (git hooks and config, shell rc files, editor and
+    /// agent config). Entries are relative paths; a trailing `/` marks a
+    /// directory. Omitted: the default list. `[]`: off. `"@default"` stands
+    /// for the default list, so `["@default", "Makefile"]` extends it. A
+    /// missing entry at the top level gets an empty read-only placeholder for
+    /// the run, which sbx removes afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protect: Option<Vec<ProtectEntry>>,
+}
+
+/// The default `filesystem.protect` list: the paths Anthropic's
+/// sandbox-runtime (srt) binds read-only inside every writable path.
+pub const DEFAULT_PROTECT: [&str; 15] = [
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".gitconfig",
+    ".gitmodules",
+    ".git/hooks/",
+    ".git/config",
+    ".ripgreprc",
+    ".mcp.json",
+    ".vscode/",
+    ".idea/",
+    ".claude/commands/",
+    ".claude/agents/",
+];
+
+/// The `filesystem.protect` token that stands for [`DEFAULT_PROTECT`].
+pub const PROTECT_DEFAULT_TOKEN: &str = "@default";
+
+/// One `filesystem.protect` entry: a relative path below an `rw` path (a
+/// trailing `/` marks a directory), or `"@default"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ProtectEntry(String);
+
+impl ProtectEntry {
+    /// The entry text, as written in the policy.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// A protect entry is joined to an rw path and must stay inside it, so it is
+// relative and lexically canonical; one trailing '/' marks a directory.
+fn check_protect_entry(s: &str) -> Result<(), String> {
+    if s == PROTECT_DEFAULT_TOKEN {
+        return Ok(());
+    }
+    if s.contains('\0') {
+        return Err(format!("must not contain NUL bytes (got {s:?})"));
+    }
+    let body = s.strip_suffix('/').unwrap_or(s);
+    if s.starts_with('/')
+        || body.is_empty()
+        || body
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(format!(
+            "must be a relative path inside the rw path, such as \".git/hooks/\" or \".bashrc\", with no '.', '..' or empty segments, or \"@default\" (got {s:?})"
+        ));
+    }
+    Ok(())
+}
+
+impl<'de> Deserialize<'de> for ProtectEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match check_protect_entry(&raw) {
+            Ok(()) => Ok(Self(raw)),
+            Err(message) => Err(serde::de::Error::custom(message)),
+        }
+    }
+}
+
+impl JsonSchema for ProtectEntry {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("ProtectEntry")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "description": "A path relative to an rw path (no leading '/', no '.', '..' or empty segments; a trailing '/' marks a directory), or \"@default\" for the default list.",
+            "pattern": "^(@default|[^/]+(/[^/]+)*/?)$"
+        })
+    }
+}
+
+impl Filesystem {
+    /// The effective `protect` list, with `"@default"` expanded and duplicates
+    /// removed (first occurrence kept): the default list when the field is
+    /// omitted, nothing for `[]`.
+    pub fn protect_entries(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut push = |entry: &str| {
+            if !out.iter().any(|e| e == entry) {
+                out.push(entry.to_owned());
+            }
+        };
+        match &self.protect {
+            None => DEFAULT_PROTECT.iter().for_each(|e| push(e)),
+            Some(list) => {
+                for entry in list {
+                    if entry.as_str() == PROTECT_DEFAULT_TOKEN {
+                        DEFAULT_PROTECT.iter().for_each(|e| push(e));
+                    } else {
+                        push(entry.as_str());
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Network egress policy.
@@ -2646,5 +2774,98 @@ mod termination_tests {
         );
         assert_eq!(defs["UrlPrefix"]["type"], "string");
         assert_eq!(defs["UrlPrefix"]["pattern"], "^https://");
+    }
+}
+
+// ---- filesystem.protect (issue #73) -----------------------------------------
+
+#[cfg(test)]
+mod protect_tests {
+    use super::*;
+
+    const DRAFT: &str = r#"{
+  "version": 1,
+  "filesystem": { "ro": ["/usr"], "rw": [], "deny": [] },
+  "network": { "mode": "none", "allow": [], "ports": [] },
+  "env": { "pass": [], "set": {} },
+  "limits": { "timeout": "10s", "output_bytes": 1024 }
+}"#;
+
+    fn with_protect(value: &str) -> String {
+        DRAFT.replace(
+            r#""deny": [] }"#,
+            &format!(r#""deny": [], "protect": {value} }}"#),
+        )
+    }
+
+    fn json_str(value: &str) -> String {
+        serde_json::Value::String(value.to_owned()).to_string()
+    }
+
+    fn policy_of(json: &str) -> Policy {
+        Policy::from_json_str(json).unwrap_or_else(|err| panic!("must parse: {err}"))
+    }
+
+    fn err_of(json: &str) -> String {
+        Policy::from_json_str(json)
+            .expect_err("must be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn protect_defaults_opt_out_and_extension() {
+        // Omitted: the default list (the field is additive, version stays 1).
+        let policy = policy_of(DRAFT);
+        assert_eq!(policy.filesystem.protect, None);
+        assert_eq!(policy.filesystem.protect_entries(), DEFAULT_PROTECT);
+        // []: off.
+        let policy = policy_of(&with_protect("[]"));
+        assert!(policy.filesystem.protect_entries().is_empty());
+        // "@default" expands in place; duplicates collapse.
+        let policy = policy_of(&with_protect(r#"["@default", "Makefile", ".bashrc"]"#));
+        let entries = policy.filesystem.protect_entries();
+        assert_eq!(entries.len(), DEFAULT_PROTECT.len() + 1);
+        assert_eq!(entries.last().map(String::as_str), Some("Makefile"));
+        // An explicit list replaces the default.
+        let policy = policy_of(&with_protect(r#"[".envrc"]"#));
+        assert_eq!(policy.filesystem.protect_entries(), [".envrc"]);
+    }
+
+    #[test]
+    fn protect_rejects_paths_outside_the_rw_path() {
+        for bad in [
+            "/etc/passwd",
+            "../x",
+            "a/../b",
+            "a//b",
+            "",
+            "/",
+            ".",
+            "./x",
+            "x/./y",
+            "//",
+        ] {
+            let err = err_of(&with_protect(&format!("[{}]", json_str(bad))));
+            assert!(
+                err.contains("must be a relative path inside the rw path"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in ["Makefile", ".git/hooks/", "a/b/c", ".envrc"] {
+            policy_of(&with_protect(&format!("[{}]", json_str(good))));
+        }
+    }
+
+    #[test]
+    fn schema_documents_protect() {
+        let schema: serde_json::Value =
+            serde_json::from_str(&schema_json()).expect("schema is JSON");
+        let defs = &schema["$defs"];
+        assert!(defs["Filesystem"]["properties"]["protect"].is_object());
+        assert_eq!(
+            defs["Filesystem"]["required"],
+            serde_json::json!(["ro", "rw", "deny"])
+        );
+        assert_eq!(defs["ProtectEntry"]["type"], "string");
     }
 }

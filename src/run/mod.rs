@@ -95,6 +95,7 @@ pub(crate) mod keepalive;
 mod lifecycle;
 mod mode;
 mod plan;
+pub(crate) mod protect;
 mod serve;
 mod session;
 mod spawn;
@@ -661,6 +662,8 @@ fn execute(
 
     // S4: the session lock comes before materialize and before any audit row.
     let lock = SessionLock::acquire(&session)?;
+    // Issue #73: placeholders a crashed earlier run of this session left behind.
+    protect::cleanup_manifest(&session);
     if hold.is_some() {
         keepalive::holder::redirect_log(&session)?;
     }
@@ -731,8 +734,15 @@ fn execute(
         args.landlock,
         &args.landlock_bind_tcp,
     );
+    // S8c (issue #73, R7): the filesystem.protect scan. Existing protected
+    // paths and placeholders for missing top-level ones become nested ro binds
+    // (pinned and verified like any other); the placeholders are listed in the
+    // session's manifest and removed after teardown (or by the drop on an early
+    // return).
+    let mut protected = protect::prepare(&policy, Some(&session)).map_err(RunError::new)?;
+    let launch_policy = protected.apply(&policy);
     let launch = build(&Build {
-        policy: &policy,
+        policy: &launch_policy,
         session_dir: &session,
         bwrap_path: &bwrap,
         command: &args.cmd,
@@ -746,8 +756,9 @@ fn execute(
     .map_err(|err| RunError::new(err.to_string()))?;
 
     // S8a (#39/#40, N19): before anything is spawned, verify the launch (see
-    // verify_launch). Refusal is 125; nothing is created outside the session
-    // directory and the audit log (S5/S7 ran already).
+    // verify_launch). Refusal is 125; nothing is left outside the session
+    // directory and the audit log (S5/S7 ran already; S8c's placeholders are
+    // removed by the drop).
     verify_launch(&launch)?;
 
     // S8b (issue #43): the cgroup v2 limits. Prepared before the spawn so a
@@ -1035,6 +1046,9 @@ fn execute(
     // Issue #43: the tree is reaped; remove the limited cgroup now (the
     // process::exit below would skip its Drop).
     drop(limits_cgroup);
+    // Issue #73: the same for the protect placeholders, while the session lock
+    // is still held.
+    protected.release();
     outcome = landlock_status_outcome(outcome, status_read.as_ref());
     let _ = lock.touch();
     // The exit row is written before the lock is released and before a `sbx stop`

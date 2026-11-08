@@ -1220,6 +1220,21 @@ fn scenarios() -> Vec<Scenario> {
             run: pin_rename_of_nested_ro_ebusy,
         },
         Scenario {
+            name: "protect-f9-f10-blocked",
+            gate: Bwrap,
+            run: protect_f9_f10_blocked,
+        },
+        Scenario {
+            name: "protect-opt-out-plants",
+            gate: Bwrap,
+            run: protect_opt_out_plants,
+        },
+        Scenario {
+            name: "protect-symlink-125",
+            gate: Bwrap,
+            run: protect_symlink_125,
+        },
+        Scenario {
             name: "pin-legit-deny-depth2-fresh-and-reused",
             gate: Bwrap,
             run: pin_legit_deny_depth2_fresh_and_reused,
@@ -1635,6 +1650,8 @@ struct Pol {
     env_pass: Vec<String>,
     /// Extra raw `limits` members (issue #43), e.g. `,"processes":16`.
     limits_extra: String,
+    /// The raw `filesystem.protect` value (issue #73); `None` omits the field.
+    protect: Option<String>,
 }
 
 impl Pol {
@@ -1652,6 +1669,7 @@ impl Pol {
             env_set: Vec::new(),
             env_pass: Vec::new(),
             limits_extra: String::new(),
+            protect: None,
         }
     }
 
@@ -1685,7 +1703,7 @@ impl Pol {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[{deny}]}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}{limits_extra}}}}}"#,
+            r#"{{"version":1,"filesystem":{{"ro":["/usr",{exe_dir:?}{ro_extra}],"rw":[{rw}],"deny":[{deny}]{protect}}},"network":{{"mode":"{mode}","allow":[{allow}],"ports":[{ports}]}},"env":{{"pass":[{pass}],"set":{{{set}}}}},"limits":{{"timeout":"{timeout}","output_bytes":{out}{limits_extra}}}}}"#,
             mode = self.mode,
             ro_extra = self
                 .ro_extra
@@ -1708,6 +1726,11 @@ impl Pol {
             timeout = self.timeout,
             out = self.output_bytes,
             limits_extra = self.limits_extra,
+            protect = self
+                .protect
+                .as_ref()
+                .map(|p| format!(r#","protect":{p}"#))
+                .unwrap_or_default(),
         )
     }
 
@@ -4518,6 +4541,105 @@ fn pin_rename_of_nested_ro_ebusy() -> Result<(), String> {
     }
     if fs::read(t.proj.join("a/ro/f")).map_err(|e| e.to_string())? != b"orig\n" {
         return Err("the host ro file changed".into());
+    }
+    Ok(())
+}
+
+// ---- filesystem.protect (issue #73, R7; srt-compare F9 and F10) -------------
+
+/// The F9/F10 payload: plants a git hook and a shell rc file in the rw
+/// checkout, appends to `.git/config` and a nested checkout's hook, and checks
+/// that ordinary writes still work and that a placeholder cannot be removed.
+fn protect_script(p: &std::path::Display<'_>) -> String {
+    format!(
+        "if echo 'echo pwned' > {p}/.git/hooks/pre-commit 2>/dev/null; then echo F9_PLANTED; else echo F9_BLOCKED; fi; \
+         if echo 'echo pwned' >> {p}/.bashrc 2>/dev/null; then echo F10_PLANTED; else echo F10_BLOCKED; fi; \
+         if echo '[core]' >> {p}/.git/config 2>/dev/null; then echo CONFIG_WRITTEN; else echo CONFIG_BLOCKED; fi; \
+         if echo pwned > {p}/sub/.git/hooks/post-checkout 2>/dev/null; then echo NESTED_PLANTED; else echo NESTED_BLOCKED; fi; \
+         if echo ok > {p}/out.txt 2>/dev/null; then echo RW_OK; else echo RW_FAILED; fi; \
+         if rmdir {p}/.bashrc 2>/dev/null; then echo PLACEHOLDER_REMOVED; else echo PLACEHOLDER_KEPT; fi"
+    )
+}
+
+/// An rw git checkout (`.git/hooks/`, `.git/config`, no `.bashrc`) with a
+/// nested checkout two levels down.
+fn protect_tree(tag: &str) -> Result<Tree, String> {
+    let t = Tree::new(tag);
+    for dir in [".git/hooks", "sub/.git/hooks"] {
+        fs::create_dir_all(t.proj.join(dir)).map_err(|e| e.to_string())?;
+    }
+    fs::write(t.proj.join(".git/config"), b"[core]\n").map_err(|e| e.to_string())?;
+    Ok(t)
+}
+
+fn protect_f9_f10_blocked() -> Result<(), String> {
+    // srt-compare F9 and F10 with the default filesystem.protect: both plants
+    // fail in the sandbox, and nothing is left on the host.
+    let t = protect_tree("protect-default")?;
+    let pol = t.policy(&[&t.proj], &[], &[]);
+    let session = t.session();
+    let done = run_script(&t, &pol, &session, &protect_script(&t.proj.display()))?;
+    expect_rc(&done, 0)?;
+    for want in [
+        "F9_BLOCKED",
+        "F10_BLOCKED",
+        "CONFIG_BLOCKED",
+        "NESTED_BLOCKED",
+        "RW_OK",
+        "PLACEHOLDER_KEPT",
+    ] {
+        if !done.stdout.contains(want) {
+            return Err(format!("missing {want}: {:?}", done.stdout));
+        }
+    }
+    if t.proj.join(".git/hooks/pre-commit").exists()
+        || t.proj.join("sub/.git/hooks/post-checkout").exists()
+    {
+        return Err("a git hook reached the host".into());
+    }
+    if fs::read(t.proj.join(".git/config")).map_err(|e| e.to_string())? != b"[core]\n" {
+        return Err("the host .git/config changed".into());
+    }
+    // The placeholders (.bashrc, .vscode, ...) are gone; the payload's own
+    // file stayed.
+    let names = entries(&t.proj)?;
+    if names != [".git", "out.txt", "sub"] {
+        return Err(format!("host tree after the run: {names:?}"));
+    }
+    if session.join("protect.list").exists() {
+        return Err("the placeholder list outlived the run".into());
+    }
+    Ok(())
+}
+
+fn protect_opt_out_plants() -> Result<(), String> {
+    // `"protect": []` turns the layer off: F9 and F10 plant as in sbx 0.1.0.
+    let t = protect_tree("protect-off")?;
+    let mut pol = t.policy(&[&t.proj], &[], &[]);
+    pol.protect = Some("[]".into());
+    let done = run_script(&t, &pol, &t.session(), &protect_script(&t.proj.display()))?;
+    expect_rc(&done, 0)?;
+    if !done.stdout.contains("F9_PLANTED") || !done.stdout.contains("F10_PLANTED") {
+        return Err(format!("the opt-out still protected: {:?}", done.stdout));
+    }
+    if !t.proj.join(".git/hooks/pre-commit").exists() {
+        return Err("the opt-out run did not write the hook".into());
+    }
+    Ok(())
+}
+
+fn protect_symlink_125() -> Result<(), String> {
+    // A protected name that is a symlink cannot be bound read-only (the bind
+    // would follow it): refused before launch.
+    let t = protect_tree("protect-link")?;
+    std::os::unix::fs::symlink(t.outside.join("key"), t.proj.join(".bashrc"))
+        .map_err(|e| e.to_string())?;
+    let pol = t.policy(&[&t.proj], &[], &[]);
+    let args = sbx_args(&pol.write(&t.dir), &t.session(), &[], &sh("true"));
+    expect_refusal(&args, "is a symbolic link")?;
+    t.outside_untouched()?;
+    if t.proj.join(".vscode").exists() {
+        return Err("a placeholder outlived the refused run".into());
     }
     Ok(())
 }

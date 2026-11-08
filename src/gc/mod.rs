@@ -526,6 +526,10 @@ fn remove_locked<O: Write, E: Write>(
         return Ok(());
     }
 
+    // 13b. issue #73: the protect placeholders a crashed run of this session
+    //      listed (only marked ones no live run holds; best effort).
+    crate::run::protect::cleanup_manifest_at(dir.as_fd());
+
     // 14. the tombstone: a session is renamed (RENAME_NOREPLACE); a tombstone
     //     already is one.
     #[cfg(test)]
@@ -821,6 +825,51 @@ mod tests {
         assert!(err.is_empty() && !failed, "{err}");
         assert!(!old.exists());
         assert!(young.join("sbx.lock").exists());
+    }
+
+    #[test]
+    fn expired_session_protect_placeholders_removed() {
+        // Issue #73: a crashed run left a marked placeholder (an empty
+        // directory with mtime 0) and its list; gc removes the placeholder
+        // before the session, and leaves an unmarked directory alone.
+        let t = Tmp::new("protect");
+        let root = t.root();
+        let tree = t.0.join("tree");
+        fs::create_dir_all(tree.join(".bashrc")).expect("placeholder");
+        fs::create_dir_all(tree.join(".vscode")).expect("user dir");
+        for name in [".bashrc", ".vscode"] {
+            let when = if name == ".bashrc" {
+                SystemTime::UNIX_EPOCH
+            } else {
+                SystemTime::now()
+            };
+            fs::File::open(tree.join(name))
+                .expect("open")
+                .set_times(FileTimes::new().set_modified(when))
+                .expect("times");
+        }
+        let s = root.join("old");
+        fs::create_dir(&s).expect("mkdir session");
+        fs::set_permissions(&s, fs::Permissions::from_mode(0o700)).expect("chmod");
+        lock_file(&s);
+        use std::os::unix::ffi::OsStringExt;
+        let mut list = tree.join(".bashrc").into_os_string().into_vec();
+        list.push(0);
+        list.extend(tree.join(".vscode").into_os_string().into_vec());
+        list.push(0);
+        fs::write(s.join("protect.list"), list).expect("list");
+        backdate(&s, DAY * 2);
+        let (out, err, failed) = run_gc(&root, DAY, false);
+        assert_eq!(out, format!("removed {:?}\n", s));
+        assert!(err.is_empty() && !failed, "{err}");
+        assert!(
+            !tree.join(".bashrc").exists(),
+            "the marked placeholder is gone"
+        );
+        assert!(
+            tree.join(".vscode").exists(),
+            "an unmarked directory is kept"
+        );
     }
 
     #[test]
