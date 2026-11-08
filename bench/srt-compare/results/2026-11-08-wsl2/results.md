@@ -1,7 +1,7 @@
 # sbx vs srt: results
 
 ```
-date:     2026-11-08T15:23:56Z
+date:     2026-11-08T15:26:43Z
 kernel:   Linux 6.18.54.1-microsoft-standard-WSL2 x86_64
 distro:   Ubuntu 24.04.2 LTS
 bwrap:    bubblewrap 0.9.0
@@ -12,7 +12,7 @@ srt tag:  c40cf14a65d025e3cd27f071f13a73c12b3b1f92
 socat:    1.8.0.0
 ripgrep:  ripgrep 14.1.0
 sbx check: network mode: transparent (policies with network mode transparent, explicit or none can run)
-runner:   7f990fb (modified)
+runner:   8766b69
 srt npm integrity: sha512-bjHDu87gjIR7+Oxy9jPiK3v8CvSELCzfpXa3fjqfSKdvlZET2iF51xcXILWPayTpowB3xtZeQVf2JR916nVW/w==
 srt npm published versions on 2026-11-08: 77
 ```
@@ -69,24 +69,24 @@ srt npm published versions on 2026-11-08: 77
 
 | ID | case | sbx | srt |
 |---|---|---|---|
-| E1 | command exits 7 | `rc=7 t=20ms  ` | `rc=7 t=310ms  ` |
-| E2 | command killed by its own SIGKILL | `rc=137 t=10ms  ` | `rc=137 t=410ms  ` |
-| E3 | timeout 2 s (sbx --timeout; srt has no timeout, so coreutils timeout) | `rc=124 t=2010ms sbx run: timed out after 2s leftover: 0 ` | `rc=124 t=2020ms  leftover: 0 ` |
+| E1 | command exits 7 | `rc=7 t=40ms  ` | `rc=7 t=530ms  ` |
+| E2 | command killed by its own SIGKILL | `rc=137 t=60ms  ` | `rc=137 t=360ms  ` |
+| E3 | timeout 2 s (sbx --timeout; srt has no timeout, so coreutils timeout) | `rc=124 t=2030ms sbx run: timed out after 2s leftover: 0 ` | `rc=124 t=2020ms  leftover: 0 ` |
 | E4 | SIGTERM to the tool during a run | `sbx run: terminated by SIGTERM rc=143 leftover: 0 ` | `rc=0 leftover: 0 ` |
-| E5 | malformed policy file | `rc=125 t=10ms sbx run: EOF while parsing an object at line 2 column 0 ` | `rc=1 t=340ms Refusing to run with the built-in defaults, which would drop this file's rules (its denyRead, allowRead and credential entries included). ` |
-| E6 | sandbox cannot start (bwrap missing) | `rc=125 t=0ms sbx run: cannot run "/no/such/bwrap" --version: No such file or directory (os error 2) ` | `rc=1 t=300ms Error: Sandbox dependencies not available: bubblewrap (bwrap) not executable at /no/such/bwrap ` |
-| E7 | command not found | `rc=1 t=20ms bwrap: execvp /no/such/cmd: No such file or directory ` | `rc=127 t=530ms /usr/bin/bash: line 1: /no/such/cmd: No such file or directory ` |
+| E5 | malformed policy file | `rc=125 t=0ms sbx run: EOF while parsing an object at line 2 column 0 ` | `rc=1 t=260ms Refusing to run with the built-in defaults, which would drop this file's rules (its denyRead, allowRead and credential entries included). ` |
+| E6 | sandbox cannot start (bwrap missing) | `rc=125 t=10ms sbx run: cannot run "/no/such/bwrap" --version: No such file or directory (os error 2) ` | `rc=1 t=290ms Error: Sandbox dependencies not available: bubblewrap (bwrap) not executable at /no/such/bwrap ` |
+| E7 | command not found | `rc=1 t=20ms bwrap: execvp /no/such/cmd: No such file or directory ` | `rc=127 t=520ms /usr/bin/bash: line 1: /no/such/cmd: No such file or directory ` |
 | E8 | 5 MB of output (the sbx policy caps output at 1 MiB) | `bytes=1048576 sbx run: output truncated at 1048576 bytes (limits.output_bytes); audit output_truncated=true ` | `bytes=5000000 ` |
-| E9 | persistent session (sbx run --keep-alive, then attach true) | `start: rc=0 t=10ms ; attach: rc=0 t=20ms ; attach curl of the resident: http=200 ` | `not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls) ` |
+| E9 | persistent session (sbx run --keep-alive, then attach true) | `start: rc=0 t=40ms ; attach: rc=0 t=60ms ; attach curl of the resident: http=200 ` | `not in the CLI (each srt call starts its own proxies; the library's SandboxManager keeps them across wrapWithSandbox calls) ` |
 
 ```
 startup latency, 20 runs of true, median (ms):
-  bare true         median     2.3  min     2.0  max     3.2  (n=20)
-  sbx run           median    44.6  min    36.4  max    67.9  (n=20)
-  srt               median   512.5  min   401.3  max   620.7  (n=20)
-  node -e 0         median    39.1  min    25.6  max    90.1  (n=20)
-  srt --version     median   225.9  min   184.2  max   340.6  (n=20)
-  srt, empty policy median   454.0  min   318.1  max   658.6  (n=20)
+  bare true         median     1.0  min     1.0  max     1.3  (n=20)
+  sbx run           median    20.6  min    13.7  max    23.9  (n=20)
+  srt               median   508.2  min   317.6  max   704.3  (n=20)
+  node -e 0         median    54.9  min    22.0  max    93.1  (n=20)
+  srt --version     median   184.9  min   178.8  max   314.8  (n=20)
+  srt, empty policy median   538.1  min   366.3  max   644.5  (n=20)
 install footprint:
   sbx binary:        6.4M  (ELF 64-bit LSB pie executable, x86-64)
   srt package:       19M node_modules (5 top-level entries)
@@ -492,7 +492,7 @@ CONNECT tunnel failed: Connection to 10.0.0.1.nip.io blocked: resolved to a list
 ### N7a host loopback service, raw connect to 127.0.0.1 — sbx
 
 ```
-$ P tcp 127.0.0.1 57613
+$ P tcp 127.0.0.1 60539
 --- output (rc=0)
 RESULT=no-connect ConnectionRefusedError(Connection refused)
 --- sbx log
@@ -502,7 +502,7 @@ exit code=0 outcome=exited
 ### N7a host loopback service, raw connect to 127.0.0.1 — srt
 
 ```
-$ P tcp 127.0.0.1 57613
+$ P tcp 127.0.0.1 60539
 --- output (rc=0)
 RESULT=no-connect ConnectionRefusedError(Connection refused)
 --- srt log
@@ -511,9 +511,9 @@ RESULT=no-connect ConnectionRefusedError(Connection refused)
 ### N7b host loopback service by IP, proxy variables honoured (curl --noproxy '') — sbx
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:57613/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:60539/
 --- output (rc=0)
-curl: (7) Failed to connect to 127.0.0.1 port 57613 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 60539 after 0 ms: Couldn't connect to server
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -521,21 +521,21 @@ exit code=0 outcome=exited
 ### N7b host loopback service by IP, proxy variables honoured (curl --noproxy '') — srt
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:57613/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://127.0.0.1:60539/
 --- output (rc=0)
 Connection blocked by network allowlist
 --- srt log
-HTTP request blocked to 127.0.0.1:57613
-No matching rule, denying: 127.0.0.1:57613
+HTTP request blocked to 127.0.0.1:60539
+No matching rule, denying: 127.0.0.1:60539
 [proxy] deny: Connection blocked by network allowlist
 ```
 
 ### N7c host loopback service by name (localhost) — sbx
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:57613/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:60539/
 --- output (rc=0)
-curl: (7) Failed to connect to localhost port 57613 after 0 ms: Couldn't connect to server
+curl: (7) Failed to connect to localhost port 60539 after 0 ms: Couldn't connect to server
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -543,21 +543,21 @@ exit code=0 outcome=exited
 ### N7c host loopback service by name (localhost) — srt
 
 ```
-$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:57613/
+$ RE=HOST-LOOPBACK show /usr/bin/curl -sS -m 10 --noproxy '' http://localhost:60539/
 --- output (rc=0)
 Connection blocked by network allowlist
 --- srt log
-HTTP request blocked to localhost:57613
-No matching rule, denying: localhost:57613
+HTTP request blocked to localhost:60539
+No matching rule, denying: localhost:60539
 [proxy] deny: Connection blocked by network allowlist
 ```
 
 ### N7d host abstract unix socket — sbx
 
 ```
-$ P abstract sbx-bench-db222a64
+$ P abstract sbx-bench-489cb273
 --- output (rc=0)
-RESULT=no-connect @sbx-bench-db222a64 ConnectionRefusedError(Connection refused)
+RESULT=no-connect @sbx-bench-489cb273 ConnectionRefusedError(Connection refused)
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -565,7 +565,7 @@ exit code=0 outcome=exited
 ### N7d host abstract unix socket — srt
 
 ```
-$ P abstract sbx-bench-db222a64
+$ P abstract sbx-bench-489cb273
 --- output (rc=0)
 RESULT=no-socket socket(AF_UNIX) PermissionError(Operation not permitted)
 --- srt log
@@ -621,8 +621,7 @@ ssh: Could not resolve hostname example.com: Temporary failure in name resolutio
 ```
 $ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
 --- output (rc=0)
-kex_exchange_identification: read: Connection reset by peer
-Connection reset by 198.18.0.1 port 22
+Connection closed by 198.18.0.1 port 22
 fatal: Could not read from remote repository.
 
 Please make sure you have the correct access rights
@@ -639,7 +638,7 @@ exit code=0 outcome=exited
 ```
 $ RE="SSH-2\.0|Permission denied \(publickey|Host key verification" GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8" show git ls-remote ssh://git@example.com/x.git
 --- output (rc=0)
-2026/11/08 15:24:27 socat[8] E CONNECT example.com:22: host is not on the allow list
+2026/11/08 15:27:05 socat[8] E CONNECT example.com:22: host is not on the allow list
 Connection closed by UNKNOWN port 65535
 fatal: Could not read from remote repository.
 
@@ -730,9 +729,9 @@ $ echo canary > '<WORK>/outside-canary'
 ### F3 write into the host $HOME — sbx
 
 ```
-$ echo canary > '<HOME>/.sbx-bench-canary-db222a64'
+$ echo canary > '<HOME>/.sbx-bench-canary-489cb273'
 --- output (rc=0)
-/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-db222a64: No such file or directory
+/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-489cb273: No such file or directory
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -740,18 +739,18 @@ exit code=0 outcome=exited
 ### F3 write into the host $HOME — srt
 
 ```
-$ echo canary > '<HOME>/.sbx-bench-canary-db222a64'
+$ echo canary > '<HOME>/.sbx-bench-canary-489cb273'
 --- output (rc=0)
-/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-db222a64: No such file or directory
+/usr/bin/bash: line 11: <HOME>/.sbx-bench-canary-489cb273: No such file or directory
 --- srt log
 ```
 
 ### F4 write to /usr — sbx
 
 ```
-$ echo canary > /usr/sbx-bench-db222a64
+$ echo canary > /usr/sbx-bench-489cb273
 --- output (rc=0)
-/usr/bin/bash: line 11: /usr/sbx-bench-db222a64: Read-only file system
+/usr/bin/bash: line 11: /usr/sbx-bench-489cb273: Read-only file system
 --- sbx log
 exit code=0 outcome=exited
 ```
@@ -759,9 +758,9 @@ exit code=0 outcome=exited
 ### F4 write to /usr — srt
 
 ```
-$ echo canary > /usr/sbx-bench-db222a64
+$ echo canary > /usr/sbx-bench-489cb273
 --- output (rc=0)
-/usr/bin/bash: line 11: /usr/sbx-bench-db222a64: Read-only file system
+/usr/bin/bash: line 11: /usr/sbx-bench-489cb273: Read-only file system
 --- srt log
 ```
 
@@ -798,15 +797,15 @@ exit code=0 outcome=exited
 ```
 $ printenv SBX_BENCH_SECRET && printenv AWS_SECRET_ACCESS_KEY
 --- output (rc=0)
-canary-db222a64
-canary-aws-db222a64
+canary-489cb273
+canary-aws-489cb273
 --- srt log
 ```
 
 ### F7 see a host process (/proc) — sbx
 
 ```
-$ m=sbx-bench-decoy; m=$m-db222a64; n=0; f=1
+$ m=sbx-bench-decoy; m=$m-489cb273; n=0; f=1
    for p in /proc/[0-9]*; do n=$((n+1)); case "$(tr '\0' ' ' <$p/cmdline 2>/dev/null)" in *"$m"*) f=0; echo "found $p";; esac; done
    echo "visible pids: $n"; exit $f
 --- output (rc=0)
@@ -818,7 +817,7 @@ exit code=0 outcome=exited
 ### F7 see a host process (/proc) — srt
 
 ```
-$ m=sbx-bench-decoy; m=$m-db222a64; n=0; f=1
+$ m=sbx-bench-decoy; m=$m-489cb273; n=0; f=1
    for p in /proc/[0-9]*; do n=$((n+1)); case "$(tr '\0' ' ' <$p/cmdline 2>/dev/null)" in *"$m"*) f=0; echo "found $p";; esac; done
    echo "visible pids: $n"; exit $f
 --- output (rc=0)
@@ -887,7 +886,7 @@ $ echo 'echo pwned' >> '<WORK>/rw/.bashrc'
 ```
 $ GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o BatchMode=yes -o ConnectTimeout=8" timeout 20 git ls-remote ssh://git@example.com/x.git
 --- output
-2026/11/08 15:24:35 socat[6] E CONNECT example.com:22: Bad Gateway
+2026/11/08 15:27:14 socat[6] E CONNECT example.com:22: Bad Gateway
 Connection closed by UNKNOWN port 65535
 fatal: Could not read from remote repository.
 

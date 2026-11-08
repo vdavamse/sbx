@@ -144,20 +144,20 @@ srt with the benchmark policy changed in one place each:
 
 | | sbx | srt |
 |---|---|---|
-| startup, median of 20 runs of `true` (hyperfine) | **44.6 ms** (min 36.4, max 67.9) | 512 ms (min 401, max 621) |
+| startup, median of 20 runs of `true` (hyperfine) | **20.6 ms** (min 13.7, max 23.9) | 508 ms (min 318, max 704) |
 | what is installed | one static binary, 6.4 MB, plus bubblewrap | node 22.12+ (the node binary is 122 MB), the npm package (19 MB of `node_modules`), socat (448 KB), ripgrep (5.1 MB), bubblewrap |
 | root, setuid, daemon | none of them. It needs unprivileged user namespaces | none of them. It needs unprivileged user namespaces (Ubuntu 24.04 with AppArmor's userns restriction needs a sysctl or a profile, per srt's README) |
 
 The host was busy with other work during the recorded run: a bare `true`
-took a median of 2.3 ms, where it takes about 0.5 ms on this machine idle. All
+took a median of 1.0 ms, where it takes about 0.5 ms on this machine idle. All
 the times above are inflated by that contention, and the ratio between the
 two tools is what to read from them. For an idle host, [Usage](usage.md)
 reports `sbx run … -- bash -c true` at 11.15 ms median (`hyperfine --runs
 100`, from a native filesystem).
 
-The same run measured where srt's time goes: starting node takes 39 ms, and
-loading the CLI (`srt --version`) takes 226 ms. A run with an empty policy
-takes 454 ms, which adds starting the proxies and the socat bridges and
+The same run measured where srt's time goes: starting node takes 55 ms, and
+loading the CLI (`srt --version`) takes 185 ms. A run with an empty policy
+takes 538 ms, which adds starting the proxies and the socat bridges and
 srt's scan for its mandatory deny paths. Both tools ran from a native
 filesystem, with the rw directory as the working directory. srt's
 library (`SandboxManager`) starts the proxies once and wraps many commands,
@@ -221,7 +221,7 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
   ssh to work (F8, V4). Each srt network gap above has a setting that closes
   it. srt cannot pass an empty environment, and denying `/tmp` hides its
   bridge socket (V3). An operator has to know each setting.
-- **Startup and footprint.** 44.6 ms against 512 ms per command, and one
+- **Startup and footprint.** 20.6 ms against 508 ms per command, and one
   static binary against a node runtime plus three tools.
 - **Harness contract.** A timeout, an output cap, distinct exit codes for
   sandbox failures (125) and signals (143), a JSON audit row for each network
