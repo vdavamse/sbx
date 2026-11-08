@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "filesystem": { "ro": ["/usr", "/etc/ssl"], "rw": ["@RW@"], "deny": [] },
+  "network": {
+    "mode": "transparent",
+    "allow": ["=example.com", "=127.0.0.1.nip.io", "=169.254.169.254.nip.io", "=10.0.0.1.nip.io"],
+    "ports": [443]
+  },
+  "env": { "pass": [], "set": {} },
+  "limits": { "timeout": "60s", "output_bytes": 1048576 }
+}
