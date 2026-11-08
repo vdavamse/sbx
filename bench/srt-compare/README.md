@@ -54,7 +54,7 @@ startup numbers). `sbx check` must report network mode `transparent`.
   answers, and stops if one does not. It removes them on exit (also on
   Ctrl-C), together with any canary file a sandbox managed to write (one is
   aimed at `$HOME`). F5 is `n/a` on a host without `~/.ssh`.
-- **Variants.** V1 to V4 run srt with the policy changed in one place, to
+- **Variants.** V1 to V4b run srt with the policy changed in one place, to
   show what each srt-specific setting is for.
 - **Redaction.** The run's paths appear as `<WORK>`, `<TOOLS>` and `<HOME>`
   in the output, and `host.txt` records the runner's git revision.
@@ -62,7 +62,8 @@ startup numbers). `sbx check` must report network mode `transparent`.
   the tool, a bad policy, a missing bwrap and a missing command. Also output
   limits and persistent sessions.
 - **Ops.** Startup latency (hyperfine, 20 runs of `true`) and install
-  footprint.
+  footprint. Startup is sensitive to other load on the host;
+  `ONLY=latency run.sh OUT` re-records it alone (host.txt and latency.txt).
 
 ## Outcome words
 
@@ -72,7 +73,7 @@ startup numbers). `sbx check` must report network mode `transparent`.
 | `BROKEN` | a permitted baseline failed (the run is not valid) |
 | `blocked` / `fails-closed` / `refused` | the action did not reach its target |
 | `unverified` | the action failed, but its target cannot answer and the tool logged no deny (N6) |
-| `broken` | a variant made a working action fail (V3, V4) |
+| `broken` / `unclear` | a variant made a working action fail (V3, V4a, V4b) / neither outcome left evidence |
 | `LEAKED` / `planted` | the action reached a target the policy denies, or wrote a file that runs later on the host |
 | `passed-uninspected` | the bytes reached the allowed upstream, and the tool could not see the part that differed (the encrypted `Host`) |
 | `dialed` | srt's proxy accepted the destination and dialed it (variants V1, V2) |
