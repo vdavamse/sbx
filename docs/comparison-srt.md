@@ -154,6 +154,10 @@ srt with the benchmark policy changed in one place each:
 
 The startup numbers come from three `ONLY=latency` runs recorded right after
 the full run ([latency-runs.md](../bench/srt-compare/results/2026-11-08-wsl2/latency-runs.md)).
+The full run's own startup block in results.md (sbx 61.7 ms, srt 553 ms,
+bare `true` 1.8 ms) was taken under heavier load and is not used here. Its
+variants table also still has the old heading "srt without the two settings
+that match the sbx policy", which the runner has since renamed.
 The host had other load at the time: a bare `true` took a median of 0.8 to
 3.2 ms, where it takes about 0.5 ms on this machine idle. Contention inflates
 sbx's short start more than srt's long one, so even the ratio is only

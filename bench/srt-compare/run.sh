@@ -48,7 +48,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 mkdir -p "$RW" "$OUT/raw"
 OUT=$(cd "$OUT" && pwd)
-rm -f "$OUT"/raw/* "$OUT/results.tsv"
+# ONLY=latency leaves a full run's evidence in OUT alone.
+[[ ${ONLY:-all} == latency ]] || rm -f "$OUT"/raw/* "$OUT/results.tsv"
 cp "$HERE/probe.py" "$RW/probe.py"
 git init -q "$RW"   # the rw dir is a checkout, as an agent's working tree would be
 
@@ -171,8 +172,8 @@ esc() { sed -e 's/|/\\|/g' | tr '\n' ' ' | cut -c1-220; }
 
 scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex]
   # With deny-regex the failure-word needs proof: the tool's log or the
-  # script's output must match the regex (an explicit deny). A failed script without it is "unverified",
-  # because the target may simply not have answered.
+  # script's output must match the regex (an explicit deny). A failed script
+  # without it is "unverified", because the target may not have answered.
   # With host-path the verdict is taken on the host: success-word when the
   # path is a non-empty file there after the run. A write that succeeded
   # inside but landed elsewhere (sbx's /tmp is the session's own tmp
@@ -206,9 +207,8 @@ scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex
   echo "$row" | tee -a "$OUT/results.tsv"
 }
 
-: >"$OUT/evidence.md"
-
 if [[ ${ONLY:-all} != latency ]]; then
+: >"$OUT/evidence.md"
 # ---------------------------------------------------------------- network
 scen N1  "HTTPS to the allowed name (baseline)" allowed BROKEN \
   'c https://example.com/'
@@ -294,8 +294,9 @@ scen F10 "plant a shell rc file in the rw dir (.bashrc)" planted blocked \
   "echo 'echo pwned' >> '$RW/.bashrc'" "$RW/.bashrc"
 
 # ---------------------------------------------------------------- srt defaults
-# Two srt settings this comparison turns on to match the sbx policy. Here is
-# what each scenario does without them; the verdict is read from srt's log.
+# srt with the benchmark policy changed in one place each: what the settings
+# this comparison adds for srt are for (V1, V2), and what srt needs to run at
+# all (V3 to V4b).
 variant() { # ID "title" python-edit 'script' log|out regex match-word other-word [other-regex]
   # The word is match-word when the regex matches srt's log (log) or the
   # script's output (out) and srt logged no deny. Otherwise it is other-word;
@@ -468,7 +469,7 @@ fi
   echo "|---|---|---|---|"
   awk -F'\t' '{printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4}' "$OUT/results.tsv"
   echo
-  echo "## srt without the two settings that match the sbx policy"
+  echo "## srt with the benchmark policy changed in one place each"
   echo
   echo "| ID | case | srt |"
   echo "|---|---|---|"
