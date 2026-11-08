@@ -62,6 +62,12 @@
 //!    same-policy invariant of R26). A call creates and removes nothing.
 //!    Two concurrent `run`s of one policy on one tree do not share a list: that
 //!    race stays open (threat-model R7, R26).
+//! 7. **Host writers.** A rename over, or a removal of, a protected path on the
+//!    host (git rewrites `.git/config` by renaming `config.lock` over it, `git
+//!    clean -fd` removes empty directories) detaches the read-only bind in the
+//!    sandbox's mount namespace (Linux 3.18 and later), so the payload can
+//!    write the path from then on. sbx cannot prevent it; it records every
+//!    target's (dev, ino) at the start and warns at the end when one changed.
 
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr};
@@ -156,6 +162,9 @@ pub(crate) struct Protected {
     gitdirs: Vec<Watched>,
     /// The session's saved path list (a keep-alive holder), removed at release.
     saved: Option<PathBuf>,
+    /// (dev, ino) of every target when the launch was prepared (module docs
+    /// point 7).
+    identities: Vec<(u64, u64)>,
 }
 
 impl Protected {
@@ -171,6 +180,7 @@ impl Protected {
     /// Removes the placeholders no other live launch holds, then the
     /// manifest. Idempotent.
     pub(crate) fn release(&mut self) {
+        self.warn_lapsed();
         for held in self.held.drain(..).rev() {
             remove_held(&held);
         }
@@ -186,6 +196,44 @@ impl Protected {
         }
     }
 
+    /// Module docs point 7: a target that a host process replaced (git's
+    /// lock-file rename of `.git/config`) or removed during the run lost its
+    /// read-only bind in the sandbox from then on. Warn, once per target.
+    fn warn_lapsed(&mut self) {
+        for path in self.lapsed() {
+            eprintln!(
+                "sbx: warning: the protected path {path:?} was replaced or removed on the host while the sandbox ran, so the sandbox could write it from then on; review it before running git or other host tools on the tree"
+            );
+        }
+        self.identities.clear();
+    }
+
+    /// The targets whose (dev, ino) changed since the launch was prepared.
+    fn lapsed(&self) -> Vec<String> {
+        use std::os::unix::fs::MetadataExt;
+        self.paths
+            .iter()
+            .zip(&self.identities)
+            .filter(|(abs, id)| {
+                std::fs::symlink_metadata(abs.as_path())
+                    .ok()
+                    .map(|m| (m.dev(), m.ino()))
+                    != Some(**id)
+            })
+            .map(|(abs, _)| abs.as_str().to_owned())
+            .collect()
+    }
+
+    /// Records the identity of the target just pushed (module docs point 7).
+    fn push_target(&mut self, abs: AbsolutePath) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(abs.as_path())
+            .map_err(|err| format!("cannot inspect protected path {:?}: {err}", abs.as_str()))?;
+        self.identities.push((meta.dev(), meta.ino()));
+        self.paths.push(abs);
+        Ok(())
+    }
+
     fn empty() -> Self {
         Protected {
             paths: Vec::new(),
@@ -193,6 +241,7 @@ impl Protected {
             manifest: None,
             gitdirs: Vec::new(),
             saved: None,
+            identities: Vec::new(),
         }
     }
 
@@ -315,7 +364,7 @@ pub(crate) fn prepare(policy: &Policy, session: Option<&Path>) -> Result<Protect
                 }
             }
         }
-        out.paths.push(abs);
+        out.push_target(abs)?;
     }
     Ok(out)
 }
@@ -372,7 +421,7 @@ pub(crate) fn load(policy: &Policy, session: &Path) -> Result<Protected, String>
                 "the session's protected path {text:?} is not inside an rw path of the policy; restart the session"
             ));
         }
-        out.paths.push(abs);
+        out.push_target(abs)?;
     }
     Ok(out)
 }
@@ -413,10 +462,9 @@ fn block_redirects(watched: &Watched) {
 
 /// Holds `dir` (a git directory) open and records which [`GIT_REDIRECTS`] it
 /// lacks.
-fn watch(dir: &Path, gitdirs: &mut Vec<Watched>) {
-    let Ok(c) = cstring(dir.as_os_str().as_bytes()) else {
-        return;
-    };
+fn watch(dir: &Path, gitdirs: &mut Vec<Watched>) -> Result<(), String> {
+    let c = cstring(dir.as_os_str().as_bytes())
+        .map_err(|err| format!("cannot open the git directory {dir:?}: {err}"))?;
     // SAFETY: NUL-terminated path; a successful call returns a fresh fd.
     let raw = unsafe {
         libc::open(
@@ -425,7 +473,15 @@ fn watch(dir: &Path, gitdirs: &mut Vec<Watched>) {
         )
     };
     if raw < 0 {
-        return;
+        let err = io::Error::last_os_error();
+        // Gone since the scan saw it: nothing to watch. Anything else (EMFILE
+        // with many git directories) refuses rather than skipping the check.
+        if matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) {
+            return Ok(());
+        }
+        return Err(format!(
+            "cannot open the git directory {dir:?} for filesystem.protect: {err}"
+        ));
     }
     // SAFETY: `raw` is a fresh descriptor returned by open.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
@@ -440,6 +496,7 @@ fn watch(dir: &Path, gitdirs: &mut Vec<Watched>) {
             absent,
         });
     }
+    Ok(())
 }
 
 /// Segment-exact "equals or is under" on lexically canonical paths.
@@ -606,13 +663,22 @@ fn git_extras(
         v.sort();
         v
     };
+    // Only a linked worktree's admin directory has a commondir; one in a
+    // `.git` directory is a redirect someone planted (a run with the
+    // protection off, or one that died before its release).
+    let planted = gitdir.join("commondir");
+    if std::fs::symlink_metadata(&planted).is_ok() {
+        return Err(format!(
+            "{planted:?} exists; a .git directory never has a commondir file, and this one makes git on the host run hooks and read config from another directory. Inspect and remove it, or set filesystem.protect to [] to turn the protection off"
+        ));
+    }
     existing(gitdir.join("config.worktree"), out)?;
-    watch(gitdir, gitdirs);
+    watch(gitdir, gitdirs)?;
     for admin in children(&sub("worktrees")?) {
         for name in ["commondir", "gitdir", "config.worktree"] {
             existing(admin.join(name), out)?;
         }
-        watch(&admin, gitdirs);
+        watch(&admin, gitdirs)?;
     }
     // Submodule git directories nest (`modules/a/modules/b`); a directory
     // with a HEAD file is one.
@@ -633,7 +699,7 @@ fn git_extras(
             for name in ["hooks", "config", "commondir", "config.worktree"] {
                 existing(dir.join(name), out)?;
             }
-            watch(&dir, gitdirs);
+            watch(&dir, gitdirs)?;
         }
         if depth >= 2 * SEARCH_DEPTH {
             continue;
@@ -917,9 +983,29 @@ fn remove_listed(path: &Path) {
     if !path.is_absolute() {
         return;
     }
-    let Ok((parent, name)) = split(path) else {
+    // The listed parent is the rw path or a real directory inside it: a
+    // symlink in its place now is not followed (the next scan adopts instead).
+    let (Some(parent_path), Some(name)) = (path.parent(), path.file_name()) else {
         return;
     };
+    let Ok(cparent) = cstring(parent_path.as_os_str().as_bytes()) else {
+        return;
+    };
+    let Ok(name) = cstring(name.as_bytes()) else {
+        return;
+    };
+    // SAFETY: NUL-terminated path; a successful call returns a fresh fd.
+    let raw = unsafe {
+        libc::open(
+            cparent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return;
+    }
+    // SAFETY: `raw` is a fresh descriptor returned by open.
+    let parent = unsafe { OwnedFd::from_raw_fd(raw) };
     let Ok(fd) = open_child_dir(parent.as_fd(), &name) else {
         return;
     };
@@ -1266,6 +1352,33 @@ mod tests {
         std::os::unix::fs::symlink("/usr", git.join("modules")).unwrap();
         let err = scan_for_test(&policy(&root, None, "")).unwrap_err();
         assert!(err.contains("is a symbolic link"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_host_rename_over_a_target_is_reported() {
+        let root = scratch("lapse");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/config"), "[core]\n").unwrap();
+        let mut prot = prepare(&policy(&root, Some(r#"[".git/config"]"#), ""), None).unwrap();
+        assert!(prot.lapsed().is_empty());
+        // git's lock-file rewrite: a new inode renamed over the target.
+        std::fs::write(root.join(".git/config.lock"), "[core]\n").unwrap();
+        std::fs::rename(root.join(".git/config.lock"), root.join(".git/config")).unwrap();
+        let lapsed = prot.lapsed();
+        assert_eq!(lapsed.len(), 1);
+        assert!(lapsed[0].ends_with("/.git/config"), "{lapsed:?}");
+        prot.release();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_planted_top_level_commondir_refuses() {
+        let root = scratch("planted-commondir");
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::fs::write(root.join(".git/commondir"), "/elsewhere\n").unwrap();
+        let err = scan_for_test(&policy(&root, None, "")).unwrap_err();
+        assert!(err.contains("never has a commondir file"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

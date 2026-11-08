@@ -4568,6 +4568,7 @@ fn protect_script(p: &std::path::Display<'_>) -> String {
          if echo pwned > {p}/sub/.git/hooks/post-checkout 2>/dev/null; then echo NESTED_PLANTED; else echo NESTED_BLOCKED; fi; \
          if echo ok > {p}/out.txt 2>/dev/null; then echo RW_OK; else echo RW_FAILED; fi; \
          if rmdir {p}/.bashrc 2>/dev/null; then echo PLACEHOLDER_REMOVED; else echo PLACEHOLDER_KEPT; fi; \
+         if mkdir {p}/.bashrc/x 2>/dev/null; then echo PLACEHOLDER_WRITABLE; else echo PLACEHOLDER_RO; fi; \
          echo /tmp/evil > {p}/.git/commondir 2>/dev/null; true"
     )
 }
@@ -4598,6 +4599,7 @@ fn protect_f9_f10_blocked() -> Result<(), String> {
         "NESTED_BLOCKED",
         "RW_OK",
         "PLACEHOLDER_KEPT",
+        "PLACEHOLDER_RO",
     ] {
         if !done.stdout.contains(want) {
             return Err(format!("missing {want}: {:?}", done.stdout));
@@ -4724,6 +4726,8 @@ fn protect_attach_blocked() -> Result<(), String> {
         "CONFIG_BLOCKED",
         "NESTED_BLOCKED",
         "RW_OK",
+        "PLACEHOLDER_KEPT",
+        "PLACEHOLDER_RO",
     ] {
         if !call.stdout.contains(want) {
             return Err(format!("attach call: missing {want}: {:?}", call.stdout));

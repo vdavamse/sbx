@@ -101,7 +101,9 @@ is the one Anthropic's sandbox-runtime (srt) uses:
   levels below (`rw/a/b/c/.git/hooks`, as srt). The scan follows no symbolic link and
   does not enter `node_modules` directories, `deny` paths or other policy binds. It
   skips an unreadable directory that belongs to another user (a container volume), and
-  refuses one of yours. A worktree's `.git` file is protected itself. Inside each
+  refuses one of yours. A worktree's `.git` file is protected itself, and a `.git`
+  directory that contains a `commondir` file (only a linked worktree's admin directory
+  has one) refuses the run. Inside each
   `.git` (when the list protects something under `.git`), the existing submodule git
   directories (`.git/modules/…`: `hooks/`, `config`, `commondir`), linked worktrees
   (`.git/worktrees/*/commondir` and `gitdir`) and every `config.worktree` are protected
@@ -140,7 +142,15 @@ is the one Anthropic's sandbox-runtime (srt) uses:
   is a scan of more than 20 000 directories in one `rw` path.
 
 The list is replaced by an explicit one; `"@default"` stands for the default list.
-Run git commands that rewrite the config on the host, or turn the protection off:
+Run git commands that rewrite the config on the host **while no sandbox runs on the
+tree**, or turn the protection off. A host process that renames over or removes a
+protected path while a sandbox runs (git rewrites `.git/config` by renaming
+`config.lock` over it, `git clean -fd` removes empty directories, editors save by
+rename) detaches the read-only bind inside the sandbox, which can then write the path.
+sbx cannot prevent this. It prints `sbx: warning: the protected path … was replaced or
+removed on the host while the sandbox ran` when the run ends; review that path before
+running host tools on the tree. With `--keep-alive` the warning comes when the session
+ends, in the session's log.
 
 ```json
 "filesystem": { "ro": ["/usr"], "rw": ["/home/me/project"], "deny": [],

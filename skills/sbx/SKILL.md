@@ -45,7 +45,8 @@ failing items, and the reasons are on stderr.
   empty read-only directory for the run. So `git config`, `git remote add` and
   `git init` in the project fail with
   `error: could not write config file .git/config: Device or resource busy`: run them on
-  the host before or after, or set `"protect": []` in `filesystem` to turn this off. A
+  the host while no sandbox runs on the tree (a host rewrite during a run detaches the
+  read-only bind), or set `"protect": []` in `filesystem` to turn this off. A
   protected name that is a symlink refuses the run (rc 125,
   `protected path … is a symbolic link; sbx cannot bind it read-only`). See
   [Protected paths](https://github.com/vdavamse/sbx/blob/main/docs/usage.md#running-commands).
