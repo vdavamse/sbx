@@ -141,8 +141,8 @@ srt with the benchmark policy changed in one place each:
 | F6 | read secrets from the environment | **blocked** | **LEAKED** | srt printed both canaries (`SBX_BENCH_SECRET`, `AWS_SECRET_ACCESS_KEY`) |
 | F7 | see a host process in `/proc` | blocked | blocked | both have a pid namespace (3 pids visible) |
 | F8 | read the host `/etc/passwd` | blocked | LEAKED | Caused by the benchmark's srt policy, which has to allow the host file for ssh (V4a). sbx generates one |
-| F9 | plant `.git/hooks/pre-commit` in the rw checkout | **planted** | **blocked** | sbx: the hook is on the host with `echo pwned` in it. srt: `Read-only file system` (a mandatory deny path) |
-| F10 | plant `.bashrc` in the rw dir | **planted** | **blocked** | srt: `Permission denied` |
+| F9 | plant `.git/hooks/pre-commit` in the rw checkout | **planted** in 0.1.0; blocked since #73 | **blocked** | sbx 0.1.0 (this run): the hook is on the host with `echo pwned` in it. Since #73 the default `filesystem.protect` binds `.git/hooks/` read-only (`Read-only file system`); the integration test `protect-f9-f10-blocked` reproduces this row, the benchmark has not been re-run. srt: `Read-only file system` (a mandatory deny path) |
+| F10 | plant `.bashrc` in the rw dir | **planted** in 0.1.0; blocked since #73 | **blocked** | sbx since #73: a missing `.bashrc` at the top of the rw dir gets an empty read-only placeholder directory for the run, so the append fails, and the placeholder is removed afterwards (`protect-f9-f10-blocked`). srt: `Permission denied` |
 
 ### Startup, footprint, privileges
 
@@ -248,11 +248,16 @@ always runs the command through `bash -c` (argv is shell-quoted and re-parsed).
   its README, its CI runs the whole suite against the bubblewrap Ubuntu ships
   and against 0.12.0, and the mount-plan suites against 0.4.1 as well. sbx
   0.1.0 is its first release.
-- **Auto-run files in writable paths.** srt makes `.git/hooks`,
-  `.git/config`, shell rc files, `.gitconfig`, `.mcp.json`, `.vscode/` and
-  similar paths read-only inside every writable directory by default (F9,
-  F10). sbx lets a payload plant a git hook that runs on the host at the next
-  commit. This is threat-model R7, which sbx only documents.
+- **Auto-run files in writable paths (sbx 0.1.0; closed by #73).** srt makes
+  `.git/hooks`, `.git/config`, shell rc files, `.gitconfig`, `.mcp.json`,
+  `.vscode/` and similar paths read-only inside every writable directory by
+  default (F9, F10). sbx 0.1.0 let a payload plant a git hook that runs on the
+  host at the next commit. Since #73 sbx binds the same list read-only by
+  default, at the same depth (`filesystem.protect`, see
+  [Usage](usage.md#running-commands)). A missing entry gets an empty directory
+  as its placeholder, which git ignores, and sbx removes it after the run.
+  Both tools leave the rest of threat-model R7 open (`Makefile`, `.envrc`,
+  `package.json` scripts, CI files).
 - **Unix sockets.** srt's seccomp filter refuses `socket(AF_UNIX)` outright
   (N7d), so a socket file that a broad bind exposes cannot be used. sbx
   allows `AF_UNIX` and relies on the mounts: a bind of `/run` or a home

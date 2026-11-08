@@ -194,7 +194,10 @@ A policy is a JSON file, schema version 1 (`sbx check --print-schema`; examples
 in [`examples/`](examples/)):
 
 - `filesystem`: `ro` and `rw` paths are bound at the same path inside the
-  sandbox; a `deny` entry hides its path with an empty tmpfs.
+  sandbox; a `deny` entry hides its path with an empty tmpfs. The optional
+  `protect` list names files that sbx binds read-only inside every `rw` path
+  (git hooks and config, shell rc files, editor and agent config: on by default,
+  `[]` turns it off; see [Protected paths](docs/usage.md#running-commands)).
 - `network`: `mode` is `transparent` (the command connects normally and the
   proxy filters it), `explicit` (the command uses sbx's HTTP proxy through the
   proxy variables sbx sets; direct connections never leave the sandbox) or

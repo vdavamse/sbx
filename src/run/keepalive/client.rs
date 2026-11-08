@@ -244,8 +244,14 @@ fn run_call(
     let setup = crate::run::landlock_setup(landlock.mode)?;
     let layer =
         crate::run::landlock_layer(&setup.exe, &setup.status, landlock.mode, &landlock.bind_tcp);
+    // Issue #73: the call binds the protected paths the holder saved, not a
+    // new scan: a scan of a tree the resident writes would let it choose new
+    // nested binds and pins and race them (the same-policy invariant of R26).
+    // The call creates and removes nothing; the holder owns the placeholders.
+    let protected = crate::run::protect::load(policy, session).map_err(RunError::new)?;
+    let launch_policy = protected.apply(policy);
     let launch: Launch = build(&Build {
-        policy,
+        policy: &launch_policy,
         session_dir: session,
         bwrap_path: &bwrap,
         command: &args.cmd,

@@ -178,7 +178,8 @@ scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex
   # path is a non-empty file there after the run. A write that succeeded
   # inside but landed elsewhere (sbx's /tmp is the session's own tmp
   # directory) is the failure-word, and so is the empty placeholder file srt
-  # leaves for a mandatory deny.
+  # leaves for a mandatory deny. Only a regular file counts: sbx's placeholder
+  # for a missing protected name is a directory (removed after the run).
   local id=$1 title=$2 ok=$3 bad=$4 body=$5 hostpath=${6:-} denyre=${7:-} tool f word rc
   local script="$PRELUDE
 ( $body ); r=\$?; if [ \$r = 0 ]; then echo OUTCOME=$ok; else echo OUTCOME=$bad; fi"
@@ -193,7 +194,7 @@ scen() { # ID "title" success-word failure-word 'script' [host-path] [deny-regex
       word=unverified
     fi
     if [[ -n $hostpath && ( $word == "$ok" || $word == "$bad" ) ]]; then
-      if [[ -s $hostpath ]]; then
+      if [[ -f $hostpath && -s $hostpath ]]; then
         word=$ok; echo "host: $hostpath written ($(head -c 40 "$hostpath"))" >>"$f.log"; rm -f "$hostpath"
       else
         [[ $word == "$ok" ]] && echo "host: write succeeded inside, but $hostpath is not on the host (the sandbox has its own mount there)" >>"$f.log"

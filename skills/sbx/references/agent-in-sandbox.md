@@ -37,6 +37,12 @@ paths, and reach the allow-listed hosts.
 - **The project.** Use `rw` so the agent can edit it, or `ro` for a review-only run. Never
   bind your whole home directory: it exposes `~/.ssh`, cloud credentials, and sockets such
   as ssh-agent.
+- **Protected files in the project.** The default `filesystem.protect` keeps git hooks,
+  `.git/config`, `.mcp.json`, `.vscode/`, `.claude/commands/` and the other auto-run files
+  read-only, so the agent cannot plant something that runs on your next `git commit` or
+  when you open the folder. The agent can still commit, but `git config` and
+  `git remote add` fail inside the sandbox. Extend the list with the project's own
+  auto-run files: `"protect": ["@default", "Makefile", ".envrc"]`.
 - **Allow list.** Add the model API host (`=api.anthropic.com` for Claude) and the package
   registries the task needs, nothing else. Telemetry and update hosts that are not listed
   appear as denied `dns` rows in the audit log. That is harmless, and the agent's own
